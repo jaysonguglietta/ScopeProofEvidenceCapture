@@ -1,0 +1,307 @@
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import { controls, evidence as seedEvidence, findings, requirementCoverage, runs as seedRuns } from "../lib/data";
+import type { CollectionRun, Evidence, EvidenceStatus, EvidenceType } from "../lib/types";
+
+type View = "Overview" | "Controls" | "Evidence" | "Collection runs" | "Findings" | "Connections" | "Settings";
+type Modal = "run" | "add" | "export" | null;
+
+const nav: { label: View; mark: string; section: "workspace" | "manage" }[] = [
+  { label: "Overview", mark: "⌂", section: "workspace" },
+  { label: "Controls", mark: "◎", section: "workspace" },
+  { label: "Evidence", mark: "▱", section: "workspace" },
+  { label: "Collection runs", mark: "↻", section: "workspace" },
+  { label: "Findings", mark: "◇", section: "workspace" },
+  { label: "Connections", mark: "⌘", section: "manage" },
+  { label: "Settings", mark: "⚙", section: "manage" },
+];
+
+const sources = [
+  { name: "AWS", detail: "3 accounts", status: "Healthy", mark: "AW" },
+  { name: "GitHub", detail: "42 repositories", status: "Healthy", mark: "GH" },
+  { name: "Okta", detail: "1 organization", status: "Healthy", mark: "OK" },
+  { name: "Cloudflare", detail: "4 zones", status: "Action needed", mark: "CF" },
+  { name: "Tenable", detail: "8 scan targets", status: "Healthy", mark: "TN" },
+  { name: "Datadog", detail: "16 monitors", status: "Healthy", mark: "DD" },
+];
+
+function cls(...values: Array<string | false | null | undefined>) {
+  return values.filter(Boolean).join(" ");
+}
+
+function StatusPill({ status }: { status: string }) {
+  const key = status.toLowerCase().replaceAll(" ", "-");
+  return <span className={`status status-${key}`}><i />{status}</span>;
+}
+
+function Ring({ value, label }: { value: number; label: string }) {
+  return (
+    <div className="ring" style={{ "--ring-value": `${value * 3.6}deg` } as React.CSSProperties}>
+      <div><strong>{value}%</strong><span>{label}</span></div>
+    </div>
+  );
+}
+
+function EvidenceVisual({ item, compact = false }: { item: Evidence; compact?: boolean }) {
+  if (item.code) {
+    return (
+      <div className={cls("code-preview", compact && "compact")}>
+        <div className="code-top"><span>{item.language}</span><b>•••</b></div>
+        <pre>{item.code}</pre>
+      </div>
+    );
+  }
+  return (
+    <div className={cls("screen-preview", `accent-${item.accent || "blue"}`, compact && "compact")} aria-label={`Screenshot preview for ${item.title}`}>
+      <div className="browser-bar"><span /><span /><span /><b /></div>
+      <div className="fake-app">
+        <div className="fake-sidebar"><i /><i /><i /><i /></div>
+        <div className="fake-content"><em /><i className="fake-title" /><p /><div className="fake-grid"><i /><i /><i /></div><div className="fake-table"><span /><span /><span /></div></div>
+      </div>
+      <span className="capture-stamp">CAPTURED</span>
+    </div>
+  );
+}
+
+function EmptyState({ message, action, onAction }: { message: string; action?: string; onAction?: () => void }) {
+  return <div className="empty-state"><span>⌕</span><h3>Nothing to show</h3><p>{message}</p>{action && <button className="button secondary" onClick={onAction}>{action}</button>}</div>;
+}
+
+export function EvidenceConsole() {
+  const [view, setView] = useState<View>("Overview");
+  const [modal, setModal] = useState<Modal>(null);
+  const [selectedEvidence, setSelectedEvidence] = useState<Evidence | null>(null);
+  const [search, setSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState("All statuses");
+  const [typeFilter, setTypeFilter] = useState("All types");
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [toast, setToast] = useState<string | null>(null);
+  const [evidenceItems, setEvidenceItems] = useState<Evidence[]>(seedEvidence);
+  const [runItems, setRunItems] = useState<CollectionRun[]>(seedRuns);
+  const [busy, setBusy] = useState(false);
+  const [redaction, setRedaction] = useState(true);
+  const [notifications, setNotifications] = useState(true);
+
+  useEffect(() => {
+    const saved = window.localStorage.getItem("scopeproof-evidence");
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        const timer = window.setTimeout(() => setEvidenceItems(parsed), 0);
+        return () => window.clearTimeout(timer);
+      } catch { /* ignore damaged local state */ }
+    }
+  }, []);
+
+  useEffect(() => {
+    if (toast) {
+      const timer = window.setTimeout(() => setToast(null), 3200);
+      return () => window.clearTimeout(timer);
+    }
+  }, [toast]);
+
+  useEffect(() => {
+    const close = (event: KeyboardEvent) => {
+      if (event.key === "Escape") { setModal(null); setSelectedEvidence(null); setSidebarOpen(false); }
+    };
+    window.addEventListener("keydown", close);
+    return () => window.removeEventListener("keydown", close);
+  }, []);
+
+  const filteredEvidence = useMemo(() => evidenceItems.filter((item) => {
+    const q = search.trim().toLowerCase();
+    const matchesQuery = !q || [item.title, item.control, item.source, item.system, item.tags.join(" ")].join(" ").toLowerCase().includes(q);
+    return matchesQuery && (statusFilter === "All statuses" || item.status === statusFilter) && (typeFilter === "All types" || item.type === typeFilter);
+  }), [evidenceItems, search, statusFilter, typeFilter]);
+
+  function navigate(next: View) {
+    setView(next); setSidebarOpen(false); setSearch("");
+  }
+
+  function approveEvidence(item: Evidence) {
+    const next = evidenceItems.map((entry) => entry.id === item.id ? { ...entry, status: "Approved" as EvidenceStatus } : entry);
+    setEvidenceItems(next); window.localStorage.setItem("scopeproof-evidence", JSON.stringify(next));
+    setSelectedEvidence({ ...item, status: "Approved" }); setToast(`${item.id} approved and added to the audit trail.`);
+  }
+
+  function handleRun(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const selected = form.getAll("source");
+    if (!selected.length) { setToast("Select at least one evidence source."); return; }
+    setBusy(true);
+    const newRun: CollectionRun = { id: `RUN-${2982 + runItems.length}`, source: selected.length === 1 ? `${selected[0]} on-demand collection` : `On-demand collection · ${selected.length} sources`, startedAt: "Just now", status: "Running", artifacts: 0, controls: 0, duration: "In progress" };
+    setRunItems((items) => [newRun, ...items]);
+    window.setTimeout(() => {
+      setRunItems((items) => items.map((run) => run.id === newRun.id ? { ...run, status: "Completed", artifacts: selected.length * 4, controls: selected.length * 2, duration: "1m 18s" } : run));
+      setBusy(false); setModal(null); setToast(`Collection complete: ${selected.length * 4} artifacts captured.`); setView("Collection runs");
+    }, 1500);
+  }
+
+  function handleAdd(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const title = String(form.get("title") || "").trim();
+    const control = String(form.get("control") || "");
+    if (!title || !control) return;
+    const type = String(form.get("type")) as EvidenceType;
+    const code = String(form.get("code") || "").trim();
+    const newItem: Evidence = {
+      id: `EV-${1049 + evidenceItems.length}`, title, control, requirement: controls.find((c) => c.id === control)?.requirement || "Manual", type,
+      source: "Manual upload", system: String(form.get("system") || "Unspecified"), capturedAt: "Just now", expiresAt: "Nov 5, 2026", status: "Needs review", collector: "Manual submission",
+      checksum: `sha256:pending-${Date.now().toString(16).slice(-6)}`, description: String(form.get("description") || "Manually submitted evidence."), code: code || undefined,
+      language: code ? String(form.get("language") || "Text") : undefined, accent: "blue", tags: ["Manual", redaction ? "Redaction scan queued" : "Unscanned"]
+    };
+    const next = [newItem, ...evidenceItems];
+    setEvidenceItems(next); window.localStorage.setItem("scopeproof-evidence", JSON.stringify(next));
+    setModal(null); setToast(`${newItem.id} added to the review queue.`); setView("Evidence");
+  }
+
+  function exportPackage() {
+    const payload = { framework: "PCI DSS 4.0.1", generatedAt: new Date().toISOString(), controls, evidence: evidenceItems, collectionRuns: runItems };
+    const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }));
+    const link = document.createElement("a"); link.href = url; link.download = "scopeproof-pci-evidence-package.json"; link.click(); URL.revokeObjectURL(url);
+    setModal(null); setToast("Evidence package generated with manifest and checksums.");
+  }
+
+  return (
+    <div className="app-shell">
+      <a className="skip-link" href="#main-content">Skip to content</a>
+      <aside className={cls("sidebar", sidebarOpen && "open")}>
+        <div className="brand"><div className="brand-mark">S</div><div><strong>Scopeproof</strong><span>PCI operations</span></div></div>
+        <div className="workspace-switch"><span>AC</span><div><strong>Acme Commerce</strong><small>PCI DSS 4.0.1</small></div><b>⌄</b></div>
+        <nav aria-label="Primary navigation">
+          <span className="nav-label">Workspace</span>
+          {nav.filter((item) => item.section === "workspace").map((item) => <button key={item.label} className={view === item.label ? "active" : ""} onClick={() => navigate(item.label)}><i>{item.mark}</i>{item.label}{item.label === "Findings" && <em>4</em>}</button>)}
+          <span className="nav-label manage">Manage</span>
+          {nav.filter((item) => item.section === "manage").map((item) => <button key={item.label} className={view === item.label ? "active" : ""} onClick={() => navigate(item.label)}><i>{item.mark}</i>{item.label}</button>)}
+        </nav>
+        <div className="assessment-card"><div><span>Q3 assessment</span><strong>82%</strong></div><progress value="82" max="100" /><p>18 days until review</p></div>
+        <div className="profile"><span>MC</span><div><strong>Maya Chen</strong><small>Compliance lead</small></div><button aria-label="Open profile menu" onClick={() => setToast("Profile and workspace access settings opened.")}>•••</button></div>
+      </aside>
+      {sidebarOpen && <button className="sidebar-scrim" aria-label="Close navigation" onClick={() => setSidebarOpen(false)} />}
+
+      <main id="main-content">
+        <header className="topbar">
+          <button className="mobile-menu" onClick={() => setSidebarOpen(true)} aria-label="Open navigation">☰</button>
+          <div className="breadcrumbs"><span>Acme Commerce</span><b>/</b><strong>{view}</strong></div>
+          <div className="top-actions">
+            <button className="icon-button" aria-label="Notifications" onClick={() => setToast("You’re all caught up. No new notifications.")}>♢<i /></button>
+            <button className="button secondary" onClick={() => setModal("export")}>↓ <span>Export package</span></button>
+            <button className="button primary" onClick={() => setModal("run")}>＋ <span>Run collection</span></button>
+          </div>
+        </header>
+
+        <section className="page-wrap">
+          {view === "Overview" && <Overview evidenceItems={evidenceItems} runItems={runItems} onNavigate={navigate} onSelect={setSelectedEvidence} onRun={() => setModal("run")} />}
+          {view === "Controls" && <ControlsView onNavigate={navigate} />}
+          {view === "Evidence" && <EvidenceView items={filteredEvidence} search={search} setSearch={setSearch} status={statusFilter} setStatus={setStatusFilter} type={typeFilter} setType={setTypeFilter} onSelect={setSelectedEvidence} onAdd={() => setModal("add")} />}
+          {view === "Collection runs" && <RunsView items={runItems} onRun={() => setModal("run")} onToast={setToast} />}
+          {view === "Findings" && <FindingsView />}
+          {view === "Connections" && <ConnectionsView onToast={setToast} />}
+          {view === "Settings" && <SettingsView redaction={redaction} setRedaction={setRedaction} notifications={notifications} setNotifications={setNotifications} onToast={setToast} />}
+        </section>
+      </main>
+
+      {selectedEvidence && <EvidenceDrawer item={selectedEvidence} onClose={() => setSelectedEvidence(null)} onApprove={approveEvidence} onToast={setToast} />}
+      {modal && <Modal type={modal} onClose={() => !busy && setModal(null)} onRun={handleRun} onAdd={handleAdd} onExport={exportPackage} busy={busy} />}
+      {toast && <div className="toast" role="status"><span>✓</span>{toast}</div>}
+    </div>
+  );
+}
+
+function PageTitle({ eyebrow, title, description, actions }: { eyebrow?: string; title: string; description: string; actions?: React.ReactNode }) {
+  return <div className="page-title"><div>{eyebrow && <span className="eyebrow">{eyebrow}</span>}<h1>{title}</h1><p>{description}</p></div>{actions && <div className="page-actions">{actions}</div>}</div>;
+}
+
+function Overview({ evidenceItems, runItems, onNavigate, onSelect, onRun }: { evidenceItems: Evidence[]; runItems: CollectionRun[]; onNavigate: (view: View) => void; onSelect: (item: Evidence) => void; onRun: () => void }) {
+  const queue = evidenceItems.filter((item) => item.status !== "Approved");
+  return <>
+    <PageTitle eyebrow="Friday, August 7" title="Good morning, Maya" description="Your PCI evidence program is healthy. Here’s what needs attention before the next review." actions={<><button className="button secondary mobile-hide" onClick={() => onNavigate("Evidence")}>Review evidence</button><button className="button primary mobile-hide" onClick={onRun}>＋ Run collection</button></>} />
+    <div className="attention-banner"><span>!</span><div><strong>{queue.length + 5} items need attention</strong><p>4 evidence items are awaiting review, 2 controls have gaps, and 1 connection requires action.</p></div><button onClick={() => onNavigate("Evidence")}>Open review queue <b>→</b></button></div>
+    <div className="metrics-grid">
+      <article className="metric-card featured"><Ring value={82} label="readiness" /><div><span>Assessment readiness</span><strong>On track for Q3</strong><p><b>↑ 6%</b> since last week</p></div></article>
+      <article className="metric-card"><div className="metric-icon blue">▱</div><span>Evidence coverage</span><strong>91 <small>/ 108</small></strong><p>84% of scoped controls</p></article>
+      <article className="metric-card"><div className="metric-icon violet">↻</div><span>Automated evidence</span><strong>76%</strong><p><b>82 collectors</b> running</p></article>
+      <article className="metric-card"><div className="metric-icon amber">◇</div><span>Open findings</span><strong>4</strong><p><em>1 high severity</em></p></article>
+    </div>
+    <div className="dashboard-grid">
+      <section className="panel coverage-panel"><div className="panel-head"><div><h2>Control coverage</h2><p>PCI DSS 4.0.1 requirements in scope</p></div><button onClick={() => onNavigate("Controls")}>View controls →</button></div>
+        <div className="coverage-list">{requirementCoverage.map((item) => <div className="coverage-row" key={item.req}><span className="req-badge">{item.req}</span><div><strong>{item.name}</strong><div className="progress-line"><i style={{ width: `${item.value}%` }} /></div></div><b className={item.value < 70 ? "low" : ""}>{item.value}%</b></div>)}</div>
+      </section>
+      <section className="panel activity-panel"><div className="panel-head"><div><h2>Collection activity</h2><p>Latest automation runs</p></div><button onClick={() => onNavigate("Collection runs")}>View all →</button></div>
+        <div className="activity-list">{runItems.slice(0, 4).map((run) => <div className="activity-item" key={run.id}><div className={cls("source-dot", run.status.toLowerCase())}>{run.source.slice(0, 2).toUpperCase()}</div><div><strong>{run.source}</strong><span>{run.artifacts ? `${run.artifacts} artifacts · ` : ""}{run.startedAt}</span></div><StatusPill status={run.status} /></div>)}</div>
+        <button className="full-button" onClick={onRun}>＋ Run a new collection</button>
+      </section>
+    </div>
+    <section className="panel recent-panel"><div className="panel-head"><div><h2>Recent evidence</h2><p>New artifacts collected across your environment</p></div><button onClick={() => onNavigate("Evidence")}>View evidence library →</button></div>
+      <div className="evidence-row">{evidenceItems.slice(0, 4).map((item) => <button className="evidence-card" key={item.id} onClick={() => onSelect(item)}><EvidenceVisual item={item} compact /><div className="evidence-card-body"><div><span className="type-label">{item.type}</span><StatusPill status={item.status} /></div><strong>{item.title}</strong><p><b>{item.control}</b> · {item.source}</p><small>{item.capturedAt}</small></div></button>)}</div>
+    </section>
+  </>;
+}
+
+function ControlsView({ onNavigate }: { onNavigate: (view: View) => void }) {
+  const [query, setQuery] = useState("");
+  const [filter, setFilter] = useState("All");
+  const items = controls.filter((control) => (!query || `${control.id} ${control.title} ${control.owner}`.toLowerCase().includes(query.toLowerCase())) && (filter === "All" || control.status === filter));
+  return <><PageTitle eyebrow="PCI DSS 4.0.1" title="Control workspace" description="Track coverage, ownership, and collection automation for every control in scope." actions={<button className="button primary" onClick={() => onNavigate("Evidence")}>Review evidence</button>} />
+    <div className="summary-strip"><div><strong>108</strong><span>Controls in scope</span></div><div><strong>91</strong><span>Fully covered</span></div><div><strong>11</strong><span>Partially covered</span></div><div><strong>6</strong><span>Evidence gaps</span></div></div>
+    <section className="panel table-panel"><div className="toolbar"><label className="search-box"><span>⌕</span><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search control, owner, or requirement…" /></label><div className="segmented">{["All", "Covered", "Partial", "Gap"].map((item) => <button className={filter === item ? "active" : ""} key={item} onClick={() => setFilter(item)}>{item}</button>)}</div></div>
+      {items.length ? <div className="data-table controls-table"><div className="table-header"><span>Control</span><span>Owner</span><span>Coverage</span><span>Automation</span><span>Next due</span><span /></div>{items.map((control) => <div className="table-row" key={control.id}><div><span className="control-id">{control.id}</span><strong>{control.title}</strong><small>{control.systems.join(" · ")}</small></div><span>{control.owner}</span><div><StatusPill status={control.status} /><small>{control.evidenceCount} artifacts</small></div><div className="automation-cell"><strong>{control.automation}%</strong><div><i style={{ width: `${control.automation}%` }} /></div></div><span className={control.nextDue === "Overdue" ? "danger-text" : ""}>{control.nextDue}</span><button aria-label={`View control ${control.id}`} onClick={() => onNavigate("Evidence")}>→</button></div>)}</div> : <EmptyState message="Try a different control search or coverage filter." />}
+    </section>
+  </>;
+}
+
+function EvidenceView({ items, search, setSearch, status, setStatus, type, setType, onSelect, onAdd }: { items: Evidence[]; search: string; setSearch: (v: string) => void; status: string; setStatus: (v: string) => void; type: string; setType: (v: string) => void; onSelect: (item: Evidence) => void; onAdd: () => void }) {
+  return <><PageTitle eyebrow="Evidence library" title="Collected evidence" description="Review, validate, and trace every artifact back to its source and PCI requirement." actions={<button className="button primary" onClick={onAdd}>＋ Add evidence</button>} />
+    <section className="panel evidence-library"><div className="toolbar"><label className="search-box wide"><span>⌕</span><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search evidence, control, system, or tag…" /></label><select aria-label="Filter by evidence type" value={type} onChange={(e) => setType(e.target.value)}><option>All types</option><option>Screenshot</option><option>Code</option><option>Configuration</option><option>Report</option></select><select aria-label="Filter by review status" value={status} onChange={(e) => setStatus(e.target.value)}><option>All statuses</option><option>Approved</option><option>Needs review</option><option>Expiring</option><option>Failed</option></select></div>
+      <div className="library-subhead"><span>{items.length} artifacts</span><span>Sorted by <b>most recent</b></span></div>
+      {items.length ? <div className="library-grid">{items.map((item) => <button className="library-card" key={item.id} onClick={() => onSelect(item)}><EvidenceVisual item={item} /><div className="library-body"><div><span className="type-label">{item.type}</span><StatusPill status={item.status} /></div><h3>{item.title}</h3><p>{item.description}</p><div className="artifact-meta"><span><b>{item.control}</b> · {item.requirement}</span><span>{item.source} / {item.system}</span><span>{item.capturedAt}</span></div></div></button>)}</div> : <EmptyState message="No evidence matches these filters." action="Clear filters" onAction={() => { setSearch(""); setStatus("All statuses"); setType("All types"); }} />}
+    </section>
+  </>;
+}
+
+function RunsView({ items, onRun, onToast }: { items: CollectionRun[]; onRun: () => void; onToast: (message: string) => void }) {
+  return <><PageTitle eyebrow="Automation" title="Collection runs" description="Monitor scheduled and on-demand collectors, captured artifacts, and failures." actions={<button className="button primary" onClick={onRun}>＋ Run collection</button>} />
+    {items[0]?.status === "Running" && <div className="running-banner"><span className="spinner" /><div><strong>Collection in progress</strong><p>Authenticating sources and capturing evidence. You can safely leave this page.</p></div><b>Running</b></div>}
+    <section className="panel table-panel"><div className="panel-head padded"><div><h2>Run history</h2><p>90-day operational record</p></div><select aria-label="Filter run history"><option>All sources</option><option>AWS</option><option>GitHub</option><option>Okta</option></select></div>
+      <div className="data-table runs-table"><div className="table-header"><span>Run</span><span>Status</span><span>Artifacts</span><span>Controls</span><span>Duration</span><span /></div>{items.map((run) => <div className="table-row" key={run.id}><div><strong>{run.source}</strong><small>{run.id} · {run.startedAt}</small></div><div><StatusPill status={run.status} />{run.note && <small>{run.note}</small>}</div><strong>{run.artifacts || "—"}</strong><span>{run.controls || "—"}</span><span>{run.duration}</span><button aria-label={`More options for ${run.id}`} onClick={() => onToast(`${run.id} log and artifact manifest opened.`)}>•••</button></div>)}</div>
+    </section>
+    <div className="info-callout"><span>i</span><div><strong>Evidence integrity is preserved automatically</strong><p>Every artifact receives a SHA-256 checksum, source timestamp, collector identity, and immutable audit event.</p></div></div>
+  </>;
+}
+
+function FindingsView() {
+  const [items, setItems] = useState(findings);
+  return <><PageTitle eyebrow="Remediation" title="Findings" description="Resolve evidence gaps and collection failures before they become assessment exceptions." />
+    <div className="finding-stats"><article><span className="severity-dot high" /><strong>1</strong><p>High severity</p></article><article><span className="severity-dot medium" /><strong>2</strong><p>Medium severity</p></article><article><span className="severity-dot low" /><strong>1</strong><p>Low severity</p></article><article><strong>11 days</strong><p>Average time to close</p></article></div>
+    <section className="panel finding-list"><div className="panel-head padded"><div><h2>Active findings</h2><p>Prioritized by severity and due date</p></div></div>{items.map((item) => <div className="finding-row" key={item.id}><span className={`severity-flag ${item.severity.toLowerCase()}`}>{item.severity}</span><div><strong>{item.title}</strong><p>{item.id} · Control {item.control}</p></div><div><small>Owner</small><span>{item.owner}</span></div><div><small>Due</small><span>{item.due}</span></div><select aria-label={`Update status for ${item.title}`} value={item.status} onChange={(e) => setItems((current) => current.map((finding) => finding.id === item.id ? { ...finding, status: e.target.value as typeof item.status } : finding))}><option>Open</option><option>In progress</option><option>Accepted</option><option>Resolved</option></select></div>)}</section>
+  </>;
+}
+
+function ConnectionsView({ onToast }: { onToast: (message: string) => void }) {
+  return <><PageTitle eyebrow="Data sources" title="Connections" description="Manage the systems Scopeproof uses to collect trustworthy PCI evidence." actions={<button className="button primary" onClick={() => onToast("Connection catalog opened. More providers can be added from your deployment settings.")}>＋ Add connection</button>} />
+    <div className="connection-alert"><span>!</span><div><strong>Cloudflare needs attention</strong><p>The API token expired on August 6. Scheduled evidence from four production zones is paused.</p></div><button onClick={() => onToast("Cloudflare reauthorization link generated.")}>Reauthorize</button></div>
+    <div className="connections-grid">{sources.map((source) => <article className="connection-card" key={source.name}><div className="connection-head"><span>{source.mark}</span><button aria-label={`Options for ${source.name}`} onClick={() => onToast(`${source.name} connection settings opened.`)}>•••</button></div><h3>{source.name}</h3><p>{source.detail}</p><StatusPill status={source.status} /><div><span>Last sync</span><b>{source.status === "Action needed" ? "Aug 6" : "12 min ago"}</b></div><button onClick={() => onToast(`${source.name} connection test ${source.status === "Action needed" ? "failed: token expired." : "passed."}`)}>Test connection</button></article>)}</div>
+  </>;
+}
+
+function SettingsView({ redaction, setRedaction, notifications, setNotifications, onToast }: { redaction: boolean; setRedaction: (value: boolean) => void; notifications: boolean; setNotifications: (value: boolean) => void; onToast: (message: string) => void }) {
+  return <><PageTitle eyebrow="Workspace" title="Settings" description="Configure evidence retention, capture safety, and reviewer notifications." />
+    <div className="settings-layout"><nav><button className="active">Evidence policy</button><button onClick={() => onToast("Team access is managed by workspace administrators.")}>Team & access</button><button onClick={() => onToast("Audit log export prepared.")}>Audit log</button></nav><section className="panel settings-panel"><h2>Evidence policy</h2><p>Defaults applied to new automated and manual evidence.</p><div className="setting-row"><div><strong>Sensitive-data redaction</strong><span>Detect and mask PAN patterns, access tokens, and secrets before evidence enters review.</span></div><button role="switch" aria-label="Toggle sensitive-data redaction" aria-checked={redaction} className={cls("switch", redaction && "on")} onClick={() => { setRedaction(!redaction); onToast(`Automatic redaction ${!redaction ? "enabled" : "disabled"}.`); }}><i /></button></div><div className="setting-row"><div><strong>Reviewer notifications</strong><span>Notify control owners when evidence is ready, expiring, or has failed collection.</span></div><button role="switch" aria-label="Toggle reviewer notifications" aria-checked={notifications} className={cls("switch", notifications && "on")} onClick={() => setNotifications(!notifications)}><i /></button></div><label className="field"><span>Default evidence validity</span><select><option>90 days</option><option>30 days</option><option>180 days</option><option>1 year</option></select><small>Control-specific schedules override this value.</small></label><label className="field"><span>Retention period</span><select><option>13 months</option><option>2 years</option><option>3 years</option><option>7 years</option></select><small>Deletion is blocked while an artifact belongs to an active assessment.</small></label><div className="settings-actions"><button className="button secondary" onClick={() => { setRedaction(true); setNotifications(true); onToast("Unsaved settings discarded."); }}>Discard</button><button className="button primary" onClick={() => onToast("Evidence policy saved.")}>Save changes</button></div></section></div>
+  </>;
+}
+
+function EvidenceDrawer({ item, onClose, onApprove, onToast }: { item: Evidence; onClose: () => void; onApprove: (item: Evidence) => void; onToast: (message: string) => void }) {
+  return <><button className="drawer-scrim" aria-label="Close evidence details" onClick={onClose} /><aside className="drawer" aria-label="Evidence details"><div className="drawer-head"><div><span>{item.id}</span><StatusPill status={item.status} /></div><button aria-label="Close evidence details" onClick={onClose}>×</button></div><div className="drawer-scroll"><span className="eyebrow">{item.type} evidence</span><h2>{item.title}</h2><p className="drawer-description">{item.description}</p><EvidenceVisual item={item} /><div className="integrity-banner"><span>✓</span><div><strong>Integrity verified</strong><p>{item.checksum} · Source unchanged</p></div></div><section className="detail-section"><h3>Evidence mapping</h3><dl><div><dt>PCI control</dt><dd>{item.control} · {item.requirement}</dd></div><div><dt>Source</dt><dd>{item.source} / {item.system}</dd></div><div><dt>Captured</dt><dd>{item.capturedAt}</dd></div><div><dt>Valid until</dt><dd>{item.expiresAt}</dd></div><div><dt>Collector</dt><dd>{item.collector}</dd></div></dl></section><section className="detail-section"><h3>Protection checks</h3><div className="check-row"><span>✓</span><div><strong>Secret scan passed</strong><p>No credentials or access tokens detected</p></div></div><div className="check-row"><span>✓</span><div><strong>Cardholder data scan passed</strong><p>No PAN or sensitive authentication data detected</p></div></div></section><section className="detail-section"><h3>Tags</h3><div className="tag-row">{item.tags.map((tag) => <span key={tag}>{tag}</span>)}</div></section></div><div className="drawer-actions"><button className="button secondary" onClick={() => onToast(`${item.id} flagged for follow-up.`)}>Flag issue</button><button className="button primary" disabled={item.status === "Approved"} onClick={() => onApprove(item)}>{item.status === "Approved" ? "✓ Approved" : "Approve evidence"}</button></div></aside></>;
+}
+
+function Modal({ type, onClose, onRun, onAdd, onExport, busy }: { type: Exclude<Modal, null>; onClose: () => void; onRun: (e: React.FormEvent<HTMLFormElement>) => void; onAdd: (e: React.FormEvent<HTMLFormElement>) => void; onExport: () => void; busy: boolean }) {
+  const titles = { run: "Run evidence collection", add: "Add manual evidence", export: "Export evidence package" };
+  return <div className="modal-layer" role="dialog" aria-modal="true" aria-labelledby="modal-title"><button className="modal-scrim" onClick={onClose} aria-label="Close dialog" /><section className="modal"><div className="modal-head"><div><span className="eyebrow">Scopeproof</span><h2 id="modal-title">{titles[type]}</h2></div><button onClick={onClose} aria-label="Close dialog">×</button></div>
+    {type === "run" && <form onSubmit={onRun}><p className="modal-intro">Select sources to collect now. Existing evidence will be de-duplicated by checksum.</p><fieldset className="source-select"><legend>Evidence sources</legend>{sources.slice(0, 5).map((source, index) => <label key={source.name} className={source.status === "Action needed" ? "disabled" : ""}><input type="checkbox" name="source" value={source.name} defaultChecked={index < 3} disabled={source.status === "Action needed"} /><span>{source.mark}</span><div><strong>{source.name}</strong><small>{source.detail}{source.status === "Action needed" ? " · Reauthorization required" : ""}</small></div></label>)}</fieldset><label className="checkbox-line"><input type="checkbox" defaultChecked /> Run sensitive-data redaction before review</label><div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy}>{busy ? <><span className="button-spinner" /> Collecting…</> : "Start collection"}</button></div></form>}
+    {type === "add" && <form onSubmit={onAdd} className="evidence-form"><div className="form-grid"><label className="field full"><span>Evidence title</span><input name="title" required placeholder="e.g. Production database encryption settings" /></label><label className="field"><span>PCI control</span><select name="control" required defaultValue=""><option value="" disabled>Select control</option>{controls.map((control) => <option key={control.id} value={control.id}>{control.id} — {control.title}</option>)}</select></label><label className="field"><span>Evidence type</span><select name="type"><option>Screenshot</option><option>Code</option><option>Configuration</option><option>Report</option></select></label><label className="field"><span>System or asset</span><input name="system" required placeholder="payments-production" /></label><label className="field"><span>Code language</span><select name="language"><option>Text</option><option>HCL</option><option>YAML</option><option>JSON</option><option>Shell</option><option>TypeScript</option></select></label><label className="field full"><span>Description</span><textarea name="description" rows={3} placeholder="What this evidence proves and where it came from" /></label><label className="field full"><span>Code or configuration excerpt <small>(optional)</small></span><textarea name="code" className="mono-input" rows={5} placeholder="# Paste a focused, redacted excerpt here" /></label></div><div className="upload-zone"><span>↑</span><div><strong>Drop a screenshot or report here</strong><p>PNG, JPG, or PDF up to 25 MB · demo capture stored locally</p></div><label className="choose-file">Choose file<input name="attachment" type="file" accept="image/png,image/jpeg,application/pdf" /></label></div><div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary">Add to review queue</button></div></form>}
+    {type === "export" && <div><p className="modal-intro">Generate an auditor-ready package containing approved artifacts, control mappings, collection history, checksums, and a manifest.</p><div className="export-summary"><div><span>▣</span><p><strong>PCI DSS 4.0.1 · Q3 2026</strong><small>{controls.length} controls · Evidence through Aug 7, 2026</small></p></div><StatusPill status="Ready" /></div><label className="checkbox-line"><input type="checkbox" defaultChecked /> Include evidence awaiting review</label><label className="checkbox-line"><input type="checkbox" defaultChecked /> Include remediation findings</label><div className="privacy-note"><span>i</span><p>Restricted evidence remains referenced in the manifest but is not embedded unless the recipient has access.</p></div><div className="modal-actions"><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" onClick={onExport}>↓ Generate package</button></div></div>}
+  </section></div>;
+}
