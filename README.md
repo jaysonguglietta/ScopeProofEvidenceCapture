@@ -1,100 +1,59 @@
-# vinext-starter
+# Scopeproof
 
-A clean full-stack starter running on
-[vinext](https://github.com/cloudflare/vinext), with optional Cloudflare D1 and
-Drizzle support.
+Scopeproof is a private PCI DSS evidence-operations application. It collects live configuration evidence from AWS, GitHub, Okta, Cloudflare, and browser-rendered administration pages; scans sensitive content; encrypts artifacts; records an append-only audit chain; and produces independently verifiable assessor packages.
 
-## Prerequisites
+## Security architecture
 
-- Node.js `>=22.13.0`
+- Authentication uses the private Sites identity headers. API routes reject anonymous requests.
+- RBAC roles are `admin`, `compliance_lead`, `reviewer`, and `auditor`. Authorization is enforced server-side.
+- Evidence is redacted before persistence, encrypted with AES-256-GCM, and stored in R2. D1 stores metadata and integrity digests.
+- Audit events are hash-chained, HMAC-authenticated, and protected from update/delete by SQLite triggers.
+- Assessor ZIPs embed approved artifacts, a PDF index, SHA-256 hashes, and an ECDSA P-256 signed manifest with its public verification key.
+- Mutating routes enforce same-origin requests. Worker responses add CSP, HSTS, no-sniff, referrer, and permissions headers.
 
-## Quick Start
+## Provider evidence
+
+- AWS: Config recorder settings and EC2 security group inventory using SigV4.
+- GitHub: organization repository inventory and default-branch protection.
+- Okta: global sign-on/MFA policies and access-review group inventory.
+- Cloudflare: WAF managed rulesets for scoped zones.
+- Browser capture: Cloudflare Browser Rendering content preflight followed by a full-page screenshot. Captures are blocked if the rendered DOM contains detected PANs or secrets.
+
+Collectors run on demand and from a 15-minute scheduler. Transient failures retry up to three times with bounded exponential backoff; authentication and unsafe-content failures require operator action.
+
+## Configuration
+
+Copy `.env.example` to `.env` for local work and configure equivalent hosted secrets in Sites. Never commit credentials.
+
+Required platform secrets:
+
+- `EVIDENCE_ENCRYPTION_KEY`: base64-encoded 32-byte AES key.
+- `AUDIT_HMAC_KEY`: high-entropy audit-chain secret.
+- `PACKAGE_SIGNING_PRIVATE_KEY`: base64 PKCS#8 ECDSA P-256 private key.
+- `PACKAGE_SIGNING_PUBLIC_KEY`: base64 SPKI ECDSA P-256 public key.
+
+Provider-specific values are documented in `.env.example`. Use read-only, least-privilege provider credentials and limit browser targets to dedicated evidence URLs that do not expose cardholder data.
+
+## Development
 
 ```bash
 npm install
 npm run dev
-npm run build
 ```
 
-This starter does not use `wrangler.jsonc`.
+Validation:
 
-## Included Shape
-
-- edit site code under `app/`
-- `.openai/hosting.json` declares optional Sites D1 and R2 bindings
-- `vite.config.ts` simulates declared bindings for local development
-- `db/schema.ts` starts intentionally empty
-- `examples/d1/` contains an optional D1 example surface
-- `drizzle.config.ts` supports local migration generation when needed
-
-## Workspace Auth Headers
-
-Signed-in visitors receive both `oai-authenticated-user-id` and `oai-authenticated-user-email`. Private Sites require every visitor to sign in; public Sites may also have anonymous visitors, for whom neither header is present.
-
-The user ID is stable for the same user on the same Site and different across Sites. Email and name are intended for display or contact purposes.
-
-SIWC-authenticated workspace sites may also receive
-`oai-authenticated-user-full-name` when the user's SIWC profile has a non-empty
-`name` claim. The full-name value is percent-encoded UTF-8 and is accompanied by
-`oai-authenticated-user-full-name-encoding: percent-encoded-utf-8`.
-
-Treat the full name as optional and fall back to email when it is absent:
-
-```tsx
-import { headers } from "next/headers";
-
-export default async function Home() {
-  const requestHeaders = await headers();
-  const userId = requestHeaders.get("oai-authenticated-user-id");
-  const email = requestHeaders.get("oai-authenticated-user-email");
-  const encodedFullName = requestHeaders.get("oai-authenticated-user-full-name");
-  const fullName =
-    encodedFullName &&
-    requestHeaders.get("oai-authenticated-user-full-name-encoding") ===
-      "percent-encoded-utf-8"
-      ? decodeURIComponent(encodedFullName)
-      : null;
-
-  const displayName = fullName ?? email;
-  // ...
-}
+```bash
+npm run lint
+npx tsc --noEmit
+npm test
 ```
 
-## Optional Dispatch-Owned ChatGPT Sign-In
+The D1 migration is in `drizzle/0000_curvy_risque.sql`. D1 and R2 logical bindings are declared in `.openai/hosting.json` and provisioned by Sites.
 
-Import the ready-to-use helpers from `app/chatgpt-auth.ts` when the site needs
-optional or required ChatGPT sign-in:
+## Operational limits
 
-- Use `getChatGPTUser()` for optional signed-in UI.
-- Use `requireChatGPTUser(returnTo)` for server-rendered pages that should send
-  anonymous visitors through Sign in with ChatGPT.
-- Use `chatGPTSignInPath(returnTo)` and `chatGPTSignOutPath(returnTo)` for
-  browser links or actions.
-- Pass a same-origin relative `returnTo` path for the destination after sign-in
-  or sign-out. The helper validates and safely encodes it.
-- Mark protected pages with `export const dynamic = "force-dynamic"` because
-  they depend on per-request identity headers.
-
-Dispatch owns `/signin-with-chatgpt`, `/signout-with-chatgpt`, `/callback`, the
-OAuth cookies, and identity header injection. Do not implement app routes for
-those reserved paths. Routes that do not import and call the helper remain
-anonymous-compatible.
-
-SIWC establishes identity only; it does not prove workspace membership. Use the
-Sites hosting platform's access policy controls for workspace-wide restrictions,
-or enforce explicit server-side membership or allowlist checks.
-
-Use SIWC for account pages, user-specific dashboards, saved records, and write
-actions tied to the current ChatGPT user. Leave public content anonymous.
-
-## Useful Commands
-
-- `npm run dev`: start local development
-- `npm run build`: verify the vinext build output
-- `npm test`: build the starter and verify its rendered loading skeleton
-- `npm run db:generate`: generate Drizzle migrations after schema changes
-
-## Learn More
-
-- [vinext Documentation](https://github.com/cloudflare/vinext)
-- [Drizzle D1 Guide](https://orm.drizzle.team/docs/get-started/d1-new)
+- Manual binary uploads are rejected because local image/PDF OCR cannot guarantee redaction. Use the browser collector for screenshots.
+- Packages include at most 100 approved artifacts and 25 MB of decrypted evidence, and expire after seven days.
+- Provider pagination and collection breadth are intentionally bounded to resist API and memory exhaustion.
+- Rotate encryption and signing keys through a documented key-rotation process before replacing them; existing artifacts require their original key version to remain decryptable.

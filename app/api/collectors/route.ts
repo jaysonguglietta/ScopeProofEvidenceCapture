@@ -1,0 +1,26 @@
+import { jsonError, requireApiUser, requireSameOrigin } from "../../../lib/server/auth";
+import { collectorConfiguration, type CollectorProvider } from "../../../lib/server/collectors";
+import { getEnv } from "../../../lib/server/env";
+import { ensureDefaultCollectors } from "../../../lib/server/jobs";
+import { appendAuditEvent } from "../../../lib/server/audit";
+
+export async function GET(request: Request) {
+  try {
+    const user = await requireApiUser(request);
+    await ensureDefaultCollectors(user);
+    const rows = (await getEnv().DB.prepare("SELECT id, provider, display_name, enabled, schedule_cron, status, last_run_at, last_error FROM collectors ORDER BY provider").all<Record<string, unknown>>()).results;
+    return Response.json({ collectors: rows.map((row: Record<string, unknown>) => ({ ...row, configuration: collectorConfiguration(String(row.provider) as CollectorProvider) })) });
+  } catch (error) { return jsonError(error); }
+}
+
+export async function PATCH(request: Request) {
+  try {
+    requireSameOrigin(request);
+    const user = await requireApiUser(request, "compliance_lead");
+    const body = await request.json() as { id?: string; enabled?: boolean; scheduleCron?: string };
+    if (!body.id || (body.scheduleCron && !/^(\*|\d{1,2}) (\*|\d{1,2}) \* \* (\*|[0-6])$/.test(body.scheduleCron))) return Response.json({ error: "Collector id and a supported five-field UTC cron are required." }, { status: 400 });
+    await getEnv().DB.prepare("UPDATE collectors SET enabled = COALESCE(?, enabled), schedule_cron = COALESCE(?, schedule_cron), updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(typeof body.enabled === "boolean" ? Number(body.enabled) : null, body.scheduleCron || null, body.id).run();
+    await appendAuditEvent(user, "collector.updated", "collector", body.id, { enabled: body.enabled, scheduleCron: body.scheduleCron });
+    return Response.json({ updated: true, actor: user.id });
+  } catch (error) { return jsonError(error); }
+}

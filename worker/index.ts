@@ -1,6 +1,7 @@
-/** Cloudflare Worker entry point for the vinext-starter template. */
+/** Cloudflare Worker entry point for Scopeproof. */
 import { handleImageOptimization, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } from "vinext/server/image-optimization";
 import handler from "vinext/server/app-router-entry";
+import { processDueWork } from "../lib/server/jobs";
 
 interface Env {
   ASSETS: Fetcher;
@@ -17,6 +18,11 @@ interface Env {
 interface ExecutionContext {
   waitUntil(promise: Promise<unknown>): void;
   passThroughOnException(): void;
+}
+
+interface ScheduledController {
+  scheduledTime: number;
+  cron: string;
 }
 
 // Image security config. SVG sources with .svg extension auto-skip the
@@ -40,7 +46,18 @@ const worker = {
       }, allowedWidths);
     }
 
-    return handler.fetch(request, env, ctx);
+    const response = await handler.fetch(request, env, ctx);
+    const headers = new Headers(response.headers);
+    headers.set("x-content-type-options", "nosniff");
+    headers.set("referrer-policy", "strict-origin-when-cross-origin");
+    headers.set("permissions-policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()");
+    headers.set("content-security-policy", "default-src 'self'; base-uri 'self'; object-src 'none'; form-action 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'");
+    if (url.protocol === "https:") headers.set("strict-transport-security", "max-age=31536000; includeSubDomains");
+    if (url.pathname.startsWith("/api/")) headers.set("cache-control", "private, no-store");
+    return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+  },
+  async scheduled(controller: ScheduledController, _env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(processDueWork(new Date(controller.scheduledTime)));
   },
 };
 

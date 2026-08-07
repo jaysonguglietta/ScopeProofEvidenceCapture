@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { controls, evidence as seedEvidence, findings, requirementCoverage, runs as seedRuns } from "../lib/data";
-import type { CollectionRun, Evidence, EvidenceStatus, EvidenceType } from "../lib/types";
+import type { CollectionRun, Evidence, EvidenceStatus } from "../lib/types";
 
 type View = "Overview" | "Controls" | "Evidence" | "Collection runs" | "Findings" | "Connections" | "Settings";
 type Modal = "run" | "add" | "export" | null;
@@ -18,16 +18,44 @@ const nav: { label: View; mark: string; section: "workspace" | "manage" }[] = [
 ];
 
 const sources = [
-  { name: "AWS", detail: "3 accounts", status: "Healthy", mark: "AW" },
-  { name: "GitHub", detail: "42 repositories", status: "Healthy", mark: "GH" },
-  { name: "Okta", detail: "1 organization", status: "Healthy", mark: "OK" },
-  { name: "Cloudflare", detail: "4 zones", status: "Action needed", mark: "CF" },
-  { name: "Tenable", detail: "8 scan targets", status: "Healthy", mark: "TN" },
-  { name: "Datadog", detail: "16 monitors", status: "Healthy", mark: "DD" },
+  { id: "collector_aws", name: "AWS", detail: "Config and EC2 controls", status: "Not configured", mark: "AW" },
+  { id: "collector_github", name: "GitHub", detail: "Inventory and branch protection", status: "Not configured", mark: "GH" },
+  { id: "collector_okta", name: "Okta", detail: "MFA policies and access groups", status: "Not configured", mark: "OK" },
+  { id: "collector_cloudflare", name: "Cloudflare", detail: "WAF managed rulesets", status: "Not configured", mark: "CF" },
+  { id: "collector_browser", name: "Browser capture", detail: "Sensitive-data preflight screenshots", status: "Not configured", mark: "BR" },
 ];
+
+type ApiCollector = { id: string; provider: string; display_name: string; enabled: number; schedule_cron: string | null; status: string; last_run_at: string | null; last_error: string | null; configuration: { configured: boolean; missing: string[] } };
+type ApiUser = { id: string; email: string; displayName: string; role: string };
 
 function cls(...values: Array<string | false | null | undefined>) {
   return values.filter(Boolean).join(" ");
+}
+
+function titleCase(value: string): string { return value.split(/[_ ]/).map((part) => part ? `${part[0].toUpperCase()}${part.slice(1)}` : "").join(" "); }
+function formatDate(value: unknown): string { const date = new Date(String(value)); return Number.isNaN(date.getTime()) ? String(value || "—") : date.toLocaleString("en-US", { month: "short", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" }); }
+async function apiError(response: Response): Promise<string> { try { const data = await response.json() as { error?: string }; return data.error || `Request failed (${response.status})`; } catch { return `Request failed (${response.status})`; } }
+
+function mapApiEvidence(row: Record<string, unknown>): Evidence {
+  const type = titleCase(String(row.type)) as Evidence["type"];
+  const statusMap: Record<string, EvidenceStatus> = { approved: "Approved", needs_review: "Needs review", expiring: "Expiring", rejected: "Failed" };
+  const redactionCount = Number(row.redaction_count || 0);
+  return {
+    id: String(row.id), title: String(row.title), control: String(row.control_id), requirement: controls.find((control) => control.id === row.control_id)?.requirement || "PCI DSS",
+    type, source: String(row.source), system: String(row.system), capturedAt: formatDate(row.captured_at), expiresAt: formatDate(row.expires_at), status: statusMap[String(row.status)] || "Needs review",
+    collector: String(row.collector_id || "Manual submission"), checksum: `sha256:${String(row.sha256).slice(0, 12)}…`, description: String(row.description || ""),
+    code: ["Code", "Configuration"].includes(type) ? "Encrypted artifact\nIntegrity verified on access\nOpen or export to inspect contents" : undefined,
+    language: type === "Code" ? "Protected source" : type === "Configuration" ? "Protected config" : undefined,
+    accent: redactionCount ? "amber" : "emerald", tags: ["Encrypted", "Server-backed", redactionCount ? `${redactionCount} value(s) redacted` : "Sensitive-data scan passed"],
+  };
+}
+
+function mapApiRun(row: Record<string, unknown>): CollectionRun {
+  const statusMap: Record<string, CollectionRun["status"]> = { completed: "Completed", partial: "Partial", running: "Running", queued: "Running", retrying: "Partial", failed: "Failed" };
+  const started = row.started_at ? new Date(String(row.started_at)).getTime() : 0;
+  const completed = row.completed_at ? new Date(String(row.completed_at)).getTime() : 0;
+  const duration = started && completed ? `${Math.max(1, Math.round((completed - started) / 1000))}s` : row.status === "running" ? "In progress" : "—";
+  return { id: String(row.id), source: String(row.display_name || row.provider || row.collector_id), startedAt: formatDate(row.created_at), status: statusMap[String(row.status)] || "Failed", artifacts: Number(row.artifact_count || 0), controls: Number(row.artifact_count || 0), duration, note: row.error_message ? String(row.error_message) : row.status === "retrying" ? `Retry ${row.attempt}/${row.max_attempts}` : undefined };
 }
 
 function StatusPill({ status }: { status: string }) {
@@ -79,19 +107,34 @@ export function EvidenceConsole() {
   const [toast, setToast] = useState<string | null>(null);
   const [evidenceItems, setEvidenceItems] = useState<Evidence[]>(seedEvidence);
   const [runItems, setRunItems] = useState<CollectionRun[]>(seedRuns);
+  const [collectorItems, setCollectorItems] = useState<ApiCollector[]>([]);
+  const [currentUser, setCurrentUser] = useState<ApiUser | null>(null);
+  const [auditIntegrity, setAuditIntegrity] = useState<{ valid: boolean; checked: number } | null>(null);
+  const [backendState, setBackendState] = useState<"loading" | "live" | "unavailable">("loading");
   const [busy, setBusy] = useState(false);
   const [redaction, setRedaction] = useState(true);
   const [notifications, setNotifications] = useState(true);
 
   useEffect(() => {
-    const saved = window.localStorage.getItem("scopeproof-evidence");
-    if (saved) {
+    let cancelled = false;
+    const load = async () => {
       try {
-        const parsed = JSON.parse(saved);
-        const timer = window.setTimeout(() => setEvidenceItems(parsed), 0);
-        return () => window.clearTimeout(timer);
-      } catch { /* ignore damaged local state */ }
-    }
+        const [meResponse, evidenceResponse, runsResponse, collectorsResponse, auditResponse] = await Promise.all([fetch("/api/me"), fetch("/api/evidence"), fetch("/api/runs"), fetch("/api/collectors"), fetch("/api/audit")]);
+        if (!meResponse.ok || !evidenceResponse.ok || !runsResponse.ok || !collectorsResponse.ok) throw new Error("Backend unavailable");
+        const [me, evidenceData, runData, collectorData, auditData] = await Promise.all([meResponse.json(), evidenceResponse.json(), runsResponse.json(), collectorsResponse.json(), auditResponse.ok ? auditResponse.json() : Promise.resolve(null)]) as [{ user: ApiUser }, { evidence: Array<Record<string, unknown>> }, { runs: Array<Record<string, unknown>> }, { collectors: ApiCollector[] }, { integrity: { valid: boolean; checked: number } } | null];
+        if (cancelled) return;
+        setCurrentUser(me.user);
+        setEvidenceItems((evidenceData.evidence as Array<Record<string, unknown>>).map(mapApiEvidence));
+        setRunItems((runData.runs as Array<Record<string, unknown>>).map(mapApiRun));
+        setCollectorItems(collectorData.collectors);
+        setAuditIntegrity(auditData?.integrity || null);
+        setBackendState("live");
+      } catch {
+        if (!cancelled) setBackendState("unavailable");
+      }
+    };
+    void load();
+    return () => { cancelled = true; };
   }, []);
 
   useEffect(() => {
@@ -119,50 +162,63 @@ export function EvidenceConsole() {
     setView(next); setSidebarOpen(false); setSearch("");
   }
 
-  function approveEvidence(item: Evidence) {
-    const next = evidenceItems.map((entry) => entry.id === item.id ? { ...entry, status: "Approved" as EvidenceStatus } : entry);
-    setEvidenceItems(next); window.localStorage.setItem("scopeproof-evidence", JSON.stringify(next));
-    setSelectedEvidence({ ...item, status: "Approved" }); setToast(`${item.id} approved and added to the audit trail.`);
+  async function approveEvidence(item: Evidence) {
+    setBusy(true);
+    try {
+      const response = await fetch(`/api/evidence/${encodeURIComponent(item.id)}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ action: "approve" }) });
+      if (!response.ok) throw new Error(await apiError(response));
+      const next = evidenceItems.map((entry) => entry.id === item.id ? { ...entry, status: "Approved" as EvidenceStatus } : entry);
+      setEvidenceItems(next); setSelectedEvidence({ ...item, status: "Approved" }); setToast(`${item.id} approved and written to the immutable audit chain.`);
+    } catch (error) { setToast(error instanceof Error ? error.message : "Approval failed."); }
+    finally { setBusy(false); }
   }
 
-  function handleRun(event: React.FormEvent<HTMLFormElement>) {
+  async function handleRun(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
-    const selected = form.getAll("source");
+    const selected = form.getAll("source").map(String);
     if (!selected.length) { setToast("Select at least one evidence source."); return; }
     setBusy(true);
-    const newRun: CollectionRun = { id: `RUN-${2982 + runItems.length}`, source: selected.length === 1 ? `${selected[0]} on-demand collection` : `On-demand collection · ${selected.length} sources`, startedAt: "Just now", status: "Running", artifacts: 0, controls: 0, duration: "In progress" };
+    const newRun: CollectionRun = { id: `pending-${Date.now()}`, source: selected.length === 1 ? `${selected[0].replace("collector_", "")} on-demand collection` : `On-demand collection · ${selected.length} sources`, startedAt: "Just now", status: "Running", artifacts: 0, controls: 0, duration: "In progress" };
     setRunItems((items) => [newRun, ...items]);
-    window.setTimeout(() => {
-      setRunItems((items) => items.map((run) => run.id === newRun.id ? { ...run, status: "Completed", artifacts: selected.length * 4, controls: selected.length * 2, duration: "1m 18s" } : run));
-      setBusy(false); setModal(null); setToast(`Collection complete: ${selected.length * 4} artifacts captured.`); setView("Collection runs");
-    }, 1500);
+    try {
+      const response = await fetch("/api/runs", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ collectorIds: selected }) });
+      const data = await response.json() as { error?: string; results: Array<{ artifacts: number; status: string }> };
+      if (!response.ok && response.status !== 207) throw new Error(data.error || "Collection failed.");
+      const refreshed = await fetch("/api/runs").then((result) => result.json()) as { runs: Array<Record<string, unknown>> };
+      setRunItems((refreshed.runs as Array<Record<string, unknown>>).map(mapApiRun));
+      const captured = (data.results as Array<{ artifacts: number }>).reduce((sum, result) => sum + result.artifacts, 0);
+      const failures = (data.results as Array<{ status: string }>).filter((result) => result.status !== "completed").length;
+      setModal(null); setToast(failures ? `Collection finished with ${failures} source issue(s). Review run details.` : `Collection complete: ${captured} new artifacts captured.`); setView("Collection runs");
+    } catch (error) { setRunItems((items) => items.filter((run) => run.id !== newRun.id)); setToast(error instanceof Error ? error.message : "Collection failed."); }
+    finally { setBusy(false); }
   }
 
-  function handleAdd(event: React.FormEvent<HTMLFormElement>) {
+  async function handleAdd(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
-    const title = String(form.get("title") || "").trim();
-    const control = String(form.get("control") || "");
-    if (!title || !control) return;
-    const type = String(form.get("type")) as EvidenceType;
-    const code = String(form.get("code") || "").trim();
-    const newItem: Evidence = {
-      id: `EV-${1049 + evidenceItems.length}`, title, control, requirement: controls.find((c) => c.id === control)?.requirement || "Manual", type,
-      source: "Manual upload", system: String(form.get("system") || "Unspecified"), capturedAt: "Just now", expiresAt: "Nov 5, 2026", status: "Needs review", collector: "Manual submission",
-      checksum: `sha256:pending-${Date.now().toString(16).slice(-6)}`, description: String(form.get("description") || "Manually submitted evidence."), code: code || undefined,
-      language: code ? String(form.get("language") || "Text") : undefined, accent: "blue", tags: ["Manual", redaction ? "Redaction scan queued" : "Unscanned"]
-    };
-    const next = [newItem, ...evidenceItems];
-    setEvidenceItems(next); window.localStorage.setItem("scopeproof-evidence", JSON.stringify(next));
-    setModal(null); setToast(`${newItem.id} added to the review queue.`); setView("Evidence");
+    setBusy(true);
+    try {
+      const response = await fetch("/api/evidence", { method: "POST", body: form });
+      if (!response.ok) throw new Error(await apiError(response));
+      const refreshed = await fetch("/api/evidence").then((result) => result.json()) as { evidence: Array<Record<string, unknown>> };
+      setEvidenceItems((refreshed.evidence as Array<Record<string, unknown>>).map(mapApiEvidence));
+      const result = await response.json() as { id: string; deduplicated: boolean };
+      setModal(null); setToast(result.deduplicated ? "Matching evidence already exists; no duplicate was stored." : `${result.id} encrypted and added to the review queue.`); setView("Evidence");
+    } catch (error) { setToast(error instanceof Error ? error.message : "Evidence upload failed."); }
+    finally { setBusy(false); }
   }
 
-  function exportPackage() {
-    const payload = { framework: "PCI DSS 4.0.1", generatedAt: new Date().toISOString(), controls, evidence: evidenceItems, collectionRuns: runItems };
-    const url = URL.createObjectURL(new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }));
-    const link = document.createElement("a"); link.href = url; link.download = "scopeproof-pci-evidence-package.json"; link.click(); URL.revokeObjectURL(url);
-    setModal(null); setToast("Evidence package generated with manifest and checksums.");
+  async function exportPackage() {
+    setBusy(true);
+    try {
+      const response = await fetch("/api/packages", { method: "POST" });
+      if (!response.ok) throw new Error(await apiError(response));
+      const data = await response.json() as { package: { id: string; evidenceCount: number } };
+      window.location.assign(`/api/packages/${encodeURIComponent(data.package.id)}`);
+      setModal(null); setToast(`Signed package ready with ${data.package.evidenceCount} encrypted artifacts.`);
+    } catch (error) { setToast(error instanceof Error ? error.message : "Package generation failed."); }
+    finally { setBusy(false); }
   }
 
   return (
@@ -178,7 +234,7 @@ export function EvidenceConsole() {
           {nav.filter((item) => item.section === "manage").map((item) => <button key={item.label} className={view === item.label ? "active" : ""} onClick={() => navigate(item.label)}><i>{item.mark}</i>{item.label}</button>)}
         </nav>
         <div className="assessment-card"><div><span>Q3 assessment</span><strong>82%</strong></div><progress value="82" max="100" /><p>18 days until review</p></div>
-        <div className="profile"><span>MC</span><div><strong>Maya Chen</strong><small>Compliance lead</small></div><button aria-label="Open profile menu" onClick={() => setToast("Profile and workspace access settings opened.")}>•••</button></div>
+        <div className="profile"><span>{(currentUser?.displayName || "M C").split(/\s|@/).slice(0, 2).map((part) => part[0]?.toUpperCase()).join("")}</span><div><strong>{currentUser?.displayName || "Authenticated user"}</strong><small>{currentUser?.role?.replaceAll("_", " ") || "Loading access…"}</small></div><button aria-label="Open profile menu" onClick={() => setToast("Identity is provided by your private Sites access policy.")}>•••</button></div>
       </aside>
       {sidebarOpen && <button className="sidebar-scrim" aria-label="Close navigation" onClick={() => setSidebarOpen(false)} />}
 
@@ -194,18 +250,19 @@ export function EvidenceConsole() {
         </header>
 
         <section className="page-wrap">
+          <div className={cls("security-strip", backendState)}><span>{backendState === "live" ? "✓" : backendState === "loading" ? "↻" : "!"}</span><div><strong>{backendState === "live" ? "Protected evidence workspace" : backendState === "loading" ? "Connecting to protected storage…" : "Protected services unavailable"}</strong><p>{backendState === "live" ? `AES-256-GCM storage · ${currentUser?.role?.replaceAll("_", " ")} access · audit chain ${auditIntegrity?.valid ? `verified (${auditIntegrity.checked} events)` : "pending"}` : backendState === "unavailable" ? "The interface is showing non-authoritative sample data until authenticated storage reconnects." : "Authenticating and verifying storage bindings."}</p></div></div>
           {view === "Overview" && <Overview evidenceItems={evidenceItems} runItems={runItems} onNavigate={navigate} onSelect={setSelectedEvidence} onRun={() => setModal("run")} />}
           {view === "Controls" && <ControlsView onNavigate={navigate} />}
           {view === "Evidence" && <EvidenceView items={filteredEvidence} search={search} setSearch={setSearch} status={statusFilter} setStatus={setStatusFilter} type={typeFilter} setType={setTypeFilter} onSelect={setSelectedEvidence} onAdd={() => setModal("add")} />}
           {view === "Collection runs" && <RunsView items={runItems} onRun={() => setModal("run")} onToast={setToast} />}
           {view === "Findings" && <FindingsView />}
-          {view === "Connections" && <ConnectionsView onToast={setToast} />}
-          {view === "Settings" && <SettingsView redaction={redaction} setRedaction={setRedaction} notifications={notifications} setNotifications={setNotifications} onToast={setToast} />}
+          {view === "Connections" && <ConnectionsView collectors={collectorItems} onToast={setToast} />}
+          {view === "Settings" && <SettingsView redaction={redaction} setRedaction={setRedaction} notifications={notifications} setNotifications={setNotifications} auditIntegrity={auditIntegrity} role={currentUser?.role || "auditor"} onToast={setToast} />}
         </section>
       </main>
 
       {selectedEvidence && <EvidenceDrawer item={selectedEvidence} onClose={() => setSelectedEvidence(null)} onApprove={approveEvidence} onToast={setToast} />}
-      {modal && <Modal type={modal} onClose={() => !busy && setModal(null)} onRun={handleRun} onAdd={handleAdd} onExport={exportPackage} busy={busy} />}
+      {modal && <Modal type={modal} collectors={collectorItems} onClose={() => !busy && setModal(null)} onRun={handleRun} onAdd={handleAdd} onExport={exportPackage} busy={busy} />}
       {toast && <div className="toast" role="status"><span>✓</span>{toast}</div>}
     </div>
   );
@@ -280,16 +337,22 @@ function FindingsView() {
   </>;
 }
 
-function ConnectionsView({ onToast }: { onToast: (message: string) => void }) {
-  return <><PageTitle eyebrow="Data sources" title="Connections" description="Manage the systems Scopeproof uses to collect trustworthy PCI evidence." actions={<button className="button primary" onClick={() => onToast("Connection catalog opened. More providers can be added from your deployment settings.")}>＋ Add connection</button>} />
-    <div className="connection-alert"><span>!</span><div><strong>Cloudflare needs attention</strong><p>The API token expired on August 6. Scheduled evidence from four production zones is paused.</p></div><button onClick={() => onToast("Cloudflare reauthorization link generated.")}>Reauthorize</button></div>
-    <div className="connections-grid">{sources.map((source) => <article className="connection-card" key={source.name}><div className="connection-head"><span>{source.mark}</span><button aria-label={`Options for ${source.name}`} onClick={() => onToast(`${source.name} connection settings opened.`)}>•••</button></div><h3>{source.name}</h3><p>{source.detail}</p><StatusPill status={source.status} /><div><span>Last sync</span><b>{source.status === "Action needed" ? "Aug 6" : "12 min ago"}</b></div><button onClick={() => onToast(`${source.name} connection test ${source.status === "Action needed" ? "failed: token expired." : "passed."}`)}>Test connection</button></article>)}</div>
+function ConnectionsView({ collectors, onToast }: { collectors: ApiCollector[]; onToast: (message: string) => void }) {
+  const cards = sources.map((source) => {
+    const collector = collectors.find((item) => item.id === source.id);
+    return { ...source, status: collector?.configuration.configured ? titleCase(collector.status) : "Not configured", detail: collector?.configuration.configured ? source.detail : `Missing ${collector?.configuration.missing.join(", ") || "hosted secrets"}`, lastRun: collector?.last_run_at ? formatDate(collector.last_run_at) : "Never", error: collector?.last_error };
+  });
+  const attention = cards.filter((card) => card.status !== "Healthy");
+  return <><PageTitle eyebrow="Data sources" title="Connections" description="Manage the systems Scopeproof uses to collect trustworthy PCI evidence." actions={<button className="button primary" onClick={() => onToast("Add provider credentials as encrypted hosted environment variables; they are never stored in the application database.")}>＋ Configure source</button>} />
+    {attention.length > 0 && <div className="connection-alert"><span>!</span><div><strong>{attention.length} collector{attention.length === 1 ? "" : "s"} need configuration</strong><p>Provider credentials are missing or the latest live API call failed. Scheduled collection remains paused for affected sources.</p></div><button onClick={() => onToast("Open hosted environment settings to add the missing secret values from .env.example.")}>Configuration guide</button></div>}
+    <div className="connections-grid">{cards.map((source) => <article className="connection-card" key={source.name}><div className="connection-head"><span>{source.mark}</span><button aria-label={`Options for ${source.name}`} onClick={() => onToast(`${source.name} runs ${collectors.find((item) => item.id === source.id)?.schedule_cron || "without a schedule"} in UTC.`)}>•••</button></div><h3>{source.name}</h3><p>{source.detail}</p><StatusPill status={source.status} /><div><span>Last successful run</span><b>{source.lastRun}</b></div><button onClick={() => onToast(source.status === "Healthy" ? `${source.name} is configured. Use Run collection to execute a live test.` : `${source.name}: ${source.error || source.detail}`)}>Inspect configuration</button></article>)}</div>
   </>;
 }
 
-function SettingsView({ redaction, setRedaction, notifications, setNotifications, onToast }: { redaction: boolean; setRedaction: (value: boolean) => void; notifications: boolean; setNotifications: (value: boolean) => void; onToast: (message: string) => void }) {
+function SettingsView({ redaction, setRedaction, notifications, setNotifications, auditIntegrity, role, onToast }: { redaction: boolean; setRedaction: (value: boolean) => void; notifications: boolean; setNotifications: (value: boolean) => void; auditIntegrity: { valid: boolean; checked: number } | null; role: string; onToast: (message: string) => void }) {
+  void redaction;
   return <><PageTitle eyebrow="Workspace" title="Settings" description="Configure evidence retention, capture safety, and reviewer notifications." />
-    <div className="settings-layout"><nav><button className="active">Evidence policy</button><button onClick={() => onToast("Team access is managed by workspace administrators.")}>Team & access</button><button onClick={() => onToast("Audit log export prepared.")}>Audit log</button></nav><section className="panel settings-panel"><h2>Evidence policy</h2><p>Defaults applied to new automated and manual evidence.</p><div className="setting-row"><div><strong>Sensitive-data redaction</strong><span>Detect and mask PAN patterns, access tokens, and secrets before evidence enters review.</span></div><button role="switch" aria-label="Toggle sensitive-data redaction" aria-checked={redaction} className={cls("switch", redaction && "on")} onClick={() => { setRedaction(!redaction); onToast(`Automatic redaction ${!redaction ? "enabled" : "disabled"}.`); }}><i /></button></div><div className="setting-row"><div><strong>Reviewer notifications</strong><span>Notify control owners when evidence is ready, expiring, or has failed collection.</span></div><button role="switch" aria-label="Toggle reviewer notifications" aria-checked={notifications} className={cls("switch", notifications && "on")} onClick={() => setNotifications(!notifications)}><i /></button></div><label className="field"><span>Default evidence validity</span><select><option>90 days</option><option>30 days</option><option>180 days</option><option>1 year</option></select><small>Control-specific schedules override this value.</small></label><label className="field"><span>Retention period</span><select><option>13 months</option><option>2 years</option><option>3 years</option><option>7 years</option></select><small>Deletion is blocked while an artifact belongs to an active assessment.</small></label><div className="settings-actions"><button className="button secondary" onClick={() => { setRedaction(true); setNotifications(true); onToast("Unsaved settings discarded."); }}>Discard</button><button className="button primary" onClick={() => onToast("Evidence policy saved.")}>Save changes</button></div></section></div>
+    <div className="settings-layout"><nav><button className="active">Evidence policy</button><button onClick={() => onToast(`Your effective role is ${role.replaceAll("_", " ")}. Role changes require an administrator.`)}>Team & access</button><button onClick={() => onToast(auditIntegrity?.valid ? `Audit chain verified across ${auditIntegrity.checked} event(s).` : "Audit chain verification is pending.")}>Audit log</button></nav><section className="panel settings-panel"><h2>Evidence policy</h2><p>Enforced protections for automated and manual evidence.</p><div className="integrity-setting"><span>{auditIntegrity?.valid ? "✓" : "↻"}</span><div><strong>{auditIntegrity?.valid ? "Immutable audit chain verified" : "Verifying audit chain"}</strong><p>{auditIntegrity?.valid ? `${auditIntegrity.checked} signed event(s) validated from genesis.` : "Integrity verification runs server-side."}</p></div></div><div className="setting-row"><div><strong>Sensitive-data redaction</strong><span>Luhn-validated PAN, access tokens, API secrets, JWTs, private keys, and authorization headers are scanned before encryption. This control is mandatory in production.</span></div><button role="switch" aria-label="Sensitive-data redaction is enforced" aria-checked="true" className="switch on" onClick={() => onToast("Redaction is a mandatory server-side control and cannot be disabled.")}><i /></button></div><div className="setting-row"><div><strong>Reviewer notifications</strong><span>Notify control owners when evidence is ready, expiring, or has failed collection.</span></div><button role="switch" aria-label="Toggle reviewer notifications" aria-checked={notifications} className={cls("switch", notifications && "on")} onClick={() => setNotifications(!notifications)}><i /></button></div><label className="field"><span>Default evidence validity</span><select><option>90 days</option><option>30 days</option><option>180 days</option><option>1 year</option></select><small>Control-specific schedules override this value.</small></label><label className="field"><span>Retention period</span><select><option>13 months</option><option>2 years</option><option>3 years</option><option>7 years</option></select><small>Deletion is blocked while an artifact belongs to an active assessment.</small></label><div className="settings-actions"><button className="button secondary" onClick={() => { setRedaction(true); setNotifications(true); onToast("Unsaved settings discarded."); }}>Discard</button><button className="button primary" onClick={() => onToast("Local notification preference saved. Security controls remain enforced server-side.")}>Save changes</button></div></section></div>
   </>;
 }
 
@@ -297,11 +360,11 @@ function EvidenceDrawer({ item, onClose, onApprove, onToast }: { item: Evidence;
   return <><button className="drawer-scrim" aria-label="Close evidence details" onClick={onClose} /><aside className="drawer" aria-label="Evidence details"><div className="drawer-head"><div><span>{item.id}</span><StatusPill status={item.status} /></div><button aria-label="Close evidence details" onClick={onClose}>×</button></div><div className="drawer-scroll"><span className="eyebrow">{item.type} evidence</span><h2>{item.title}</h2><p className="drawer-description">{item.description}</p><EvidenceVisual item={item} /><div className="integrity-banner"><span>✓</span><div><strong>Integrity verified</strong><p>{item.checksum} · Source unchanged</p></div></div><section className="detail-section"><h3>Evidence mapping</h3><dl><div><dt>PCI control</dt><dd>{item.control} · {item.requirement}</dd></div><div><dt>Source</dt><dd>{item.source} / {item.system}</dd></div><div><dt>Captured</dt><dd>{item.capturedAt}</dd></div><div><dt>Valid until</dt><dd>{item.expiresAt}</dd></div><div><dt>Collector</dt><dd>{item.collector}</dd></div></dl></section><section className="detail-section"><h3>Protection checks</h3><div className="check-row"><span>✓</span><div><strong>Secret scan passed</strong><p>No credentials or access tokens detected</p></div></div><div className="check-row"><span>✓</span><div><strong>Cardholder data scan passed</strong><p>No PAN or sensitive authentication data detected</p></div></div></section><section className="detail-section"><h3>Tags</h3><div className="tag-row">{item.tags.map((tag) => <span key={tag}>{tag}</span>)}</div></section></div><div className="drawer-actions"><button className="button secondary" onClick={() => onToast(`${item.id} flagged for follow-up.`)}>Flag issue</button><button className="button primary" disabled={item.status === "Approved"} onClick={() => onApprove(item)}>{item.status === "Approved" ? "✓ Approved" : "Approve evidence"}</button></div></aside></>;
 }
 
-function Modal({ type, onClose, onRun, onAdd, onExport, busy }: { type: Exclude<Modal, null>; onClose: () => void; onRun: (e: React.FormEvent<HTMLFormElement>) => void; onAdd: (e: React.FormEvent<HTMLFormElement>) => void; onExport: () => void; busy: boolean }) {
+function Modal({ type, collectors, onClose, onRun, onAdd, onExport, busy }: { type: Exclude<Modal, null>; collectors: ApiCollector[]; onClose: () => void; onRun: (e: React.FormEvent<HTMLFormElement>) => void; onAdd: (e: React.FormEvent<HTMLFormElement>) => void; onExport: () => void; busy: boolean }) {
   const titles = { run: "Run evidence collection", add: "Add manual evidence", export: "Export evidence package" };
   return <div className="modal-layer" role="dialog" aria-modal="true" aria-labelledby="modal-title"><button className="modal-scrim" onClick={onClose} aria-label="Close dialog" /><section className="modal"><div className="modal-head"><div><span className="eyebrow">Scopeproof</span><h2 id="modal-title">{titles[type]}</h2></div><button onClick={onClose} aria-label="Close dialog">×</button></div>
-    {type === "run" && <form onSubmit={onRun}><p className="modal-intro">Select sources to collect now. Existing evidence will be de-duplicated by checksum.</p><fieldset className="source-select"><legend>Evidence sources</legend>{sources.slice(0, 5).map((source, index) => <label key={source.name} className={source.status === "Action needed" ? "disabled" : ""}><input type="checkbox" name="source" value={source.name} defaultChecked={index < 3} disabled={source.status === "Action needed"} /><span>{source.mark}</span><div><strong>{source.name}</strong><small>{source.detail}{source.status === "Action needed" ? " · Reauthorization required" : ""}</small></div></label>)}</fieldset><label className="checkbox-line"><input type="checkbox" defaultChecked /> Run sensitive-data redaction before review</label><div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy}>{busy ? <><span className="button-spinner" /> Collecting…</> : "Start collection"}</button></div></form>}
-    {type === "add" && <form onSubmit={onAdd} className="evidence-form"><div className="form-grid"><label className="field full"><span>Evidence title</span><input name="title" required placeholder="e.g. Production database encryption settings" /></label><label className="field"><span>PCI control</span><select name="control" required defaultValue=""><option value="" disabled>Select control</option>{controls.map((control) => <option key={control.id} value={control.id}>{control.id} — {control.title}</option>)}</select></label><label className="field"><span>Evidence type</span><select name="type"><option>Screenshot</option><option>Code</option><option>Configuration</option><option>Report</option></select></label><label className="field"><span>System or asset</span><input name="system" required placeholder="payments-production" /></label><label className="field"><span>Code language</span><select name="language"><option>Text</option><option>HCL</option><option>YAML</option><option>JSON</option><option>Shell</option><option>TypeScript</option></select></label><label className="field full"><span>Description</span><textarea name="description" rows={3} placeholder="What this evidence proves and where it came from" /></label><label className="field full"><span>Code or configuration excerpt <small>(optional)</small></span><textarea name="code" className="mono-input" rows={5} placeholder="# Paste a focused, redacted excerpt here" /></label></div><div className="upload-zone"><span>↑</span><div><strong>Drop a screenshot or report here</strong><p>PNG, JPG, or PDF up to 25 MB · demo capture stored locally</p></div><label className="choose-file">Choose file<input name="attachment" type="file" accept="image/png,image/jpeg,application/pdf" /></label></div><div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary">Add to review queue</button></div></form>}
-    {type === "export" && <div><p className="modal-intro">Generate an auditor-ready package containing approved artifacts, control mappings, collection history, checksums, and a manifest.</p><div className="export-summary"><div><span>▣</span><p><strong>PCI DSS 4.0.1 · Q3 2026</strong><small>{controls.length} controls · Evidence through Aug 7, 2026</small></p></div><StatusPill status="Ready" /></div><label className="checkbox-line"><input type="checkbox" defaultChecked /> Include evidence awaiting review</label><label className="checkbox-line"><input type="checkbox" defaultChecked /> Include remediation findings</label><div className="privacy-note"><span>i</span><p>Restricted evidence remains referenced in the manifest but is not embedded unless the recipient has access.</p></div><div className="modal-actions"><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" onClick={onExport}>↓ Generate package</button></div></div>}
+    {type === "run" && <form onSubmit={onRun}><p className="modal-intro">Select configured sources to query now. Provider responses are scanned, encrypted, checksum de-duplicated, and written to the audit chain.</p><fieldset className="source-select"><legend>Live evidence sources</legend>{sources.map((source, index) => { const collector = collectors.find((item) => item.id === source.id); const configured = collector?.configuration.configured === true; return <label key={source.name} className={!configured ? "disabled" : ""}><input type="checkbox" name="source" value={source.id} defaultChecked={configured && index < 3} disabled={!configured} /><span>{source.mark}</span><div><strong>{source.name}</strong><small>{configured ? `${source.detail} · ${collector?.schedule_cron || "On demand"} UTC` : `Missing ${collector?.configuration.missing.join(", ") || "hosted credentials"}`}</small></div></label>; })}</fieldset><label className="checkbox-line"><input type="checkbox" checked readOnly /> Enforce PAN, secret, and token scanning before encryption</label><div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy}>{busy ? <><span className="button-spinner" /> Collecting live evidence…</> : "Start live collection"}</button></div></form>}
+    {type === "add" && <form onSubmit={onAdd} className="evidence-form"><div className="form-grid"><label className="field full"><span>Evidence title</span><input name="title" required placeholder="e.g. Production database encryption settings" /></label><label className="field"><span>PCI control</span><select name="control" required defaultValue=""><option value="" disabled>Select control</option>{controls.map((control) => <option key={control.id} value={control.id}>{control.id} — {control.title}</option>)}</select></label><label className="field"><span>Evidence type</span><select name="type"><option value="code">Code</option><option value="configuration">Configuration</option><option value="report">Text report</option></select></label><label className="field"><span>System or asset</span><input name="system" required placeholder="payments-production" /></label><label className="field"><span>Code language</span><select name="language"><option>Text</option><option>HCL</option><option>YAML</option><option>JSON</option><option>Shell</option><option>TypeScript</option></select></label><label className="field full"><span>Description</span><textarea name="description" rows={3} placeholder="What this evidence proves and where it came from" /></label><label className="field full"><span>Code or configuration excerpt</span><textarea name="code" className="mono-input" rows={5} required placeholder="# Paste the focused excerpt here; server-side redaction runs before encryption" /></label></div><div className="upload-zone"><span>↑</span><div><strong>Attach an optional text-based artifact</strong><p>TXT, JSON, XML, or YAML up to 10 MB · screenshots must use the preflight browser collector</p></div><label className="choose-file">Choose file<input name="attachment" type="file" accept="text/*,application/json,application/xml,application/yaml" /></label></div><div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy}>{busy ? "Encrypting…" : "Scan, encrypt & add"}</button></div></form>}
+    {type === "export" && <div><p className="modal-intro">Generate a signed assessor package containing every approved artifact, a SHA-256 manifest, integrity attestation, and a PDF evidence index.</p><div className="export-summary"><div><span>▣</span><p><strong>PCI DSS 4.0.1 · Q3 2026</strong><small>Approved evidence only · Encrypted while stored</small></p></div><StatusPill status="Ready" /></div><label className="checkbox-line"><input type="checkbox" checked readOnly /> Embed decrypted artifacts into the protected ZIP</label><label className="checkbox-line"><input type="checkbox" checked readOnly /> ECDSA-sign manifest and include public verification key</label><div className="privacy-note"><span>i</span><p>The package is generated server-side, integrity-checked after decryption, and expires after seven days. Downloads are recorded in the immutable audit chain.</p></div><div className="modal-actions"><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy} onClick={onExport}>{busy ? "Building signed package…" : "↓ Generate signed ZIP"}</button></div></div>}
   </section></div>;
 }
