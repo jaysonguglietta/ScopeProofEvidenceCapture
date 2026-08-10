@@ -28,3 +28,22 @@ test("migration makes audit events append-only at the database layer", async () 
   assert.match(migration, /CREATE TRIGGER `audit_events_chain_guard`/);
   assert.match(migration, /RAISE\(ABORT, 'audit_events are immutable'\)/);
 });
+
+test("native capture migration stores revocable device identities and chain-of-custody metadata", async () => {
+  const migration = await readFile(new URL("../drizzle/0001_sloppy_stark_industries.sql", import.meta.url), "utf8");
+  assert.match(migration, /CREATE TABLE `capture_devices`/);
+  assert.match(migration, /CREATE UNIQUE INDEX `idx_capture_devices_token_hash`/);
+  assert.match(migration, /CREATE TABLE `capture_sessions`/);
+  assert.match(migration, /ADD `manifest_sha256` text/);
+  assert.match(migration, /ADD `chain_previous_hash` text/);
+  assert.match(migration, /ADD `chain_event_hash` text/);
+  assert.match(migration, /ADD `timestamp_token` text/);
+});
+
+test("native upload route enforces image integrity and local safety review", async () => {
+  const source = await readFile(new URL("../app/api/native/evidence/route.ts", import.meta.url), "utf8");
+  assert.match(source, /manifest\.sha256 !== imageDigest/);
+  assert.match(source, /\["passed", "redacted"\]\.includes\(safetyStatus\)/);
+  assert.match(source, /Only PNG capture evidence is accepted/);
+  assert.match(source, /requireCaptureDevice/);
+});

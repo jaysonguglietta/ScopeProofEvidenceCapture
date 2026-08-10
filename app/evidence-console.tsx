@@ -4,8 +4,8 @@ import { useEffect, useMemo, useState } from "react";
 import { controls, evidence as seedEvidence, findings, requirementCoverage, runs as seedRuns } from "../lib/data";
 import type { CollectionRun, Evidence, EvidenceStatus } from "../lib/types";
 
-type View = "Overview" | "Controls" | "Evidence" | "Collection runs" | "Findings" | "Connections" | "Settings";
-type Modal = "run" | "add" | "export" | null;
+type View = "Overview" | "Controls" | "Evidence" | "Collection runs" | "Findings" | "Connections" | "Settings" | "Help";
+type Modal = "run" | "add" | "export" | "device" | null;
 
 const nav: { label: View; mark: string; section: "workspace" | "manage" }[] = [
   { label: "Overview", mark: "⌂", section: "workspace" },
@@ -15,6 +15,7 @@ const nav: { label: View; mark: string; section: "workspace" | "manage" }[] = [
   { label: "Findings", mark: "◇", section: "workspace" },
   { label: "Connections", mark: "⌘", section: "manage" },
   { label: "Settings", mark: "⚙", section: "manage" },
+  { label: "Help", mark: "?", section: "manage" },
 ];
 
 const sources = [
@@ -27,6 +28,7 @@ const sources = [
 
 type ApiCollector = { id: string; provider: string; display_name: string; enabled: number; schedule_cron: string | null; status: string; last_run_at: string | null; last_error: string | null; configuration: { configured: boolean; missing: string[] } };
 type ApiUser = { id: string; email: string; displayName: string; role: string };
+type ApiDevice = { id: string; display_name: string; platform: string; status: string; app_version: string | null; last_seen_at: string | null; created_at: string; revoked_at: string | null };
 
 function cls(...values: Array<string | false | null | undefined>) {
   return values.filter(Boolean).join(" ");
@@ -108,6 +110,8 @@ export function EvidenceConsole() {
   const [evidenceItems, setEvidenceItems] = useState<Evidence[]>(seedEvidence);
   const [runItems, setRunItems] = useState<CollectionRun[]>(seedRuns);
   const [collectorItems, setCollectorItems] = useState<ApiCollector[]>([]);
+  const [deviceItems, setDeviceItems] = useState<ApiDevice[]>([]);
+  const [deviceToken, setDeviceToken] = useState<string | null>(null);
   const [currentUser, setCurrentUser] = useState<ApiUser | null>(null);
   const [auditIntegrity, setAuditIntegrity] = useState<{ valid: boolean; checked: number } | null>(null);
   const [backendState, setBackendState] = useState<"loading" | "live" | "unavailable">("loading");
@@ -128,6 +132,8 @@ export function EvidenceConsole() {
         setRunItems((runData.runs as Array<Record<string, unknown>>).map(mapApiRun));
         setCollectorItems(collectorData.collectors);
         setAuditIntegrity(auditData?.integrity || null);
+        const deviceResponse = await fetch("/api/devices");
+        if (deviceResponse.ok) setDeviceItems(((await deviceResponse.json()) as { devices: ApiDevice[] }).devices);
         setBackendState("live");
       } catch {
         if (!cancelled) setBackendState("unavailable");
@@ -221,6 +227,34 @@ export function EvidenceConsole() {
     finally { setBusy(false); }
   }
 
+  async function enrollDevice(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const displayName = String(new FormData(event.currentTarget).get("displayName") || "").trim();
+    if (!displayName) return;
+    setBusy(true);
+    try {
+      const response = await fetch("/api/devices", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ displayName }) });
+      if (!response.ok) throw new Error(await apiError(response));
+      const data = await response.json() as { token: string; device: ApiDevice };
+      setDeviceToken(data.token);
+      const refreshed = await fetch("/api/devices").then((result) => result.json()) as { devices: ApiDevice[] };
+      setDeviceItems(refreshed.devices);
+      setToast(`${displayName} enrolled. Copy the token now; Scopeproof will not show it again.`);
+    } catch (error) { setToast(error instanceof Error ? error.message : "Device enrollment failed."); }
+    finally { setBusy(false); }
+  }
+
+  async function revokeDevice(id: string) {
+    setBusy(true);
+    try {
+      const response = await fetch("/api/devices", { method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ id }) });
+      if (!response.ok) throw new Error(await apiError(response));
+      setDeviceItems((items) => items.map((item) => item.id === id ? { ...item, status: "revoked", revoked_at: new Date().toISOString() } : item));
+      setToast("Capture device revoked. Its token can no longer upload evidence.");
+    } catch (error) { setToast(error instanceof Error ? error.message : "Device revocation failed."); }
+    finally { setBusy(false); }
+  }
+
   return (
     <div className="app-shell">
       <a className="skip-link" href="#main-content">Skip to content</a>
@@ -256,13 +290,14 @@ export function EvidenceConsole() {
           {view === "Evidence" && <EvidenceView items={filteredEvidence} search={search} setSearch={setSearch} status={statusFilter} setStatus={setStatusFilter} type={typeFilter} setType={setTypeFilter} onSelect={setSelectedEvidence} onAdd={() => setModal("add")} />}
           {view === "Collection runs" && <RunsView items={runItems} onRun={() => setModal("run")} onToast={setToast} />}
           {view === "Findings" && <FindingsView />}
-          {view === "Connections" && <ConnectionsView collectors={collectorItems} onToast={setToast} />}
+          {view === "Connections" && <ConnectionsView collectors={collectorItems} devices={deviceItems} onEnroll={() => { setDeviceToken(null); setModal("device"); }} onRevoke={revokeDevice} onToast={setToast} />}
           {view === "Settings" && <SettingsView redaction={redaction} setRedaction={setRedaction} notifications={notifications} setNotifications={setNotifications} auditIntegrity={auditIntegrity} role={currentUser?.role || "auditor"} onToast={setToast} />}
+          {view === "Help" && <HelpView onNavigate={navigate} />}
         </section>
       </main>
 
       {selectedEvidence && <EvidenceDrawer item={selectedEvidence} onClose={() => setSelectedEvidence(null)} onApprove={approveEvidence} onToast={setToast} />}
-      {modal && <Modal type={modal} collectors={collectorItems} onClose={() => !busy && setModal(null)} onRun={handleRun} onAdd={handleAdd} onExport={exportPackage} busy={busy} />}
+      {modal && <Modal type={modal} collectors={collectorItems} deviceToken={deviceToken} onClose={() => !busy && setModal(null)} onRun={handleRun} onAdd={handleAdd} onExport={exportPackage} onDevice={enrollDevice} busy={busy} />}
       {toast && <div className="toast" role="status"><span>✓</span>{toast}</div>}
     </div>
   );
@@ -337,7 +372,7 @@ function FindingsView() {
   </>;
 }
 
-function ConnectionsView({ collectors, onToast }: { collectors: ApiCollector[]; onToast: (message: string) => void }) {
+function ConnectionsView({ collectors, devices, onEnroll, onRevoke, onToast }: { collectors: ApiCollector[]; devices: ApiDevice[]; onEnroll: () => void; onRevoke: (id: string) => void; onToast: (message: string) => void }) {
   const cards = sources.map((source) => {
     const collector = collectors.find((item) => item.id === source.id);
     return { ...source, status: collector?.configuration.configured ? titleCase(collector.status) : "Not configured", detail: collector?.configuration.configured ? source.detail : `Missing ${collector?.configuration.missing.join(", ") || "hosted secrets"}`, lastRun: collector?.last_run_at ? formatDate(collector.last_run_at) : "Never", error: collector?.last_error };
@@ -346,6 +381,9 @@ function ConnectionsView({ collectors, onToast }: { collectors: ApiCollector[]; 
   return <><PageTitle eyebrow="Data sources" title="Connections" description="Manage the systems Scopeproof uses to collect trustworthy PCI evidence." actions={<button className="button primary" onClick={() => onToast("Add provider credentials as encrypted hosted environment variables; they are never stored in the application database.")}>＋ Configure source</button>} />
     {attention.length > 0 && <div className="connection-alert"><span>!</span><div><strong>{attention.length} collector{attention.length === 1 ? "" : "s"} need configuration</strong><p>Provider credentials are missing or the latest live API call failed. Scheduled collection remains paused for affected sources.</p></div><button onClick={() => onToast("Open hosted environment settings to add the missing secret values from .env.example.")}>Configuration guide</button></div>}
     <div className="connections-grid">{cards.map((source) => <article className="connection-card" key={source.name}><div className="connection-head"><span>{source.mark}</span><button aria-label={`Options for ${source.name}`} onClick={() => onToast(`${source.name} runs ${collectors.find((item) => item.id === source.id)?.schedule_cron || "without a schedule"} in UTC.`)}>•••</button></div><h3>{source.name}</h3><p>{source.detail}</p><StatusPill status={source.status} /><div><span>Last successful run</span><b>{source.lastRun}</b></div><button onClick={() => onToast(source.status === "Healthy" ? `${source.name} is configured. Use Run collection to execute a live test.` : `${source.name}: ${source.error || source.detail}`)}>Inspect configuration</button></article>)}</div>
+    <section className="panel device-panel"><div className="panel-head"><div><h2>Mac capture devices</h2><p>Revocable device identities for locally reviewed screenshot uploads</p></div><button className="button primary" onClick={onEnroll}>＋ Enroll Mac</button></div>
+      {devices.length ? <div className="device-list">{devices.map((device) => <div className="device-row" key={device.id}><span className="device-icon">⌘</span><div><strong>{device.display_name}</strong><small>{device.platform} · {device.app_version ? `v${device.app_version}` : "Not connected yet"} · {device.last_seen_at ? `Seen ${formatDate(device.last_seen_at)}` : "Awaiting first upload"}</small></div><StatusPill status={titleCase(device.status)} /><button className="button secondary" disabled={device.status === "revoked"} onClick={() => onRevoke(device.id)}>{device.status === "revoked" ? "Revoked" : "Revoke"}</button></div>)}</div> : <EmptyState message="No Mac capture devices are enrolled. Create a one-time token, then paste it into Scopeproof Capture Settings." action="Enroll first Mac" onAction={onEnroll} />}
+    </section>
   </>;
 }
 
@@ -356,15 +394,30 @@ function SettingsView({ redaction, setRedaction, notifications, setNotifications
   </>;
 }
 
+function HelpView({ onNavigate }: { onNavigate: (view: View) => void }) {
+  return <><PageTitle eyebrow="Product guide" title="Help & how to use Scopeproof" description="Follow the evidence lifecycle from a live source to a signed assessor package." />
+    <section className="help-steps" aria-label="Evidence workflow">
+      {[['1', 'Connect sources', 'Configure least-privilege provider credentials or enroll a Mac capture device.', 'Connections'], ['2', 'Collect safely', 'Run an API collector or review a locally scanned screenshot before it enters Scopeproof.', 'Collection runs'], ['3', 'Review evidence', 'Confirm control mapping, scope, freshness, redactions, and integrity before approval.', 'Evidence'], ['4', 'Export for assessment', 'Generate a signed ZIP with embedded artifacts, a PDF index, hashes, and verification material.', 'Overview']].map(([number, title, copy, destination]) => <article key={number}><span>{number}</span><div><h2>{title}</h2><p>{copy}</p><button onClick={() => onNavigate(destination as View)}>Open {destination} →</button></div></article>)}
+    </section>
+    <div className="help-grid">
+      <section className="panel help-panel"><h2>Mac screenshot quick start</h2><ol><li>Open <strong>Connections</strong>, enroll a Mac, and copy the one-time token.</li><li>In the Scopeproof shield menu, open <strong>Capture Settings</strong>; enter this workspace’s HTTPS URL and token.</li><li>Create a capture session with the PCI control, system, environment, period, and evidence title.</li><li>Select an exact window. Scopeproof runs local OCR, masks PANs and credentials, stamps the image, and shows a preview.</li><li>Save the reviewed image. Automatic upload or <strong>Retry Pending Uploads</strong> adds it to the review queue.</li></ol><button className="button secondary" onClick={() => onNavigate('Connections')}>Manage capture devices</button></section>
+      <section className="panel help-panel"><h2>What proves integrity</h2><dl><div><dt>Visible stamp</dt><dd>Local date, time, timezone, control, system, environment, period, and evidence ID.</dd></div><div><dt>Local manifest</dt><dd>PNG SHA-256, source metadata, redaction counts, and previous/current chain hashes.</dd></div><div><dt>Server receipt</dt><dd>Signed server time, device identity, audit event, and optional RFC 3161 timestamp token.</dd></div><div><dt>Assessor package</dt><dd>ECDSA-signed manifest, public key, independent hashes, embedded evidence, and PDF index.</dd></div></dl></section>
+      <section className="panel help-panel"><h2>Safety & privacy</h2><ul><li>Captured OCR text is processed on the Mac and is not retained.</li><li>Device tokens are shown once, hashed server-side, stored in Keychain, and revocable.</li><li>Artifacts are encrypted with AES-256-GCM before R2 persistence.</li><li>Every material action is written to a tamper-evident, append-only audit chain.</li><li>Scopeproof never captures the screen without an explicit menu action.</li></ul></section>
+      <section className="panel help-panel"><h2>Troubleshooting</h2><dl><div><dt>Capture permission fails</dt><dd>Open the shield menu → Screen Recording Settings, enable Scopeproof Capture, then fully quit and reopen it.</dd></div><div><dt>Upload is pending</dt><dd>Confirm the HTTPS server URL and active device token, then choose Retry Pending Uploads.</dd></div><div><dt>A collector is paused</dt><dd>Open Connections and inspect its missing hosted secret or most recent provider error.</dd></div><div><dt>Evidence was blocked</dt><dd>Remove cardholder data or credentials from the source and collect again; unsafe automated captures are not stored.</dd></div></dl></section>
+    </div>
+  </>;
+}
+
 function EvidenceDrawer({ item, onClose, onApprove, onToast }: { item: Evidence; onClose: () => void; onApprove: (item: Evidence) => void; onToast: (message: string) => void }) {
   return <><button className="drawer-scrim" aria-label="Close evidence details" onClick={onClose} /><aside className="drawer" aria-label="Evidence details"><div className="drawer-head"><div><span>{item.id}</span><StatusPill status={item.status} /></div><button aria-label="Close evidence details" onClick={onClose}>×</button></div><div className="drawer-scroll"><span className="eyebrow">{item.type} evidence</span><h2>{item.title}</h2><p className="drawer-description">{item.description}</p><EvidenceVisual item={item} /><div className="integrity-banner"><span>✓</span><div><strong>Integrity verified</strong><p>{item.checksum} · Source unchanged</p></div></div><section className="detail-section"><h3>Evidence mapping</h3><dl><div><dt>PCI control</dt><dd>{item.control} · {item.requirement}</dd></div><div><dt>Source</dt><dd>{item.source} / {item.system}</dd></div><div><dt>Captured</dt><dd>{item.capturedAt}</dd></div><div><dt>Valid until</dt><dd>{item.expiresAt}</dd></div><div><dt>Collector</dt><dd>{item.collector}</dd></div></dl></section><section className="detail-section"><h3>Protection checks</h3><div className="check-row"><span>✓</span><div><strong>Secret scan passed</strong><p>No credentials or access tokens detected</p></div></div><div className="check-row"><span>✓</span><div><strong>Cardholder data scan passed</strong><p>No PAN or sensitive authentication data detected</p></div></div></section><section className="detail-section"><h3>Tags</h3><div className="tag-row">{item.tags.map((tag) => <span key={tag}>{tag}</span>)}</div></section></div><div className="drawer-actions"><button className="button secondary" onClick={() => onToast(`${item.id} flagged for follow-up.`)}>Flag issue</button><button className="button primary" disabled={item.status === "Approved"} onClick={() => onApprove(item)}>{item.status === "Approved" ? "✓ Approved" : "Approve evidence"}</button></div></aside></>;
 }
 
-function Modal({ type, collectors, onClose, onRun, onAdd, onExport, busy }: { type: Exclude<Modal, null>; collectors: ApiCollector[]; onClose: () => void; onRun: (e: React.FormEvent<HTMLFormElement>) => void; onAdd: (e: React.FormEvent<HTMLFormElement>) => void; onExport: () => void; busy: boolean }) {
-  const titles = { run: "Run evidence collection", add: "Add manual evidence", export: "Export evidence package" };
+function Modal({ type, collectors, deviceToken, onClose, onRun, onAdd, onExport, onDevice, busy }: { type: Exclude<Modal, null>; collectors: ApiCollector[]; deviceToken: string | null; onClose: () => void; onRun: (e: React.FormEvent<HTMLFormElement>) => void; onAdd: (e: React.FormEvent<HTMLFormElement>) => void; onExport: () => void; onDevice: (e: React.FormEvent<HTMLFormElement>) => void; busy: boolean }) {
+  const titles = { run: "Run evidence collection", add: "Add manual evidence", export: "Export evidence package", device: "Enroll Mac capture device" };
   return <div className="modal-layer" role="dialog" aria-modal="true" aria-labelledby="modal-title"><button className="modal-scrim" onClick={onClose} aria-label="Close dialog" /><section className="modal"><div className="modal-head"><div><span className="eyebrow">Scopeproof</span><h2 id="modal-title">{titles[type]}</h2></div><button onClick={onClose} aria-label="Close dialog">×</button></div>
     {type === "run" && <form onSubmit={onRun}><p className="modal-intro">Select configured sources to query now. Provider responses are scanned, encrypted, checksum de-duplicated, and written to the audit chain.</p><fieldset className="source-select"><legend>Live evidence sources</legend>{sources.map((source, index) => { const collector = collectors.find((item) => item.id === source.id); const configured = collector?.configuration.configured === true; return <label key={source.name} className={!configured ? "disabled" : ""}><input type="checkbox" name="source" value={source.id} defaultChecked={configured && index < 3} disabled={!configured} /><span>{source.mark}</span><div><strong>{source.name}</strong><small>{configured ? `${source.detail} · ${collector?.schedule_cron || "On demand"} UTC` : `Missing ${collector?.configuration.missing.join(", ") || "hosted credentials"}`}</small></div></label>; })}</fieldset><label className="checkbox-line"><input type="checkbox" checked readOnly /> Enforce PAN, secret, and token scanning before encryption</label><div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy}>{busy ? <><span className="button-spinner" /> Collecting live evidence…</> : "Start live collection"}</button></div></form>}
     {type === "add" && <form onSubmit={onAdd} className="evidence-form"><div className="form-grid"><label className="field full"><span>Evidence title</span><input name="title" required placeholder="e.g. Production database encryption settings" /></label><label className="field"><span>PCI control</span><select name="control" required defaultValue=""><option value="" disabled>Select control</option>{controls.map((control) => <option key={control.id} value={control.id}>{control.id} — {control.title}</option>)}</select></label><label className="field"><span>Evidence type</span><select name="type"><option value="code">Code</option><option value="configuration">Configuration</option><option value="report">Text report</option></select></label><label className="field"><span>System or asset</span><input name="system" required placeholder="payments-production" /></label><label className="field"><span>Code language</span><select name="language"><option>Text</option><option>HCL</option><option>YAML</option><option>JSON</option><option>Shell</option><option>TypeScript</option></select></label><label className="field full"><span>Description</span><textarea name="description" rows={3} placeholder="What this evidence proves and where it came from" /></label><label className="field full"><span>Code or configuration excerpt</span><textarea name="code" className="mono-input" rows={5} required placeholder="# Paste the focused excerpt here; server-side redaction runs before encryption" /></label></div><div className="upload-zone"><span>↑</span><div><strong>Attach an optional text-based artifact</strong><p>TXT, JSON, XML, or YAML up to 10 MB · screenshots must use the preflight browser collector</p></div><label className="choose-file">Choose file<input name="attachment" type="file" accept="text/*,application/json,application/xml,application/yaml" /></label></div><div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy}>{busy ? "Encrypting…" : "Scan, encrypt & add"}</button></div></form>}
     {type === "export" && <div><p className="modal-intro">Generate a signed assessor package containing every approved artifact, a SHA-256 manifest, integrity attestation, and a PDF evidence index.</p><div className="export-summary"><div><span>▣</span><p><strong>PCI DSS 4.0.1 · Q3 2026</strong><small>Approved evidence only · Encrypted while stored</small></p></div><StatusPill status="Ready" /></div><label className="checkbox-line"><input type="checkbox" checked readOnly /> Embed decrypted artifacts into the protected ZIP</label><label className="checkbox-line"><input type="checkbox" checked readOnly /> ECDSA-sign manifest and include public verification key</label><div className="privacy-note"><span>i</span><p>The package is generated server-side, integrity-checked after decryption, and expires after seven days. Downloads are recorded in the immutable audit chain.</p></div><div className="modal-actions"><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy} onClick={onExport}>{busy ? "Building signed package…" : "↓ Generate signed ZIP"}</button></div></div>}
+    {type === "device" && (deviceToken ? <div><p className="modal-intro">This token is shown once. Copy it into the Mac app under <strong>Scopeproof shield → Capture Settings</strong>, then close this dialog.</p><div className="token-reveal"><code>{deviceToken}</code><button className="button secondary" onClick={() => void navigator.clipboard.writeText(deviceToken)}>Copy token</button></div><div className="privacy-note"><span>!</span><p>Treat this token like a password. It is stored hashed on the server and in the Mac login Keychain. Revoke the device immediately if the token is exposed.</p></div><div className="modal-actions"><button className="button primary" onClick={onClose}>I saved the token</button></div></div> : <form onSubmit={onDevice}><p className="modal-intro">Create a revocable identity for one Mac. Evidence uploaded by this device is attributed to your user and written to the immutable audit chain.</p><label className="field"><span>Device name</span><input name="displayName" required maxLength={100} defaultValue="Jayson’s Mac" placeholder="e.g. Compliance MacBook Pro" /></label><div className="privacy-note"><span>i</span><p>The token is displayed only once. The Mac stores it in Keychain and sends it only to your configured Scopeproof server.</p></div><div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy}>{busy ? "Creating secure token…" : "Create device token"}</button></div></form>)}
   </section></div>;
 }

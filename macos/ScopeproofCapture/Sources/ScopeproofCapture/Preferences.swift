@@ -1,0 +1,127 @@
+import Foundation
+
+struct BrowserChoice: Equatable, Sendable {
+    let name: String
+    let bundleIdentifier: String?
+
+    static let supported: [BrowserChoice] = [
+        BrowserChoice(name: "System Default", bundleIdentifier: nil),
+        BrowserChoice(name: "Safari", bundleIdentifier: "com.apple.Safari"),
+        BrowserChoice(name: "Google Chrome", bundleIdentifier: "com.google.Chrome"),
+        BrowserChoice(name: "Microsoft Edge", bundleIdentifier: "com.microsoft.edgemac"),
+        BrowserChoice(name: "Firefox", bundleIdentifier: "org.mozilla.firefox"),
+        BrowserChoice(name: "Arc", bundleIdentifier: "company.thebrowser.Browser"),
+    ]
+}
+
+struct CaptureContext: Codable, Sendable {
+    let sessionID: String
+    var sessionName: String
+    var controlID: String
+    var title: String
+    var system: String
+    var environment: String
+    var assessmentPeriod: String
+    var description: String
+
+    var isValid: Bool {
+        !sessionID.isEmpty && !sessionName.isEmpty && !controlID.isEmpty && !title.isEmpty && !system.isEmpty && !environment.isEmpty && !assessmentPeriod.isEmpty
+    }
+
+    static func new() -> CaptureContext {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy 'Q'Q"
+        return CaptureContext(
+            sessionID: "session_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased())",
+            sessionName: "",
+            controlID: "",
+            title: "",
+            system: "",
+            environment: "Production",
+            assessmentPeriod: formatter.string(from: Date()),
+            description: ""
+        )
+    }
+}
+
+@MainActor
+final class CapturePreferences {
+    private let defaults = UserDefaults.standard
+    private enum Key {
+        static let browser = "capture.browser"
+        static let delay = "capture.delay"
+        static let targets = "capture.targets"
+        static let context = "capture.context"
+        static let serverURL = "capture.serverURL"
+        static let autoUpload = "capture.autoUpload"
+        static let retentionDays = "capture.retentionDays"
+        static let lastUpdateCheck = "capture.lastUpdateCheck"
+        static let chainHead = "capture.chainHead"
+    }
+
+    var browser: BrowserChoice {
+        get {
+            let saved = defaults.string(forKey: Key.browser)
+            return BrowserChoice.supported.first(where: { $0.bundleIdentifier == saved }) ?? .supported[0]
+        }
+        set { defaults.set(newValue.bundleIdentifier ?? "", forKey: Key.browser) }
+    }
+
+    var delay: Int {
+        get {
+            let value = defaults.integer(forKey: Key.delay)
+            return [3, 5, 10, 15].contains(value) ? value : 5
+        }
+        set { defaults.set(newValue, forKey: Key.delay) }
+    }
+
+    var targets: [String] {
+        get {
+            let saved = defaults.stringArray(forKey: Key.targets) ?? []
+            return saved.isEmpty ? ["https://scopeproof-pci.jayson-guglietta.chatgpt.site"] : saved
+        }
+        set { defaults.set(Array(newValue.prefix(12)), forKey: Key.targets) }
+    }
+
+    var activeContext: CaptureContext? {
+        get {
+            guard let data = defaults.data(forKey: Key.context) else { return nil }
+            return try? JSONDecoder().decode(CaptureContext.self, from: data)
+        }
+        set { defaults.set(try? JSONEncoder().encode(newValue), forKey: Key.context) }
+    }
+
+    var serverURL: URL? {
+        get { URL(string: defaults.string(forKey: Key.serverURL) ?? "https://scopeproof-pci.jayson-guglietta.chatgpt.site") }
+        set { defaults.set(newValue?.absoluteString, forKey: Key.serverURL) }
+    }
+
+    var autoUpload: Bool {
+        get { defaults.object(forKey: Key.autoUpload) == nil ? false : defaults.bool(forKey: Key.autoUpload) }
+        set { defaults.set(newValue, forKey: Key.autoUpload) }
+    }
+
+    var retentionDays: Int {
+        get {
+            let value = defaults.integer(forKey: Key.retentionDays)
+            return [30, 90, 180, 365, 1095].contains(value) ? value : 365
+        }
+        set { defaults.set(newValue, forKey: Key.retentionDays) }
+    }
+
+    var chainHead: String {
+        get { defaults.string(forKey: Key.chainHead) ?? "GENESIS" }
+        set { defaults.set(newValue, forKey: Key.chainHead) }
+    }
+
+    var lastUpdateCheck: Date? {
+        get { defaults.object(forKey: Key.lastUpdateCheck) as? Date }
+        set { defaults.set(newValue, forKey: Key.lastUpdateCheck) }
+    }
+
+    func addTarget(_ target: String) {
+        var updated = targets.filter { $0 != target }
+        updated.insert(target, at: 0)
+        targets = updated
+    }
+}

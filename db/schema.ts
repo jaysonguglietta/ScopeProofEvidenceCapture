@@ -10,6 +10,32 @@ export const users = sqliteTable("users", {
   lastSeenAt: text("last_seen_at").notNull().default(sql`CURRENT_TIMESTAMP`),
 }, (table) => [uniqueIndex("idx_users_email").on(table.email)]);
 
+export const captureDevices = sqliteTable("capture_devices", {
+  id: text("id").primaryKey(),
+  displayName: text("display_name").notNull(),
+  platform: text("platform").notNull().default("macOS"),
+  tokenHash: text("token_hash").notNull(),
+  ownerId: text("owner_id").notNull(),
+  status: text("status", { enum: ["active", "revoked"] }).notNull().default("active"),
+  appVersion: text("app_version"),
+  lastSeenAt: text("last_seen_at"),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  revokedAt: text("revoked_at"),
+}, (table) => [uniqueIndex("idx_capture_devices_token_hash").on(table.tokenHash), index("idx_capture_devices_owner_status").on(table.ownerId, table.status)]);
+
+export const captureSessions = sqliteTable("capture_sessions", {
+  id: text("id").primaryKey(),
+  displayName: text("display_name").notNull(),
+  controlId: text("control_id").notNull(),
+  system: text("system_name").notNull(),
+  environment: text("environment").notNull(),
+  assessmentPeriod: text("assessment_period").notNull(),
+  createdBy: text("created_by").notNull(),
+  status: text("status", { enum: ["open", "complete"] }).notNull().default("open"),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  completedAt: text("completed_at"),
+}, (table) => [index("idx_capture_sessions_control_created").on(table.controlId, table.createdAt), index("idx_capture_sessions_creator_status").on(table.createdBy, table.status)]);
+
 export const collectors = sqliteTable("collectors", {
   id: text("id").primaryKey(),
   provider: text("provider", { enum: ["aws", "github", "okta", "cloudflare", "browser"] }).notNull(),
@@ -52,6 +78,8 @@ export const evidenceArtifacts = sqliteTable("evidence_artifacts", {
   system: text("system").notNull(),
   collectorId: text("collector_id"),
   jobId: text("job_id"),
+  sessionId: text("session_id"),
+  deviceId: text("device_id"),
   r2Key: text("r2_key").notNull(),
   contentType: text("content_type").notNull(),
   byteSize: integer("byte_size").notNull(),
@@ -63,6 +91,11 @@ export const evidenceArtifacts = sqliteTable("evidence_artifacts", {
   status: text("status", { enum: ["needs_review", "approved", "expiring", "rejected"] }).notNull().default("needs_review"),
   redactionCount: integer("redaction_count").notNull().default(0),
   redactionSummaryJson: text("redaction_summary_json").notNull().default("[]"),
+  manifestSha256: text("manifest_sha256"),
+  chainPreviousHash: text("chain_previous_hash"),
+  chainEventHash: text("chain_event_hash"),
+  timestampAuthority: text("timestamp_authority"),
+  timestampToken: text("timestamp_token"),
   createdBy: text("created_by").notNull(),
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
   approvedBy: text("approved_by"),
@@ -72,6 +105,8 @@ export const evidenceArtifacts = sqliteTable("evidence_artifacts", {
   index("idx_evidence_status_created").on(table.status, table.createdAt),
   index("idx_evidence_control_captured").on(table.controlId, table.capturedAt),
   index("idx_evidence_job").on(table.jobId),
+  index("idx_evidence_device_captured").on(table.deviceId, table.capturedAt),
+  index("idx_evidence_session").on(table.sessionId),
 ]);
 
 export const auditEvents = sqliteTable("audit_events", {

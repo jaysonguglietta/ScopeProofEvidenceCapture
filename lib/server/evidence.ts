@@ -16,10 +16,17 @@ export interface EvidenceInput {
   bytes: Uint8Array;
   collectorId?: string;
   jobId?: string;
+  sessionId?: string;
+  deviceId?: string;
   capturedAt?: string;
   validityDays?: number;
   createdBy: AuthenticatedUser;
   preflightFindings?: RedactionFinding[];
+  manifestSha256?: string;
+  chainPreviousHash?: string;
+  chainEventHash?: string;
+  timestampAuthority?: string;
+  timestampToken?: string;
 }
 
 function isTextual(contentType: string): boolean {
@@ -48,10 +55,11 @@ export async function storeEvidence(input: EvidenceInput): Promise<{ id: string;
   await env.EVIDENCE_BUCKET.put(r2Key, encrypted.ciphertext, { customMetadata: { evidenceId: id, sha256: digest, encryptionVersion: "1" }, httpMetadata: { contentType: "application/octet-stream" } });
   try {
     await env.DB.prepare(`INSERT INTO evidence_artifacts
-      (id, control_id, title, description, type, source, system, collector_id, job_id, r2_key, content_type, byte_size, sha256, encryption_iv, captured_at, expires_at, redaction_count, redaction_summary_json, created_by)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(
+      (id, control_id, title, description, type, source, system, collector_id, job_id, session_id, device_id, r2_key, content_type, byte_size, sha256, encryption_iv, captured_at, expires_at, redaction_count, redaction_summary_json, manifest_sha256, chain_previous_hash, chain_event_hash, timestamp_authority, timestamp_token, created_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(
       id, input.controlId, input.title, input.description, input.type, input.source, input.system, input.collectorId || null, input.jobId || null,
-      r2Key, input.contentType, bytes.byteLength, digest, encrypted.iv, capturedAt, expiresAt, redactionCount, stableJson(findings), input.createdBy.id,
+      input.sessionId || null, input.deviceId || null, r2Key, input.contentType, bytes.byteLength, digest, encrypted.iv, capturedAt, expiresAt, redactionCount, stableJson(findings),
+      input.manifestSha256 || null, input.chainPreviousHash || null, input.chainEventHash || null, input.timestampAuthority || null, input.timestampToken || null, input.createdBy.id,
     ).run();
   } catch (error) {
     await env.EVIDENCE_BUCKET.delete(r2Key);
@@ -62,7 +70,7 @@ export async function storeEvidence(input: EvidenceInput): Promise<{ id: string;
 }
 
 export async function listEvidence(limit = 100): Promise<Array<Record<string, unknown>>> {
-  const rows = (await getEnv().DB.prepare(`SELECT id, control_id, title, description, type, source, system, collector_id, job_id, content_type, byte_size, sha256, captured_at, expires_at, status, redaction_count, redaction_summary_json, created_by, created_at, approved_by, approved_at
+  const rows = (await getEnv().DB.prepare(`SELECT id, control_id, title, description, type, source, system, collector_id, job_id, session_id, device_id, content_type, byte_size, sha256, captured_at, expires_at, status, redaction_count, redaction_summary_json, manifest_sha256, chain_previous_hash, chain_event_hash, timestamp_authority, created_by, created_at, approved_by, approved_at
     FROM evidence_artifacts ORDER BY captured_at DESC LIMIT ?`).bind(Math.min(Math.max(limit, 1), 250)).all<Record<string, unknown>>()).results;
   return rows.map((row: Record<string, unknown>) => ({ ...row, redaction_summary: JSON.parse(String(row.redaction_summary_json || "[]")), redaction_summary_json: undefined }));
 }

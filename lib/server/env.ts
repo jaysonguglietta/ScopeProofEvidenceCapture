@@ -20,6 +20,11 @@ export interface ScopeproofEnv {
   CLOUDFLARE_ACCOUNT_ID?: string;
   CLOUDFLARE_ZONE_IDS?: string;
   BROWSER_CAPTURE_URLS?: string;
+  MACOS_LATEST_VERSION?: string;
+  MACOS_RELEASE_URL?: string;
+  MACOS_RELEASE_SHA256?: string;
+  MACOS_RELEASE_NOTES?: string;
+  RFC3161_TSA_URL?: string;
 }
 
 export function getEnv(): ScopeproofEnv {
