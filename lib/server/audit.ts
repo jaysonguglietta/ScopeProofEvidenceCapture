@@ -22,15 +22,24 @@ export async function appendAuditEvent(actor: AuthenticatedUser, action: string,
   }
 }
 
-export async function verifyAuditChain(): Promise<{ valid: boolean; checked: number; failedAt?: number }> {
+export type AuditChainVerification = { valid: boolean; checked: number; failedAt?: number; failureReason?: "invalid_details_json" | "non_canonical_details" | "chain_mismatch" };
+
+export async function verifyAuditChain(): Promise<AuditChainVerification> {
   const rows = (await getEnv().DB.prepare("SELECT sequence, id, occurred_at, actor_id, actor_email, action, resource_type, resource_id, details_json, previous_hash, event_hash, signature FROM audit_events ORDER BY sequence ASC").all<Record<string, unknown>>()).results;
   let previousHash = "GENESIS";
   for (const row of rows) {
-    const details = JSON.parse(String(row.details_json || "{}"));
+    let details: unknown;
+    try { details = JSON.parse(String(row.details_json || "{}")); }
+    catch { return { valid: false, checked: Number(row.sequence) - 1, failedAt: Number(row.sequence), failureReason: "invalid_details_json" }; }
+    try {
+      if (stableJson(details) !== String(row.details_json)) return { valid: false, checked: Number(row.sequence) - 1, failedAt: Number(row.sequence), failureReason: "non_canonical_details" };
+    } catch {
+      return { valid: false, checked: Number(row.sequence) - 1, failedAt: Number(row.sequence), failureReason: "non_canonical_details" };
+    }
     const canonical = stableJson({ id: row.id, occurredAt: row.occurred_at, actorId: row.actor_id, actorEmail: row.actor_email, action: row.action, resourceType: row.resource_type, resourceId: row.resource_id, details, previousHash: row.previous_hash });
     const eventHash = await sha256(canonical);
     const signature = await hmac(eventHash);
-    if (row.previous_hash !== previousHash || row.event_hash !== eventHash || row.signature !== signature) return { valid: false, checked: Number(row.sequence) - 1, failedAt: Number(row.sequence) };
+    if (row.previous_hash !== previousHash || row.event_hash !== eventHash || row.signature !== signature) return { valid: false, checked: Number(row.sequence) - 1, failedAt: Number(row.sequence), failureReason: "chain_mismatch" };
     previousHash = eventHash;
   }
   return { valid: true, checked: rows.length };

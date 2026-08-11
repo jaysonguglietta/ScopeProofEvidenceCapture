@@ -20,7 +20,7 @@ export async function PATCH(request: Request) {
     const body = await request.json() as { id?: string; enabled?: boolean; scheduleCron?: string };
     if (!body.id || (body.scheduleCron && !/^(\*|\d{1,2}) (\*|\d{1,2}) \* \* (\*|[0-6])$/.test(body.scheduleCron))) return Response.json({ error: "Collector id and a supported five-field UTC cron are required." }, { status: 400 });
     await getEnv().DB.prepare("UPDATE collectors SET enabled = COALESCE(?, enabled), schedule_cron = COALESCE(?, schedule_cron), updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(typeof body.enabled === "boolean" ? Number(body.enabled) : null, body.scheduleCron || null, body.id).run();
-    await appendAuditEvent(user, "collector.updated", "collector", body.id, { enabled: body.enabled, scheduleCron: body.scheduleCron });
+    await appendAuditEvent(user, "collector.updated", "collector", body.id, { enabled: body.enabled ?? null, scheduleCron: body.scheduleCron ?? null });
     return Response.json({ updated: true, actor: user.id });
   } catch (error) { return jsonError(error); }
 }

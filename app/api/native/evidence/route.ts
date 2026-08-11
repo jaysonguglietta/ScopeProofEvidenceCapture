@@ -88,7 +88,7 @@ export async function POST(request: Request) {
       manifestSha256: attestationBody.manifestSha256, chainPreviousHash: attestationBody.chainPreviousHash, chainEventHash: attestationBody.chainEventHash,
       timestampAuthority, timestampToken,
     });
-    await appendAuditEvent(actor, "capture_device.uploaded", "evidence", result.id, { deviceId: device.id, sessionId, complianceArea, controlId, jiraIssueKey: jiraIssueKey || undefined, imageSha256: imageDigest, safetyStatus, redactionCount: localFindings.reduce((sum, item) => sum + item.count, 0) });
+    await appendAuditEvent(actor, "capture_device.uploaded", "evidence", result.id, { deviceId: device.id, sessionId, complianceArea, controlId, jiraIssueKey: jiraIssueKey || null, imageSha256: imageDigest, safetyStatus, redactionCount: localFindings.reduce((sum, item) => sum + item.count, 0) });
     return Response.json({ ...result, receipt: { evidenceId: result.id, deviceId: device.id, attestation: { ...attestationBody, signature: signed.signature, publicKeySpkiBase64: signed.publicKey, algorithm: "ECDSA-P256-SHA256", trustedTimestamp, trustedTimestampError } } }, { status: result.deduplicated ? 200 : 201 });
   } catch (error) { return jsonError(error); }
 }

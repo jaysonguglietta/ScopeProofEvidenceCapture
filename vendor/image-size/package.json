@@ -1,0 +1,19 @@
+{
+  "name": "image-size",
+  "version": "2.0.3-scopeproof.1",
+  "description": "Bounded image dimension parser for Scopeproof build metadata",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.js",
+      "default": "./index.js"
+    }
+  },
+  "files": [
+    "index.js",
+    "index.d.ts"
+  ],
+  "license": "UNLICENSED",
+  "private": true
+}

@@ -78,7 +78,7 @@ export async function storeEvidence(input: EvidenceInput): Promise<{ id: string;
     await env.EVIDENCE_BUCKET.delete(r2Key);
     throw error;
   }
-  await appendAuditEvent(input.createdBy, "evidence.created", "evidence", id, { controlId: input.controlId, source: input.source, jiraIssueKey: input.jiraIssueKey || undefined, sha256: digest, redactionCount, byteSize: bytes.byteLength });
+  await appendAuditEvent(input.createdBy, "evidence.created", "evidence", id, { controlId: input.controlId, source: input.source, jiraIssueKey: input.jiraIssueKey || null, sha256: digest, redactionCount, byteSize: bytes.byteLength });
   return { id, deduplicated: false, redactionCount };
 }
 
