@@ -53,7 +53,7 @@ export async function buildAssessorPackage(actor: AuthenticatedUser): Promise<{ 
   const id = randomId("pkg");
   await env.DB.prepare("INSERT INTO export_packages (id, requested_by) VALUES (?, ?)").bind(id, actor.id).run();
   try {
-    const rows = (await env.DB.prepare(`SELECT id, control_id, framework, catalog_version, title, description, type, source, system, environment, assessment_period, evidence_owner, tags_json, expected_evidence, mapped_controls_json, jira_issue_key, jira_issue_url, content_type, byte_size, sha256, captured_at, expires_at, redaction_count, manual_redactions, approved_by, approved_at
+    const rows = (await env.DB.prepare(`SELECT id, control_id, framework, catalog_version, title, description, type, source, system, environment, assessment_period, evidence_owner, tags_json, expected_evidence, mapped_controls_json, jira_issue_key, jira_issue_url, content_type, byte_size, sha256, captured_at, expires_at, redaction_count, manual_redactions, safety_scan_sha256, safety_scan_policy, safety_scan_completed_at, approved_by, approved_at
       FROM evidence_artifacts WHERE status = 'approved' ORDER BY control_id, captured_at DESC LIMIT 100`).all<Record<string, unknown>>()).results;
     if (!rows.length) throw new Error("No approved evidence is available for export.");
     const generatedAt = new Date().toISOString();

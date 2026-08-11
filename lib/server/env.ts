@@ -21,6 +21,9 @@ export interface ScopeproofEnv {
   CLOUDFLARE_ACCOUNT_ID?: string;
   CLOUDFLARE_ZONE_IDS?: string;
   BROWSER_CAPTURE_URLS?: string;
+  BROWSER_OCR_ENDPOINT?: string;
+  BROWSER_OCR_TOKEN?: string;
+  BROWSER_OCR_ALLOWED_HOSTS?: string;
   MACOS_LATEST_VERSION?: string;
   MACOS_RELEASE_URL?: string;
   MACOS_RELEASE_SHA256?: string;

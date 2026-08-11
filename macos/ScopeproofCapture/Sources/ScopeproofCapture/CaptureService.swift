@@ -37,6 +37,9 @@ struct CaptureManifest: Codable, Sendable {
     let safetyStatus: String
     let redactionFindings: [SensitiveFinding]
     let redactedRegions: Int
+    let safetyScanSha256: String?
+    let safetyScanPolicy: String?
+    let safetyScanCompletedAt: String?
     let sessionID: String
     let sessionName: String
     let controlID: String
@@ -74,6 +77,7 @@ enum CaptureFailure: LocalizedError {
     case browserUnavailable(String)
     case noBrowserWindow
     case screenshotFailed(String)
+    case safetyScanFailed(String)
     case imageProcessingFailed
     case cancelled
 
@@ -84,6 +88,7 @@ enum CaptureFailure: LocalizedError {
         case .browserUnavailable(let name): return "\(name) is not installed on this Mac."
         case .noBrowserWindow: return "No visible browser window was found. Bring the evidence page to the front and try again."
         case .screenshotFailed(let detail): return "macOS could not capture the browser window. \(detail)"
+        case .safetyScanFailed(let detail): return "The required final-image safety scan did not complete. No evidence was saved. \(detail)"
         case .imageProcessingFailed: return "The screenshot was captured but the protected evidence files could not be created."
         case .cancelled: return "The capture was discarded during review."
         }
@@ -171,10 +176,7 @@ final class CaptureService {
                 if #available(macOS 14.2, *) { filter.includeMenuBar = true }
                 let configuration = captureConfiguration(width: CGFloat(display.width), height: CGFloat(display.height), scale: CGFloat(filter.pointPixelScale))
                 let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
-                let temporary = outputDirectory.appendingPathComponent(".scopeproof-display-\(UUID().uuidString).png")
-                defer { try? fileManager.removeItem(at: temporary) }
-                try writePNG(image, to: temporary)
-                completion(.success(try finalizeCapture(temporaryURL: temporary, sourceURL: nil, browser: "Entire Display", windowTitle: "Full display with menu bar", method: "ScreenCaptureKit full-display", context: context)))
+                completion(.success(try finalizeCapture(original: image, sourceURL: nil, browser: "Entire Display", windowTitle: "Full display with menu bar", method: "ScreenCaptureKit full-display", context: context)))
             } catch { completion(.failure(error as? CaptureFailure ?? .screenshotFailed(error.localizedDescription))) }
         }
     }
@@ -211,10 +213,7 @@ final class CaptureService {
                 let filter = SCContentFilter(desktopIndependentWindow: shareableWindow)
                 let configuration = captureConfiguration(width: shareableWindow.frame.width, height: shareableWindow.frame.height, scale: CGFloat(filter.pointPixelScale))
                 let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
-                let temporary = outputDirectory.appendingPathComponent(".scopeproof-window-\(UUID().uuidString).png")
-                defer { try? fileManager.removeItem(at: temporary) }
-                try writePNG(image, to: temporary)
-                completion(.success(try finalizeCapture(temporaryURL: temporary, sourceURL: sourceURL, browser: window.owner, windowTitle: window.title, method: "ScreenCaptureKit desktop-independent-window", context: context)))
+                completion(.success(try finalizeCapture(original: image, sourceURL: sourceURL, browser: window.owner, windowTitle: window.title, method: "ScreenCaptureKit desktop-independent-window", context: context)))
             } catch { completion(.failure(error as? CaptureFailure ?? .screenshotFailed(error.localizedDescription))) }
         }
     }
@@ -231,20 +230,20 @@ final class CaptureService {
         return configuration
     }
 
-    private func writePNG(_ image: CGImage, to url: URL) throws {
-        guard let destination = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil) else { throw CaptureFailure.imageProcessingFailed }
+    private func pngData(_ image: CGImage) throws -> Data {
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(data as CFMutableData, UTType.png.identifier as CFString, 1, nil) else { throw CaptureFailure.imageProcessingFailed }
         CGImageDestinationAddImage(destination, image, nil)
         guard CGImageDestinationFinalize(destination) else { throw CaptureFailure.imageProcessingFailed }
+        return data as Data
     }
 
-    private func finalizeCapture(temporaryURL: URL, sourceURL: URL?, browser: String, windowTitle: String, method: String, context: CaptureContext) throws -> CaptureResult {
-        guard let imageSource = CGImageSourceCreateWithURL(temporaryURL as CFURL, nil), let original = CGImageSourceCreateImageAtIndex(imageSource, 0, nil) else { throw CaptureFailure.imageProcessingFailed }
-        let scan = try SensitiveDataScanner.scanAndRedact(original)
+    private func finalizeCapture(original: CGImage, sourceURL: URL?, browser: String, windowTitle: String, method: String, context: CaptureContext) throws -> CaptureResult {
+        let initialScan = try requiredSafetyScan(original)
         let now = Date()
         let capturedAt = ISO8601DateFormatter().string(from: now)
         let evidenceID = "EV-\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(10).uppercased())"
         let framework = ComplianceCatalog.framework(named: context.resolvedComplianceArea)
-        guard let review = reviewController.review(image: scan.image, findings: scan.findings, automaticRedactions: scan.redactedRegions, context: context) else { throw CaptureFailure.cancelled }
         let controlComponent = String(ComplianceCatalog.safeFileBase(context.controlID).prefix(64))
         let periodComponent = String(ComplianceCatalog.safeFileBase(context.assessmentPeriod).prefix(64))
         let evidenceDirectory = outputDirectory
@@ -260,25 +259,37 @@ final class CaptureService {
         let imageURL = evidenceDirectory.appendingPathComponent(baseName).appendingPathExtension("png")
         let manifestURL = evidenceDirectory.appendingPathComponent(baseName).appendingPathExtension("json")
         let localTimestamp = localFormatter.string(from: now)
-        let rawSourceLabel = sourceURL?.absoluteString ?? windowTitle
+        let recordedSourceURL = sanitizedSourceURL(sourceURL)
+        let rawSourceLabel = recordedSourceURL?.absoluteString ?? windowTitle
         let sourceLabel = rawSourceLabel.count > 220 ? "\(rawSourceLabel.prefix(219))…" : rawSourceLabel
         let controlLabel = context.resolvedControlTitle.isEmpty ? context.controlID : "\(context.controlID) — \(context.resolvedControlTitle)"
         let ownerLabel = context.resolvedEvidenceOwner.isEmpty ? "UNASSIGNED" : context.resolvedEvidenceOwner
         let jiraLabel = jiraIssueKey.isEmpty ? "" : "  •  JIRA \(jiraIssueKey)"
         let stamp = "SCOPEPROOF EVIDENCE  •  CAPTURED \(localTimestamp)  •  \(evidenceID)\n\(framework.name.uppercased())  •  CONTROL \(controlLabel)\(jiraLabel)\nEVIDENCE \(context.title)  •  OWNER \(ownerLabel)\n\(context.system) / \(context.environment)  •  \(context.assessmentPeriod)  •  SOURCE \(browser) — \(sourceLabel)"
-        let dimensions = try stampImage(source: review.image, destination: imageURL, stamp: stamp)
-        let imageData = try Data(contentsOf: imageURL, options: [.mappedIfSafe])
+        let stamped = try stampedImage(source: initialScan.image, stamp: stamp)
+        let stampedScan = try requiredSafetyScan(stamped)
+        let automaticFindings = mergedFindings(initialScan.findings + stampedScan.findings)
+        let automaticRedactions = initialScan.redactedRegions + stampedScan.redactedRegions
+        guard let review = reviewController.review(image: stampedScan.image, findings: automaticFindings, automaticRedactions: automaticRedactions, context: context) else { throw CaptureFailure.cancelled }
+        let imageData = try pngData(review.image)
+        guard let exactSource = CGImageSourceCreateWithData(imageData as CFData, nil), let exactImage = CGImageSourceCreateImageAtIndex(exactSource, 0, nil) else { throw CaptureFailure.imageProcessingFailed }
+        let exactScan = try requiredSafetyScan(exactImage)
+        guard exactScan.redactedRegions == 0 else { throw CaptureFailure.safetyScanFailed("Sensitive content remained after review; capture again and remove the reported value.") }
         let digest = sha256(imageData)
+        try imageData.write(to: imageURL, options: [.atomic, .completeFileProtection])
+        try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: imageURL.path)
+        let dimensions = (width: review.image.width, height: review.image.height)
         let previousHash = preferences.chainHead
         let eventHash = sha256(Data("\(previousHash)|\(digest)|\(evidenceID)|\(capturedAt)|\(context.sessionID)".utf8))
-        let safetyStatus = scan.redactedRegions + review.manualRedactions > 0 ? "redacted" : "passed"
+        let safetyStatus = automaticRedactions + review.manualRedactions > 0 ? "redacted" : "passed"
         let mappings = ComplianceCatalog.mappings(frameworkName: framework.name, controlID: context.controlID)
         let manifest = CaptureManifest(
-            schemaVersion: 5, evidenceID: evidenceID, capturedAt: capturedAt, localTimestamp: localTimestamp, timezone: TimeZone.current.identifier,
-            sourceURL: sourceURL?.absoluteString, sourceHost: sourceURL?.host, browser: browser, windowTitle: windowTitle, screenshotFilename: imageURL.lastPathComponent,
+            schemaVersion: 6, evidenceID: evidenceID, capturedAt: capturedAt, localTimestamp: localTimestamp, timezone: TimeZone.current.identifier,
+            sourceURL: recordedSourceURL?.absoluteString, sourceHost: recordedSourceURL?.host, browser: browser, windowTitle: windowTitle, screenshotFilename: imageURL.lastPathComponent,
             sha256: digest, pixelWidth: dimensions.width, pixelHeight: dimensions.height, captureMethod: method,
             timestampAuthority: "Local macOS clock; signed Scopeproof server attestation is stored in the upload receipt",
-            safetyStatus: safetyStatus, redactionFindings: scan.findings, redactedRegions: scan.redactedRegions,
+            safetyStatus: safetyStatus, redactionFindings: automaticFindings, redactedRegions: automaticRedactions,
+            safetyScanSha256: digest, safetyScanPolicy: SensitiveDataScanner.policyVersion, safetyScanCompletedAt: capturedAt,
             sessionID: context.sessionID, sessionName: context.sessionName, controlID: context.controlID, title: context.title, system: context.system,
             environment: context.environment, assessmentPeriod: context.assessmentPeriod, description: context.description,
             complianceArea: framework.name, controlTitle: context.resolvedControlTitle, customFileName: context.resolvedCustomFileName,
@@ -306,10 +317,10 @@ final class CaptureService {
             tags: context.resolvedTags
         )
         preferences.chainHead = eventHash
-        return CaptureResult(imageURL: imageURL, manifestURL: manifestURL, evidenceID: evidenceID, context: context, capturedAt: capturedAt, safetyStatus: safetyStatus, findings: scan.findings, sha256: digest, chainPreviousHash: previousHash, chainEventHash: eventHash)
+        return CaptureResult(imageURL: imageURL, manifestURL: manifestURL, evidenceID: evidenceID, context: context, capturedAt: capturedAt, safetyStatus: safetyStatus, findings: automaticFindings, sha256: digest, chainPreviousHash: previousHash, chainEventHash: eventHash)
     }
 
-    func stampImage(source: CGImage, destination: URL, stamp: String) throws -> (width: Int, height: Int) {
+    func stampedImage(source: CGImage, stamp: String) throws -> CGImage {
         let padding: CGFloat = max(16, CGFloat(source.width) * 0.012)
         let fontSize: CGFloat = max(14, min(24, CGFloat(source.width) * 0.012))
         let paragraph = NSMutableParagraphStyle()
@@ -342,11 +353,28 @@ final class CaptureService {
         NSGraphicsContext.current = graphics
         attributed.draw(in: CGRect(x: padding, y: CGFloat(source.height) + padding, width: textWidth, height: textSize.height + 2))
         NSGraphicsContext.restoreGraphicsState()
-        guard let stamped = context.makeImage(), let destinationRef = CGImageDestinationCreateWithURL(destination as CFURL, UTType.png.identifier as CFString, 1, nil) else { throw CaptureFailure.imageProcessingFailed }
-        CGImageDestinationAddImage(destinationRef, stamped, [kCGImagePropertyPNGDictionary: [:]] as CFDictionary)
-        guard CGImageDestinationFinalize(destinationRef) else { throw CaptureFailure.imageProcessingFailed }
-        try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
-        return (source.width, outputHeight)
+        guard let stamped = context.makeImage() else { throw CaptureFailure.imageProcessingFailed }
+        return stamped
+    }
+
+    private func mergedFindings(_ findings: [SensitiveFinding]) -> [SensitiveFinding] {
+        let counts = findings.reduce(into: [SensitiveKind: Int]()) { result, finding in result[finding.kind, default: 0] += finding.count }
+        return counts.sorted { $0.key.rawValue < $1.key.rawValue }.map { SensitiveFinding(kind: $0.key, count: $0.value) }
+    }
+
+    private func requiredSafetyScan(_ image: CGImage) throws -> ScanResult {
+        do { return try SensitiveDataScanner.scanAndRedact(image) }
+        catch let failure as CaptureFailure { throw failure }
+        catch { throw CaptureFailure.safetyScanFailed(error.localizedDescription) }
+    }
+
+    private func sanitizedSourceURL(_ sourceURL: URL?) -> URL? {
+        guard let sourceURL, var components = URLComponents(url: sourceURL, resolvingAgainstBaseURL: false) else { return sourceURL }
+        components.user = nil
+        components.password = nil
+        components.query = nil
+        components.fragment = nil
+        return components.url
     }
 
     private func sha256(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }

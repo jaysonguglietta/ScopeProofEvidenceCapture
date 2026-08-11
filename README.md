@@ -5,7 +5,7 @@ Scopeproof is a private, multi-framework compliance evidence-operations applicat
 The repository contains two coordinated products:
 
 - A private web console for collection orchestration, review, encrypted storage, audit history, and signed exports.
-- **Scopeproof Capture 1.3.1** for macOS, a menu-bar application for explicitly initiated, timestamped, redacted, control-mapped screenshots and Jira handoff.
+- **Scopeproof Capture 1.3.2** for macOS, a menu-bar application for explicitly initiated, timestamped, redacted, control-mapped screenshots and Jira handoff.
 
 ## Documentation
 
@@ -49,13 +49,13 @@ The first time you capture, macOS may ask for Screen Recording access. Allow **S
 - GitHub: organization repository inventory and default-branch protection.
 - Okta: global sign-on/MFA policies and access-review group inventory.
 - Cloudflare: WAF managed rulesets for scoped zones.
-- Browser capture: Cloudflare Browser Rendering content preflight followed by a full-page screenshot. Captures are blocked if the rendered DOM contains detected PANs or secrets.
+- Browser capture: Cloudflare Browser Rendering produces one immutable full-page PNG, then an approved OCR service scans those exact digest-bound pixels. Captures fail closed if OCR is unavailable, the digest differs, or detected pixels contain PANs or secrets.
 
 Collectors run on demand and from a 15-minute scheduler. Transient failures retry up to three times with bounded exponential backoff; authentication and unsafe-content failures require operator action.
 
 ## Native screenshot evidence
 
-The menu-bar app in `macos/ScopeproofCapture` captures a user-selected browser window or display through ScreenCaptureKit. Each capture is classified against PCI DSS, HIPAA, FedRAMP/NIST, SOC 2, ISO 27001, an imported OSCAL/JSON/CSV catalog, or a custom framework; runs local Vision OCR; masks detected PANs and credentials; supports irreversible drag-to-redact review; adds a full-width date/time/framework/control header above the captured pixels; and requires explicit approval before saving. Capture presets, evidence owner/tags, expected-evidence guidance, catalog versions, and curated cross-framework mappings reduce classification drift.
+The menu-bar app in `macos/ScopeproofCapture` captures a user-selected browser window or display through ScreenCaptureKit. Raw pixels remain in memory. Scopeproof runs local Vision OCR, masks detected PANs and credentials, adds the full evidence header, scans the composited image again, presents those pixels for irreversible manual redaction, then re-scans the exact encoded PNG before atomically writing it. Scan failure prevents saving or upload. Capture presets, evidence owner/tags, expected-evidence guidance, catalog versions, and curated cross-framework mappings reduce classification drift.
 
 The PNG is paired with an immutable JSON manifest containing its SHA-256 digest and local chain-of-custody hashes. Review decisions are stored separately in a hash-chained lifecycle sidecar with Draft, In Review, Approved, Rejected, and Superseded states. An optional Jira issue key is carried into the filename, visible banner, manifest, search, hosted metadata, and package index. Search supports thumbnails plus framework, control, Jira issue, status, date, system, owner, tag, and keyword discovery, and can copy a ticket-ready Jira comment with the approved attachment checklist and integrity hash. Enrolled devices can upload reviewed evidence directly; the client authenticates the exact manifest/image pair, and the server rejects alternate multipart metadata, malformed/polyglot PNGs, dimension mismatches, broken capture-chain hashes, and unknown manifest schemas before preserving metadata or bytes. Configure `RFC3161_TSA_URL` to include an external timestamp-authority token.
 
@@ -76,7 +76,7 @@ Required platform secrets:
 - `PACKAGE_SIGNING_PRIVATE_KEY`: base64 PKCS#8 ECDSA P-256 private key.
 - `PACKAGE_SIGNING_PUBLIC_KEY`: base64 SPKI ECDSA P-256 public key.
 
-Provider-specific values are documented in `.env.example`. Use read-only, least-privilege provider credentials and limit browser targets to dedicated evidence URLs that do not expose cardholder data.
+Provider-specific values are documented in `.env.example`. Browser capture additionally requires `BROWSER_OCR_ENDPOINT`, `BROWSER_OCR_TOKEN`, and an exact `BROWSER_OCR_ALLOWED_HOSTS` allowlist; the OCR service must return the submitted PNG digest, recognized text, and a policy version. Use read-only, least-privilege credentials and limit browser targets to dedicated evidence URLs that do not expose cardholder data.
 
 Native release values are `MACOS_LATEST_VERSION`, `MACOS_RELEASE_URL`, `MACOS_RELEASE_SHA256`, and `MACOS_RELEASE_NOTES`. `RFC3161_TSA_URL` is optional. Device enrollment and revocation are managed in **Connections → Mac capture devices**.
 

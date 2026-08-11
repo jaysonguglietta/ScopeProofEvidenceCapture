@@ -54,7 +54,7 @@ final class CaptureReviewController: NSObject {
         self.countLabel = countLabel
         let undo = NSButton(title: "Undo Redaction", target: self, action: #selector(undoRedaction))
         let clear = NSButton(title: "Clear Manual Redactions", target: self, action: #selector(clearRedactions))
-        let toolHint = NSTextField(labelWithString: "Redactions are permanently burned into the image before hashing. The unredacted capture is never retained.")
+        let toolHint = NSTextField(labelWithString: "Redactions are burned in-memory. These exact final pixels are scanned again, hashed, and only then saved.")
         toolHint.textColor = .secondaryLabelColor
         toolHint.font = .systemFont(ofSize: 11)
         toolHint.lineBreakMode = .byTruncatingTail

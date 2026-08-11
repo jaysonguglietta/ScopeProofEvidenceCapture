@@ -57,6 +57,31 @@ test("native upload route derives metadata from a signed manifest and strictly d
   assert.match(client, /HMAC<SHA256>/);
 });
 
+test("screenshot pipelines scan the exact persisted pixels and fail closed", async () => {
+  const [capture, scanner, collectors, evidence, nativeRoute, migration] = await Promise.all([
+    readFile(new URL("../macos/ScopeproofCapture/Sources/ScopeproofCapture/CaptureService.swift", import.meta.url), "utf8"),
+    readFile(new URL("../macos/ScopeproofCapture/Sources/ScopeproofCapture/SensitiveDataScanner.swift", import.meta.url), "utf8"),
+    readFile(new URL("../lib/server/collectors.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/server/evidence.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/native/evidence/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../drizzle/0008_real_nebula.sql", import.meta.url), "utf8"),
+  ]);
+  assert.doesNotMatch(capture, /scopeproof-(?:window|display)-/);
+  assert.match(capture, /let imageData = try pngData\(review\.image\)/);
+  assert.match(capture, /let exactScan = try requiredSafetyScan\(exactImage\)/);
+  assert.ok(capture.indexOf("let exactScan") < capture.indexOf("imageData.write(to: imageURL"));
+  assert.match(capture, /safetyScanSha256: digest/);
+  assert.match(capture, /components\.query = nil/);
+  assert.match(scanner, /vision-ocr-sensitive-patterns-v1/);
+  assert.doesNotMatch(collectors, /\/content`/);
+  assert.match(collectors, /scanExactBrowserPixels/);
+  assert.match(collectors, /result\.sha256 !== digest/);
+  assert.match(collectors, /BROWSER_OCR_ALLOWED_HOSTS/);
+  assert.match(evidence, /Safety scan digest does not match the evidence artifact/);
+  assert.match(nativeRoute, /manifest\.safetyScanSha256 !== imageDigest/);
+  for (const column of ["safety_scan_sha256", "safety_scan_policy", "safety_scan_completed_at"]) assert.ok(migration.includes(column));
+});
+
 test("assessor metadata migration and package preserve framework organization", async () => {
   const [migration, packageSource] = await Promise.all([
     readFile(new URL("../drizzle/0003_fine_wonder_man.sql", import.meta.url), "utf8"),

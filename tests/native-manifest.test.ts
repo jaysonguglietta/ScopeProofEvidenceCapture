@@ -4,7 +4,7 @@ import { NativeManifestError, parseNativeManifest, validatePng } from "../lib/se
 
 function manifest(overrides: Record<string, unknown> = {}): Uint8Array {
   return new TextEncoder().encode(JSON.stringify({
-    schemaVersion: 5,
+    schemaVersion: 6,
     evidenceID: "EV-0123456789",
     capturedAt: new Date().toISOString(),
     localTimestamp: "2026-08-11 16:00:00 EDT",
@@ -20,6 +20,9 @@ function manifest(overrides: Record<string, unknown> = {}): Uint8Array {
     safetyStatus: "passed",
     redactionFindings: [],
     redactedRegions: 0,
+    safetyScanSha256: "a".repeat(64),
+    safetyScanPolicy: "vision-ocr-sensitive-patterns-v1",
+    safetyScanCompletedAt: new Date().toISOString(),
     sessionID: "session-1",
     sessionName: "PCI review",
     controlID: "8.3.1",
@@ -43,10 +46,11 @@ function manifest(overrides: Record<string, unknown> = {}): Uint8Array {
 
 test("native manifest parser accepts the versioned schema and rejects ambiguity", () => {
   const parsed = parseNativeManifest(manifest());
-  assert.equal(parsed.schemaVersion, 5);
+  assert.equal(parsed.schemaVersion, 6);
   assert.equal(parsed.controlID, "8.3.1");
   assert.throws(() => parseNativeManifest(manifest({ unsupported: true })), NativeManifestError);
   assert.throws(() => parseNativeManifest(manifest({ safetyStatus: "passed", pixelWidth: 20_000 })), NativeManifestError);
+  assert.throws(() => parseNativeManifest(manifest({ safetyScanSha256: "c".repeat(64) })), /not bound/);
   assert.throws(() => parseNativeManifest(manifest({ jiraIssueKey: "PCI-12", jiraIssueURL: "https://evil.example/browse/PCI-12" })), NativeManifestError);
 });
 

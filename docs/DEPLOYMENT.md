@@ -30,7 +30,7 @@ Never reuse one value for multiple purposes. Record key ownership, creation date
 | GitHub | `GITHUB_TOKEN`, `GITHUB_ORG` | Organization repository metadata and default-branch protection read access. |
 | Okta | `OKTA_BASE_URL`, `OKTA_API_TOKEN` | Read-only policy and group inventory. |
 | Cloudflare | `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, optional `CLOUDFLARE_ZONE_IDS` | Zone and managed-ruleset read access. |
-| Browser Rendering | Cloudflare variables plus `BROWSER_CAPTURE_URLS` | Dedicated HTTPS evidence URLs only. |
+| Browser Rendering | Cloudflare variables, `BROWSER_CAPTURE_URLS`, `BROWSER_OCR_ENDPOINT`, `BROWSER_OCR_TOKEN`, `BROWSER_OCR_ALLOWED_HOSTS` | Dedicated HTTPS evidence URLs and a contractually approved OCR processor. The OCR response must echo the exact PNG SHA-256 and a policy version. |
 
 Missing variables leave the corresponding collector in **Not configured**. Authentication and unsafe-content failures require operator action; transient rate-limit/server failures can retry up to three times.
 
@@ -55,7 +55,7 @@ Inspect generated SQL for destructive operations, unintended nullability changes
 
 Review role assignments regularly. Use separate named accounts; do not share administrator sessions.
 
-Apply `drizzle/0007_greedy_nextwave.sql` before this authorization model. It records the one-time administrator-bootstrap invariant, preserves an existing administrator during upgrades, and prevents database-level demotion of the final administrator. Production fails closed when `BOOTSTRAP_ADMIN_EMAILS` or `TRUSTED_APP_ORIGINS` is empty, malformed, or contains a wildcard. Only the first allowlisted identity can claim initial administration; later role grants require an existing administrator.
+Apply migrations through `drizzle/0008_real_nebula.sql`. Migration 0007 records the one-time administrator-bootstrap invariant and protects the final administrator; migration 0008 records digest-bound exact-pixel safety-scan metadata. Production fails closed when `BOOTSTRAP_ADMIN_EMAILS` or `TRUSTED_APP_ORIGINS` is unsafe. Browser collection remains unavailable until its OCR endpoint, token, and exact host allowlist are all configured.
 
 ## macOS device deployment
 
@@ -63,7 +63,7 @@ Apply `drizzle/0007_greedy_nextwave.sql` before this authorization model. It rec
 2. For managed production distribution, set `SCOPEPROOF_CODESIGN_IDENTITY` to a trusted Developer ID Application identity.
 3. Set `SCOPEPROOF_NOTARY_PROFILE` to a Keychain profile created for `xcrun notarytool` when notarization is required.
 4. Publish only through HTTPS with an independently recorded release SHA-256.
-5. Configure `MACOS_LATEST_VERSION=1.3.1`, `MACOS_RELEASE_URL`, `MACOS_RELEASE_SHA256`, and operator-facing `MACOS_RELEASE_NOTES` in the hosted environment.
+5. Configure `MACOS_LATEST_VERSION=1.3.2`, `MACOS_RELEASE_URL`, `MACOS_RELEASE_SHA256`, and operator-facing `MACOS_RELEASE_NOTES` in the hosted environment.
 6. Enroll each Mac separately from **Connections**. Revoke devices when reassigned, lost, or retired.
 
 The development build is ad-hoc signed with a stable designated requirement for `com.scopeproof.capture`; it is not a notarized production release.

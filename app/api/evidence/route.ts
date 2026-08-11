@@ -16,7 +16,7 @@ export async function POST(request: Request) {
     const system = String(form.get("system") || "").trim().slice(0, 180);
     const description = String(form.get("description") || "").trim().slice(0, 2000);
     const type = String(form.get("type") || "code").toLowerCase() as ArtifactType;
-    if (!title || !controlId || !system || !["screenshot", "code", "configuration", "report"].includes(type)) return Response.json({ error: "Title, control, system, and a valid evidence type are required." }, { status: 400 });
+    if (!title || !controlId || !system || !["code", "configuration", "report"].includes(type)) return Response.json({ error: "Title, control, system, and a scannable text evidence type are required. Screenshots must use a digest-bound capture workflow." }, { status: 400 });
     const attachment = form.get("attachment");
     let contentType = "text/plain";
     let bytes = new TextEncoder().encode(String(form.get("code") || description));

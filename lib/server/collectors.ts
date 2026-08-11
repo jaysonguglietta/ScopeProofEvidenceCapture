@@ -2,6 +2,7 @@ import type { AuthenticatedUser } from "./auth";
 import { sha256 } from "./crypto";
 import { getEnv, type ScopeproofEnv } from "./env";
 import type { EvidenceInput } from "./evidence";
+import { validatePng } from "./native-manifest";
 import { redactText } from "./redaction";
 
 export type CollectorProvider = "aws" | "github" | "okta" | "cloudflare" | "browser";
@@ -23,6 +24,47 @@ async function providerFetch(url: string, init: RequestInit, label: string): Pro
   const text = (await response.text()).slice(0, 500);
   const retryable = response.status === 429 || response.status >= 500;
   throw new CollectorError(`${label} returned ${response.status}: ${text}`, response.status === 401 || response.status === 403 ? "AUTH_FAILED" : "PROVIDER_ERROR", retryable, response.status);
+}
+
+function approvedOcrEndpoint(env: ScopeproofEnv): URL {
+  const endpoint = new URL(configured(env.BROWSER_OCR_ENDPOINT, "BROWSER_OCR_ENDPOINT"));
+  const allowedHosts = new Set(configured(env.BROWSER_OCR_ALLOWED_HOSTS, "BROWSER_OCR_ALLOWED_HOSTS").split(",").map((host) => host.trim().toLowerCase()).filter(Boolean));
+  if (endpoint.protocol !== "https:" || endpoint.username || endpoint.password || endpoint.hash || !allowedHosts.has(endpoint.hostname.toLowerCase())) {
+    throw new CollectorError("Browser OCR endpoint must be HTTPS and use an explicitly approved host.", "UNSAFE_OCR_ENDPOINT", false);
+  }
+  return endpoint;
+}
+
+function base64(bytes: Uint8Array): string {
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 32_768) binary += String.fromCharCode(...bytes.subarray(offset, offset + 32_768));
+  return btoa(binary);
+}
+
+async function scanExactBrowserPixels(env: ScopeproofEnv, image: Uint8Array): Promise<{ digest: string; policy: string; completedAt: string }> {
+  if (image.byteLength > 15 * 1024 * 1024) throw new CollectorError("Browser screenshot exceeds the safety scanner limit.", "SCREENSHOT_TOO_LARGE", false);
+  await validatePng(image);
+  const digest = await sha256(image);
+  const endpoint = approvedOcrEndpoint(env);
+  const response = await providerFetch(endpoint.toString(), {
+    method: "POST",
+    headers: { authorization: `Bearer ${configured(env.BROWSER_OCR_TOKEN, "BROWSER_OCR_TOKEN")}`, "content-type": "application/json", accept: "application/json" },
+    body: JSON.stringify({ version: 1, sha256: digest, contentType: "image/png", imageBase64: base64(image) }),
+  }, "Browser exact-pixel OCR scan");
+  const declaredLength = Number(response.headers.get("content-length") || 0);
+  if (declaredLength > 2 * 1024 * 1024) throw new CollectorError("Browser OCR response exceeds the scanner limit.", "OCR_RESPONSE_TOO_LARGE", false);
+  const responseText = await response.text();
+  if (responseText.length > 2 * 1024 * 1024) throw new CollectorError("Browser OCR response exceeds the scanner limit.", "OCR_RESPONSE_TOO_LARGE", false);
+  let payload: unknown;
+  try { payload = JSON.parse(responseText); } catch { throw new CollectorError("Browser OCR service returned invalid JSON.", "OCR_INVALID_RESPONSE", false); }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new CollectorError("Browser OCR service returned an invalid result.", "OCR_INVALID_RESPONSE", false);
+  const result = payload as Record<string, unknown>;
+  if (Object.keys(result).some((key) => !["sha256", "text", "policyVersion"].includes(key)) || result.sha256 !== digest || typeof result.text !== "string" || result.text.length > 1_500_000 || typeof result.policyVersion !== "string" || !/^[A-Za-z0-9._-]{1,100}$/.test(result.policyVersion)) {
+    throw new CollectorError("Browser OCR result is not bound to the captured screenshot.", "OCR_DIGEST_MISMATCH", false);
+  }
+  const scan = redactText(result.text);
+  if (scan.total > 0) throw new CollectorError(`Screenshot blocked: ${scan.total} sensitive value(s) detected in the captured pixels.`, "SENSITIVE_CONTENT_BLOCKED", false);
+  return { digest, policy: result.policyVersion, completedAt: new Date().toISOString() };
 }
 
 async function githubCollector(env: ScopeproofEnv): Promise<Artifact[]> {
@@ -131,14 +173,10 @@ async function browserCollector(env: ScopeproofEnv): Promise<Artifact[]> {
     if (url.protocol !== "https:") throw new CollectorError(`Browser capture only permits HTTPS targets: ${target}`, "UNSAFE_TARGET", false);
     const endpoint = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/browser-rendering`;
     const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
-    const body = JSON.stringify({ url: target, gotoOptions: { waitUntil: "networkidle0", timeout: 30000 } });
-    const contentResponse = await providerFetch(`${endpoint}/content`, { method: "POST", headers, body }, `Browser content preflight for ${url.hostname}`);
-    const content = await contentResponse.text();
-    const scan = redactText(content);
-    if (scan.total > 0) throw new CollectorError(`Screenshot blocked: ${scan.total} sensitive value(s) detected in rendered content for ${url.hostname}.`, "SENSITIVE_CONTENT_BLOCKED", false);
     const screenshotResponse = await providerFetch(`${endpoint}/screenshot`, { method: "POST", headers, body: JSON.stringify({ url: target, gotoOptions: { waitUntil: "networkidle0", timeout: 30000 }, screenshotOptions: { type: "png", fullPage: true } }) }, `Browser screenshot for ${url.hostname}`);
     const image = new Uint8Array(await screenshotResponse.arrayBuffer());
-    artifacts.push({ controlId: "2.2.1", title: `Authenticated configuration capture — ${url.hostname}`, description: `Browser-rendered evidence captured from ${url.pathname}. DOM content passed PAN and secret preflight scanning before screenshot persistence.`, type: "screenshot", source: "Browser capture", system: url.hostname, contentType: "image/png", bytes: image, preflightFindings: scan.findings });
+    const safetyScan = await scanExactBrowserPixels(env, image);
+    artifacts.push({ controlId: "2.2.1", title: `Authenticated configuration capture — ${url.hostname}`, description: `Browser-rendered evidence captured from ${url.pathname}. The immutable PNG pixels passed digest-bound OCR safety policy ${safetyScan.policy} before persistence.`, type: "screenshot", source: "Browser capture", system: url.hostname, contentType: "image/png", bytes: image, safetyScanSha256: safetyScan.digest, safetyScanPolicy: safetyScan.policy, safetyScanCompletedAt: safetyScan.completedAt });
   }
   return artifacts;
 }
@@ -159,7 +197,7 @@ export function collectorConfiguration(provider: CollectorProvider): { configure
   const env = getEnv();
   const required: Record<CollectorProvider, Array<keyof ScopeproofEnv>> = {
     aws: ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"], github: ["GITHUB_TOKEN", "GITHUB_ORG"], okta: ["OKTA_BASE_URL", "OKTA_API_TOKEN"],
-    cloudflare: ["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID"], browser: ["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID", "BROWSER_CAPTURE_URLS"],
+    cloudflare: ["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID"], browser: ["CLOUDFLARE_API_TOKEN", "CLOUDFLARE_ACCOUNT_ID", "BROWSER_CAPTURE_URLS", "BROWSER_OCR_ENDPOINT", "BROWSER_OCR_TOKEN", "BROWSER_OCR_ALLOWED_HOSTS"],
   };
   const missing = required[provider].filter((key) => !env[key]).map(String);
   return { configured: missing.length === 0, missing };
