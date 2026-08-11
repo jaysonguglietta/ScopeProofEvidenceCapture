@@ -6,6 +6,7 @@ export interface Evidence {
   id: string;
   title: string;
   control: string;
+  framework?: string;
   requirement: string;
   type: EvidenceType;
   source: string;
@@ -20,6 +21,10 @@ export interface Evidence {
   language?: string;
   accent?: "blue" | "violet" | "emerald" | "amber";
   tags: string[];
+  owner?: string;
+  environment?: string;
+  assessmentPeriod?: string;
+  mappedControls?: Array<{ framework: string; controlID: string; relationship: string }>;
 }
 
 export interface Control {

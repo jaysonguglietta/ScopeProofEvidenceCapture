@@ -24,9 +24,11 @@ Collectors run on demand and from a 15-minute scheduler. Transient failures retr
 
 ## Native screenshot evidence
 
-The menu-bar app in `macos/ScopeproofCapture` captures a user-selected browser window or display through ScreenCaptureKit. Each capture requires PCI session context, runs local Vision OCR, masks detected PANs and credentials, adds a visible local date/time/timezone and control stamp, and requires preview approval before saving.
+The menu-bar app in `macos/ScopeproofCapture` captures a user-selected browser window or display through ScreenCaptureKit. Each capture is classified against PCI DSS, HIPAA, FedRAMP/NIST, SOC 2, ISO 27001, an imported OSCAL/JSON/CSV catalog, or a custom framework; runs local Vision OCR; masks detected PANs and credentials; supports irreversible drag-to-redact review; adds a full-width date/time/framework/control header above the captured pixels; and requires explicit approval before saving. Capture presets, evidence owner/tags, expected-evidence guidance, catalog versions, and curated cross-framework mappings reduce classification drift.
 
-The PNG is paired with a JSON manifest containing its SHA-256 digest and local chain-of-custody hashes. Enrolled devices can upload reviewed evidence directly; the server validates the manifest and image, encrypts the artifact, records an immutable audit event, and returns a signed server-time receipt. Configure `RFC3161_TSA_URL` to include an external timestamp-authority token.
+The PNG is paired with an immutable JSON manifest containing its SHA-256 digest and local chain-of-custody hashes. Review decisions are stored separately in a hash-chained lifecycle sidecar with Draft, In Review, Approved, Rejected, and Superseded states. Search supports thumbnails plus framework, control, status, date, system, owner, tag, and keyword discovery. Enrolled devices can upload reviewed evidence directly; the server validates the manifest and image, preserves framework and assessor metadata, encrypts the artifact, records an immutable audit event, and returns a signed server-time receipt. Configure `RFC3161_TSA_URL` to include an external timestamp-authority token.
+
+The Mac app can build a local approved-only assessor ZIP filtered by framework and assessment period. It revalidates artifact hashes and review chains, organizes content by framework/control, and embeds a Read Me, CSV index, ECDSA-signed manifest, verification instructions, capture manifests, lifecycle records, and server receipts. Hosted packages use the same framework-aware organization and also include a PDF index.
 
 The app includes **Help & How to Use…**, recent capture history, offline retry, configurable retention, Launch at Login, Screen Recording recovery, and secure release checks. See `macos/ScopeproofCapture/README.md` for the operator workflow.
 
@@ -60,7 +62,7 @@ npx tsc --noEmit
 npm test
 ```
 
-Apply both D1 migrations in order from `drizzle/`. D1 and R2 logical bindings are declared in `.openai/hosting.json` and provisioned by Sites.
+Apply all D1 migrations in order from `drizzle/`. D1 and R2 logical bindings are declared in `.openai/hosting.json` and provisioned by Sites.
 
 Build the local menu-bar app with:
 

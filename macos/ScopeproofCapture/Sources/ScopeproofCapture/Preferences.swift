@@ -23,9 +23,23 @@ struct CaptureContext: Codable, Sendable {
     var environment: String
     var assessmentPeriod: String
     var description: String
+    var complianceArea: String? = nil
+    var controlTitle: String? = nil
+    var customFileName: String? = nil
+    var evidenceOwner: String? = nil
+    var tags: [String]? = nil
+    var expectedEvidence: String? = nil
 
     var isValid: Bool {
-        !sessionID.isEmpty && !sessionName.isEmpty && !controlID.isEmpty && !title.isEmpty && !system.isEmpty && !environment.isEmpty && !assessmentPeriod.isEmpty
+        !sessionID.isEmpty && !sessionName.isEmpty && !resolvedComplianceArea.isEmpty && !controlID.isEmpty && !resolvedCustomFileName.isEmpty && !title.isEmpty && !system.isEmpty && !environment.isEmpty && !assessmentPeriod.isEmpty
+    }
+
+    var resolvedComplianceArea: String { complianceArea?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty ?? "PCI DSS 4.0.1" }
+    var resolvedControlTitle: String { controlTitle?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "" }
+    var resolvedCustomFileName: String { customFileName?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty ?? title }
+    var resolvedEvidenceOwner: String { evidenceOwner?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "" }
+    var resolvedTags: [String] {
+        Array(Set((tags ?? []).map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }.filter { !$0.isEmpty })).sorted()
     }
 
     static func new() -> CaptureContext {
@@ -39,9 +53,26 @@ struct CaptureContext: Codable, Sendable {
             system: "",
             environment: "Production",
             assessmentPeriod: formatter.string(from: Date()),
-            description: ""
+            description: "",
+            complianceArea: ComplianceCatalog.defaultFramework.name,
+            controlTitle: nil,
+            customFileName: "",
+            evidenceOwner: NSFullUserName(),
+            tags: [],
+            expectedEvidence: ""
         )
     }
+}
+
+struct CapturePreset: Codable, Identifiable, Sendable {
+    let id: String
+    var name: String
+    var context: CaptureContext
+    var createdAt: String
+}
+
+private extension String {
+    var nonEmpty: String? { isEmpty ? nil : self }
 }
 
 @MainActor
@@ -57,6 +88,7 @@ final class CapturePreferences {
         static let retentionDays = "capture.retentionDays"
         static let lastUpdateCheck = "capture.lastUpdateCheck"
         static let chainHead = "capture.chainHead"
+        static let presets = "capture.presets"
     }
 
     var browser: BrowserChoice {
@@ -118,6 +150,24 @@ final class CapturePreferences {
         get { defaults.object(forKey: Key.lastUpdateCheck) as? Date }
         set { defaults.set(newValue, forKey: Key.lastUpdateCheck) }
     }
+
+    var presets: [CapturePreset] {
+        get {
+            guard let data = defaults.data(forKey: Key.presets), let value = try? JSONDecoder().decode([CapturePreset].self, from: data) else { return [] }
+            return value.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        }
+        set { defaults.set(try? JSONEncoder().encode(Array(newValue.prefix(50))), forKey: Key.presets) }
+    }
+
+    func savePreset(name: String, context: CaptureContext) {
+        let cleanName = String(name.trimmingCharacters(in: .whitespacesAndNewlines).prefix(80))
+        guard !cleanName.isEmpty else { return }
+        var updated = presets.filter { $0.name.caseInsensitiveCompare(cleanName) != .orderedSame }
+        updated.append(CapturePreset(id: "preset_\(UUID().uuidString.lowercased())", name: cleanName, context: context, createdAt: ISO8601DateFormatter().string(from: Date())))
+        presets = updated
+    }
+
+    func deletePreset(id: String) { presets = presets.filter { $0.id != id } }
 
     func addTarget(_ target: String) {
         var updated = targets.filter { $0 != target }

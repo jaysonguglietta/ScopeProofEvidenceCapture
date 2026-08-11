@@ -24,7 +24,7 @@ enum UploadFailure: LocalizedError {
 }
 
 actor UploadService {
-    private let appVersion = "1.1.0"
+    private var appVersion: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.3.0" }
 
     func upload(_ capture: CaptureResult, serverURL: URL?) async throws -> URL {
         guard let token = KeychainStore.readToken(), !token.isEmpty else { throw UploadFailure.notConfigured }
@@ -34,6 +34,9 @@ actor UploadService {
         let manifestModel = try JSONDecoder().decode(CaptureManifest.self, from: manifest)
         let fields: [String: String] = [
             "controlId": capture.context.controlID,
+            "complianceArea": capture.context.resolvedComplianceArea,
+            "controlTitle": capture.context.resolvedControlTitle,
+            "customFileName": capture.context.resolvedCustomFileName,
             "title": capture.context.title,
             "system": capture.context.system,
             "environment": capture.context.environment,
@@ -44,6 +47,12 @@ actor UploadService {
             "capturedAt": capture.capturedAt,
             "safetyStatus": capture.safetyStatus,
             "redactionFindings": String(data: try JSONEncoder().encode(capture.findings), encoding: .utf8) ?? "[]",
+            "catalogVersion": manifestModel.catalogVersion ?? ComplianceCatalog.catalogVersion,
+            "evidenceOwner": manifestModel.evidenceOwner ?? "",
+            "tags": String(data: try JSONEncoder().encode(manifestModel.tags ?? []), encoding: .utf8) ?? "[]",
+            "expectedEvidence": manifestModel.expectedEvidence ?? "",
+            "mappedControls": String(data: try JSONEncoder().encode(manifestModel.mappedControls ?? []), encoding: .utf8) ?? "[]",
+            "manualRedactions": String(manifestModel.manualRedactions ?? 0),
             "chainPreviousHash": capture.chainPreviousHash,
             "chainEventHash": capture.chainEventHash,
         ]

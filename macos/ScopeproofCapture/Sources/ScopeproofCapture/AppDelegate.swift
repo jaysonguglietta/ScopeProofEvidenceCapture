@@ -1,5 +1,7 @@
 @preconcurrency import AppKit
+import OSLog
 import ServiceManagement
+import UniformTypeIdentifiers
 import UserNotifications
 
 @MainActor
@@ -10,6 +12,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private lazy var captureService = CaptureService(preferences: preferences)
     private let uploadService = UploadService()
     private let helpController = HelpController()
+    private let evidenceSearchController = EvidenceSearchController()
+    private let logger = Logger(subsystem: "com.scopeproof.capture", category: "application")
     private var statusMenuItem = NSMenuItem(title: "Ready to capture", action: nil, keyEquivalent: "")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -24,7 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func configureStatusItem() {
         if let button = statusItem.button {
             button.image = NSImage(systemSymbolName: "shield.lefthalf.filled", accessibilityDescription: "Scopeproof Capture")
-            button.toolTip = "Scopeproof PCI Evidence Capture"
+            button.toolTip = "Scopeproof Compliance Evidence Capture"
         }
         menu.delegate = self
         statusItem.menu = menu
@@ -45,13 +49,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
 
         let context = preferences.activeContext
-        let session = NSMenuItem(title: context?.isValid == true ? "Session: \(context!.sessionName) · PCI \(context!.controlID)" : "Session: Not configured", action: nil, keyEquivalent: "")
+        let sessionFramework = context.map { ComplianceCatalog.framework(named: $0.resolvedComplianceArea).fileCode } ?? ""
+        let session = NSMenuItem(title: context?.isValid == true ? "Session: \(context!.sessionName) · \(sessionFramework) \(context!.controlID)" : "Session: Not configured", action: nil, keyEquivalent: "")
         session.isEnabled = false
         menu.addItem(session)
-        let newSession = NSMenuItem(title: context?.isValid == true ? "Start or Change Capture Session…" : "Start Capture Session…", action: #selector(startCaptureSession), keyEquivalent: "s")
+        let newSession = NSMenuItem(title: context?.isValid == true ? "Edit Capture Defaults…" : "Configure Capture Defaults…", action: #selector(startCaptureSession), keyEquivalent: "s")
         newSession.keyEquivalentModifierMask = [.command, .shift]
         newSession.target = self
         menu.addItem(newSession)
+        let presetsItem = NSMenuItem(title: "Capture Presets", action: nil, keyEquivalent: "")
+        let presetsMenu = NSMenu()
+        for preset in preferences.presets {
+            let item = NSMenuItem(title: preset.name, action: #selector(applyPreset(_:)), keyEquivalent: "")
+            item.representedObject = preset.id; item.target = self; presetsMenu.addItem(item)
+        }
+        if !preferences.presets.isEmpty { presetsMenu.addItem(.separator()) }
+        let savePreset = NSMenuItem(title: "Save Current as Preset…", action: #selector(saveCurrentPreset), keyEquivalent: ""); savePreset.target = self; savePreset.isEnabled = context?.isValid == true; presetsMenu.addItem(savePreset)
+        let managePresets = NSMenuItem(title: "Remove a Preset…", action: #selector(removePreset), keyEquivalent: ""); managePresets.target = self; managePresets.isEnabled = !preferences.presets.isEmpty; presetsMenu.addItem(managePresets)
+        presetsItem.submenu = presetsMenu
+        menu.addItem(presetsItem)
+        addItem("Import Control Catalog…", action: #selector(importControlCatalog))
+        let removeCatalog = NSMenuItem(title: "Remove Imported Catalog…", action: #selector(removeImportedCatalog), keyEquivalent: ""); removeCatalog.target = self; removeCatalog.isEnabled = !ComplianceCatalog.importedFrameworks.isEmpty; menu.addItem(removeCatalog)
         menu.addItem(.separator())
 
         addItem("Capture Frontmost Browser Window", action: #selector(captureFrontmost), key: "e", modifiers: [.command, .shift])
@@ -109,6 +127,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(upload)
         menu.addItem(.separator())
 
+        addItem("Search Evidence…", action: #selector(searchEvidence), key: "f", modifiers: [.command, .shift])
+        addItem("Export Assessor Package…", action: #selector(exportAssessorPackage), key: "x", modifiers: [.command, .shift])
         let historyItem = NSMenuItem(title: "Recent Captures", action: nil, keyEquivalent: "")
         let historyMenu = NSMenu()
         let entries = Array(CaptureHistory.entries(in: captureService.outputDirectory).prefix(10))
@@ -117,7 +137,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             for entry in entries {
                 let marker = entry.isUploaded ? "✓" : "↥"
-                let item = NSMenuItem(title: "\(marker) \(entry.manifest.controlID) · \(entry.manifest.evidenceID) · \(entry.manifest.localTimestamp)", action: #selector(openHistoryEntry(_:)), keyEquivalent: "")
+                let framework = ComplianceCatalog.framework(named: entry.manifest.complianceArea).fileCode
+                let item = NSMenuItem(title: "\(marker) \(framework) \(entry.manifest.controlID) · \(entry.manifest.evidenceID) · \(entry.manifest.localTimestamp)", action: #selector(openHistoryEntry(_:)), keyEquivalent: "")
                 item.representedObject = entry.imageURL.path
                 item.target = self
                 historyMenu.addItem(item)
@@ -150,50 +171,125 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func captureContext() -> CaptureContext? {
-        if let context = preferences.activeContext, context.isValid { return context }
-        return promptForCaptureSession()
+        promptForCaptureSession(actionTitle: "Continue to Capture")
     }
 
-    @objc private func startCaptureSession() { _ = promptForCaptureSession() }
+    @objc private func startCaptureSession() { _ = promptForCaptureSession(actionTitle: "Save Defaults") }
 
-    private func promptForCaptureSession() -> CaptureContext? {
+    private func promptForCaptureSession(actionTitle: String) -> CaptureContext? {
         NSApplication.shared.activate(ignoringOtherApps: true)
         let previous = preferences.activeContext
-        let alert = NSAlert()
-        alert.messageText = "Start a PCI evidence capture session"
-        alert.informativeText = "This context is embedded in every screenshot and manifest until you change sessions."
-        alert.addButton(withTitle: "Start Session")
-        alert.addButton(withTitle: "Cancel")
-        let sessionName = NSTextField(string: previous?.sessionName ?? "")
-        let control = NSTextField(string: previous?.controlID ?? "")
-        let title = NSTextField(string: previous?.title ?? "")
-        let system = NSTextField(string: previous?.system ?? "")
-        let environment = NSPopUpButton(); environment.addItems(withTitles: ["Production", "Staging", "Development", "Corporate", "Other"]); environment.selectItem(withTitle: previous?.environment ?? "Production")
-        let period = NSTextField(string: previous?.assessmentPeriod ?? CaptureContext.new().assessmentPeriod)
-        let description = NSTextField(string: previous?.description ?? "")
-        for field in [sessionName, control, title, system, period, description] { field.frame.size.width = 380 }
-        let grid = NSGridView(views: [
-            [label("Session name"), sessionName], [label("PCI control"), control], [label("Evidence title"), title], [label("System or asset"), system],
-            [label("Environment"), environment], [label("Assessment period"), period], [label("What this proves"), description],
-        ])
-        grid.column(at: 0).xPlacement = .trailing
-        grid.column(at: 1).xPlacement = .fill
-        grid.rowSpacing = 10
-        grid.columnSpacing = 12
-        alert.accessoryView = grid
-        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
-        let context = CaptureContext(
-            sessionID: "session_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased())",
-            sessionName: sessionName.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), controlID: control.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
-            title: title.stringValue.trimmingCharacters(in: .whitespacesAndNewlines), system: system.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
-            environment: environment.titleOfSelectedItem ?? "Production", assessmentPeriod: period.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
-            description: description.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        )
-        guard context.isValid else { showError(NSError(domain: "Scopeproof", code: 1, userInfo: [NSLocalizedDescriptionKey: "Session name, PCI control, evidence title, system, environment, and assessment period are required."])); return nil }
-        preferences.activeContext = context
-        setReady("Session \(context.sessionName) ready")
-        rebuildMenu()
-        return context
+        let defaultPeriod = CaptureContext.new().assessmentPeriod
+        var frameworkValue = previous?.complianceArea ?? ComplianceCatalog.defaultFramework.name
+        var sessionValue = previous?.sessionName ?? "Compliance Evidence – \(defaultPeriod)"
+        var controlValue = previous?.controlID ?? ""
+        var filenameValue = previous?.customFileName ?? previous?.title ?? "Evidence"
+        var titleValue = previous?.title ?? ""
+        var systemValue = previous?.system ?? ""
+        var environmentValue = previous?.environment ?? "Production"
+        var periodValue = previous?.assessmentPeriod ?? defaultPeriod
+        var descriptionValue = previous?.description ?? ""
+        var ownerValue = previous?.evidenceOwner ?? NSFullUserName()
+        var tagsValue = previous?.tags?.joined(separator: ", ") ?? ""
+        var expectedValue = previous?.expectedEvidence ?? ""
+        var missingFields: [String] = []
+
+        while true {
+            let alert = NSAlert()
+            alert.messageText = missingFields.isEmpty ? "Classify this evidence capture" : "Complete the required capture context"
+            alert.informativeText = missingFields.isEmpty
+                ? "Confirm the prefilled classification before every capture. Required context is embedded in the screenshot and immutable manifest."
+                : "Enter \(missingFields.joined(separator: ", ")). Your previous entries have been preserved below."
+            alert.alertStyle = missingFields.isEmpty ? .informational : .warning
+            alert.addButton(withTitle: actionTitle)
+            alert.addButton(withTitle: "Cancel")
+
+            let framework = NSPopUpButton()
+            framework.addItems(withTitles: ComplianceCatalog.frameworks.map(\.name))
+            framework.selectItem(withTitle: frameworkValue)
+            let control = NSComboBox()
+            control.isEditable = true
+            control.completes = true
+            control.numberOfVisibleItems = 12
+            let fileName = NSTextField(string: filenameValue)
+            let sessionName = NSTextField(string: sessionValue)
+            let title = NSTextField(string: titleValue)
+            let system = NSTextField(string: systemValue)
+            let environment = NSPopUpButton()
+            environment.addItems(withTitles: ["Production", "Staging", "Development", "Corporate", "Other"])
+            environment.selectItem(withTitle: environmentValue)
+            let period = NSTextField(string: periodValue)
+            let description = NSTextField(string: descriptionValue)
+            let owner = NSTextField(string: ownerValue)
+            let tags = NSTextField(string: tagsValue)
+            let expected = NSTextField(string: expectedValue)
+            control.placeholderString = "Select or type a control ID"
+            fileName.placeholderString = "e.g. Production-MFA-Settings"
+            title.placeholderString = "e.g. Production MFA settings"
+            system.placeholderString = "e.g. Okta production tenant"
+            description.placeholderString = "Optional assessor note"
+            owner.placeholderString = "Control owner or evidence custodian"
+            tags.placeholderString = "identity, quarterly, production"
+            expected.placeholderString = "What should an assessor verify in this artifact?"
+            let preview = NSTextField(wrappingLabelWithString: "")
+            preview.textColor = .secondaryLabelColor
+            preview.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+            preview.maximumNumberOfLines = 2
+            let mappings = NSTextField(wrappingLabelWithString: "")
+            mappings.textColor = .secondaryLabelColor
+            mappings.font = .systemFont(ofSize: 10)
+            mappings.maximumNumberOfLines = 2
+            for field in [fileName, sessionName, title, system, period, description, owner, tags, expected] { field.frame.size.width = 400 }
+            control.frame.size.width = 400
+            framework.frame.size.width = 400
+            preview.frame.size.width = 400
+            mappings.frame.size.width = 400
+            let grid = NSGridView(views: [
+                [label("Compliance area *"), framework], [label("Control *"), control], [label("File name *"), fileName], [label("Saved as"), preview],
+                [label("Evidence title *"), title], [label("System or asset *"), system], [label("Environment *"), environment],
+                [label("Assessment period *"), period], [label("Session name *"), sessionName], [label("Evidence owner"), owner],
+                [label("Tags"), tags], [label("Expected evidence"), expected], [label("What this proves"), description], [label("Related controls"), mappings],
+            ])
+            grid.column(at: 0).xPlacement = .trailing
+            grid.column(at: 1).xPlacement = .fill
+            grid.rowSpacing = 10
+            grid.columnSpacing = 12
+            grid.frame = NSRect(x: 0, y: 0, width: 560, height: 500)
+            alert.accessoryView = grid
+            let coordinator = CaptureMetadataCoordinator(
+                frameworkPopup: framework, controlCombo: control, filenameField: fileName, periodField: period,
+                previewLabel: preview, preferredControlID: controlValue, mappingLabel: mappings
+            )
+            alert.window.initialFirstResponder = missingFields.contains("control") ? control : (missingFields.contains("file name") ? fileName : (missingFields.contains("evidence title") ? title : control))
+
+            guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+            frameworkValue = coordinator.frameworkName
+            sessionValue = sessionName.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            controlValue = coordinator.controlID
+            filenameValue = fileName.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            titleValue = title.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            systemValue = system.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            environmentValue = environment.titleOfSelectedItem ?? "Production"
+            periodValue = period.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            descriptionValue = description.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            ownerValue = owner.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            tagsValue = tags.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            expectedValue = expected.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            let missing = [("compliance area", frameworkValue), ("control", controlValue), ("file name", filenameValue), ("session name", sessionValue), ("evidence title", titleValue), ("system or asset", systemValue), ("environment", environmentValue), ("assessment period", periodValue)].filter { $0.1.isEmpty }.map(\.0)
+            guard missing.isEmpty else { missingFields = missing; continue }
+            let context = CaptureContext(
+                sessionID: previous?.sessionID ?? "session_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased())",
+                sessionName: sessionValue, controlID: controlValue, title: titleValue, system: systemValue,
+                environment: environmentValue, assessmentPeriod: periodValue,
+                description: descriptionValue, complianceArea: frameworkValue,
+                controlTitle: coordinator.controlTitle, customFileName: filenameValue,
+                evidenceOwner: ownerValue, tags: tagsValue.split(separator: ",").map(String.init), expectedEvidence: expectedValue
+            )
+            preferences.activeContext = context
+            setReady("Session \(context.sessionName) ready")
+            rebuildMenu()
+            return context
+        }
     }
 
     private func label(_ value: String) -> NSTextField {
@@ -261,7 +357,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             setReady("Saved \(capture.evidenceID)")
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(capture.imageURL.path, forType: .string)
-            notify(title: "PCI evidence captured", body: "\(capture.evidenceID) passed review and was saved. The file path is on your clipboard.")
+            notify(title: "Compliance evidence captured", body: "\(capture.context.resolvedComplianceArea) \(capture.context.controlID) was saved. The file path is on your clipboard.")
             if preferences.autoUpload { upload(capture) }
         case .failure(.cancelled): setReady("Capture discarded")
         case .failure(let error): setReady("Capture failed"); showError(error)
@@ -288,7 +384,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             var completed = 0
             for entry in pending {
                 let capture = CaptureResult(imageURL: entry.imageURL, manifestURL: entry.manifestURL, evidenceID: entry.manifest.evidenceID,
-                    context: CaptureContext(sessionID: entry.manifest.sessionID, sessionName: entry.manifest.sessionName, controlID: entry.manifest.controlID, title: entry.manifest.title, system: entry.manifest.system, environment: entry.manifest.environment, assessmentPeriod: entry.manifest.assessmentPeriod, description: entry.manifest.description),
+                    context: CaptureContext(sessionID: entry.manifest.sessionID, sessionName: entry.manifest.sessionName, controlID: entry.manifest.controlID, title: entry.manifest.title, system: entry.manifest.system, environment: entry.manifest.environment, assessmentPeriod: entry.manifest.assessmentPeriod, description: entry.manifest.description, complianceArea: entry.manifest.complianceArea, controlTitle: entry.manifest.controlTitle, customFileName: entry.manifest.customFileName, evidenceOwner: entry.manifest.evidenceOwner, tags: entry.manifest.tags, expectedEvidence: entry.manifest.expectedEvidence),
                     capturedAt: entry.manifest.capturedAt, safetyStatus: entry.manifest.safetyStatus, findings: entry.manifest.redactionFindings, sha256: entry.manifest.sha256, chainPreviousHash: entry.manifest.chainPreviousHash, chainEventHash: entry.manifest.chainEventHash)
                 if (try? await uploadService.upload(capture, serverURL: preferences.serverURL)) != nil { completed += 1 }
             }
@@ -297,6 +393,85 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func openHistoryEntry(_ sender: NSMenuItem) { if let path = sender.representedObject as? String { NSWorkspace.shared.open(URL(fileURLWithPath: path)) } }
+    @objc private func searchEvidence() { evidenceSearchController.show(evidenceRoot: captureService.outputDirectory) }
+
+    @objc private func applyPreset(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String, let preset = preferences.presets.first(where: { $0.id == id }) else { return }
+        let source = preset.context
+        let context = CaptureContext(
+            sessionID: "session_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased())",
+            sessionName: source.sessionName, controlID: source.controlID, title: source.title, system: source.system,
+            environment: source.environment, assessmentPeriod: source.assessmentPeriod, description: source.description,
+            complianceArea: source.complianceArea, controlTitle: source.controlTitle, customFileName: source.customFileName,
+            evidenceOwner: source.evidenceOwner, tags: source.tags, expectedEvidence: source.expectedEvidence
+        )
+        preferences.activeContext = context
+        setReady("Preset \(preset.name) applied")
+        rebuildMenu()
+    }
+
+    @objc private func saveCurrentPreset() {
+        guard let context = preferences.activeContext, context.isValid,
+              let name = prompt(title: "Save Capture Preset", message: "Presets reuse framework, control, system, owner, tags, and assessor context. Each applied preset starts a new capture session.", placeholder: "e.g. Quarterly Okta MFA Review"), !name.isEmpty else { return }
+        preferences.savePreset(name: name, context: context)
+        setReady("Capture preset saved")
+        rebuildMenu()
+    }
+
+    @objc private func removePreset() {
+        let presets = preferences.presets
+        guard !presets.isEmpty else { return }
+        let alert = NSAlert(); alert.messageText = "Remove a capture preset"; alert.informativeText = "Existing evidence is not affected."; alert.addButton(withTitle: "Remove"); alert.addButton(withTitle: "Cancel")
+        let picker = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 420, height: 28)); picker.addItems(withTitles: presets.map(\.name)); alert.accessoryView = picker
+        guard alert.runModal() == .alertFirstButtonReturn, picker.indexOfSelectedItem >= 0 else { return }
+        preferences.deletePreset(id: presets[picker.indexOfSelectedItem].id); setReady("Capture preset removed"); rebuildMenu()
+    }
+
+    @objc private func importControlCatalog() {
+        let panel = NSOpenPanel(); panel.title = "Import Control Catalog"; panel.message = "Choose Scopeproof JSON, OSCAL catalog JSON, or CSV with control ID and title columns."; panel.allowedContentTypes = [.json, .commaSeparatedText]; panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do { let catalog = try ComplianceCatalog.importCatalog(from: url); setReady("Imported \(catalog.name) · \(catalog.controls.count) controls"); rebuildMenu() }
+        catch { showError(NSError(domain: "Scopeproof", code: 14, userInfo: [NSLocalizedDescriptionKey: "The catalog could not be imported. Use a Scopeproof framework JSON object, OSCAL catalog JSON, or CSV with a header followed by control ID,title rows."])) }
+    }
+
+    @objc private func removeImportedCatalog() {
+        let catalogs = ComplianceCatalog.importedFrameworks
+        guard !catalogs.isEmpty else { return }
+        let alert = NSAlert(); alert.messageText = "Remove an imported control catalog"; alert.informativeText = "Existing evidence keeps its framework, catalog version, and control metadata. Only future selection options are affected."; alert.addButton(withTitle: "Remove"); alert.addButton(withTitle: "Cancel")
+        let picker = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 430, height: 28)); picker.addItems(withTitles: catalogs.map { "\($0.name)\($0.version.map { " · \($0)" } ?? "")" }); alert.accessoryView = picker
+        guard alert.runModal() == .alertFirstButtonReturn, picker.indexOfSelectedItem >= 0 else { return }
+        ComplianceCatalog.removeImportedCatalog(named: catalogs[picker.indexOfSelectedItem].name); setReady("Imported catalog removed"); rebuildMenu()
+    }
+
+    @objc private func exportAssessorPackage() {
+        let allEntries = CaptureHistory.entries(in: captureService.outputDirectory)
+        let approved = allEntries.filter { $0.lifecycle.status == .approved }
+        guard !approved.isEmpty else { showError(AssessorPackageFailure.noApprovedEvidence); return }
+        let frameworks = Array(Set(approved.map { $0.manifest.complianceArea ?? "PCI DSS 4.0.1" })).sorted()
+        let periods = Array(Set(approved.map { $0.manifest.assessmentPeriod })).sorted()
+        let alert = NSAlert(); alert.messageText = "Build assessor evidence package"; alert.informativeText = "Only Approved evidence is included. Every artifact is re-hashed and every lifecycle chain is verified before export."; alert.addButton(withTitle: "Choose Save Location"); alert.addButton(withTitle: "Cancel")
+        let framework = NSPopUpButton(); framework.addItem(withTitle: "All compliance areas"); framework.addItems(withTitles: frameworks)
+        let period = NSPopUpButton(); period.addItem(withTitle: "All assessment periods"); period.addItems(withTitles: periods)
+        let name = NSTextField(string: "External Assessor Evidence – \(CaptureContext.new().assessmentPeriod)")
+        let preparedBy = NSTextField(string: NSFullUserName())
+        for field in [name, preparedBy] { field.frame.size.width = 390 }
+        let grid = NSGridView(views: [[label("Package name"), name], [label("Compliance area"), framework], [label("Assessment period"), period], [label("Prepared by"), preparedBy]])
+        grid.rowSpacing = 10; grid.columnSpacing = 12; grid.column(at: 0).xPlacement = .trailing; grid.column(at: 1).xPlacement = .fill; alert.accessoryView = grid
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let selected = approved.filter { entry in
+            (framework.indexOfSelectedItem == 0 || (entry.manifest.complianceArea ?? "PCI DSS 4.0.1") == framework.titleOfSelectedItem) &&
+            (period.indexOfSelectedItem == 0 || entry.manifest.assessmentPeriod == period.titleOfSelectedItem)
+        }
+        guard !selected.isEmpty else { showError(AssessorPackageFailure.noApprovedEvidence); return }
+        let save = NSSavePanel(); save.title = "Save Assessor Package"; save.allowedContentTypes = [.zip]; save.nameFieldStringValue = "Scopeproof-Assessor-Package-\(ComplianceCatalog.safeFileBase(name.stringValue)).zip"
+        guard save.runModal() == .OK, let destination = save.url else { return }
+        do {
+            let result = try AssessorPackageExporter.export(entries: selected, to: destination, preparedBy: preparedBy.stringValue, packageName: name.stringValue)
+            setReady("Exported \(result.evidenceCount) approved evidence items")
+            NSWorkspace.shared.activateFileViewerSelecting([result.zipURL, result.checksumURL])
+            notify(title: "Assessor package ready", body: "\(result.evidenceCount) approved artifacts were validated and packaged.")
+        } catch { showError(error) }
+    }
     @objc private func selectBrowser(_ sender: NSMenuItem) { let bundleID = (sender.representedObject as? String).flatMap { $0.isEmpty ? nil : $0 }; if let browser = BrowserChoice.supported.first(where: { $0.bundleIdentifier == bundleID }) { preferences.browser = browser }; rebuildMenu() }
     @objc private func selectDelay(_ sender: NSMenuItem) { preferences.delay = sender.tag; rebuildMenu() }
 
@@ -308,7 +483,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func applyRetention() {
         let alert = NSAlert()
         alert.messageText = "Apply local retention policy?"
-        alert.informativeText = "PNG, manifest, and receipt files older than \(preferences.retentionDays) days will be moved to Trash. Hosted evidence is not affected."
+        alert.informativeText = "PNG, manifest, review lifecycle, and receipt files older than \(preferences.retentionDays) days will be moved to Trash. Hosted evidence is not affected."
         alert.alertStyle = .warning
         alert.addButton(withTitle: "Move Expired Files to Trash")
         alert.addButton(withTitle: "Cancel")
@@ -369,7 +544,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let release = try await uploadService.checkForUpdates(serverURL: preferences.serverURL)
                 await MainActor.run {
                     self.preferences.lastUpdateCheck = Date()
-                    guard self.isNewer(release.version, than: "1.1.0") else { if !silent { self.setReady("Scopeproof Capture is up to date") }; return }
+                    let installedVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.3.0"
+                    guard self.isNewer(release.version, than: installedVersion) else { if !silent { self.setReady("Scopeproof Capture is up to date") }; return }
                     let alert = NSAlert(); alert.messageText = "Scopeproof Capture \(release.version) is available"; alert.informativeText = release.notes
                     alert.addButton(withTitle: release.downloadUrl == nil ? "OK" : "Open Download"); alert.addButton(withTitle: "Later")
                     if alert.runModal() == .alertFirstButtonReturn, let url = release.downloadUrl { NSWorkspace.shared.open(url) }
@@ -403,6 +579,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return alert.runModal() == .alertFirstButtonReturn ? field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) : nil
     }
 
-    private func showError(_ error: Error) { NSApplication.shared.activate(ignoringOtherApps: true); let alert = NSAlert(error: error); alert.messageText = "Scopeproof could not complete the operation"; alert.runModal() }
+    private func showError(_ error: Error) {
+        logger.error("Operation failed: \(error.localizedDescription, privacy: .public)")
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Scopeproof could not complete the operation"
+        alert.informativeText = error.localizedDescription
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
+    }
     private func notify(title: String, body: String) { NSSound(named: "Glass")?.play(); let content = UNMutableNotificationContent(); content.title = title; content.body = body; content.sound = .default; UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)) }
 }

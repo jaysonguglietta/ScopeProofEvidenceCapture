@@ -37,11 +37,19 @@ export async function POST(request: Request) {
     if (manifest.sha256 !== imageDigest) return Response.json({ error: "Screenshot integrity does not match its manifest." }, { status: 422 });
     const safetyStatus = field(form, "safetyStatus", 32);
     if (!["passed", "redacted"].includes(safetyStatus)) return Response.json({ error: "Capture must pass local sensitive-data review before upload." }, { status: 422 });
-    const controlId = field(form, "controlId", 32);
+    const complianceArea = field(form, "complianceArea", 100) || "PCI DSS 4.0.1";
+    const controlId = field(form, "controlId", 80);
     const system = field(form, "system", 180);
     const title = field(form, "title", 180);
     const environment = field(form, "environment", 80);
     const assessmentPeriod = field(form, "assessmentPeriod", 80);
+    const evidenceOwner = field(form, "evidenceOwner", 160);
+    const catalogVersion = field(form, "catalogVersion", 80);
+    const expectedEvidence = field(form, "expectedEvidence", 1000);
+    const manualRedactions = Math.max(0, Math.min(Number(field(form, "manualRedactions", 8)) || 0, 10_000));
+    const parseArray = (name: string, maximum: number): unknown[] => { try { const value = JSON.parse(field(form, name, maximum)); return Array.isArray(value) ? value : []; } catch { return []; } };
+    const tags = parseArray("tags", 4000).filter((item): item is string => typeof item === "string").map((item) => item.trim().slice(0, 80)).filter(Boolean).slice(0, 30);
+    const mappedControls = parseArray("mappedControls", 20000).filter((item): item is { framework: string; controlID: string; relationship: string } => Boolean(item && typeof item === "object" && typeof (item as Record<string, unknown>).framework === "string" && typeof (item as Record<string, unknown>).controlID === "string" && typeof (item as Record<string, unknown>).relationship === "string")).slice(0, 100);
     const sessionId = field(form, "sessionId", 96);
     if (!controlId || !system || !title || !environment || !assessmentPeriod || !sessionId) return Response.json({ error: "Control, system, title, environment, assessment period, and session are required." }, { status: 400 });
     await getEnv().DB.prepare(`INSERT INTO capture_sessions (id, display_name, control_id, system_name, environment, assessment_period, created_by)
@@ -52,7 +60,7 @@ export async function POST(request: Request) {
     const attestationBody = {
       version: 1, evidenceId: String(manifest.evidenceID || ""), imageSha256: imageDigest, manifestSha256: await sha256(manifestBytes),
       chainPreviousHash: field(form, "chainPreviousHash", 128) || "GENESIS", chainEventHash: field(form, "chainEventHash", 128),
-      deviceId: device.id, capturedAt, receivedAt: new Date().toISOString(), controlId, system, environment, assessmentPeriod,
+      deviceId: device.id, capturedAt, receivedAt: new Date().toISOString(), complianceArea, controlId, system, environment, assessmentPeriod,
     };
     const signed = await signPackage(stableJson(attestationBody));
     let trustedTimestamp: Awaited<ReturnType<typeof requestTrustedTimestamp>> = null;
@@ -61,12 +69,13 @@ export async function POST(request: Request) {
     const timestampAuthority = trustedTimestamp?.authority || "Scopeproof signed server time";
     const timestampToken = JSON.stringify({ ...attestationBody, signature: signed.signature, publicKeySpkiBase64: signed.publicKey, algorithm: "ECDSA-P256-SHA256", trustedTimestamp, trustedTimestampError });
     const result = await storeEvidence({
-      controlId, title, description: field(form, "description", 2000), type: "screenshot", source: `Scopeproof Capture / ${device.displayName}`, system,
+      controlId, framework: complianceArea, catalogVersion, title, description: field(form, "description", 2000), type: "screenshot", source: `Scopeproof Capture / ${device.displayName} / ${complianceArea}`, system,
+      environment, assessmentPeriod, evidenceOwner, tags, expectedEvidence, mappedControls, manualRedactions,
       contentType: "image/png", bytes: image, sessionId, deviceId: device.id, capturedAt, createdBy: actor, preflightFindings: localFindings,
       manifestSha256: attestationBody.manifestSha256, chainPreviousHash: attestationBody.chainPreviousHash, chainEventHash: attestationBody.chainEventHash,
       timestampAuthority, timestampToken,
     });
-    await appendAuditEvent(actor, "capture_device.uploaded", "evidence", result.id, { deviceId: device.id, sessionId, imageSha256: imageDigest, safetyStatus, redactionCount: localFindings.reduce((sum, item) => sum + item.count, 0) });
+    await appendAuditEvent(actor, "capture_device.uploaded", "evidence", result.id, { deviceId: device.id, sessionId, complianceArea, controlId, imageSha256: imageDigest, safetyStatus, redactionCount: localFindings.reduce((sum, item) => sum + item.count, 0) });
     return Response.json({ ...result, receipt: { evidenceId: result.id, deviceId: device.id, attestation: { ...attestationBody, signature: signed.signature, publicKeySpkiBase64: signed.publicKey, algorithm: "ECDSA-P256-SHA256", trustedTimestamp, trustedTimestampError } } }, { status: result.deduplicated ? 200 : 201 });
   } catch (error) { return jsonError(error); }
 }

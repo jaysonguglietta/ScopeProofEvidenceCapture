@@ -47,3 +47,16 @@ test("native upload route enforces image integrity and local safety review", asy
   assert.match(source, /Only PNG capture evidence is accepted/);
   assert.match(source, /requireCaptureDevice/);
 });
+
+test("assessor metadata migration and package preserve framework organization", async () => {
+  const [migration, packageSource] = await Promise.all([
+    readFile(new URL("../drizzle/0003_fine_wonder_man.sql", import.meta.url), "utf8"),
+    readFile(new URL("../lib/server/packages.ts", import.meta.url), "utf8"),
+  ]);
+  for (const column of ["framework", "catalog_version", "assessment_period", "evidence_owner", "tags_json", "mapped_controls_json", "manual_redactions"]) {
+    assert.ok(migration.includes(`ADD \`${column}\``));
+  }
+  assert.match(packageSource, /evidence\/\$\{safeName\(String\(row\.framework/);
+  assert.match(packageSource, /01-Evidence-Index\.csv/);
+  assert.match(packageSource, /ECDSA-P256-SHA256/);
+});

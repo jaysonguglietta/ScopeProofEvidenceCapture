@@ -45,6 +45,16 @@ struct CaptureManifest: Codable, Sendable {
     let environment: String
     let assessmentPeriod: String
     let description: String
+    let complianceArea: String?
+    let controlTitle: String?
+    let customFileName: String?
+    let catalogVersion: String?
+    let evidenceOwner: String?
+    let tags: [String]?
+    let expectedEvidence: String?
+    let mappedControls: [ControlMapping]?
+    let manualRedactions: Int?
+    let reviewerNote: String?
     let chainPreviousHash: String
     let chainEventHash: String
 }
@@ -84,6 +94,7 @@ typealias CaptureCompletion = @MainActor @Sendable (Result<CaptureResult, Captur
 final class CaptureService {
     private let fileManager = FileManager.default
     private let preferences: CapturePreferences
+    private let reviewController = CaptureReviewController()
     private let localFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd HH:mm:ss zzz"
@@ -230,87 +241,106 @@ final class CaptureService {
         let now = Date()
         let capturedAt = ISO8601DateFormatter().string(from: now)
         let evidenceID = "EV-\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(10).uppercased())"
-        let host = sourceURL?.host?.replacingOccurrences(of: ".", with: "-") ?? "local"
-        let baseName = "PCI-Evidence_\(filenameFormatter.string(from: now))_\(host)_\(evidenceID)"
-        let imageURL = outputDirectory.appendingPathComponent(baseName).appendingPathExtension("png")
-        let manifestURL = outputDirectory.appendingPathComponent(baseName).appendingPathExtension("json")
+        let framework = ComplianceCatalog.framework(named: context.resolvedComplianceArea)
+        guard let review = reviewController.review(image: scan.image, findings: scan.findings, automaticRedactions: scan.redactedRegions, context: context) else { throw CaptureFailure.cancelled }
+        let controlComponent = String(ComplianceCatalog.safeFileBase(context.controlID).prefix(64))
+        let periodComponent = String(ComplianceCatalog.safeFileBase(context.assessmentPeriod).prefix(64))
+        let evidenceDirectory = outputDirectory
+            .appendingPathComponent(framework.folderName, isDirectory: true)
+            .appendingPathComponent(controlComponent, isDirectory: true)
+            .appendingPathComponent(periodComponent, isDirectory: true)
+        try fileManager.createDirectory(at: evidenceDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let controlFile = ComplianceCatalog.safeFileBase(context.controlID)
+        let customFile = ComplianceCatalog.safeFileBase(context.resolvedCustomFileName)
+        let baseName = "\(framework.fileCode)_\(controlFile)_\(customFile)_\(filenameFormatter.string(from: now))_\(evidenceID)"
+        let imageURL = evidenceDirectory.appendingPathComponent(baseName).appendingPathExtension("png")
+        let manifestURL = evidenceDirectory.appendingPathComponent(baseName).appendingPathExtension("json")
         let localTimestamp = localFormatter.string(from: now)
-        let sourceLabel = sourceURL?.absoluteString ?? windowTitle
-        let stamp = "SCOPEPROOF EVIDENCE  •  \(localTimestamp)\n\(browser)  •  \(sourceLabel)  •  \(evidenceID)\nPCI \(context.controlID)  •  \(context.system) / \(context.environment)  •  \(context.assessmentPeriod)"
-        let dimensions = try stampImage(source: scan.image, destination: imageURL, stamp: stamp)
+        let rawSourceLabel = sourceURL?.absoluteString ?? windowTitle
+        let sourceLabel = rawSourceLabel.count > 220 ? "\(rawSourceLabel.prefix(219))…" : rawSourceLabel
+        let controlLabel = context.resolvedControlTitle.isEmpty ? context.controlID : "\(context.controlID) — \(context.resolvedControlTitle)"
+        let ownerLabel = context.resolvedEvidenceOwner.isEmpty ? "UNASSIGNED" : context.resolvedEvidenceOwner
+        let stamp = "SCOPEPROOF EVIDENCE  •  CAPTURED \(localTimestamp)  •  \(evidenceID)\n\(framework.name.uppercased())  •  CONTROL \(controlLabel)\nEVIDENCE \(context.title)  •  OWNER \(ownerLabel)\n\(context.system) / \(context.environment)  •  \(context.assessmentPeriod)  •  SOURCE \(browser) — \(sourceLabel)"
+        let dimensions = try stampImage(source: review.image, destination: imageURL, stamp: stamp)
         let imageData = try Data(contentsOf: imageURL, options: [.mappedIfSafe])
         let digest = sha256(imageData)
         let previousHash = preferences.chainHead
         let eventHash = sha256(Data("\(previousHash)|\(digest)|\(evidenceID)|\(capturedAt)|\(context.sessionID)".utf8))
-        let safetyStatus = scan.redactedRegions > 0 ? "redacted" : "passed"
+        let safetyStatus = scan.redactedRegions + review.manualRedactions > 0 ? "redacted" : "passed"
+        let mappings = ComplianceCatalog.mappings(frameworkName: framework.name, controlID: context.controlID)
         let manifest = CaptureManifest(
-            schemaVersion: 2, evidenceID: evidenceID, capturedAt: capturedAt, localTimestamp: localTimestamp, timezone: TimeZone.current.identifier,
+            schemaVersion: 4, evidenceID: evidenceID, capturedAt: capturedAt, localTimestamp: localTimestamp, timezone: TimeZone.current.identifier,
             sourceURL: sourceURL?.absoluteString, sourceHost: sourceURL?.host, browser: browser, windowTitle: windowTitle, screenshotFilename: imageURL.lastPathComponent,
             sha256: digest, pixelWidth: dimensions.width, pixelHeight: dimensions.height, captureMethod: method,
             timestampAuthority: "Local macOS clock; signed Scopeproof server attestation is stored in the upload receipt",
             safetyStatus: safetyStatus, redactionFindings: scan.findings, redactedRegions: scan.redactedRegions,
             sessionID: context.sessionID, sessionName: context.sessionName, controlID: context.controlID, title: context.title, system: context.system,
             environment: context.environment, assessmentPeriod: context.assessmentPeriod, description: context.description,
+            complianceArea: framework.name, controlTitle: context.resolvedControlTitle, customFileName: context.resolvedCustomFileName,
+            catalogVersion: framework.version ?? ComplianceCatalog.catalogVersion, evidenceOwner: context.resolvedEvidenceOwner, tags: context.resolvedTags,
+            expectedEvidence: context.expectedEvidence, mappedControls: mappings, manualRedactions: review.manualRedactions, reviewerNote: review.reviewerNote,
             chainPreviousHash: previousHash, chainEventHash: eventHash
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         try encoder.encode(manifest).write(to: manifestURL, options: [.atomic, .completeFileProtection])
         try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: manifestURL.path)
-        guard reviewCapture(imageURL: imageURL, findings: scan.findings, redactedRegions: scan.redactedRegions, context: context) else {
-            try? fileManager.removeItem(at: imageURL)
-            try? fileManager.removeItem(at: manifestURL)
-            throw CaptureFailure.cancelled
-        }
+        let historyEntry = CaptureHistoryEntry(
+            manifest: manifest,
+            manifestURL: manifestURL,
+            imageURL: imageURL,
+            receiptURL: manifestURL.deletingPathExtension().appendingPathExtension("receipt.json")
+        )
+        try EvidenceLifecycleStore.update(
+            entry: historyEntry,
+            status: .draft,
+            owner: context.resolvedEvidenceOwner,
+            reviewer: context.resolvedEvidenceOwner,
+            notes: review.reviewerNote,
+            tags: context.resolvedTags
+        )
         preferences.chainHead = eventHash
         return CaptureResult(imageURL: imageURL, manifestURL: manifestURL, evidenceID: evidenceID, context: context, capturedAt: capturedAt, safetyStatus: safetyStatus, findings: scan.findings, sha256: digest, chainPreviousHash: previousHash, chainEventHash: eventHash)
     }
 
-    private func reviewCapture(imageURL: URL, findings: [SensitiveFinding], redactedRegions: Int, context: CaptureContext) -> Bool {
-        NSApplication.shared.activate(ignoringOtherApps: true)
-        let alert = NSAlert()
-        alert.messageText = redactedRegions > 0 ? "Review redacted PCI evidence" : "Review PCI evidence"
-        alert.informativeText = redactedRegions > 0
-            ? "Scopeproof detected and masked \(redactedRegions) sensitive text region(s). Confirm the masking and surrounding context before saving. The unredacted image is not retained."
-            : "No PAN, secret, or token patterns were detected by local OCR. Confirm the selected window and PCI \(context.controlID) context before saving."
-        alert.alertStyle = redactedRegions > 0 ? .warning : .informational
-        alert.addButton(withTitle: "Save Evidence")
-        alert.addButton(withTitle: "Discard")
-        let preview = NSImageView(frame: NSRect(x: 0, y: 0, width: 720, height: 420))
-        preview.image = NSImage(contentsOf: imageURL)
-        preview.imageScaling = .scaleProportionallyUpOrDown
-        preview.wantsLayer = true
-        preview.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
-        preview.layer?.cornerRadius = 8
-        alert.accessoryView = preview
-        if !findings.isEmpty { alert.informativeText += "\nDetected: " + findings.map { "\($0.kind.rawValue) ×\($0.count)" }.joined(separator: ", ") }
-        return alert.runModal() == .alertFirstButtonReturn
-    }
-
-    private func stampImage(source: CGImage, destination: URL, stamp: String) throws -> (width: Int, height: Int) {
+    func stampImage(source: CGImage, destination: URL, stamp: String) throws -> (width: Int, height: Int) {
+        let padding: CGFloat = max(16, CGFloat(source.width) * 0.012)
+        let fontSize: CGFloat = max(14, min(24, CGFloat(source.width) * 0.012))
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineSpacing = 3
+        paragraph.lineBreakMode = .byWordWrapping
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedSystemFont(ofSize: fontSize, weight: .semibold),
+            .foregroundColor: NSColor.white,
+            .paragraphStyle: paragraph,
+        ]
+        let attributed = NSAttributedString(string: stamp, attributes: attributes)
+        let textWidth = max(1, CGFloat(source.width) - padding * 2)
+        let textSize = attributed.boundingRect(
+            with: NSSize(width: textWidth, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        ).size
+        let headerHeight = max(88, Int(ceil(textSize.height + padding * 2)))
+        let outputHeight = source.height + headerHeight
         guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
-              let context = CGContext(data: nil, width: source.width, height: source.height, bitsPerComponent: 8, bytesPerRow: 0, space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { throw CaptureFailure.imageProcessingFailed }
+              let context = CGContext(data: nil, width: source.width, height: outputHeight, bitsPerComponent: 8, bytesPerRow: 0, space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { throw CaptureFailure.imageProcessingFailed }
         context.draw(source, in: CGRect(x: 0, y: 0, width: source.width, height: source.height))
+        let header = CGRect(x: 0, y: source.height, width: source.width, height: headerHeight)
+        context.setFillColor(CGColor(red: 0.035, green: 0.065, blue: 0.12, alpha: 1))
+        context.fill(header)
+        context.setFillColor(CGColor(red: 0.29, green: 0.45, blue: 0.95, alpha: 1))
+        let accentHeight: CGFloat = Swift.max(4.0, CGFloat(source.width) * 0.003)
+        context.fill(CGRect(x: 0, y: CGFloat(source.height), width: CGFloat(source.width), height: accentHeight))
         let graphics = NSGraphicsContext(cgContext: context, flipped: false)
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = graphics
-        let padding: CGFloat = max(18, CGFloat(source.width) * 0.012)
-        let fontSize: CGFloat = max(15, min(24, CGFloat(source.width) * 0.012))
-        let paragraph = NSMutableParagraphStyle()
-        paragraph.lineSpacing = 3
-        let attributes: [NSAttributedString.Key: Any] = [.font: NSFont.monospacedSystemFont(ofSize: fontSize, weight: .semibold), .foregroundColor: NSColor.white, .paragraphStyle: paragraph]
-        let attributed = NSAttributedString(string: stamp, attributes: attributes)
-        let textSize = attributed.boundingRect(with: NSSize(width: CGFloat(source.width) * 0.84, height: .greatestFiniteMagnitude), options: [.usesLineFragmentOrigin, .usesFontLeading]).size
-        let box = CGRect(x: padding, y: padding, width: min(CGFloat(source.width) - padding * 2, textSize.width + padding * 1.5), height: textSize.height + padding)
-        NSColor(calibratedRed: 0.05, green: 0.09, blue: 0.16, alpha: 0.9).setFill()
-        NSBezierPath(roundedRect: box, xRadius: 10, yRadius: 10).fill()
-        attributed.draw(in: box.insetBy(dx: padding * 0.75, dy: padding * 0.5))
+        attributed.draw(in: CGRect(x: padding, y: CGFloat(source.height) + padding, width: textWidth, height: textSize.height + 2))
         NSGraphicsContext.restoreGraphicsState()
         guard let stamped = context.makeImage(), let destinationRef = CGImageDestinationCreateWithURL(destination as CFURL, UTType.png.identifier as CFString, 1, nil) else { throw CaptureFailure.imageProcessingFailed }
         CGImageDestinationAddImage(destinationRef, stamped, [kCGImagePropertyPNGDictionary: [:]] as CFDictionary)
         guard CGImageDestinationFinalize(destinationRef) else { throw CaptureFailure.imageProcessingFailed }
         try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
-        return (source.width, source.height)
+        return (source.width, outputHeight)
     }
 
     private func sha256(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
