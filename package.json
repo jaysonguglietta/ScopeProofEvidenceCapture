@@ -16,6 +16,7 @@
   "dependencies": {
     "drizzle-orm": "0.45.2",
     "fflate": "^0.8.2",
+    "image-size": "file:vendor/image-size",
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "react-server-dom-webpack": "19.2.8",
@@ -48,7 +49,7 @@
     "brace-expansion@1.1.14": "1.1.18",
     "brace-expansion@5.0.6": "5.0.9",
     "fast-uri@3.1.2": "3.1.5",
-    "image-size": "file:vendor/image-size",
+    "image-size": "$image-size",
     "js-yaml@4.1.1": "4.3.1"
   },
   "type": "module"
