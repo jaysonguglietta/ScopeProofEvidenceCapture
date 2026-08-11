@@ -4,6 +4,8 @@ import { collectorConfiguration, CollectorError, runCollector, type CollectorPro
 import { randomId } from "./crypto";
 import { getEnv } from "./env";
 import { storeEvidence } from "./evidence";
+import { purgeRateLimitBuckets } from "./rate-limit";
+import { purgeExpiredEvidence } from "./retention";
 
 const systemActor: AuthenticatedUser = { id: "system:scheduler", email: "scheduler@scopeproof.internal", displayName: "Scopeproof Scheduler", role: "admin" };
 
@@ -40,22 +42,29 @@ export async function processJob(jobId: string, actor?: AuthenticatedUser): Prom
   if (!collector) throw new Error("Collector not found.");
   const runActor = actor || systemActor;
   const attempt = Number(job.attempt || 0) + 1;
-  await executeAuditedBatch(runActor, "collection.started", "collection_job", jobId, { collectorId: collector.id, attempt }, [
-    env.DB.prepare("UPDATE collection_jobs SET status = 'running', attempt = ?, started_at = ?, error_code = NULL, error_message = NULL WHERE id = ?").bind(attempt, new Date().toISOString(), jobId),
-    env.DB.prepare("UPDATE collectors SET status = 'running', updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(collector.id),
-  ]);
+  const leaseId = randomId("lease");
+  const startedAt = new Date().toISOString();
+  const leaseExpiresAt = new Date(Date.now() + 30 * 60_000).toISOString();
+  const [claim] = await executeAuditedBatch(runActor, "collection.started", "collection_job", jobId, { collectorId: collector.id, attempt, leaseId, leaseExpiresAt }, [
+    env.DB.prepare(`UPDATE collection_jobs SET status = 'running', attempt = ?, started_at = ?, lease_id = ?, lease_expires_at = ?, error_code = NULL, error_message = NULL
+      WHERE id = ? AND (status = 'queued' OR (status = 'retrying' AND next_attempt_at <= ?) OR (status = 'running' AND lease_expires_at < ?))`).bind(attempt, startedAt, leaseId, leaseExpiresAt, jobId, startedAt, startedAt),
+    env.DB.prepare("UPDATE collectors SET status = 'running', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND EXISTS (SELECT 1 FROM collection_jobs WHERE id = ? AND lease_id = ?)").bind(collector.id, jobId, leaseId),
+  ], { sql: "EXISTS (SELECT 1 FROM collection_jobs WHERE id = ? AND lease_id = ?)", bindings: [jobId, leaseId] });
+  if (!claim.meta.changes) return { status: String(job.status), artifacts: Number(job.artifact_count || 0), error: "Collection job is already claimed." };
   try {
     const artifacts = await runCollector(String(collector.provider) as CollectorProvider, { actor: runActor, config: JSON.parse(String(collector.config_json || "{}")) });
     let stored = 0;
     for (const artifact of artifacts) {
+      const ownsLease = await env.DB.prepare("SELECT 1 FROM collection_jobs WHERE id = ? AND status = 'running' AND lease_id = ? AND lease_expires_at > ?").bind(jobId, leaseId, new Date().toISOString()).first();
+      if (!ownsLease) throw new CollectorError("Collection lease expired before evidence persistence.", "LEASE_LOST", true);
       const result = await storeEvidence({ ...artifact, createdBy: runActor, collectorId: String(collector.id), jobId });
       if (!result.deduplicated) stored += 1;
     }
     const completed = new Date().toISOString();
     await executeAuditedBatch(runActor, "collection.completed", "collection_job", jobId, { collectorId: collector.id, artifactCount: stored, attempt }, [
-      env.DB.prepare("UPDATE collection_jobs SET status = 'completed', artifact_count = ?, completed_at = ? WHERE id = ?").bind(stored, completed, jobId),
-      env.DB.prepare("UPDATE collectors SET status = 'healthy', last_run_at = ?, last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(completed, collector.id),
-    ]);
+      env.DB.prepare("UPDATE collection_jobs SET status = 'completed', artifact_count = ?, completed_at = ?, lease_id = NULL, lease_expires_at = NULL WHERE id = ? AND status = 'running' AND lease_id = ?").bind(stored, completed, jobId, leaseId),
+      env.DB.prepare("UPDATE collectors SET status = 'healthy', last_run_at = ?, last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND EXISTS (SELECT 1 FROM collection_jobs WHERE id = ? AND status = 'completed' AND completed_at = ?)").bind(completed, collector.id, jobId, completed),
+    ], { sql: "EXISTS (SELECT 1 FROM collection_jobs WHERE id = ? AND status = 'completed' AND completed_at = ?)", bindings: [jobId, completed] });
     return { status: "completed", artifacts: stored };
   } catch (error) {
     const collectorError = error instanceof CollectorError ? error : new CollectorError(error instanceof Error ? error.message : "Unknown collector failure", "INTERNAL_ERROR", true);
@@ -63,16 +72,18 @@ export async function processJob(jobId: string, actor?: AuthenticatedUser): Prom
     const retry = collectorError.retryable && attempt < maxAttempts;
     const nextAttemptAt = retry ? new Date(Date.now() + Math.min(60 * 60_000, 2 ** attempt * 60_000)).toISOString() : null;
     await executeAuditedBatch(runActor, retry ? "collection.retry_scheduled" : "collection.failed", "collection_job", jobId, { collectorId: collector.id, attempt, code: collectorError.code, retryAt: nextAttemptAt }, [
-      env.DB.prepare("UPDATE collection_jobs SET status = ?, next_attempt_at = ?, error_code = ?, error_message = ?, completed_at = ? WHERE id = ?").bind(retry ? "retrying" : "failed", nextAttemptAt, collectorError.code, collectorError.message.slice(0, 1000), retry ? null : new Date().toISOString(), jobId),
-      env.DB.prepare("UPDATE collectors SET status = 'action_needed', last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(collectorError.message.slice(0, 1000), collector.id),
-    ]);
+      env.DB.prepare("UPDATE collection_jobs SET status = ?, next_attempt_at = ?, error_code = ?, error_message = ?, completed_at = ?, lease_id = NULL, lease_expires_at = NULL WHERE id = ? AND status = 'running' AND lease_id = ?").bind(retry ? "retrying" : "failed", nextAttemptAt, collectorError.code, collectorError.message.slice(0, 1000), retry ? null : new Date().toISOString(), jobId, leaseId),
+      env.DB.prepare("UPDATE collectors SET status = 'action_needed', last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND EXISTS (SELECT 1 FROM collection_jobs WHERE id = ? AND lease_id IS NULL AND status = ? AND attempt = ?)").bind(collectorError.message.slice(0, 1000), collector.id, jobId, retry ? "retrying" : "failed", attempt),
+    ], { sql: "EXISTS (SELECT 1 FROM collection_jobs WHERE id = ? AND lease_id IS NULL AND status = ? AND attempt = ?)", bindings: [jobId, retry ? "retrying" : "failed", attempt] });
     return { status: retry ? "retrying" : "failed", artifacts: 0, error: collectorError.message };
   }
 }
 
 export async function processDueWork(now = new Date()): Promise<void> {
   const env = getEnv();
-  const dueRetries = (await env.DB.prepare("SELECT id FROM collection_jobs WHERE status = 'retrying' AND next_attempt_at <= ? ORDER BY next_attempt_at LIMIT 10").bind(now.toISOString()).all<{ id: string }>()).results;
+  await purgeExpiredEvidence(now, systemActor);
+  await purgeRateLimitBuckets(Math.floor(now.getTime() / 1_000));
+  const dueRetries = (await env.DB.prepare("SELECT id FROM collection_jobs WHERE (status = 'retrying' AND next_attempt_at <= ?) OR (status = 'running' AND lease_expires_at < ?) ORDER BY next_attempt_at LIMIT 10").bind(now.toISOString(), now.toISOString()).all<{ id: string }>()).results;
   for (const job of dueRetries) await processJob(job.id);
   const collectors = (await env.DB.prepare("SELECT id, schedule_cron, last_run_at FROM collectors WHERE enabled = 1 AND schedule_cron IS NOT NULL").all<{ id: string; schedule_cron: string; last_run_at: string | null }>()).results;
   for (const collector of collectors) {

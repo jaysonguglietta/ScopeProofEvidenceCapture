@@ -61,6 +61,8 @@ Scopeproof handles security and compliance evidence that may expose sensitive co
 - Local lifecycle schema 2 derives all projected state from the final verified event. Every event binds reviewer identity, time, artifact digest, review policy, scanner policy, owner, rationale, tags, and supersession state. Obsolete/unbound or inconsistent sidecars are draft/ineligible and require recapture. The package-signing identity rotates to a user-presence-protected Keychain item.
 - The package’s embedded public key must be fingerprint-verified out of band to establish signer continuity.
 - Jira permissions, issue security, marketplace apps, notifications, backups, exports, retention, and downstream sharing remain outside Scopeproof’s control. Timeout failures can leave an ambiguous attachment outcome that must be inspected before retry.
+- Spreadsheet CSV indexes are presentation-only and prefix formula-like cells (including after leading ASCII whitespace/control characters) with an apostrophe. Use the signed JSON manifest for machine verification.
+- Update trust depends on protecting the offline release private key and accurately provisioning its matching public key and validity window in the signed app bundle. An empty key list fails closed and intentionally disables updates.
 - Provider coverage is intentionally bounded and may require additional collection for large environments.
 - Key rotation is not automatic; replacing an encryption key without a migration can make prior evidence undecryptable.
 - An ad-hoc local macOS build is not notarized and does not provide a Developer ID trust chain.

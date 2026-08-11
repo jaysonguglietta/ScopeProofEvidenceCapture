@@ -1,9 +1,11 @@
 import { jsonError, requireApiPermission, requireApiUser, requireSameOrigin } from "../../../../lib/server/auth";
 import { approveEvidence, readEvidenceBytes } from "../../../../lib/server/evidence";
+import { enforceRateLimit, requireBoundedContentLength } from "../../../../lib/server/rate-limit";
 
 export async function GET(request: Request, context: { params: Promise<{ id: string }> }) {
   try {
-    await requireApiUser(request);
+    const user = await requireApiUser(request);
+    await enforceRateLimit(request, user.id, "evidence:read", 120, 60);
     const { id } = await context.params;
     const artifact = await readEvidenceBytes(id);
     if (!artifact) return Response.json({ error: "Evidence not found" }, { status: 404 });
@@ -23,6 +25,8 @@ export async function PATCH(request: Request, context: { params: Promise<{ id: s
   try {
     requireSameOrigin(request);
     const user = await requireApiPermission(request, "approve_evidence");
+    await enforceRateLimit(request, user.id, "evidence:approve", 60, 3_600);
+    requireBoundedContentLength(request, 4 * 1024);
     const { id } = await context.params;
     const body = await request.json() as { action?: string; expectedSha256?: string; rationale?: string; confirmedActualArtifact?: boolean };
     if (body.action !== "approve" || body.confirmedActualArtifact !== true) return Response.json({ error: "Approval requires explicit confirmation that the actual artifact was reviewed." }, { status: 400 });

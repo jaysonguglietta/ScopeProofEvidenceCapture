@@ -35,10 +35,13 @@ export async function appendAuditEvent(actor: AuthenticatedUser, action: string,
   await executeAuditedBatch(actor, action, resourceType, resourceId, details, []);
 }
 
-export type AuditChainVerification = { valid: boolean; checked: number; failedAt?: number; failureReason?: "invalid_details_json" | "non_canonical_details" | "chain_mismatch" };
+export type AuditChainVerification = { valid: boolean; checked: number; failedAt?: number; failureReason?: "invalid_details_json" | "non_canonical_details" | "chain_mismatch" | "verification_limit_exceeded" };
 
-export async function verifyAuditChain(): Promise<AuditChainVerification> {
-  const rows = (await getEnv().DB.prepare("SELECT sequence, id, occurred_at, actor_id, actor_email, action, resource_type, resource_id, details_json, previous_hash, event_hash, signature FROM audit_events ORDER BY sequence ASC").all<Record<string, unknown>>()).results;
+export async function verifyAuditChain(maximumEvents = 10_000): Promise<AuditChainVerification> {
+  const env = getEnv();
+  const count = await env.DB.prepare("SELECT COUNT(*) AS count FROM audit_events").first<{ count: number }>();
+  if (Number(count?.count || 0) > maximumEvents) return { valid: false, checked: 0, failureReason: "verification_limit_exceeded" };
+  const rows = (await env.DB.prepare("SELECT sequence, id, occurred_at, actor_id, actor_email, action, resource_type, resource_id, details_json, previous_hash, event_hash, signature FROM audit_events ORDER BY sequence ASC LIMIT ?").bind(maximumEvents).all<Record<string, unknown>>()).results;
   let previousHash = "GENESIS";
   for (const row of rows) {
     let details: unknown;

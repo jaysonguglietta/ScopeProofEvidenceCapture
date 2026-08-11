@@ -1,16 +1,14 @@
 import { jsonError } from "../../../../../lib/server/auth";
 import { requireCaptureDevice } from "../../../../../lib/server/devices";
 import { getEnv } from "../../../../../lib/server/env";
+import { enforceRateLimit } from "../../../../../lib/server/rate-limit";
+import { configuredMacRelease } from "../../../../../lib/server/releases";
 
 export async function GET(request: Request) {
   try {
-    await requireCaptureDevice(request);
+    const { device } = await requireCaptureDevice(request);
+    await enforceRateLimit(request, device.id, "native-release-check", 30, 3_600);
     const env = getEnv();
-    return Response.json({
-      version: env.MACOS_LATEST_VERSION || "1.1.0",
-      downloadUrl: env.MACOS_RELEASE_URL || null,
-      sha256: env.MACOS_RELEASE_SHA256 || null,
-      notes: env.MACOS_RELEASE_NOTES || "Capture safety, device upload, guided sessions, and Help improvements.",
-    });
+    return Response.json(configuredMacRelease(env));
   } catch (error) { return jsonError(error); }
 }

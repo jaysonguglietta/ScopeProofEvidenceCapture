@@ -1,13 +1,6 @@
 import Foundation
 import CryptoKit
 
-struct ReleaseInfo: Decodable, Sendable {
-    let version: String
-    let downloadUrl: URL?
-    let sha256: String?
-    let notes: String
-}
-
 enum UploadFailure: LocalizedError {
     case notConfigured
     case invalidServer
@@ -28,8 +21,8 @@ actor UploadService {
     private var appVersion: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.3.2" }
 
     func upload(_ capture: CaptureResult, serverURL: URL?) async throws -> URL {
-        guard let token = KeychainStore.readToken(), !token.isEmpty else { throw UploadFailure.notConfigured }
-        guard let serverURL, Self.isAllowedServerURL(serverURL) else { throw UploadFailure.invalidServer }
+        guard let serverURL = BackendTrust.normalizedOrigin(serverURL) else { throw UploadFailure.invalidServer }
+        guard let token = KeychainStore.readToken(for: serverURL), !token.isEmpty else { throw UploadFailure.notConfigured }
         let image = try Data(contentsOf: capture.imageURL)
         let manifest = try Data(contentsOf: capture.manifestURL)
         let manifestModel = try JSONDecoder().decode(CaptureManifest.self, from: manifest)
@@ -45,7 +38,7 @@ actor UploadService {
             ("screenshot", manifestModel.screenshotFilename, "image/png", image),
             ("manifest", capture.manifestURL.lastPathComponent, "application/json", manifest),
         ])
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await BackendHTTP.data(for: request, audience: serverURL)
         guard let http = response as? HTTPURLResponse else { throw UploadFailure.invalidResponse }
         guard (200..<300).contains(http.statusCode) else {
             let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
@@ -58,22 +51,8 @@ actor UploadService {
         return receiptURL
     }
 
-    func checkForUpdates(serverURL: URL?) async throws -> ReleaseInfo {
-        guard let token = KeychainStore.readToken(), !token.isEmpty else { throw UploadFailure.notConfigured }
-        guard let serverURL, Self.isAllowedServerURL(serverURL) else { throw UploadFailure.invalidServer }
-        var request = URLRequest(url: serverURL.appendingPathComponent("api/native/releases/latest"))
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        request.setValue(appVersion, forHTTPHeaderField: "X-Scopeproof-Version")
-        request.timeoutInterval = 20
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { throw UploadFailure.invalidResponse }
-        return try JSONDecoder().decode(ReleaseInfo.self, from: data)
-    }
-
     nonisolated static func isAllowedServerURL(_ url: URL) -> Bool {
-        guard let scheme = url.scheme?.lowercased(), let host = url.host?.lowercased() else { return false }
-        if scheme == "https" { return true }
-        return scheme == "http" && ["localhost", "127.0.0.1", "::1"].contains(host)
+        BackendTrust.normalizedOrigin(url) != nil
     }
 
     nonisolated static func uploadSignature(token: String, manifest: Data, image: Data) -> String {

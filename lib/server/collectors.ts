@@ -18,12 +18,33 @@ function configured(value: string | undefined, name: string): string {
   return value;
 }
 
-async function providerFetch(url: string, init: RequestInit, label: string): Promise<Response> {
-  const response = await fetch(url, init);
-  if (response.ok) return response;
-  const text = (await response.text()).slice(0, 500);
-  const retryable = response.status === 429 || response.status >= 500;
-  throw new CollectorError(`${label} returned ${response.status}: ${text}`, response.status === 401 || response.status === 403 ? "AUTH_FAILED" : "PROVIDER_ERROR", retryable, response.status);
+async function providerFetch(url: string, init: RequestInit, label: string, maximumBytes = 5 * 1024 * 1024, allowedStatuses: number[] = []): Promise<Response> {
+  const response = await fetch(url, { ...init, redirect: "error", signal: AbortSignal.timeout(60_000) });
+  const declaredLength = Number(response.headers.get("content-length") || 0);
+  if (declaredLength > maximumBytes) throw new CollectorError(`${label} response exceeds the ${maximumBytes}-byte limit.`, "PROVIDER_RESPONSE_TOO_LARGE", false);
+  const reader = response.body?.getReader();
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  if (reader) {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      received += value.byteLength;
+      if (received > maximumBytes) {
+        await reader.cancel("response size limit exceeded");
+        throw new CollectorError(`${label} response exceeds the ${maximumBytes}-byte limit.`, "PROVIDER_RESPONSE_TOO_LARGE", false);
+      }
+      chunks.push(value);
+    }
+  }
+  const bytes = new Uint8Array(received);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  const bounded = new Response(bytes, { status: response.status, statusText: response.statusText, headers: response.headers });
+  if (bounded.ok || allowedStatuses.includes(bounded.status)) return bounded;
+  const text = new TextDecoder().decode(bytes).slice(0, 500);
+  const retryable = bounded.status === 429 || bounded.status >= 500;
+  throw new CollectorError(`${label} returned ${bounded.status}: ${text}`, bounded.status === 401 || bounded.status === 403 ? "AUTH_FAILED" : "PROVIDER_ERROR", retryable, bounded.status);
 }
 
 function approvedOcrEndpoint(env: ScopeproofEnv): URL {
@@ -50,7 +71,7 @@ async function scanExactBrowserPixels(env: ScopeproofEnv, image: Uint8Array): Pr
     method: "POST",
     headers: { authorization: `Bearer ${configured(env.BROWSER_OCR_TOKEN, "BROWSER_OCR_TOKEN")}`, "content-type": "application/json", accept: "application/json" },
     body: JSON.stringify({ version: 1, sha256: digest, contentType: "image/png", imageBase64: base64(image) }),
-  }, "Browser exact-pixel OCR scan");
+  }, "Browser exact-pixel OCR scan", 2 * 1024 * 1024);
   const declaredLength = Number(response.headers.get("content-length") || 0);
   if (declaredLength > 2 * 1024 * 1024) throw new CollectorError("Browser OCR response exceeds the scanner limit.", "OCR_RESPONSE_TOO_LARGE", false);
   const responseText = await response.text();
@@ -74,7 +95,7 @@ async function githubCollector(env: ScopeproofEnv): Promise<Artifact[]> {
   const reposResponse = await providerFetch(`https://api.github.com/orgs/${encodeURIComponent(org)}/repos?per_page=100&type=all&sort=full_name`, { headers }, "GitHub repository inventory");
   const repos = await reposResponse.json() as Array<{ name: string; full_name: string; private: boolean; archived: boolean; default_branch: string; visibility: string; security_and_analysis?: unknown }>;
   const protection = await Promise.all(repos.filter((repo) => !repo.archived).slice(0, 25).map(async (repo) => {
-    const response = await fetch(`https://api.github.com/repos/${encodeURIComponent(org)}/${encodeURIComponent(repo.name)}/branches/${encodeURIComponent(repo.default_branch)}/protection`, { headers });
+    const response = await providerFetch(`https://api.github.com/repos/${encodeURIComponent(org)}/${encodeURIComponent(repo.name)}/branches/${encodeURIComponent(repo.default_branch)}/protection`, { headers }, `GitHub branch protection for ${repo.full_name}`, 2 * 1024 * 1024, [404]);
     if (response.status === 404) return { repository: repo.full_name, defaultBranch: repo.default_branch, protected: false };
     if (!response.ok) return { repository: repo.full_name, defaultBranch: repo.default_branch, protected: null, collectionError: response.status };
     const data = await response.json() as Record<string, unknown>;
@@ -173,7 +194,7 @@ async function browserCollector(env: ScopeproofEnv): Promise<Artifact[]> {
     if (url.protocol !== "https:") throw new CollectorError(`Browser capture only permits HTTPS targets: ${target}`, "UNSAFE_TARGET", false);
     const endpoint = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/browser-rendering`;
     const headers = { authorization: `Bearer ${token}`, "content-type": "application/json" };
-    const screenshotResponse = await providerFetch(`${endpoint}/screenshot`, { method: "POST", headers, body: JSON.stringify({ url: target, gotoOptions: { waitUntil: "networkidle0", timeout: 30000 }, screenshotOptions: { type: "png", fullPage: true } }) }, `Browser screenshot for ${url.hostname}`);
+    const screenshotResponse = await providerFetch(`${endpoint}/screenshot`, { method: "POST", headers, body: JSON.stringify({ url: target, gotoOptions: { waitUntil: "networkidle0", timeout: 30000 }, screenshotOptions: { type: "png", fullPage: true } }) }, `Browser screenshot for ${url.hostname}`, 15 * 1024 * 1024);
     const image = new Uint8Array(await screenshotResponse.arrayBuffer());
     const safetyScan = await scanExactBrowserPixels(env, image);
     artifacts.push({ controlId: "2.2.1", title: `Authenticated configuration capture — ${url.hostname}`, description: `Browser-rendered evidence captured from ${url.pathname}. The immutable PNG pixels passed digest-bound OCR safety policy ${safetyScan.policy} before persistence.`, type: "screenshot", source: "Browser capture", system: url.hostname, contentType: "image/png", bytes: image, safetyScanSha256: safetyScan.digest, safetyScanPolicy: safetyScan.policy, safetyScanCompletedAt: safetyScan.completedAt });

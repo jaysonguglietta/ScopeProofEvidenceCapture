@@ -1,10 +1,12 @@
 import { jsonError, requireApiUser } from "../../../lib/server/auth";
 import { verifyAuditChain } from "../../../lib/server/audit";
 import { getEnv } from "../../../lib/server/env";
+import { enforceRateLimit } from "../../../lib/server/rate-limit";
 
 export async function GET(request: Request) {
   try {
-    await requireApiUser(request, "auditor");
+    const actor = await requireApiUser(request, "auditor");
+    await enforceRateLimit(request, actor.id, "audit:verify", 10, 60);
     const events = (await getEnv().DB.prepare("SELECT sequence, id, occurred_at, actor_email, action, resource_type, resource_id, details_json, previous_hash, event_hash, signature FROM audit_events ORDER BY sequence DESC LIMIT 250").all<Record<string, unknown>>()).results;
     return Response.json({ integrity: await verifyAuditChain(), events: events.map((event: Record<string, unknown>) => {
       const { details_json: detailsJson, ...fields } = event;

@@ -56,16 +56,17 @@ Inspect generated SQL for destructive operations, unintended nullability changes
 
 Review role assignments regularly. Use separate named accounts; do not share administrator sessions.
 
-Apply migrations through `drizzle/0008_real_nebula.sql`. Migration 0007 records the one-time administrator-bootstrap invariant and protects the final administrator; migration 0008 records digest-bound exact-pixel safety-scan metadata. Production fails closed when `BOOTSTRAP_ADMIN_EMAILS` or `TRUSTED_APP_ORIGINS` is unsafe. Browser collection remains unavailable until its OCR endpoint, token, and exact host allowlist are all configured.
+Apply migrations through `drizzle/0009_chubby_martin_li.sql`. Migration 0009 adds collection leases, persistent rate-limit buckets, retention holds, and purge state. Production fails closed when `BOOTSTRAP_ADMIN_EMAILS` or `TRUSTED_APP_ORIGINS` is unsafe. Browser collection remains unavailable until its OCR endpoint, token, and exact host allowlist are all configured.
 
 ## macOS device deployment
 
 1. Build with `./Scripts/build_macos_capture.sh`.
 2. For managed production distribution, set `SCOPEPROOF_CODESIGN_IDENTITY` to a trusted Developer ID Application identity.
 3. Set `SCOPEPROOF_NOTARY_PROFILE` to a Keychain profile created for `xcrun notarytool` when notarization is required.
-4. Publish only through HTTPS with an independently recorded release SHA-256.
-5. Configure `MACOS_LATEST_VERSION=1.3.2`, `MACOS_RELEASE_URL`, `MACOS_RELEASE_SHA256`, and operator-facing `MACOS_RELEASE_NOTES` in the hosted environment.
-6. Enroll each Mac separately from **Connections**. Revoke devices when reassigned, lost, or retired.
+4. Generate an offline P-256 release key, compile its X9.63 public key and validity window into `ScopeproofUpdatePublicKeys` in `Info.plist`, and keep the private key outside the repository.
+5. Set the `SCOPEPROOF_UPDATE_*` and `SCOPEPROOF_RELEASE_*` variables required by `./Scripts/publish_release.sh`. The script refuses unsigned, non-notarized, identity-mismatched, or key-mismatched releases and emits `DerivedData/macos-release-envelope.json`.
+6. Publish the exact ZIP to its final HTTPS origin. Store only the envelope's `manifest` as `MACOS_RELEASE_MANIFEST_JSON`, its `signatureDERBase64` as `MACOS_RELEASE_SIGNATURE_DER_BASE64`, and configure the exact hostname in `MACOS_RELEASE_ALLOWED_HOSTS`.
+7. Enroll each Mac separately from **Connections**. Revoke devices when reassigned, lost, or retired.
 
 The development build is ad-hoc signed with a stable designated requirement for `com.scopeproof.capture`; it is not a notarized production release.
 
@@ -76,6 +77,8 @@ Scopeproof does not parse CMS itself. The configured verifier must use a maintai
 Maintain at least two verifier public keys during a controlled rotation window by deploying application support before switching the verifier signer. Update TSA trust-anchor fingerprints only after out-of-band validation, document the change, and retain prior verification metadata with existing evidence. If any verifier setting is absent or validation fails, Scopeproof records signed server time but never labels the RFC 3161 response trusted.
 
 Alert on repeated `scopeproof_audited_batch_failure` events and any sustained Jira operation in `unknown`, collector `action_needed`, or package `failed` state. Database state and its required audit event are committed in one D1 batch; external Jira/R2 work uses durable intent/state records so uncertain outcomes can be reconciled instead of replayed blindly.
+
+The 15-minute scheduler also retries expired collection leases, purges expired evidence/export objects, and removes expired rate-limit buckets. Alert on `evidence.purge_failed`, investigate R2 deletion errors, and do not treat a legal hold as indefinite: every hold records an owner, reason, and expiry of at most one year.
 
 ## Jira Cloud OAuth deployment
 
