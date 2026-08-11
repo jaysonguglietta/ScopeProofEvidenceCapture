@@ -179,3 +179,39 @@ test("identity bootstrap and independent approval fail closed", async () => {
   assert.match(consoleSource, /Independent review attestation/);
   assert.match(consoleSource, /actual decrypted, digest-verified artifact|Decrypting and verifying the actual artifact/);
 });
+
+test("security mutations are atomic with audit events and timestamps require pinned verification", async () => {
+  const [audit, evidence, devices, jobs, jira, users, collectors, packages, timestamp, lifecycle, exporter, keychain] = await Promise.all([
+    readFile(new URL("../lib/server/audit.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/server/evidence.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/server/devices.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/server/jobs.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/server/jira.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/users/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/collectors/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/server/packages.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/server/timestamp.ts", import.meta.url), "utf8"),
+    readFile(new URL("../macos/ScopeproofCapture/Sources/ScopeproofCapture/EvidenceLifecycle.swift", import.meta.url), "utf8"),
+    readFile(new URL("../macos/ScopeproofCapture/Sources/ScopeproofCapture/AssessorPackageExporter.swift", import.meta.url), "utf8"),
+    readFile(new URL("../macos/ScopeproofCapture/Sources/ScopeproofCapture/KeychainStore.swift", import.meta.url), "utf8"),
+  ]);
+  assert.match(audit, /executeAuditedBatch/);
+  assert.match(audit, /env\.DB\.batch\(\[/);
+  assert.match(audit, /scopeproof_audited_batch_failure/);
+  for (const source of [evidence, devices, jobs, jira, users, collectors, packages]) assert.match(source, /executeAuditedBatch/);
+  assert.doesNotMatch(jira, /await appendAuditEvent/);
+  assert.match(timestamp, /verification\.nonceHex !== request\.nonceHex/);
+  assert.match(timestamp, /verification\.digestSha256 !== digestSha256/);
+  assert.match(timestamp, /verification\.tokenSha256 !== tokenSha256/);
+  assert.match(timestamp, /tsaExtendedKeyUsage/);
+  assert.match(timestamp, /revocationStatus/);
+  assert.match(timestamp, /RFC3161_TSA_TRUST_ANCHOR_SHA256/);
+  assert.match(timestamp, /crypto\.subtle\.verify/);
+  assert.doesNotMatch(lifecycle, /var status: EvidenceReviewStatus\s*=/);
+  assert.match(lifecycle, /var status: EvidenceReviewStatus \{ events\.last\?\.status/);
+  assert.match(lifecycle, /artifactSha256/);
+  assert.match(lifecycle, /policyVersion/);
+  assert.match(exporter, /verify\(entry\.lifecycle, artifactSha256:/);
+  assert.match(keychain, /SecAccessControlCreateWithFlags/);
+  assert.match(keychain, /userPresence/);
+});

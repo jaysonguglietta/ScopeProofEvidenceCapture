@@ -23,7 +23,7 @@ enum AssessorPackageFailure: LocalizedError {
 }
 
 enum AssessorPackageExporter {
-    static func export(entries: [CaptureHistoryEntry], to destination: URL, preparedBy: String, packageName: String, jiraSettings: JiraHandoffSettings = .defaults) throws -> AssessorPackageResult {
+    static func export(entries: [CaptureHistoryEntry], to destination: URL, preparedBy: String, packageName: String, jiraSettings: JiraHandoffSettings = .defaults, signingKeyOverride: P256.Signing.PrivateKey? = nil) throws -> AssessorPackageResult {
         let approved = entries.filter { $0.lifecycle.status.isPackageEligible }
         guard !approved.isEmpty else { throw AssessorPackageFailure.noApprovedEvidence }
         let fileManager = FileManager.default
@@ -40,7 +40,7 @@ enum AssessorPackageExporter {
         var csvRows = ["Evidence ID,Framework,Control,Control title,Jira issue,Jira URL,Evidence title,System,Environment,Assessment period,Captured at,Owner,Status,Tags,Redactions,SHA-256,File"]
         for entry in approved {
             let imageData = try Data(contentsOf: entry.imageURL, options: [.mappedIfSafe])
-            guard sha256(imageData) == entry.manifest.sha256, EvidenceLifecycleStore.verify(entry.lifecycle) else { throw AssessorPackageFailure.integrityMismatch(entry.manifest.evidenceID) }
+            guard sha256(imageData) == entry.manifest.sha256, EvidenceLifecycleStore.verify(entry.lifecycle, artifactSha256: entry.manifest.sha256), entry.lifecycle.status == .approved else { throw AssessorPackageFailure.integrityMismatch(entry.manifest.evidenceID) }
             let framework = ComplianceCatalog.framework(named: entry.manifest.complianceArea)
             let evidenceFolder = packageRoot.appendingPathComponent("Evidence", isDirectory: true)
                 .appendingPathComponent(framework.folderName, isDirectory: true)
@@ -138,17 +138,23 @@ enum AssessorPackageExporter {
         ]
         let canonical = try JSONSerialization.data(withJSONObject: unsigned, options: [.sortedKeys, .withoutEscapingSlashes])
         let signingKey: P256.Signing.PrivateKey
-        if let stored = KeychainStore.readPackageSigningKey(), let key = try? P256.Signing.PrivateKey(rawRepresentation: stored) {
+        if let signingKeyOverride {
+            signingKey = signingKeyOverride
+        } else if let stored = KeychainStore.readPackageSigningKey(), let key = try? P256.Signing.PrivateKey(rawRepresentation: stored) {
             signingKey = key
         } else {
-            signingKey = P256.Signing.PrivateKey()
-            try KeychainStore.savePackageSigningKey(signingKey.rawRepresentation)
+            let generated = P256.Signing.PrivateKey()
+            try KeychainStore.savePackageSigningKey(generated.rawRepresentation)
+            guard let protected = KeychainStore.readPackageSigningKey(), let key = try? P256.Signing.PrivateKey(rawRepresentation: protected) else {
+                throw AssessorPackageFailure.packageToolFailed("Local user presence is required to activate the protected package-signing identity.")
+            }
+            signingKey = key
         }
         let publicKeyFingerprint = sha256(signingKey.publicKey.x963Representation)
         let signature = try signingKey.signature(for: canonical)
         let envelope: [String: Any] = [
             "manifest": unsigned,
-            "signature": ["algorithm": "ECDSA-P256-SHA256", "canonicalization": "JSON sorted keys", "valueDERBase64": signature.derRepresentation.base64EncodedString(), "publicKeyX963Base64": signingKey.publicKey.x963Representation.base64EncodedString(), "publicKeySha256": publicKeyFingerprint, "keyStorage": "macOS Keychain; device-bound persistent signing identity"],
+            "signature": ["algorithm": "ECDSA-P256-SHA256", "canonicalization": "JSON sorted keys", "valueDERBase64": signature.derRepresentation.base64EncodedString(), "publicKeyX963Base64": signingKey.publicKey.x963Representation.base64EncodedString(), "publicKeySha256": publicKeyFingerprint, "keyStorage": "macOS Keychain; device-bound persistent signing identity requiring local user presence"],
         ]
         let manifestData = try JSONSerialization.data(withJSONObject: envelope, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
         try manifestData.write(to: packageRoot.appendingPathComponent("03-Package-Manifest.json"), options: [.atomic])
@@ -163,7 +169,7 @@ enum AssessorPackageExporter {
 
         SIGNER IDENTITY
         Public-key SHA-256: \(publicKeyFingerprint)
-        Confirm this fingerprint with the package preparer through a separate trusted channel. The signing key is persistent and device-bound in the preparer's macOS Keychain; it is not a publicly trusted certificate.
+        Confirm this fingerprint with the package preparer through a separate trusted channel. The signing key is persistent and device-bound in the preparer's macOS Keychain and requires local user presence for use; it is not a publicly trusted certificate.
 
         Package ID: \(packageID)
         Manifest SHA-256: \(sha256(manifestData))

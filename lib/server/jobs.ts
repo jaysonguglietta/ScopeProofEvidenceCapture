@@ -1,5 +1,5 @@
 import type { AuthenticatedUser } from "./auth";
-import { appendAuditEvent } from "./audit";
+import { executeAuditedBatch } from "./audit";
 import { collectorConfiguration, CollectorError, runCollector, type CollectorProvider } from "./collectors";
 import { randomId } from "./crypto";
 import { getEnv } from "./env";
@@ -26,8 +26,9 @@ export async function queueCollection(collectorId: string, actor: AuthenticatedU
   const collector = await env.DB.prepare("SELECT id FROM collectors WHERE id = ? AND enabled = 1").bind(collectorId).first();
   if (!collector) throw new Error("Collector is unavailable or disabled.");
   const id = randomId("job");
-  await env.DB.prepare("INSERT INTO collection_jobs (id, collector_id, requested_by, trigger_type) VALUES (?, ?, ?, ?)").bind(id, collectorId, actor.id, triggerType).run();
-  await appendAuditEvent(actor, "collection.queued", "collection_job", id, { collectorId, triggerType });
+  await executeAuditedBatch(actor, "collection.queued", "collection_job", id, { collectorId, triggerType }, [
+    env.DB.prepare("INSERT INTO collection_jobs (id, collector_id, requested_by, trigger_type) VALUES (?, ?, ?, ?)").bind(id, collectorId, actor.id, triggerType),
+  ]);
   return id;
 }
 
@@ -39,7 +40,7 @@ export async function processJob(jobId: string, actor?: AuthenticatedUser): Prom
   if (!collector) throw new Error("Collector not found.");
   const runActor = actor || systemActor;
   const attempt = Number(job.attempt || 0) + 1;
-  await env.DB.batch([
+  await executeAuditedBatch(runActor, "collection.started", "collection_job", jobId, { collectorId: collector.id, attempt }, [
     env.DB.prepare("UPDATE collection_jobs SET status = 'running', attempt = ?, started_at = ?, error_code = NULL, error_message = NULL WHERE id = ?").bind(attempt, new Date().toISOString(), jobId),
     env.DB.prepare("UPDATE collectors SET status = 'running', updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(collector.id),
   ]);
@@ -51,22 +52,20 @@ export async function processJob(jobId: string, actor?: AuthenticatedUser): Prom
       if (!result.deduplicated) stored += 1;
     }
     const completed = new Date().toISOString();
-    await env.DB.batch([
+    await executeAuditedBatch(runActor, "collection.completed", "collection_job", jobId, { collectorId: collector.id, artifactCount: stored, attempt }, [
       env.DB.prepare("UPDATE collection_jobs SET status = 'completed', artifact_count = ?, completed_at = ? WHERE id = ?").bind(stored, completed, jobId),
       env.DB.prepare("UPDATE collectors SET status = 'healthy', last_run_at = ?, last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(completed, collector.id),
     ]);
-    await appendAuditEvent(runActor, "collection.completed", "collection_job", jobId, { collectorId: collector.id, artifactCount: stored, attempt });
     return { status: "completed", artifacts: stored };
   } catch (error) {
     const collectorError = error instanceof CollectorError ? error : new CollectorError(error instanceof Error ? error.message : "Unknown collector failure", "INTERNAL_ERROR", true);
     const maxAttempts = Number(job.max_attempts || 3);
     const retry = collectorError.retryable && attempt < maxAttempts;
     const nextAttemptAt = retry ? new Date(Date.now() + Math.min(60 * 60_000, 2 ** attempt * 60_000)).toISOString() : null;
-    await env.DB.batch([
+    await executeAuditedBatch(runActor, retry ? "collection.retry_scheduled" : "collection.failed", "collection_job", jobId, { collectorId: collector.id, attempt, code: collectorError.code, retryAt: nextAttemptAt }, [
       env.DB.prepare("UPDATE collection_jobs SET status = ?, next_attempt_at = ?, error_code = ?, error_message = ?, completed_at = ? WHERE id = ?").bind(retry ? "retrying" : "failed", nextAttemptAt, collectorError.code, collectorError.message.slice(0, 1000), retry ? null : new Date().toISOString(), jobId),
       env.DB.prepare("UPDATE collectors SET status = 'action_needed', last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(collectorError.message.slice(0, 1000), collector.id),
     ]);
-    await appendAuditEvent(runActor, retry ? "collection.retry_scheduled" : "collection.failed", "collection_job", jobId, { collectorId: collector.id, attempt, code: collectorError.code, retryAt: nextAttemptAt });
     return { status: retry ? "retrying" : "failed", artifacts: 0, error: collectorError.message };
   }
 }

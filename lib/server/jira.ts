@@ -1,5 +1,5 @@
 import { assertPermission, type AuthenticatedUser } from "./auth";
-import { appendAuditEvent } from "./audit";
+import { executeAuditedBatch } from "./audit";
 import { bytesToBase64, decryptSecret, encryptSecret, hmac, randomId, sha256, stableJson } from "./crypto";
 import { getEnv, requireEnv } from "./env";
 
@@ -191,13 +191,12 @@ export async function startJiraOAuth(actor: AuthenticatedUser, siteValue: string
   const state = base64url(crypto.getRandomValues(new Uint8Array(32)));
   const stateHash = await sha256(state);
   const expiresAt = new Date(Date.now() + 10 * 60_000).toISOString();
-  await getEnv().DB.batch([
+  await executeAuditedBatch(actor, "jira.oauth_started", "jira_connection", actor.id, { siteUrl, allowedProjects: projects }, [
     getEnv().DB.prepare("DELETE FROM jira_oauth_states WHERE user_id = ? OR expires_at < ?").bind(actor.id, new Date().toISOString()),
     getEnv().DB.prepare("INSERT INTO jira_oauth_states (state_hash, user_id, requested_site_url, allowed_projects_json, expires_at) VALUES (?, ?, ?, ?, ?)").bind(stateHash, actor.id, siteUrl, stableJson(projects), expiresAt),
   ]);
   const authorize = new URL("https://auth.atlassian.com/authorize");
   authorize.search = new URLSearchParams({ audience: "api.atlassian.com", client_id: config.clientId, scope: oauthScopes.join(" "), redirect_uri: config.callbackUrl, state, response_type: "code", prompt: "consent" }).toString();
-  await appendAuditEvent(actor, "jira.oauth_started", "jira_connection", actor.id, { siteUrl, allowedProjects: projects });
   return authorize.toString();
 }
 
@@ -206,7 +205,6 @@ export async function completeJiraOAuth(actor: AuthenticatedUser, state: string,
   const stateHash = await sha256(state);
   const pending = await getEnv().DB.prepare("SELECT state_hash, user_id, requested_site_url, allowed_projects_json, expires_at FROM jira_oauth_states WHERE state_hash = ? AND user_id = ?").bind(stateHash, actor.id).first<{ state_hash: string; user_id: string; requested_site_url: string; allowed_projects_json: string; expires_at: string }>();
   if (!pending || Date.parse(pending.expires_at) < Date.now()) throw new Error("The Jira authorization request expired or was already used.");
-  await getEnv().DB.prepare("DELETE FROM jira_oauth_states WHERE state_hash = ?").bind(stateHash).run();
   const config = oauthConfiguration();
   const token = await tokenExchange({ grant_type: "authorization_code", client_id: config.clientId, client_secret: config.clientSecret, code, redirect_uri: config.callbackUrl });
   if (!token.access_token || !token.refresh_token || !Number.isFinite(token.expires_in) || Number(token.expires_in) < 60) throw new Error("Atlassian did not return the required OAuth tokens.");
@@ -220,7 +218,7 @@ export async function completeJiraOAuth(actor: AuthenticatedUser, state: string,
   const access = await encryptSecret(token.access_token, config.tokenKey, tokenKeyName, connectionAad(id, actor.id, "access"));
   const refresh = await encryptSecret(token.refresh_token, config.tokenKey, tokenKeyName, connectionAad(id, actor.id, "refresh"));
   const expiresAt = new Date(Date.now() + Number(token.expires_in) * 1_000).toISOString();
-  await getEnv().DB.prepare(`INSERT INTO jira_connections
+  const connectionMutation = getEnv().DB.prepare(`INSERT INTO jira_connections
     (id, user_id, cloud_id, site_url, site_name, allowed_projects_json, access_token_ciphertext, access_token_iv, refresh_token_ciphertext, refresh_token_iv, access_token_expires_at, scopes, status, last_tested_at, last_error, updated_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', CURRENT_TIMESTAMP, NULL, CURRENT_TIMESTAMP)
     ON CONFLICT(user_id) DO UPDATE SET cloud_id = excluded.cloud_id, site_url = excluded.site_url, site_name = excluded.site_name,
@@ -228,8 +226,11 @@ export async function completeJiraOAuth(actor: AuthenticatedUser, state: string,
       refresh_token_ciphertext = excluded.refresh_token_ciphertext, refresh_token_iv = excluded.refresh_token_iv, access_token_expires_at = excluded.access_token_expires_at,
       scopes = excluded.scopes, status = 'active', token_version = jira_connections.token_version + 1, refresh_lease_id = NULL,
       refresh_lease_expires_at = NULL, last_tested_at = CURRENT_TIMESTAMP, last_error = NULL, updated_at = CURRENT_TIMESTAMP`)
-    .bind(id, actor.id, selected.id, normalizeJiraSite(selected.url), selected.name.slice(0, 160), pending.allowed_projects_json, access.ciphertext, access.iv, refresh.ciphertext, refresh.iv, expiresAt, String(token.scope || oauthScopes.join(" ")).slice(0, 1_000)).run();
-  await appendAuditEvent(actor, existing ? "jira.connection_reauthorized" : "jira.connection_created", "jira_connection", id, { siteUrl: pending.requested_site_url, siteName: selected.name.slice(0, 160), allowedProjects: JSON.parse(pending.allowed_projects_json) });
+    .bind(id, actor.id, selected.id, normalizeJiraSite(selected.url), selected.name.slice(0, 160), pending.allowed_projects_json, access.ciphertext, access.iv, refresh.ciphertext, refresh.iv, expiresAt, String(token.scope || oauthScopes.join(" ")).slice(0, 1_000));
+  await executeAuditedBatch(actor, existing ? "jira.connection_reauthorized" : "jira.connection_created", "jira_connection", id, { siteUrl: pending.requested_site_url, siteName: selected.name.slice(0, 160), allowedProjects: JSON.parse(pending.allowed_projects_json) }, [
+    connectionMutation,
+    getEnv().DB.prepare("DELETE FROM jira_oauth_states WHERE state_hash = ? AND user_id = ?").bind(stateHash, actor.id),
+  ]);
   return summary(await connectionRow(actor.id));
 }
 
@@ -306,16 +307,20 @@ export async function testJiraConnection(actor: AuthenticatedUser): Promise<Jira
     await markReauthorizationRequired(row, "The selected Jira site is no longer accessible.");
     throw new Response(JSON.stringify({ error: "The selected Jira Cloud site is no longer accessible. Reconnect Jira." }), { status: 409, headers: { "content-type": "application/json" } });
   }
-  await getEnv().DB.prepare("UPDATE jira_connections SET status = 'active', last_tested_at = CURRENT_TIMESTAMP, last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(row.id).run();
-  await appendAuditEvent(actor, "jira.connection_tested", "jira_connection", row.id, { siteUrl: row.site_url });
+  const testedAt = new Date().toISOString();
+  await executeAuditedBatch(actor, "jira.connection_tested", "jira_connection", row.id, { siteUrl: row.site_url }, [
+    getEnv().DB.prepare("UPDATE jira_connections SET status = 'active', last_tested_at = ?, last_error = NULL, updated_at = ? WHERE id = ?").bind(testedAt, testedAt, row.id),
+  ], { sql: "EXISTS (SELECT 1 FROM jira_connections WHERE id = ? AND last_tested_at = ?)", bindings: [row.id, testedAt] });
   return summary(await connectionRow(actor.id));
 }
 
 export async function disconnectJira(actor: AuthenticatedUser): Promise<boolean> {
   const row = await connectionRow(actor.id);
   if (!row) return false;
-  await getEnv().DB.prepare("DELETE FROM jira_connections WHERE id = ? AND user_id = ?").bind(row.id, actor.id).run();
-  await appendAuditEvent(actor, "jira.connection_deleted", "jira_connection", row.id, { siteUrl: row.site_url });
+  const [result] = await executeAuditedBatch(actor, "jira.connection_deleted", "jira_connection", row.id, { siteUrl: row.site_url }, [
+    getEnv().DB.prepare("DELETE FROM jira_connections WHERE id = ? AND user_id = ?").bind(row.id, actor.id),
+  ]);
+  if (!changed(result)) return false;
   return true;
 }
 
@@ -411,13 +416,12 @@ export async function uploadJiraEvidence(actor: AuthenticatedUser, deviceId: str
   const unsigned = { version: 1, receiptId, connectionId: row.id, userId: actor.id, deviceId, evidenceId, issueKey, siteUrl: row.site_url, uploadedAt, attachments };
   const receiptSha256 = await sha256(stableJson(unsigned));
   const signature = await hmac(receiptSha256);
-  const committed = await getEnv().DB.batch([
+  const committed = await executeAuditedBatch(actor, "jira.evidence_uploaded", "jira_upload_receipt", receiptId, { connectionId: row.id, deviceId, evidenceId, issueKey, siteUrl: row.site_url, attachmentIds: attachments.map((item) => item.id), receiptSha256 }, [
     getEnv().DB.prepare("INSERT INTO jira_upload_receipts (id, connection_id, user_id, device_id, evidence_id, issue_key, site_url, uploaded_at, attachments_json, receipt_sha256, signature) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
       .bind(receiptId, row.id, actor.id, deviceId, evidenceId, issueKey, row.site_url, uploadedAt, stableJson(attachments), receiptSha256, signature),
     getEnv().DB.prepare("UPDATE jira_upload_operations SET status = 'succeeded', receipt_id = ?, lease_id = NULL, lease_expires_at = NULL, last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND lease_id = ? AND status = 'uploading'")
       .bind(receiptId, operationId, leaseId),
   ]);
   if (committed.length !== 2 || !changed(committed[1])) throw new Error("The Jira upload receipt could not be committed atomically.");
-  await appendAuditEvent(actor, "jira.evidence_uploaded", "jira_upload_receipt", receiptId, { connectionId: row.id, deviceId, evidenceId, issueKey, siteUrl: row.site_url, attachmentIds: attachments.map((item) => item.id), receiptSha256 });
   return { receiptId, evidenceId, issueKey, siteUrl: row.site_url, uploadedAt, attachments, receiptSha256, signature };
 }
