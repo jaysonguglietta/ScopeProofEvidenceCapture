@@ -4,7 +4,9 @@
 final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
     private var window: NSWindow?
     private var evidenceRoot: URL?
+    private var serverURL: URL?
     private var jiraSettings: JiraHandoffSettings = .defaults
+    private let jiraCloudService = JiraCloudService()
     private var allEntries: [CaptureHistoryEntry] = []
     private var filteredEntries: [CaptureHistoryEntry] = []
     private let frameworkPopup = NSPopUpButton()
@@ -19,11 +21,13 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
     private let revealButton = NSButton(title: "Reveal in Finder", target: nil, action: nil)
     private let reviewButton = NSButton(title: "Review Status…", target: nil, action: nil)
     private let jiraButton = NSButton(title: "Copy Jira Comment", target: nil, action: nil)
+    private let jiraUploadButton = NSButton(title: "Upload to Jira Cloud…", target: nil, action: nil)
     private let detailsLabel = NSTextField(wrappingLabelWithString: "")
 
-    func show(evidenceRoot: URL, jiraSettings: JiraHandoffSettings = .defaults) {
+    func show(evidenceRoot: URL, jiraSettings: JiraHandoffSettings = .defaults, serverURL: URL? = nil) {
         self.evidenceRoot = evidenceRoot
         self.jiraSettings = jiraSettings
+        self.serverURL = serverURL
         allEntries = CaptureHistory.entries(in: evidenceRoot)
         if window == nil { buildWindow() }
         populateFrameworks()
@@ -126,11 +130,15 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
         jiraButton.action = #selector(copyJiraComment)
         jiraButton.bezelStyle = .rounded
         jiraButton.toolTip = "Copy a ticket-ready summary and attachment checklist"
+        jiraUploadButton.target = self
+        jiraUploadButton.action = #selector(uploadToJiraCloud)
+        jiraUploadButton.bezelStyle = .rounded
+        jiraUploadButton.toolTip = "Upload a hash-verified Approved evidence set through the connected Scopeproof backend"
         detailsLabel.textColor = .secondaryLabelColor
         detailsLabel.font = .systemFont(ofSize: 11)
         detailsLabel.maximumNumberOfLines = 2
         let spacer = NSView()
-        let actions = NSStackView(views: [statusLabel, spacer, jiraButton, reviewButton, revealButton, openButton])
+        let actions = NSStackView(views: [statusLabel, spacer, jiraUploadButton, jiraButton, reviewButton, revealButton, openButton])
         actions.orientation = .horizontal
         actions.alignment = .centerY
         actions.spacing = 9
@@ -267,6 +275,7 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
         revealButton.isEnabled = hasSelection
         reviewButton.isEnabled = hasSelection
         jiraButton.isEnabled = hasSelection
+        jiraUploadButton.isEnabled = hasSelection && selectedEntry?.lifecycle.status == .approved && selectedEntry?.manifest.jiraIssueKey?.isEmpty == false
         statusLabel.stringValue = filteredEntries.isEmpty ? "No screenshots match these filters." : "\(filteredEntries.count) screenshot\(filteredEntries.count == 1 ? "" : "s") found"
         if let entry = selectedEntry {
             let lifecycle = entry.lifecycle
@@ -289,6 +298,35 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(JiraHandoff.comment(for: entry, settings: jiraSettings), forType: .string)
         statusLabel.stringValue = "Jira comment copied for \(entry.manifest.jiraIssueKey ?? entry.manifest.evidenceID). Attach only the listed reviewed files."
+    }
+
+    @objc private func uploadToJiraCloud() {
+        guard let entry = selectedEntry, entry.lifecycle.status == .approved, EvidenceLifecycleStore.verify(entry.lifecycle), let issueKey = entry.manifest.jiraIssueKey, !issueKey.isEmpty else {
+            let alert = NSAlert(); alert.alertStyle = .warning; alert.messageText = "Approved Jira-linked evidence required"; alert.informativeText = "Assign a Jira issue, mark the evidence Approved with a rationale, and resolve any lifecycle integrity error before upload."; alert.runModal(); return
+        }
+        statusLabel.stringValue = "Checking Jira Cloud issue \(issueKey)…"
+        jiraUploadButton.isEnabled = false
+        Task {
+            do {
+                let connection = try await jiraCloudService.connection(serverURL: serverURL)
+                guard connection.connected else { throw JiraCloudFailure.rejected("Jira Cloud is not connected for this Scopeproof account. Open Scopeproof web → Connections and authorize it first.") }
+                let issue = try await jiraCloudService.issue(issueKey, serverURL: serverURL)
+                let confirmation = NSAlert()
+                confirmation.alertStyle = .warning
+                confirmation.messageText = "Upload approved evidence to \(issue.key)?"
+                confirmation.informativeText = "Site: \(connection.siteName ?? connection.siteURL ?? "Jira Cloud")\n\(issue.summary)\nStatus: \(issue.status)\n\nScopeproof will require the exact hosted artifact to have authenticated reviewer approval, then attach the redacted PNG, immutable manifest, Approved lifecycle record, and server receipt when available. This disclosure is recorded in the audit chain and cannot be undone from Scopeproof."
+                confirmation.addButton(withTitle: "Upload to Jira Cloud")
+                confirmation.addButton(withTitle: "Cancel")
+                guard confirmation.runModal() == .alertFirstButtonReturn else { updateSelectionState(); return }
+                statusLabel.stringValue = "Uploading \(entry.manifest.evidenceID) to \(issue.key)…"
+                let receiptURL = try await jiraCloudService.upload(entry: entry, serverURL: serverURL)
+                statusLabel.stringValue = "Uploaded to \(issue.key). Signed receipt saved as \(receiptURL.lastPathComponent)."
+            } catch {
+                let failure = NSAlert(); failure.alertStyle = .warning; failure.messageText = "Jira Cloud upload failed"; failure.informativeText = error.localizedDescription; failure.runModal()
+                statusLabel.stringValue = "Jira Cloud upload failed. No successful receipt was recorded."
+            }
+            updateSelectionState()
+        }
     }
 
     @objc private func reviewSelected() {

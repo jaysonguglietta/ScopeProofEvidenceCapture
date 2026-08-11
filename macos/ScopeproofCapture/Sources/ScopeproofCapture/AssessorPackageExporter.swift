@@ -46,7 +46,7 @@ enum AssessorPackageExporter {
                 .appendingPathComponent(framework.folderName, isDirectory: true)
                 .appendingPathComponent(ComplianceCatalog.safePathComponent(entry.manifest.controlID), isDirectory: true)
             try fileManager.createDirectory(at: evidenceFolder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-            let files = [entry.imageURL, entry.manifestURL, EvidenceLifecycleStore.url(for: entry.manifestURL), entry.receiptURL]
+            let files = [entry.imageURL, entry.manifestURL, EvidenceLifecycleStore.url(for: entry.manifestURL), entry.receiptURL, entry.jiraReceiptURL]
                 .filter { fileManager.fileExists(atPath: $0.path) }
             var packagedFiles: [[String: String]] = []
             for source in files {

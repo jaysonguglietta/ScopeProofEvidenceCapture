@@ -4,6 +4,18 @@ Scopeproof Capture 1.3.1 is a local menu-bar companion for producing timestamped
 
 Related guides: [operator workflow](../../docs/OPERATOR_GUIDE.md), [Jira handoff](../../docs/JIRA_HANDOFF.md), [assessor verification](../../docs/ASSESSOR_GUIDE.md), and [security model](../../docs/SECURITY.md).
 
+## Run locally
+
+Requirements: macOS 14 or newer and Apple’s Swift toolchain. From the repository root, run:
+
+```bash
+./Scripts/run_macos_capture.sh
+```
+
+This single command builds the app, installs it in `~/Applications`, and launches it without requiring an administrator password. Look for the shield in the menu bar.
+
+When you make the first capture, allow **Scopeproof Capture** under **System Settings → Privacy & Security → Screen & System Audio Recording**. Quit and reopen the app once after granting access. If Swift is unavailable, run `xcode-select --install`, finish the installation, and retry the command.
+
 ## Capture workflow
 
 1. Launch the app and select the shield icon in the macOS menu bar.
@@ -20,11 +32,11 @@ Use **Export Assessor Package…** after review. The exporter includes only Appr
 
 ## Jira handoff
 
-1. Open **Capture & Jira Settings…** and enter the Jira HTTPS site, default project key, preferred attachment set, and any internal handling steps. Scopeproof stores no Jira username, API token, or session.
-2. Enter a destination key such as `GRC-123` during capture. It becomes part of the banner, filename, immutable manifest, Search Evidence result, hosted metadata, and package index.
-3. Review and approve the artifact. In **Search Evidence…**, select it and choose **Copy Jira Comment**. Paste the generated summary, SHA-256, and attachment checklist into the intended ticket.
-4. Attach either the complete evidence set (PNG, `.json`, `.review.json`, and `.receipt.json` when available) or the approved assessor ZIP together with its separate `.sha256.txt` file.
-5. Download the attachment from Jira and verify the hash. Confirm project permissions, external-auditor access, data classification, and retention first. Never attach an unredacted source screenshot, credentials, cookies, access tokens, private keys, or PAN.
+1. In the Scopeproof web console, open **Connections → Jira Cloud**, enter the Jira Cloud site and allowed project keys, then authorize the site through Atlassian OAuth and test the connection. OAuth tokens remain encrypted on the hosted server and never enter the Mac app.
+2. Open **Capture & Jira Settings…** on the Mac and enter the Jira HTTPS site, default project key, preferred attachment set, and any internal handling steps. These are handoff defaults, not credentials.
+3. Enter a destination key such as `GRC-123` during capture. It becomes part of the banner, filename, immutable manifest, Search Evidence result, hosted metadata, and package index.
+4. Review and approve the artifact locally, upload those exact bytes to Scopeproof, and have an authenticated web reviewer approve the hosted artifact. In **Search Evidence…**, choose **Upload to Jira Cloud…**, inspect the live issue summary, and explicitly confirm the upload. Scopeproof verifies both approvals, the PNG hash, safety state, lifecycle chain, site, project allowlist, and Jira permissions before attaching the evidence set.
+5. Keep the signed `.jira.json` receipt beside the evidence. **Copy Jira Comment** and manual attachment remain available as a fallback. Confirm project permissions, external-auditor access, data classification, and retention first.
 
 The app never captures on a timer or in the background without an explicit menu action. OCR runs on the Mac and recognized text is not retained. Device credentials are stored in the macOS Keychain, not preferences or screenshot metadata.
 
@@ -35,13 +47,13 @@ The app never captures on a timer or in the background without an explicit menu 
 3. In the menu-bar app, open **Capture & Jira Settings**, enter the HTTPS Scopeproof URL, paste the token, and optionally enable automatic upload.
 4. Use **Retry Pending Uploads** after an offline capture. Tokens can be revoked from the web app at any time.
 
-The hosted API verifies the PNG digest and manifest safety state before accepting an upload, encrypts accepted evidence with AES-256-GCM in R2, and records device identity plus chain-of-custody metadata in the append-only audit trail.
+The app signs the exact manifest and PNG digests with its enrolled device credential. The hosted API rejects unsigned, mismatched, ambiguous, malformed, oversized, or polyglot uploads; derives evidence metadata only from the versioned manifest; labels local scanning as a client claim; encrypts accepted evidence with AES-256-GCM in R2; and records device identity plus chain-of-custody metadata in the append-only audit trail. Servers containing this protocol require the matching app release; older clients that send independent multipart metadata are intentionally rejected.
 
 ## Help and operations
 
 Choose **Help & How to Use…** from the menu for an in-app quick start, assessor handoff checklist, evidence-file explanation, permission recovery, security model, and troubleshooting guidance. The menu also provides capture presets, catalog import, recent captures, the evidence folder, configurable retention, Launch at Login, permission status, and secure update checks.
 
-## Build
+## Build only
 
 From the repository root:
 
@@ -49,7 +61,7 @@ From the repository root:
 ./Scripts/build_macos_capture.sh
 ```
 
-The signed local app is created at `DerivedData/Scopeproof Capture.app`.
+The signed local app is created at `DerivedData/Scopeproof Capture.app`, but it is not installed or launched. Use `./Scripts/run_macos_capture.sh` for the one-command local workflow.
 
 The local build uses an explicit designated requirement tied to `com.scopeproof.capture`. This keeps the app's Screen Recording permission identity stable across local rebuilds.
 

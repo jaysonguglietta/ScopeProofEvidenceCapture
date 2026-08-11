@@ -21,6 +21,18 @@ The repository contains two coordinated products:
 
 The native-specific build and usage reference remains in [macos/ScopeproofCapture/README.md](macos/ScopeproofCapture/README.md). The macOS application also includes **Help & How to Use…** in its shield menu.
 
+## Run the local Mac app
+
+On macOS 14 or newer, run this from the repository root:
+
+```bash
+./Scripts/run_macos_capture.sh
+```
+
+The command builds Scopeproof Capture, installs it in your personal `~/Applications` folder, and launches it. It does not require an administrator password. Look for the shield in the menu bar.
+
+The first time you capture, macOS may ask for Screen Recording access. Allow **Scopeproof Capture** under **System Settings → Privacy & Security → Screen & System Audio Recording**, then quit and reopen the app. If the command reports that Swift is missing, run `xcode-select --install`, complete Apple’s installer, and run the command again.
+
 ## Security architecture
 
 - Authentication uses the private Sites identity headers. API routes reject anonymous requests.
@@ -29,7 +41,7 @@ The native-specific build and usage reference remains in [macos/ScopeproofCaptur
 - Audit events are hash-chained, HMAC-authenticated, and protected from update/delete by SQLite triggers.
 - Assessor ZIPs embed approved artifacts, a PDF index, SHA-256 hashes, and an ECDSA P-256 signed manifest with its public verification key.
 - Mutating routes enforce same-origin requests. Worker responses add CSP, HSTS, no-sniff, referrer, and permissions headers.
-- Revocable Mac device tokens are stored as SHA-256 hashes server-side. Native uploads must carry a reviewed safety state and matching PNG digest.
+- Revocable Mac device tokens are stored as SHA-256 hashes server-side. Native uploads use a device-token HMAC over the exact manifest and PNG digests; the server derives metadata from the signed manifest and strictly decodes the PNG before storage.
 
 ## Provider evidence
 
@@ -45,11 +57,11 @@ Collectors run on demand and from a 15-minute scheduler. Transient failures retr
 
 The menu-bar app in `macos/ScopeproofCapture` captures a user-selected browser window or display through ScreenCaptureKit. Each capture is classified against PCI DSS, HIPAA, FedRAMP/NIST, SOC 2, ISO 27001, an imported OSCAL/JSON/CSV catalog, or a custom framework; runs local Vision OCR; masks detected PANs and credentials; supports irreversible drag-to-redact review; adds a full-width date/time/framework/control header above the captured pixels; and requires explicit approval before saving. Capture presets, evidence owner/tags, expected-evidence guidance, catalog versions, and curated cross-framework mappings reduce classification drift.
 
-The PNG is paired with an immutable JSON manifest containing its SHA-256 digest and local chain-of-custody hashes. Review decisions are stored separately in a hash-chained lifecycle sidecar with Draft, In Review, Approved, Rejected, and Superseded states. An optional Jira issue key is carried into the filename, visible banner, manifest, search, hosted metadata, and package index. Search supports thumbnails plus framework, control, Jira issue, status, date, system, owner, tag, and keyword discovery, and can copy a ticket-ready Jira comment with the approved attachment checklist and integrity hash. Enrolled devices can upload reviewed evidence directly; the server validates the manifest and image, preserves framework and assessor metadata, encrypts the artifact, records an immutable audit event, and returns a signed server-time receipt. Configure `RFC3161_TSA_URL` to include an external timestamp-authority token.
+The PNG is paired with an immutable JSON manifest containing its SHA-256 digest and local chain-of-custody hashes. Review decisions are stored separately in a hash-chained lifecycle sidecar with Draft, In Review, Approved, Rejected, and Superseded states. An optional Jira issue key is carried into the filename, visible banner, manifest, search, hosted metadata, and package index. Search supports thumbnails plus framework, control, Jira issue, status, date, system, owner, tag, and keyword discovery, and can copy a ticket-ready Jira comment with the approved attachment checklist and integrity hash. Enrolled devices can upload reviewed evidence directly; the client authenticates the exact manifest/image pair, and the server rejects alternate multipart metadata, malformed/polyglot PNGs, dimension mismatches, broken capture-chain hashes, and unknown manifest schemas before preserving metadata or bytes. Configure `RFC3161_TSA_URL` to include an external timestamp-authority token.
 
 The Mac app can build a local approved-only assessor ZIP filtered by framework and assessment period. It revalidates artifact hashes and review chains, organizes content by framework/control, and embeds a Read Me, CSV index, Jira handoff guide, ECDSA-signed manifest, verification instructions, capture manifests, lifecycle records, and server receipts. Hosted packages use the same framework-aware organization and also include a PDF index.
 
-**Capture & Jira Settings…** stores only routing and procedure metadata: Jira HTTPS site, default project key, preferred attachment set, and organization-specific instructions. Scopeproof does not store Jira credentials or upload evidence automatically. Operators approve the artifact, use **Search Evidence… → Copy Jira Comment**, attach the full evidence set or signed ZIP/checksum to the authorized ticket, then download and verify SHA-256. Jira project permissions, data classification, external-auditor access, and retention must be approved before evidence is attached.
+Jira Cloud uses hosted OAuth 2.0 authorization-code flow with rotating refresh tokens. OAuth tokens are encrypted under a Jira-specific key and never enter the Mac app; user-bound state, fixed Atlassian API hosts, site matching, project allowlists, and optimistic refresh leases constrain the connection. Operators connect Jira under **Connections**, approve an artifact locally, upload those exact bytes to Scopeproof, obtain hosted reviewer approval, and explicitly choose **Search Evidence… → Upload to Jira Cloud…**. The server revalidates both approvals, the issue, allowlist, PNG hash, safety state, and lifecycle chain before reserving an idempotent attachment operation and recording a signed immutable receipt. Ambiguous Jira outcomes stop for reconciliation instead of blindly retrying. **Copy Jira Comment** and manual attachment remain available as a fallback; uploads never run automatically.
 
 The app includes **Help & How to Use…**, recent capture history, offline retry, configurable retention, Launch at Login, Screen Recording recovery, and secure release checks.
 
@@ -68,6 +80,8 @@ Provider-specific values are documented in `.env.example`. Use read-only, least-
 
 Native release values are `MACOS_LATEST_VERSION`, `MACOS_RELEASE_URL`, `MACOS_RELEASE_SHA256`, and `MACOS_RELEASE_NOTES`. `RFC3161_TSA_URL` is optional. Device enrollment and revocation are managed in **Connections → Mac capture devices**.
 
+Jira Cloud requires `JIRA_OAUTH_CLIENT_ID`, `JIRA_OAUTH_CLIENT_SECRET`, an exact `JIRA_OAUTH_CALLBACK_URL`, and a distinct base64-encoded 32-byte `JIRA_OAUTH_TOKEN_ENCRYPTION_KEY`. Create one OAuth 2.0 (3LO) integration in the Atlassian developer console with `read:jira-work` and `write:jira-work`; Scopeproof requests `offline_access` for rotating refresh tokens.
+
 ## Development
 
 ```bash
@@ -85,7 +99,7 @@ npm test
 
 Apply all D1 migrations in order from `drizzle/`. D1 and R2 logical bindings are declared in `.openai/hosting.json` and provisioned by Sites.
 
-Build the local menu-bar app with:
+To build the local menu-bar app without installing or launching it, use:
 
 ```bash
 ./Scripts/build_macos_capture.sh

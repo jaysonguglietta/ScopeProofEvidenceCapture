@@ -25,6 +25,10 @@ export interface ScopeproofEnv {
   MACOS_RELEASE_SHA256?: string;
   MACOS_RELEASE_NOTES?: string;
   RFC3161_TSA_URL?: string;
+  JIRA_OAUTH_CLIENT_ID?: string;
+  JIRA_OAUTH_CLIENT_SECRET?: string;
+  JIRA_OAUTH_CALLBACK_URL?: string;
+  JIRA_OAUTH_TOKEN_ENCRYPTION_KEY?: string;
 }
 
 export function getEnv(): ScopeproofEnv {

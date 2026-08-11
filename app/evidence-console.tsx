@@ -29,6 +29,7 @@ const sources = [
 type ApiCollector = { id: string; provider: string; display_name: string; enabled: number; schedule_cron: string | null; status: string; last_run_at: string | null; last_error: string | null; configuration: { configured: boolean; missing: string[] } };
 type ApiUser = { id: string; email: string; displayName: string; role: string };
 type ApiDevice = { id: string; display_name: string; platform: string; status: string; app_version: string | null; last_seen_at: string | null; created_at: string; revoked_at: string | null };
+type ApiJiraConnection = { connected: boolean; configured: boolean; id?: string; siteUrl?: string; siteName?: string; allowedProjects?: string[]; status?: "active" | "reauthorization_required"; lastTestedAt?: string | null; updatedAt?: string };
 
 function cls(...values: Array<string | false | null | undefined>) {
   return values.filter(Boolean).join(" ");
@@ -117,6 +118,7 @@ export function EvidenceConsole() {
   const [collectorItems, setCollectorItems] = useState<ApiCollector[]>([]);
   const [deviceItems, setDeviceItems] = useState<ApiDevice[]>([]);
   const [deviceToken, setDeviceToken] = useState<string | null>(null);
+  const [jiraConnection, setJiraConnection] = useState<ApiJiraConnection | null>(null);
   const [currentUser, setCurrentUser] = useState<ApiUser | null>(null);
   const [auditIntegrity, setAuditIntegrity] = useState<{ valid: boolean; checked: number } | null>(null);
   const [backendState, setBackendState] = useState<"loading" | "live" | "unavailable">("loading");
@@ -139,6 +141,10 @@ export function EvidenceConsole() {
         setAuditIntegrity(auditData?.integrity || null);
         const deviceResponse = await fetch("/api/devices");
         if (deviceResponse.ok) setDeviceItems(((await deviceResponse.json()) as { devices: ApiDevice[] }).devices);
+        if (["reviewer", "compliance_lead", "admin"].includes(me.user.role)) {
+          const jiraResponse = await fetch("/api/jira/connection");
+          if (jiraResponse.ok) setJiraConnection(((await jiraResponse.json()) as { connection: ApiJiraConnection }).connection);
+        }
         setBackendState("live");
       } catch {
         if (!cancelled) setBackendState("unavailable");
@@ -146,6 +152,19 @@ export function EvidenceConsole() {
     };
     void load();
     return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    const query = new URLSearchParams(window.location.search);
+    const jira = query.get("jira");
+    if (!jira) return;
+    window.history.replaceState({}, "", window.location.pathname);
+    const timer = window.setTimeout(() => {
+      setView("Connections");
+      if (jira === "connected") setToast("Jira Cloud connected. Test the connection before sending evidence.");
+      else setToast(query.get("reason") === "consent_denied" ? "Jira Cloud authorization was cancelled." : "Jira Cloud could not be connected. Review the OAuth configuration and try again.");
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, []);
 
   useEffect(() => {
@@ -260,6 +279,42 @@ export function EvidenceConsole() {
     finally { setBusy(false); }
   }
 
+  async function connectJira(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const siteUrl = String(form.get("siteUrl") || "").trim();
+    const allowedProjects = String(form.get("allowedProjects") || "").split(/[\s,]+/).map((value) => value.trim()).filter(Boolean);
+    setBusy(true);
+    try {
+      const response = await fetch("/api/jira/oauth/start", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ siteUrl, allowedProjects }) });
+      if (!response.ok) throw new Error(await apiError(response));
+      const data = await response.json() as { authorizeUrl: string };
+      window.location.assign(data.authorizeUrl);
+    } catch (error) { setToast(error instanceof Error ? error.message : "Jira Cloud authorization could not start."); setBusy(false); }
+  }
+
+  async function testJira() {
+    setBusy(true);
+    try {
+      const response = await fetch("/api/jira/connection", { method: "POST" });
+      if (!response.ok) throw new Error(await apiError(response));
+      const data = await response.json() as { connection: ApiJiraConnection };
+      setJiraConnection(data.connection); setToast(`Connected to ${data.connection.siteName || "Jira Cloud"}.`);
+    } catch (error) { setToast(error instanceof Error ? error.message : "Jira Cloud connection test failed."); }
+    finally { setBusy(false); }
+  }
+
+  async function disconnectJiraConnection() {
+    if (!window.confirm("Disconnect Jira Cloud? Scopeproof will delete the encrypted OAuth tokens. Existing Jira attachments and audit receipts are not removed.")) return;
+    setBusy(true);
+    try {
+      const response = await fetch("/api/jira/connection", { method: "DELETE" });
+      if (!response.ok) throw new Error(await apiError(response));
+      setJiraConnection({ connected: false, configured: true }); setToast("Jira Cloud disconnected and its stored OAuth tokens were deleted.");
+    } catch (error) { setToast(error instanceof Error ? error.message : "Jira Cloud could not be disconnected."); }
+    finally { setBusy(false); }
+  }
+
   return (
     <div className="app-shell">
       <a className="skip-link" href="#main-content">Skip to content</a>
@@ -295,7 +350,7 @@ export function EvidenceConsole() {
           {view === "Evidence" && <EvidenceView items={filteredEvidence} search={search} setSearch={setSearch} status={statusFilter} setStatus={setStatusFilter} type={typeFilter} setType={setTypeFilter} onSelect={setSelectedEvidence} onAdd={() => setModal("add")} />}
           {view === "Collection runs" && <RunsView items={runItems} onRun={() => setModal("run")} onToast={setToast} />}
           {view === "Findings" && <FindingsView />}
-          {view === "Connections" && <ConnectionsView collectors={collectorItems} devices={deviceItems} onEnroll={() => { setDeviceToken(null); setModal("device"); }} onRevoke={revokeDevice} onToast={setToast} />}
+          {view === "Connections" && <ConnectionsView collectors={collectorItems} devices={deviceItems} jira={jiraConnection} canManageJira={["reviewer", "compliance_lead", "admin"].includes(currentUser?.role || "")} busy={busy} onConnectJira={connectJira} onTestJira={testJira} onDisconnectJira={disconnectJiraConnection} onEnroll={() => { setDeviceToken(null); setModal("device"); }} onRevoke={revokeDevice} onToast={setToast} />}
           {view === "Settings" && <SettingsView redaction={redaction} setRedaction={setRedaction} notifications={notifications} setNotifications={setNotifications} auditIntegrity={auditIntegrity} role={currentUser?.role || "auditor"} onToast={setToast} />}
           {view === "Help" && <HelpView onNavigate={navigate} />}
         </section>
@@ -377,7 +432,7 @@ function FindingsView() {
   </>;
 }
 
-function ConnectionsView({ collectors, devices, onEnroll, onRevoke, onToast }: { collectors: ApiCollector[]; devices: ApiDevice[]; onEnroll: () => void; onRevoke: (id: string) => void; onToast: (message: string) => void }) {
+function ConnectionsView({ collectors, devices, jira, canManageJira, busy, onConnectJira, onTestJira, onDisconnectJira, onEnroll, onRevoke, onToast }: { collectors: ApiCollector[]; devices: ApiDevice[]; jira: ApiJiraConnection | null; canManageJira: boolean; busy: boolean; onConnectJira: (event: React.FormEvent<HTMLFormElement>) => void; onTestJira: () => void; onDisconnectJira: () => void; onEnroll: () => void; onRevoke: (id: string) => void; onToast: (message: string) => void }) {
   const cards = sources.map((source) => {
     const collector = collectors.find((item) => item.id === source.id);
     return { ...source, status: collector?.configuration.configured ? titleCase(collector.status) : "Not configured", detail: collector?.configuration.configured ? source.detail : `Missing ${collector?.configuration.missing.join(", ") || "hosted secrets"}`, lastRun: collector?.last_run_at ? formatDate(collector.last_run_at) : "Never", error: collector?.last_error };
@@ -386,6 +441,9 @@ function ConnectionsView({ collectors, devices, onEnroll, onRevoke, onToast }: {
   return <><PageTitle eyebrow="Data sources" title="Connections" description="Manage the systems Scopeproof uses to collect trustworthy compliance evidence." actions={<button className="button primary" onClick={() => onToast("Add provider credentials as encrypted hosted environment variables; they are never stored in the application database.")}>＋ Configure source</button>} />
     {attention.length > 0 && <div className="connection-alert"><span>!</span><div><strong>{attention.length} collector{attention.length === 1 ? "" : "s"} need configuration</strong><p>Provider credentials are missing or the latest live API call failed. Scheduled collection remains paused for affected sources.</p></div><button onClick={() => onToast("Open hosted environment settings to add the missing secret values from .env.example.")}>Configuration guide</button></div>}
     <div className="connections-grid">{cards.map((source) => <article className="connection-card" key={source.name}><div className="connection-head"><span>{source.mark}</span><button aria-label={`Options for ${source.name}`} onClick={() => onToast(`${source.name} runs ${collectors.find((item) => item.id === source.id)?.schedule_cron || "without a schedule"} in UTC.`)}>•••</button></div><h3>{source.name}</h3><p>{source.detail}</p><StatusPill status={source.status} /><div><span>Last successful run</span><b>{source.lastRun}</b></div><button onClick={() => onToast(source.status === "Healthy" ? `${source.name} is configured. Use Run collection to execute a live test.` : `${source.name}: ${source.error || source.detail}`)}>Inspect configuration</button></article>)}</div>
+    <section className="panel jira-cloud-panel"><div className="panel-head"><div><h2>Jira Cloud</h2><p>OAuth connection used by enrolled Macs for explicit, approved evidence uploads</p></div>{jira?.connected ? <StatusPill status="Connected" /> : jira?.status === "reauthorization_required" ? <StatusPill status="Action needed" /> : <StatusPill status="Not connected" />}</div>
+      {!canManageJira ? <div className="jira-access-note"><strong>Reviewer access required</strong><p>An administrator, compliance lead, or reviewer must connect Jira Cloud. Auditors retain read-only access.</p></div> : jira?.connected ? <div className="jira-connected"><div className="jira-site-mark">JI</div><div><strong>{jira.siteName}</strong><a href={jira.siteUrl} target="_blank" rel="noreferrer">{jira.siteUrl} ↗</a><small>Allowed projects: {jira.allowedProjects?.join(", ") || "None"} · {jira.lastTestedAt ? `Tested ${formatDate(jira.lastTestedAt)}` : "Not tested yet"}</small></div><div className="jira-actions"><button className="button secondary" disabled={busy} onClick={onTestJira}>{busy ? "Testing…" : "Test connection"}</button><button className="button secondary danger" disabled={busy} onClick={onDisconnectJira}>Disconnect</button></div></div> : <form className="jira-connect-form" onSubmit={onConnectJira}><label className="field"><span>Jira Cloud site URL</span><input name="siteUrl" type="url" required defaultValue={jira?.siteUrl || ""} placeholder="https://your-company.atlassian.net" autoComplete="url" /></label><label className="field"><span>Allowed project keys</span><input name="allowedProjects" required defaultValue={jira?.allowedProjects?.join(", ") || ""} placeholder="GRC, PCI" autoCapitalize="characters" /><small>Only these projects may receive evidence from Scopeproof.</small></label><div className="jira-connect-copy"><strong>Secure OAuth connection</strong><p>You will continue to Atlassian to choose the site and approve access. Scopeproof stores encrypted rotating tokens in the hosted service; Jira credentials never enter the Mac app.</p></div><button className="button primary" disabled={busy || jira?.configured === false}>{busy ? "Preparing Atlassian authorization…" : "Connect Jira Cloud"}</button>{jira?.configured === false && <p className="field-error">A platform administrator must configure the four JIRA_OAUTH_* hosted secrets first.</p>}</form>}
+    </section>
     <section className="panel device-panel"><div className="panel-head"><div><h2>Mac capture devices</h2><p>Revocable device identities for locally reviewed screenshot uploads</p></div><button className="button primary" onClick={onEnroll}>＋ Enroll Mac</button></div>
       {devices.length ? <div className="device-list">{devices.map((device) => <div className="device-row" key={device.id}><span className="device-icon">⌘</span><div><strong>{device.display_name}</strong><small>{device.platform} · {device.app_version ? `v${device.app_version}` : "Not connected yet"} · {device.last_seen_at ? `Seen ${formatDate(device.last_seen_at)}` : "Awaiting first upload"}</small></div><StatusPill status={titleCase(device.status)} /><button className="button secondary" disabled={device.status === "revoked"} onClick={() => onRevoke(device.id)}>{device.status === "revoked" ? "Revoked" : "Revoke"}</button></div>)}</div> : <EmptyState message="No Mac capture devices are enrolled. Create a one-time token, then paste it into Scopeproof Capture & Jira Settings." action="Enroll first Mac" onAction={onEnroll} />}
     </section>
@@ -406,7 +464,7 @@ function HelpView({ onNavigate }: { onNavigate: (view: View) => void }) {
     </section>
     <div className="help-grid">
       <section className="panel help-panel"><h2>Mac screenshot quick start</h2><ol><li>Open <strong>Connections</strong>, enroll a Mac, and copy the one-time token.</li><li>In the Scopeproof shield menu, open <strong>Capture & Jira Settings</strong>; enter this workspace’s HTTPS URL and token.</li><li>Select PCI DSS, HIPAA, FedRAMP, SOC 2, ISO 27001, or an imported catalog; then choose the control, system, owner, period, evidence title, and optional Jira issue.</li><li>Select an exact window. Scopeproof runs local OCR, masks PANs and credentials, lets you add manual redactions, stamps the image, and shows a preview.</li><li>Use <strong>Search Evidence</strong> on the Mac to tag, review, approve, and copy a Jira-ready comment before building an assessor package.</li></ol><button className="button secondary" onClick={() => onNavigate('Connections')}>Manage capture devices</button></section>
-      <section className="panel help-panel"><h2>Jira evidence handoff</h2><ol><li>Configure the Jira HTTPS site, project key, attachment set, and internal handling instructions in the Mac app. No Jira credentials are stored.</li><li>Assign the destination issue key during capture; it flows into the banner, filename, manifest, search, and package index.</li><li>Approve the evidence, then use <strong>Copy Jira Comment</strong> in Mac Search Evidence and paste it into the intended ticket.</li><li>Attach the complete reviewed evidence set or the signed assessor ZIP with its separate checksum. Download from Jira and verify SHA-256 afterward.</li></ol><p>Confirm ticket permissions, auditor access, classification, and retention before attaching evidence. Never upload an unredacted source image, token, password, private key, or PAN.</p></section>
+      <section className="panel help-panel"><h2>Jira Cloud evidence handoff</h2><ol><li>Open <strong>Connections → Jira Cloud</strong>, enter the site and allowed projects, then authorize Scopeproof through Atlassian OAuth.</li><li>Assign the destination issue key during capture; it flows into the banner, filename, manifest, search, and package index.</li><li>Approve the evidence locally, upload those exact bytes to Scopeproof, and have an authenticated web reviewer approve the hosted artifact.</li><li>Select it in <strong>Search Evidence</strong> and explicitly choose <strong>Upload to Jira Cloud</strong>. Scopeproof verifies both approvals, the issue, project allowlist, PNG hash, redaction status, and lifecycle chain before sending the complete evidence set and recording a signed receipt.</li></ol><p>The manual Copy Jira Comment workflow remains available. Confirm ticket permissions, classification, and retention before disclosure.</p></section>
       <section className="panel help-panel"><h2>What proves integrity</h2><dl><div><dt>Visible stamp</dt><dd>Local date, time, timezone, control, system, environment, period, and evidence ID.</dd></div><div><dt>Local manifest</dt><dd>PNG SHA-256, source metadata, redaction counts, and previous/current chain hashes.</dd></div><div><dt>Server receipt</dt><dd>Signed server time, device identity, audit event, and optional RFC 3161 timestamp token.</dd></div><div><dt>Assessor package</dt><dd>ECDSA-signed manifest, public key, independent hashes, embedded evidence, and PDF index.</dd></div></dl></section>
       <section className="panel help-panel"><h2>Safety & privacy</h2><ul><li>Captured OCR text is processed on the Mac and is not retained.</li><li>Device tokens are shown once, hashed server-side, stored in Keychain, and revocable.</li><li>Artifacts are encrypted with AES-256-GCM before R2 persistence.</li><li>Every material action is written to a tamper-evident, append-only audit chain.</li><li>Scopeproof never captures the screen without an explicit menu action.</li></ul></section>
       <section className="panel help-panel"><h2>Troubleshooting</h2><dl><div><dt>Capture permission fails</dt><dd>Open the shield menu → Screen Recording Settings, enable Scopeproof Capture, then fully quit and reopen it.</dd></div><div><dt>Upload is pending</dt><dd>Confirm the HTTPS server URL and active device token, then choose Retry Pending Uploads.</dd></div><div><dt>A collector is paused</dt><dd>Open Connections and inspect its missing hosted secret or most recent provider error.</dd></div><div><dt>Evidence was blocked</dt><dd>Remove cardholder data or credentials from the source and collect again; unsafe automated captures are not stored.</dd></div></dl></section>

@@ -65,6 +65,19 @@ Review role assignments regularly. Use separate named accounts; do not share adm
 
 The development build is ad-hoc signed with a stable designated requirement for `com.scopeproof.capture`; it is not a notarized production release.
 
+## Jira Cloud OAuth deployment
+
+1. In the [Atlassian developer console](https://developer.atlassian.com/console/myapps/), create one OAuth 2.0 (3LO) integration for this Scopeproof deployment.
+2. Add the Jira Cloud API and grant `read:jira-work` and `write:jira-work`. Scopeproof requests `offline_access` so it can use rotating refresh tokens.
+3. Set the callback exactly to `https://<scopeproof-host>/api/jira/oauth/callback` in Atlassian and in `JIRA_OAUTH_CALLBACK_URL`.
+4. Store `JIRA_OAUTH_CLIENT_ID` and `JIRA_OAUTH_CLIENT_SECRET` only in the hosted secret manager.
+5. Generate a distinct 32-byte key with `openssl rand -base64 32` and store the output as `JIRA_OAUTH_TOKEN_ENCRYPTION_KEY`. Do not reuse the evidence-encryption or audit key.
+6. Apply `drizzle/0004_cheerful_tombstone.sql`, `drizzle/0005_nappy_alice.sql`, and `drizzle/0006_first_madelyne_pryor.sql` in order, deploy, then connect and test Jira under **Connections**.
+
+Do not embed the OAuth client secret in the Mac app or distribute personal Jira API tokens. Restrict each user connection to the minimum approved project keys, review Atlassian consent and connected-app access regularly, and reconnect after a revoked or expired grant.
+
+Migration `0006` adds OAuth refresh leases and durable Jira upload reservations. Deploy it before a server build that contains the concurrency-safe Jira code. Existing connections start at token version 1; existing immutable receipts remain valid. If an upload operation reaches `unknown`, inspect the destination issue and reconcile its attachments before any operator-authorized retry.
+
 ## Production validation
 
 Before releasing:

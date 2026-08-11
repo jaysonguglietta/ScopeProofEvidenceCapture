@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 struct ReleaseInfo: Decodable, Sendable {
     let version: String
@@ -32,40 +33,15 @@ actor UploadService {
         let image = try Data(contentsOf: capture.imageURL)
         let manifest = try Data(contentsOf: capture.manifestURL)
         let manifestModel = try JSONDecoder().decode(CaptureManifest.self, from: manifest)
-        let fields: [String: String] = [
-            "controlId": capture.context.controlID,
-            "complianceArea": capture.context.resolvedComplianceArea,
-            "controlTitle": capture.context.resolvedControlTitle,
-            "customFileName": capture.context.resolvedCustomFileName,
-            "title": capture.context.title,
-            "system": capture.context.system,
-            "environment": capture.context.environment,
-            "assessmentPeriod": capture.context.assessmentPeriod,
-            "description": capture.context.description,
-            "sessionId": capture.context.sessionID,
-            "sessionName": capture.context.sessionName,
-            "capturedAt": capture.capturedAt,
-            "safetyStatus": capture.safetyStatus,
-            "redactionFindings": String(data: try JSONEncoder().encode(capture.findings), encoding: .utf8) ?? "[]",
-            "catalogVersion": manifestModel.catalogVersion ?? ComplianceCatalog.catalogVersion,
-            "evidenceOwner": manifestModel.evidenceOwner ?? "",
-            "tags": String(data: try JSONEncoder().encode(manifestModel.tags ?? []), encoding: .utf8) ?? "[]",
-            "expectedEvidence": manifestModel.expectedEvidence ?? "",
-            "mappedControls": String(data: try JSONEncoder().encode(manifestModel.mappedControls ?? []), encoding: .utf8) ?? "[]",
-            "manualRedactions": String(manifestModel.manualRedactions ?? 0),
-            "jiraIssueKey": manifestModel.jiraIssueKey ?? "",
-            "jiraIssueURL": manifestModel.jiraIssueURL ?? "",
-            "chainPreviousHash": capture.chainPreviousHash,
-            "chainEventHash": capture.chainEventHash,
-        ]
         let boundary = "ScopeproofBoundary\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))"
         var request = URLRequest(url: serverURL.appendingPathComponent("api/native/evidence"))
         request.httpMethod = "POST"
         request.timeoutInterval = 60
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue(appVersion, forHTTPHeaderField: "X-Scopeproof-Version")
+        request.setValue(Self.uploadSignature(token: token, manifest: manifest, image: image), forHTTPHeaderField: "X-Scopeproof-Upload-Signature")
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        request.httpBody = multipart(boundary: boundary, fields: fields, files: [
+        request.httpBody = multipart(boundary: boundary, files: [
             ("screenshot", manifestModel.screenshotFilename, "image/png", image),
             ("manifest", capture.manifestURL.lastPathComponent, "application/json", manifest),
         ])
@@ -100,12 +76,17 @@ actor UploadService {
         return scheme == "http" && ["localhost", "127.0.0.1", "::1"].contains(host)
     }
 
-    private func multipart(boundary: String, fields: [String: String], files: [(String, String, String, Data)]) -> Data {
+    nonisolated static func uploadSignature(token: String, manifest: Data, image: Data) -> String {
+        let manifestDigest = SHA256.hash(data: manifest).map { String(format: "%02x", $0) }.joined()
+        let imageDigest = SHA256.hash(data: image).map { String(format: "%02x", $0) }.joined()
+        let payload = Data("scopeproof-native-upload-v1\n\(manifestDigest)\n\(imageDigest)".utf8)
+        let signature = HMAC<SHA256>.authenticationCode(for: payload, using: SymmetricKey(data: Data(token.utf8)))
+        return signature.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func multipart(boundary: String, files: [(String, String, String, Data)]) -> Data {
         var data = Data()
         let append = { (value: String) in data.append(Data(value.utf8)) }
-        for (name, value) in fields {
-            append("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n")
-        }
         for (name, filename, contentType, bytes) in files {
             append("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"; filename=\"\(filename.replacingOccurrences(of: "\"", with: ""))\"\r\nContent-Type: \(contentType)\r\n\r\n")
             data.append(bytes)

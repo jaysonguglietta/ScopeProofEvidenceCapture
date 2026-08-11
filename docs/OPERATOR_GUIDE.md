@@ -2,6 +2,18 @@
 
 This guide is for evidence collectors, control owners, and reviewers. It describes the normal evidence lifecycle from a live system to an assessor-ready artifact.
 
+## Install and open the local Mac app
+
+From the repository root, run:
+
+```bash
+./Scripts/run_macos_capture.sh
+```
+
+The command builds Scopeproof Capture, installs it for the current user in `~/Applications`, and launches it. No administrator password is required. If Swift is missing, run `xcode-select --install`, complete the installation, and try again.
+
+Look for the Scopeproof shield in the menu bar. On the first capture, allow **Scopeproof Capture** under **System Settings → Privacy & Security → Screen & System Audio Recording**, then quit and reopen the app once.
+
 ## Before collecting evidence
 
 1. Confirm the system, environment, assessment period, framework, and control are in scope.
@@ -12,7 +24,7 @@ This guide is for evidence collectors, control owners, and reviewers. It describ
 
 ## Capture a screenshot on macOS
 
-1. Open **Scopeproof Capture** from `/Applications`, then select its shield in the menu bar.
+1. Open **Scopeproof Capture** from your Applications folder, then select its shield in the menu bar.
 2. Choose **Capture Frontmost Browser Window**, **Choose Browser Window…**, **Open URL & Capture…**, or **Capture Entire Display**.
 3. In the classification dialog, select the compliance area and control. Enter a meaningful evidence filename, title, system/asset, environment, assessment period, and evidence owner.
 4. Optionally enter a Jira issue key such as `GRC-123`, tags, expected-evidence guidance, and a concise explanation of what the artifact proves.
@@ -44,6 +56,12 @@ Approval, rejection, and supersession require a note. Lifecycle changes are writ
 Enroll the Mac from **Connections → Mac capture devices**, then paste the one-time device token into **Capture & Jira Settings…**. The token is stored in the macOS Keychain. Automatic upload is optional.
 
 If an upload fails, local evidence remains available. Correct the network, server URL, or revoked-token issue and choose **Retry Pending Uploads**. Never send a device token in email, Jira, chat, or an evidence package.
+
+## Send approved evidence to Jira Cloud
+
+First connect your Jira account under **Scopeproof web → Connections → Jira Cloud**, select the intended site, and restrict the connection to approved project keys. Use **Test connection** before the first transfer.
+
+On the Mac, assign a Jira issue during capture, complete lifecycle review, and mark the artifact **Approved** with a rationale. Upload that exact evidence set to Scopeproof and have an authenticated reviewer approve the hosted artifact. Then open **Search Evidence…**, select the artifact, and choose **Upload to Jira Cloud…**. Confirm the live issue summary and status before uploading. Scopeproof validates both approval records and the evidence hashes, then records a signed `.jira.json` receipt. Use **Copy Jira Comment** and manual attachment when OAuth is unavailable or policy requires manual transfer.
 
 ## Export for an assessor
 

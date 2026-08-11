@@ -122,6 +122,20 @@ export const evidenceArtifacts = sqliteTable("evidence_artifacts", {
   index("idx_evidence_jira_issue").on(table.jiraIssueKey),
 ]);
 
+export const nativeEvidenceManifests = sqliteTable("native_evidence_manifests", {
+  id: text("id").primaryKey(),
+  deviceId: text("device_id").notNull(),
+  localEvidenceId: text("local_evidence_id").notNull(),
+  artifactId: text("artifact_id").notNull(),
+  manifestSha256: text("manifest_sha256").notNull(),
+  imageSha256: text("image_sha256").notNull(),
+  jiraIssueKey: text("jira_issue_key"),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [
+  uniqueIndex("idx_native_manifest_device_local").on(table.deviceId, table.localEvidenceId),
+  index("idx_native_manifest_artifact").on(table.artifactId),
+]);
+
 export const auditEvents = sqliteTable("audit_events", {
   sequence: integer("sequence").primaryKey({ autoIncrement: true }),
   id: text("id").notNull(),
@@ -151,3 +165,74 @@ export const exportPackages = sqliteTable("export_packages", {
   completedAt: text("completed_at"),
   expiresAt: text("expires_at"),
 }, (table) => [index("idx_exports_requested_created").on(table.requestedBy, table.createdAt)]);
+
+export const jiraConnections = sqliteTable("jira_connections", {
+  id: text("id").primaryKey(),
+  userId: text("user_id").notNull(),
+  cloudId: text("cloud_id").notNull(),
+  siteUrl: text("site_url").notNull(),
+  siteName: text("site_name").notNull(),
+  allowedProjectsJson: text("allowed_projects_json").notNull().default("[]"),
+  accessTokenCiphertext: text("access_token_ciphertext").notNull(),
+  accessTokenIv: text("access_token_iv").notNull(),
+  refreshTokenCiphertext: text("refresh_token_ciphertext").notNull(),
+  refreshTokenIv: text("refresh_token_iv").notNull(),
+  accessTokenExpiresAt: text("access_token_expires_at").notNull(),
+  scopes: text("scopes").notNull(),
+  status: text("status", { enum: ["active", "reauthorization_required"] }).notNull().default("active"),
+  tokenVersion: integer("token_version").notNull().default(1),
+  refreshLeaseId: text("refresh_lease_id"),
+  refreshLeaseExpiresAt: text("refresh_lease_expires_at"),
+  lastTestedAt: text("last_tested_at"),
+  lastError: text("last_error"),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [uniqueIndex("idx_jira_connections_user").on(table.userId), uniqueIndex("idx_jira_connections_user_cloud").on(table.userId, table.cloudId)]);
+
+export const jiraOauthStates = sqliteTable("jira_oauth_states", {
+  stateHash: text("state_hash").primaryKey(),
+  userId: text("user_id").notNull(),
+  requestedSiteUrl: text("requested_site_url").notNull(),
+  allowedProjectsJson: text("allowed_projects_json").notNull(),
+  expiresAt: text("expires_at").notNull(),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [index("idx_jira_oauth_states_user_expires").on(table.userId, table.expiresAt)]);
+
+export const jiraUploadReceipts = sqliteTable("jira_upload_receipts", {
+  id: text("id").primaryKey(),
+  connectionId: text("connection_id").notNull(),
+  userId: text("user_id").notNull(),
+  deviceId: text("device_id").notNull(),
+  evidenceId: text("evidence_id").notNull(),
+  issueKey: text("issue_key").notNull(),
+  siteUrl: text("site_url").notNull(),
+  uploadedAt: text("uploaded_at").notNull(),
+  attachmentsJson: text("attachments_json").notNull(),
+  receiptSha256: text("receipt_sha256").notNull(),
+  signature: text("signature").notNull(),
+}, (table) => [
+  uniqueIndex("idx_jira_upload_receipts_target").on(table.connectionId, table.evidenceId, table.issueKey),
+  uniqueIndex("idx_jira_upload_receipts_sha").on(table.receiptSha256),
+  index("idx_jira_upload_receipts_user_created").on(table.userId, table.uploadedAt),
+]);
+
+export const jiraUploadOperations = sqliteTable("jira_upload_operations", {
+  id: text("id").primaryKey(),
+  connectionId: text("connection_id").notNull(),
+  userId: text("user_id").notNull(),
+  deviceId: text("device_id").notNull(),
+  evidenceId: text("evidence_id").notNull(),
+  issueKey: text("issue_key").notNull(),
+  requestSha256: text("request_sha256").notNull(),
+  status: text("status", { enum: ["reserved", "uploading", "succeeded", "failed", "unknown"] }).notNull().default("reserved"),
+  leaseId: text("lease_id"),
+  leaseExpiresAt: text("lease_expires_at"),
+  attempt: integer("attempt").notNull().default(0),
+  receiptId: text("receipt_id"),
+  lastError: text("last_error"),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [
+  uniqueIndex("idx_jira_upload_operations_target").on(table.connectionId, table.evidenceId, table.issueKey),
+  index("idx_jira_upload_operations_status_lease").on(table.status, table.leaseExpiresAt),
+]);

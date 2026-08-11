@@ -5,6 +5,7 @@ struct CaptureHistoryEntry: Sendable {
     let manifestURL: URL
     let imageURL: URL
     let receiptURL: URL
+    var jiraReceiptURL: URL { manifestURL.deletingPathExtension().appendingPathExtension("jira.json") }
     var isUploaded: Bool { FileManager.default.fileExists(atPath: receiptURL.path) }
     var lifecycle: EvidenceLifecycleRecord { EvidenceLifecycleStore.load(for: self) }
 }
@@ -32,7 +33,7 @@ enum CaptureHistory {
         for entry in entries(in: directory) {
             guard let date = ISO8601DateFormatter().date(from: entry.manifest.capturedAt), date < cutoff else { continue }
             let lifecycleURL = EvidenceLifecycleStore.url(for: entry.manifestURL)
-            for url in [entry.imageURL, entry.manifestURL, entry.receiptURL, lifecycleURL] where FileManager.default.fileExists(atPath: url.path) {
+            for url in [entry.imageURL, entry.manifestURL, entry.receiptURL, entry.jiraReceiptURL, lifecycleURL] where FileManager.default.fileExists(atPath: url.path) {
                 try FileManager.default.trashItem(at: url, resultingItemURL: nil)
             }
             removed += 1

@@ -26,6 +26,12 @@ function safeEqual(left: string, right: string): boolean {
   return difference === 0;
 }
 
+async function deviceUploadSignature(token: string, manifestSha256: string, imageSha256: string): Promise<string> {
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(token), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const payload = new TextEncoder().encode(`scopeproof-native-upload-v1\n${manifestSha256}\n${imageSha256}`);
+  return Array.from(new Uint8Array(await crypto.subtle.sign("HMAC", key, payload))).map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
 export async function createCaptureDevice(actor: AuthenticatedUser, displayName: string): Promise<{ device: CaptureDevice; token: string }> {
   const id = randomId("dev");
   const secret = base64url(crypto.getRandomValues(new Uint8Array(32)));
@@ -55,7 +61,7 @@ export async function revokeCaptureDevice(actor: AuthenticatedUser, id: string):
   return true;
 }
 
-export async function requireCaptureDevice(request: Request): Promise<{ device: CaptureDevice; actor: AuthenticatedUser }> {
+export async function requireCaptureDevice(request: Request): Promise<{ device: CaptureDevice; actor: AuthenticatedUser; verifyUploadSignature: (manifestSha256: string, imageSha256: string, signature: string) => Promise<boolean> }> {
   const authorization = request.headers.get("authorization") || "";
   const token = authorization.startsWith("Bearer ") ? authorization.slice(7).trim() : "";
   const separator = token.indexOf(".");
@@ -70,5 +76,6 @@ export async function requireCaptureDevice(request: Request): Promise<{ device: 
   return {
     device: { id: String(row.id), displayName: String(row.display_name), platform: String(row.platform), ownerId: String(row.owner_id), status: "active", appVersion: appVersion || String(row.app_version || ""), lastSeenAt: String(row.last_seen_at || "") },
     actor: { id: String(row.owner_id), email: String(row.email), displayName: String(row.owner_name), role: String(row.role) as Role },
+    verifyUploadSignature: async (manifestSha256, imageSha256, signature) => /^[a-f0-9]{64}$/.test(signature) && safeEqual(await deviceUploadSignature(token, manifestSha256, imageSha256), signature),
   };
 }
