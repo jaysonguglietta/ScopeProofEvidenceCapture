@@ -40,15 +40,29 @@ struct SensitiveDataScannerTests {
         sourceContext.setFillColor(CGColor(gray: 1, alpha: 1))
         sourceContext.fill(CGRect(x: 0, y: 0, width: width, height: height))
         let source = sourceContext.makeImage()!
-        let destination = FileManager.default.temporaryDirectory.appendingPathComponent("scopeproof-header-\(UUID().uuidString).png")
-        defer { try? FileManager.default.removeItem(at: destination) }
-
         let service = CaptureService(preferences: CapturePreferences())
-        let output = try service.stampImage(source: source, destination: destination, stamp: "SCOPEPROOF EVIDENCE • CAPTURED 2026-08-10 08:00:00 EDT\nPCI 8.3.1 • payments / Production • 2026 Q3\nSOURCE Safari • Security settings")
+        let output = try service.stampedImage(source: source, stamp: "SCOPEPROOF EVIDENCE • CAPTURED 2026-08-10 08:00:00 EDT\nPCI 8.3.1 • payments / Production • 2026 Q3\nSOURCE Safari • Security settings")
 
         #expect(output.width == width)
         #expect(output.height > height)
-        #expect(FileManager.default.fileExists(atPath: destination.path))
+    }
+
+    @Test("Scans sensitive values introduced only by the final header")
+    @MainActor
+    func scansFinalHeaderPixels() throws {
+        let width = 1200
+        let height = 500
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+        let sourceContext = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0, space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        sourceContext.setFillColor(CGColor(gray: 1, alpha: 1))
+        sourceContext.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        let source = sourceContext.makeImage()!
+        let service = CaptureService(preferences: CapturePreferences())
+        let stamped = try service.stampedImage(source: source, stamp: "SCOPEPROOF EVIDENCE\nSOURCE Safari — https://admin.example/settings?api_token=very-sensitive-token-value-12345")
+        let scan = try SensitiveDataScanner.scanAndRedact(stamped)
+
+        #expect(scan.findings.contains { $0.kind == .apiToken })
+        #expect(scan.redactedRegions > 0)
     }
 
     @Test("Provides framework-specific controls and safe evidence paths")
@@ -78,7 +92,7 @@ struct SensitiveDataScannerTests {
             schemaVersion: 2, evidenceID: "EV-LEGACY", capturedAt: "2026-08-11T12:00:00Z", localTimestamp: "2026-08-11 08:00:00 EDT", timezone: "America/New_York",
             sourceURL: nil, sourceHost: nil, browser: "Safari", windowTitle: "Settings", screenshotFilename: imageURL.lastPathComponent,
             sha256: "abc", pixelWidth: 100, pixelHeight: 100, captureMethod: "test", timestampAuthority: "local",
-            safetyStatus: "passed", redactionFindings: [], redactedRegions: 0, sessionID: "session_test", sessionName: "Legacy",
+            safetyStatus: "passed", redactionFindings: [], redactedRegions: 0, safetyScanSha256: nil, safetyScanPolicy: nil, safetyScanCompletedAt: nil, sessionID: "session_test", sessionName: "Legacy",
             controlID: "164.312(b)", title: "Audit controls", system: "EHR", environment: "Production", assessmentPeriod: "2026 Q3", description: "",
             complianceArea: nil, controlTitle: nil, customFileName: nil, catalogVersion: nil, evidenceOwner: nil, tags: nil, expectedEvidence: nil,
             mappedControls: nil, manualRedactions: nil, reviewerNote: nil, jiraIssueKey: nil, jiraIssueURL: nil, chainPreviousHash: "GENESIS", chainEventHash: "event"
@@ -109,7 +123,7 @@ struct SensitiveDataScannerTests {
             schemaVersion: 3, evidenceID: "EV-APPROVED", capturedAt: "2026-08-11T12:00:00Z", localTimestamp: "2026-08-11 08:00:00 EDT", timezone: "America/New_York",
             sourceURL: nil, sourceHost: nil, browser: "Safari", windowTitle: "Settings", screenshotFilename: imageURL.lastPathComponent,
             sha256: digest, pixelWidth: 100, pixelHeight: 100, captureMethod: "test", timestampAuthority: "local",
-            safetyStatus: "passed", redactionFindings: [], redactedRegions: 0, sessionID: "session_test", sessionName: "Audit",
+            safetyStatus: "passed", redactionFindings: [], redactedRegions: 0, safetyScanSha256: nil, safetyScanPolicy: nil, safetyScanCompletedAt: nil, sessionID: "session_test", sessionName: "Audit",
             controlID: "8.3.1", title: "MFA", system: "Okta", environment: "Production", assessmentPeriod: "2026 Q3", description: "MFA enabled",
             complianceArea: "PCI DSS 4.0.1", controlTitle: "Strong authentication", customFileName: "MFA",
             catalogVersion: ComplianceCatalog.catalogVersion, evidenceOwner: "Control Owner", tags: ["identity"], expectedEvidence: "MFA status",

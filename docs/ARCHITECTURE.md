@@ -20,7 +20,7 @@ Scopeproof combines a private Cloudflare-hosted evidence console with a local ma
 1. **User and browser → private Sites application:** the private Sites dispatcher strips untrusted identity headers and supplies authenticated values. APIs consume them only on an exact configured canonical origin, validate identity syntax, enforce server-side capability checks, and require same-origin proof for mutations. Direct Worker/preview origins are not trusted web entry points.
 2. **Worker → provider APIs:** hosted secrets authorize bounded evidence reads. Provider data is untrusted input and is scanned before encrypted persistence.
 3. **Worker → D1/R2:** D1 holds metadata and digests; R2 holds ciphertext. Encryption uses artifact-specific IVs and authenticated associated data.
-4. **macOS screen → Scopeproof Capture:** ScreenCaptureKit provides pixels only after macOS permission and an explicit user action. OCR and initial redaction remain local.
+4. **macOS screen → Scopeproof Capture:** ScreenCaptureKit provides pixels only after macOS permission and an explicit user action. Unreviewed pixels stay in memory; local OCR covers source pixels, the rendered header, and the exact final encoded artifact before persistence.
 5. **Mac → native upload endpoint:** a revocable bearer token identifies the device and HMAC-authenticates the exact manifest/image digest pair. The server derives metadata only from the versioned manifest and strictly validates PNG structure, decompression bounds, dimensions, digest, and capture-chain consistency before storage.
 6. **Scopeproof → assessor/Jira:** exports leave the system through an operator-controlled handoff. Hashes, signatures, visible stamps, and package instructions support independent verification, but destination authorization remains an organizational responsibility.
 7. **Scopeproof → Atlassian:** the hosted service exchanges OAuth codes, encrypts rotating tokens with a Jira-specific key, resolves the consented cloud ID, and calls only `api.atlassian.com`. A user/device may access only its own connection and configured project allowlist. The Mac sends approved evidence to Scopeproof, never Atlassian credentials.
@@ -28,18 +28,19 @@ Scopeproof combines a private Cloudflare-hosted evidence console with a local ma
 ## Native capture data flow
 
 1. The operator selects a window, URL, or display and supplies control context.
-2. ScreenCaptureKit captures pixels into a temporary local PNG.
-3. Vision OCR detects supported PAN/credential patterns; detected rectangles are masked.
-4. The review workspace permits additional irreversible manual masks.
-5. Scopeproof adds a header above the captured pixels containing local date/time/timezone, evidence ID, framework/control, optional Jira key, evidence title/owner, system/environment/period, and source.
-6. The final PNG is hashed. A capture manifest and hash-chain event are written beside it; the temporary unredacted PNG is removed.
-7. Review decisions are recorded in a separate hash-chained lifecycle sidecar.
-8. Optional upload returns a signed server receipt. Only Approved evidence is eligible for local assessor export.
+2. ScreenCaptureKit captures pixels into process memory; unreviewed pixels are never written to a temporary file.
+3. Vision OCR detects supported PAN/credential patterns and masks detected rectangles in memory.
+4. Scopeproof adds a header above the redacted pixels. Source URLs are stripped of credentials, query parameters, and fragments before rendering or recording.
+5. The composited image is scanned again, then the review workspace permits additional irreversible manual masks.
+6. Scopeproof encodes the reviewed PNG in memory, decodes and scans those exact bytes, and fails closed if the scan cannot complete or detects remaining sensitive content.
+7. The same verified bytes are atomically written and hashed. The manifest records that digest as both the artifact and safety-scan digest with the policy/version and completion time.
+8. Review decisions are recorded in a separate hash-chained lifecycle sidecar.
+9. Optional upload returns a signed server receipt. Only Approved evidence is eligible for local assessor export.
 
 ## Hosted evidence data flow
 
 1. A scheduled/manual job calls a configured provider or receives an authenticated native upload.
-2. Textual evidence is scanned and redacted; unsafe browser-rendered content is blocked before screenshot persistence.
+2. Textual evidence is scanned and redacted. Browser Rendering returns one PNG; an allowlisted OCR processor scans those exact bytes and echoes their digest before persistence is allowed.
 3. SHA-256 supports integrity checking and source/control de-duplication.
 4. Evidence is encrypted with AES-256-GCM and stored in R2. D1 stores the IV, associated metadata, digest, review status, and object key.
 5. The material action is appended to the HMAC-authenticated audit chain.

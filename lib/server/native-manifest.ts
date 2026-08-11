@@ -7,14 +7,14 @@ const jiraIssuePattern = /^[A-Z][A-Z0-9_]{1,31}-[1-9][0-9]*$/;
 const allowedManifestKeys = new Set([
   "schemaVersion", "evidenceID", "capturedAt", "localTimestamp", "timezone", "sourceURL", "sourceHost", "browser", "windowTitle",
   "screenshotFilename", "sha256", "pixelWidth", "pixelHeight", "captureMethod", "timestampAuthority", "safetyStatus",
-  "redactionFindings", "redactedRegions", "sessionID", "sessionName", "controlID", "title", "system", "environment",
+  "redactionFindings", "redactedRegions", "safetyScanSha256", "safetyScanPolicy", "safetyScanCompletedAt", "sessionID", "sessionName", "controlID", "title", "system", "environment",
   "assessmentPeriod", "description", "complianceArea", "controlTitle", "customFileName", "catalogVersion", "evidenceOwner", "tags",
   "expectedEvidence", "mappedControls", "manualRedactions", "reviewerNote", "jiraIssueKey", "jiraIssueURL", "chainPreviousHash", "chainEventHash",
 ]);
 
 export type NativeControlMapping = { framework: string; controlID: string; relationship: string };
 export type NativeCaptureManifest = {
-  schemaVersion: 5;
+  schemaVersion: 6;
   evidenceID: string;
   capturedAt: string;
   screenshotFilename: string;
@@ -24,6 +24,9 @@ export type NativeCaptureManifest = {
   safetyStatus: "passed" | "redacted";
   redactionFindings: RedactionFinding[];
   redactedRegions: number;
+  safetyScanSha256: string;
+  safetyScanPolicy: string;
+  safetyScanCompletedAt: string;
   sessionID: string;
   sessionName: string;
   controlID: string;
@@ -128,7 +131,7 @@ export function parseNativeManifest(bytes: Uint8Array): NativeCaptureManifest {
   try { parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); } catch { throw new NativeManifestError("Manifest must be valid UTF-8 JSON."); }
   const source = record(parsed);
   if (!source || Object.keys(source).some((key) => !allowedManifestKeys.has(key))) throw new NativeManifestError("Manifest schema contains unsupported fields.");
-  if (source.schemaVersion !== 5) throw new NativeManifestError("Manifest schema version is not supported.");
+  if (source.schemaVersion !== 6) throw new NativeManifestError("Manifest schema version is not supported. Upgrade Scopeproof Capture before uploading evidence.");
   const evidenceID = text(source, "evidenceID", 35, true);
   if (!evidenceIdPattern.test(evidenceID)) throw new NativeManifestError("Manifest evidence ID is invalid.");
   const capturedAt = text(source, "capturedAt", 64, true);
@@ -136,6 +139,13 @@ export function parseNativeManifest(bytes: Uint8Array): NativeCaptureManifest {
   if (!Number.isFinite(capturedMillis) || Math.abs(Date.now() - capturedMillis) > 366 * 24 * 60 * 60_000) throw new NativeManifestError("Manifest capture time is invalid.");
   const sha256 = text(source, "sha256", 64, true).toLowerCase();
   if (!digestPattern.test(sha256)) throw new NativeManifestError("Manifest image digest is invalid.");
+  const safetyScanSha256 = text(source, "safetyScanSha256", 64, true).toLowerCase();
+  if (safetyScanSha256 !== sha256) throw new NativeManifestError("Final-image safety scan is not bound to the uploaded screenshot digest.");
+  const safetyScanPolicy = text(source, "safetyScanPolicy", 100, true);
+  if (safetyScanPolicy !== "vision-ocr-sensitive-patterns-v1") throw new NativeManifestError("Manifest safety scanner policy is not supported.");
+  const safetyScanCompletedAt = text(source, "safetyScanCompletedAt", 64, true);
+  const scanMillis = Date.parse(safetyScanCompletedAt);
+  if (!Number.isFinite(scanMillis) || Math.abs(scanMillis - capturedMillis) > 5 * 60_000) throw new NativeManifestError("Manifest safety scan time is invalid.");
   const safetyStatus = text(source, "safetyStatus", 16, true);
   if (safetyStatus !== "passed" && safetyStatus !== "redacted") throw new NativeManifestError("Manifest safety claim is invalid.");
   const jiraIssueKey = text(source, "jiraIssueKey", 80).toUpperCase();
@@ -146,7 +156,7 @@ export function parseNativeManifest(bytes: Uint8Array): NativeCaptureManifest {
   const chainEventHash = text(source, "chainEventHash", 128, true);
   if ((chainPreviousHash !== "GENESIS" && !digestPattern.test(chainPreviousHash)) || !digestPattern.test(chainEventHash)) throw new NativeManifestError("Manifest capture-chain hashes are invalid.");
   return {
-    schemaVersion: 5,
+    schemaVersion: 6,
     evidenceID,
     capturedAt,
     screenshotFilename: text(source, "screenshotFilename", 240, true),
@@ -156,6 +166,9 @@ export function parseNativeManifest(bytes: Uint8Array): NativeCaptureManifest {
     safetyStatus,
     redactionFindings: parseFindings(source),
     redactedRegions: integer(source, "redactedRegions", 0, 10_000),
+    safetyScanSha256,
+    safetyScanPolicy,
+    safetyScanCompletedAt,
     sessionID: text(source, "sessionID", 96, true),
     sessionName: text(source, "sessionName", 160, true),
     controlID: text(source, "controlID", 80, true),

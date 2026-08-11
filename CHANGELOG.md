@@ -2,6 +2,15 @@
 
 All notable Scopeproof changes are recorded here. Dates use the repository’s release timezone.
 
+## 1.3.2 — 2026-08-11
+
+### Security
+
+- Native capture keeps unreviewed pixels in memory, scans after stamping and review, and atomically saves only the exact verified PNG bytes.
+- Native manifest schema 6 binds the saved screenshot digest to the local scanner policy and completion time; older upload manifests now fail closed.
+- Hosted browser capture scans the single immutable screenshot through an allowlisted, digest-binding OCR service and fails closed on scanner errors, sensitive pixels, or digest mismatch.
+- Source URLs recorded by the Mac client exclude credentials, query parameters, and fragments.
+
 ## 1.3.1 — 2026-08-11
 
 ### Added

@@ -25,7 +25,7 @@ enum UploadFailure: LocalizedError {
 }
 
 actor UploadService {
-    private var appVersion: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.3.1" }
+    private var appVersion: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.3.2" }
 
     func upload(_ capture: CaptureResult, serverURL: URL?) async throws -> URL {
         guard let token = KeychainStore.readToken(), !token.isEmpty else { throw UploadFailure.notConfigured }

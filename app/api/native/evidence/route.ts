@@ -27,6 +27,7 @@ export async function POST(request: Request) {
     if (dimensions.width !== manifest.pixelWidth || dimensions.height !== manifest.pixelHeight) return Response.json({ error: "Screenshot dimensions do not match the manifest." }, { status: 422 });
     const imageDigest = await sha256(image);
     if (manifest.sha256 !== imageDigest) return Response.json({ error: "Screenshot integrity does not match its manifest." }, { status: 422 });
+    if (manifest.safetyScanSha256 !== imageDigest) return Response.json({ error: "Final-image safety scan does not match the uploaded screenshot." }, { status: 422 });
     const manifestSha256 = await sha256(manifestBytes);
     const signature = String(request.headers.get("x-scopeproof-upload-signature") || "").trim().toLowerCase();
     if (!await verifyUploadSignature(manifestSha256, imageDigest, signature)) return Response.json({ error: "Capture manifest signature is invalid." }, { status: 401 });
@@ -55,6 +56,7 @@ export async function POST(request: Request) {
       contentType: "image/png", bytes: image, sessionId, deviceId: device.id, capturedAt, createdBy: actor, preflightFindings: localFindings,
       manifestSha256: attestationBody.manifestSha256, chainPreviousHash: attestationBody.chainPreviousHash, chainEventHash: attestationBody.chainEventHash,
       timestampAuthority, timestampToken,
+      safetyScanSha256: manifest.safetyScanSha256, safetyScanPolicy: manifest.safetyScanPolicy, safetyScanCompletedAt: manifest.safetyScanCompletedAt,
     });
     const hostedArtifact = await getEnv().DB.prepare("SELECT device_id, created_by, sha256, manifest_sha256, jira_issue_key FROM evidence_artifacts WHERE id = ?")
       .bind(result.id).first<{ device_id: string | null; created_by: string; sha256: string; manifest_sha256: string | null; jira_issue_key: string | null }>();
@@ -66,7 +68,7 @@ export async function POST(request: Request) {
     if (existingManifest && (existingManifest.artifact_id !== result.id || existingManifest.manifest_sha256 !== attestationBody.manifestSha256 || existingManifest.image_sha256 !== imageDigest || String(existingManifest.jira_issue_key || "") !== jiraIssueKey)) return Response.json({ error: "This local evidence identity is already bound to different hosted evidence." }, { status: 409 });
     if (!existingManifest) await getEnv().DB.prepare("INSERT INTO native_evidence_manifests (id, device_id, local_evidence_id, artifact_id, manifest_sha256, image_sha256, jira_issue_key) VALUES (?, ?, ?, ?, ?, ?, ?)")
       .bind(manifestIdentity, device.id, manifest.evidenceID, result.id, attestationBody.manifestSha256, imageDigest, jiraIssueKey || null).run();
-    await appendAuditEvent(actor, "capture_device.uploaded", "evidence", result.id, { deviceId: device.id, sessionId, complianceArea, controlId, jiraIssueKey: jiraIssueKey || null, imageSha256: imageDigest, clientSafetyClaim: manifest.safetyStatus, redactionCount: localFindings.reduce((sum, item) => sum + item.count, 0) });
+    await appendAuditEvent(actor, "capture_device.uploaded", "evidence", result.id, { deviceId: device.id, sessionId, complianceArea, controlId, jiraIssueKey: jiraIssueKey || null, imageSha256: imageDigest, safetyScanSha256: manifest.safetyScanSha256, safetyScanPolicy: manifest.safetyScanPolicy, clientSafetyClaim: manifest.safetyStatus, redactionCount: localFindings.reduce((sum, item) => sum + item.count, 0) });
     return Response.json({ ...result, receipt: { evidenceId: result.id, deviceId: device.id, attestation: { ...attestationBody, signature: signed.signature, publicKeySpkiBase64: signed.publicKey, algorithm: "ECDSA-P256-SHA256", trustedTimestamp, trustedTimestampError } } }, { status: result.deduplicated ? 200 : 201 });
   } catch (error) {
     if (error instanceof NativeManifestError) return Response.json({ error: error.message }, { status: 422 });

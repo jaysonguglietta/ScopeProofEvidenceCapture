@@ -1,6 +1,6 @@
 # Scopeproof Capture for macOS
 
-Scopeproof Capture 1.3.1 is a local menu-bar companion for producing timestamped PCI DSS, HIPAA, FedRAMP, SOC 2, ISO 27001, and custom compliance evidence screenshots.
+Scopeproof Capture 1.3.2 is a local menu-bar companion for producing timestamped PCI DSS, HIPAA, FedRAMP, SOC 2, ISO 27001, and custom compliance evidence screenshots.
 
 Related guides: [operator workflow](../../docs/OPERATOR_GUIDE.md), [Jira handoff](../../docs/JIRA_HANDOFF.md), [assessor verification](../../docs/ASSESSOR_GUIDE.md), and [security model](../../docs/SECURITY.md).
 

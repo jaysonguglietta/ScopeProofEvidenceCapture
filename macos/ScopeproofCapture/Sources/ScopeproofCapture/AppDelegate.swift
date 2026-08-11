@@ -572,7 +572,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let release = try await uploadService.checkForUpdates(serverURL: preferences.serverURL)
                 await MainActor.run {
                     self.preferences.lastUpdateCheck = Date()
-                    let installedVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.3.1"
+                    let installedVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.3.2"
                     guard self.isNewer(release.version, than: installedVersion) else { if !silent { self.setReady("Scopeproof Capture is up to date") }; return }
                     let alert = NSAlert(); alert.messageText = "Scopeproof Capture \(release.version) is available"; alert.informativeText = release.notes
                     alert.addButton(withTitle: release.downloadUrl == nil ? "OK" : "Open Download"); alert.addButton(withTitle: "Later")

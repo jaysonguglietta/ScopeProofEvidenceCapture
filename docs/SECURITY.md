@@ -25,7 +25,7 @@ Scopeproof handles security and compliance evidence that may expose sensitive co
 ### Data protection and integrity
 
 - Textual evidence is scanned for Luhn-valid PAN and supported secret/token families before persistence.
-- Native screenshots run local OCR/redaction. The client HMAC-authenticates the exact manifest and PNG digests with its enrolled device credential; the server accepts metadata only from the versioned manifest, validates capture-chain hashes, and fully parses/decompresses bounded PNG data before storage. Local scan results remain explicitly labeled as client claims.
+- Native screenshots never write the unreviewed source pixels to disk. Local OCR/redaction runs before and after stamping, the reviewed PNG is encoded in memory and scanned again, and the manifest binds the exact saved digest, scanner policy, and completion time. The client HMAC-authenticates the exact manifest/PNG digest pair; the server requires schema 6, validates the scan binding and capture chain, and fully parses/decompresses bounded PNG data before storage. Local scan results remain explicitly labeled as client claims.
 - Evidence and generated packages are encrypted with AES-256-GCM in R2.
 - D1 contains metadata, object references, IVs, and integrity digests rather than evidence plaintext.
 - Audit events are canonicalized, hash-chained, HMAC-authenticated, and protected from update/delete by D1 triggers.
@@ -37,7 +37,7 @@ Scopeproof handles security and compliance evidence that may expose sensitive co
 ### Abuse resistance
 
 - Provider requests, pagination, browser targets, retries, due work, upload sizes, package counts, and decrypted package bytes are bounded.
-- Browser collection permits HTTPS targets only and blocks persistence when rendered text contains detected sensitive values.
+- Browser collection permits HTTPS targets only. It scans the single captured PNG through an HTTPS OCR endpoint on an exact host allowlist, verifies the OCR response names the same digest, and fails closed on scan errors or sensitive recognized pixels.
 - Error responses use request IDs and avoid returning server exception details to clients.
 
 ## Secure operating requirements
@@ -55,7 +55,7 @@ Scopeproof handles security and compliance evidence that may expose sensitive co
 
 ## Residual risks and limitations
 
-- OCR and pattern matching cannot guarantee detection of every sensitive value. Operator preview remains mandatory.
+- OCR and pattern matching cannot guarantee detection of every sensitive value. Native operator preview remains mandatory, and browser OCR services require independent security/privacy review because captured pixels are disclosed to that processor.
 - A compromised endpoint can display falsified source content or capture manipulated pixels.
 - Local timestamps depend on the Mac clock. Hosted receipts add signed server time; RFC 3161 requires an independently configured authority.
 - The package’s embedded public key must be fingerprint-verified out of band to establish signer continuity.

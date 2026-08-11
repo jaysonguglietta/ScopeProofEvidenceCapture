@@ -57,7 +57,7 @@ actor JiraCloudService {
     private struct ConnectionEnvelope: Decodable { let connection: JiraCloudConnection }
     private struct IssueEnvelope: Decodable { let issue: JiraCloudIssue }
     private struct ReceiptEnvelope: Decodable { let receipt: JiraCloudUploadReceipt }
-    private var appVersion: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.3.1" }
+    private var appVersion: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.3.2" }
 
     func connection(serverURL: URL?) async throws -> JiraCloudConnection {
         let request = try authorizedRequest(serverURL: serverURL, path: "api/native/jira/status")

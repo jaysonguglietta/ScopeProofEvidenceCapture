@@ -24,6 +24,8 @@ struct ScanResult {
 }
 
 enum SensitiveDataScanner {
+    static let policyVersion = "vision-ocr-sensitive-patterns-v1"
+
     static func scanAndRedact(_ image: CGImage) throws -> ScanResult {
         let request = VNRecognizeTextRequest()
         request.recognitionLevel = .accurate
