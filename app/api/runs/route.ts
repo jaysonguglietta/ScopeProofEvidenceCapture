@@ -1,4 +1,4 @@
-import { jsonError, requireApiUser, requireSameOrigin } from "../../../lib/server/auth";
+import { jsonError, requireApiPermission, requireApiUser, requireSameOrigin } from "../../../lib/server/auth";
 import { getEnv } from "../../../lib/server/env";
 import { ensureDefaultCollectors, processJob, queueCollection } from "../../../lib/server/jobs";
 
@@ -14,7 +14,7 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   try {
     requireSameOrigin(request);
-    const user = await requireApiUser(request, "compliance_lead");
+    const user = await requireApiPermission(request, "manage_collectors");
     await ensureDefaultCollectors(user);
     const body = await request.json() as { collectorIds?: string[] };
     const ids = [...new Set(body.collectorIds || [])].filter((id) => /^collector_(aws|github|okta|cloudflare|browser)$/.test(id)).slice(0, 5);

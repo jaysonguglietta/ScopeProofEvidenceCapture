@@ -18,6 +18,7 @@ The logical hosted bindings are declared in `.openai/hosting.json`. Do not place
 | `PACKAGE_SIGNING_PRIVATE_KEY` | Base64 PKCS#8 ECDSA P-256 private key. |
 | `PACKAGE_SIGNING_PUBLIC_KEY` | Matching base64 SPKI public key. |
 | `BOOTSTRAP_ADMIN_EMAILS` | Comma-separated lowercase administrator emails configured before first sign-in. |
+| `TRUSTED_APP_ORIGINS` | Comma-separated exact HTTPS Sites origins allowed to carry platform identity headers; no paths or wildcards. |
 
 Never reuse one value for multiple purposes. Record key ownership, creation date, rotation version, recovery escrow, and destruction approval outside the repository.
 
@@ -48,11 +49,13 @@ Inspect generated SQL for destructive operations, unintended nullability changes
 | Role | Typical capabilities |
 | --- | --- |
 | `auditor` | Read evidence/package metadata and audit-chain status; download authorized packages. |
-| `reviewer` | Auditor access plus manual evidence submission, approval, and own-device enrollment/revocation. |
-| `compliance_lead` | Reviewer access plus collector operation, package generation, user/device oversight, and schedules. |
-| `admin` | Compliance-lead access plus role administration. |
+| `reviewer` | Auditor access plus independent evidence inspection/approval and package generation. Cannot collect, enroll devices, or operate Jira. |
+| `compliance_lead` | Evidence collection, collector schedules, device enrollment, Jira operations, and package generation. Cannot approve evidence. |
+| `admin` | All operational permissions plus role administration; still cannot approve evidence the same identity created or uploaded. |
 
 Review role assignments regularly. Use separate named accounts; do not share administrator sessions.
+
+Apply `drizzle/0007_greedy_nextwave.sql` before this authorization model. It records the one-time administrator-bootstrap invariant, preserves an existing administrator during upgrades, and prevents database-level demotion of the final administrator. Production fails closed when `BOOTSTRAP_ADMIN_EMAILS` or `TRUSTED_APP_ORIGINS` is empty, malformed, or contains a wildcard. Only the first allowlisted identity can claim initial administration; later role grants require an existing administrator.
 
 ## macOS device deployment
 

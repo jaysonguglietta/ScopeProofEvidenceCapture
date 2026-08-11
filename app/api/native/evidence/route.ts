@@ -1,5 +1,5 @@
 import { appendAuditEvent } from "../../../../lib/server/audit";
-import { jsonError } from "../../../../lib/server/auth";
+import { assertPermission, jsonError } from "../../../../lib/server/auth";
 import { sha256, signPackage, stableJson } from "../../../../lib/server/crypto";
 import { requireCaptureDevice } from "../../../../lib/server/devices";
 import { storeEvidence } from "../../../../lib/server/evidence";
@@ -10,6 +10,7 @@ import { requestTrustedTimestamp } from "../../../../lib/server/timestamp";
 export async function POST(request: Request) {
   try {
     const { device, actor, verifyUploadSignature } = await requireCaptureDevice(request);
+    assertPermission(actor, "collect_evidence");
     const contentLength = Number(request.headers.get("content-length") || 0);
     if (!Number.isFinite(contentLength) || contentLength <= 0 || contentLength > 16 * 1024 * 1024) return Response.json({ error: "Capture payload size is invalid." }, { status: 413 });
     const form = await request.formData();

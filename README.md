@@ -35,8 +35,8 @@ The first time you capture, macOS may ask for Screen Recording access. Allow **S
 
 ## Security architecture
 
-- Authentication uses the private Sites identity headers. API routes reject anonymous requests.
-- RBAC roles are `admin`, `compliance_lead`, `reviewer`, and `auditor`. Authorization is enforced server-side.
+- Authentication uses private Sites identity headers only on exact canonical origins configured in `TRUSTED_APP_ORIGINS`; API routes reject anonymous, direct-origin, preview-origin, and malformed identities.
+- Roles are `admin`, `compliance_lead`, `reviewer`, and `auditor`, with explicit server-side permissions. Reviewers approve but cannot collect or disclose; compliance leads collect and disclose but cannot approve. No identity can approve its own evidence.
 - Evidence is redacted before persistence, encrypted with AES-256-GCM, and stored in R2. D1 stores metadata and integrity digests.
 - Audit events are hash-chained, HMAC-authenticated, and protected from update/delete by SQLite triggers.
 - Assessor ZIPs embed approved artifacts, a PDF index, SHA-256 hashes, and an ECDSA P-256 signed manifest with its public verification key.

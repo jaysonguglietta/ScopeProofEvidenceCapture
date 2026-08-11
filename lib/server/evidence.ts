@@ -100,9 +100,16 @@ export async function readEvidenceBytes(id: string): Promise<{ bytes: Uint8Array
   return { bytes, row };
 }
 
-export async function approveEvidence(id: string, actor: AuthenticatedUser): Promise<boolean> {
-  const result = await getEnv().DB.prepare("UPDATE evidence_artifacts SET status = 'approved', approved_by = ?, approved_at = ? WHERE id = ? AND status != 'approved'").bind(actor.id, new Date().toISOString(), id).run();
+export async function approveEvidence(id: string, actor: AuthenticatedUser, review: { expectedSha256: string; rationale: string }): Promise<boolean> {
+  const expectedSha256 = review.expectedSha256.trim().toLowerCase();
+  const rationale = review.rationale.trim();
+  if (!/^[a-f0-9]{64}$/.test(expectedSha256) || rationale.length < 20 || rationale.length > 1_000) throw new Response(JSON.stringify({ error: "Approval requires the full artifact digest and a 20–1,000 character review rationale." }), { status: 400, headers: { "content-type": "application/json" } });
+  const artifact = await getEnv().DB.prepare("SELECT id, sha256, created_by, status FROM evidence_artifacts WHERE id = ?").bind(id).first<{ id: string; sha256: string; created_by: string; status: string }>();
+  if (!artifact) throw new Response(JSON.stringify({ error: "Evidence not found" }), { status: 404, headers: { "content-type": "application/json" } });
+  if (artifact.created_by === actor.id) throw new Response(JSON.stringify({ error: "Collectors and uploaders cannot approve their own evidence." }), { status: 403, headers: { "content-type": "application/json" } });
+  if (artifact.sha256 !== expectedSha256) throw new Response(JSON.stringify({ error: "The reviewed artifact digest changed. Reload and inspect the evidence again." }), { status: 409, headers: { "content-type": "application/json" } });
+  const result = await getEnv().DB.prepare("UPDATE evidence_artifacts SET status = 'approved', approved_by = ?, approved_at = ? WHERE id = ? AND sha256 = ? AND created_by != ? AND status IN ('needs_review', 'expiring')").bind(actor.id, new Date().toISOString(), id, expectedSha256, actor.id).run();
   if (!result.meta.changes) return false;
-  await appendAuditEvent(actor, "evidence.approved", "evidence", id);
+  await appendAuditEvent(actor, "evidence.approved", "evidence", id, { artifactSha256: expectedSha256, rationale });
   return true;
 }

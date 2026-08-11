@@ -1,4 +1,4 @@
-import { jsonError, requireApiUser, requireSameOrigin } from "../../../lib/server/auth";
+import { jsonError, requireApiPermission, requireApiUser, requireSameOrigin } from "../../../lib/server/auth";
 import { listEvidence, storeEvidence, type ArtifactType } from "../../../lib/server/evidence";
 
 export async function GET(request: Request) {
@@ -9,7 +9,7 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   try {
     requireSameOrigin(request);
-    const user = await requireApiUser(request, "reviewer");
+    const user = await requireApiPermission(request, "collect_evidence");
     const form = await request.formData();
     const title = String(form.get("title") || "").trim().slice(0, 180);
     const controlId = String(form.get("control") || "").trim().slice(0, 32);
