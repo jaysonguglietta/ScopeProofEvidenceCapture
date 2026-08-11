@@ -89,8 +89,11 @@ export async function storeEvidence(input: EvidenceInput): Promise<{ id: string;
 }
 
 export async function listEvidence(limit = 100): Promise<Array<Record<string, unknown>>> {
-  const rows = (await getEnv().DB.prepare(`SELECT id, control_id, framework, catalog_version, title, description, type, source, system, environment, assessment_period, evidence_owner, tags_json, expected_evidence, mapped_controls_json, jira_issue_key, jira_issue_url, manual_redactions, collector_id, job_id, session_id, device_id, content_type, byte_size, sha256, captured_at, expires_at, status, redaction_count, redaction_summary_json, manifest_sha256, chain_previous_hash, chain_event_hash, timestamp_authority, safety_scan_sha256, safety_scan_policy, safety_scan_completed_at, created_by, created_at, approved_by, approved_at
-    FROM evidence_artifacts ORDER BY captured_at DESC LIMIT ?`).bind(Math.min(Math.max(limit, 1), 250)).all<Record<string, unknown>>()).results;
+  const rows = (await getEnv().DB.prepare(`SELECT id, control_id, framework, catalog_version, title, description, type, source, system, environment, assessment_period, evidence_owner, tags_json, expected_evidence, mapped_controls_json, jira_issue_key, jira_issue_url, manual_redactions, collector_id, job_id, session_id, device_id, content_type, byte_size, sha256, captured_at, expires_at,
+      CASE WHEN status != 'purged' AND expires_at <= ? THEN 'expired' ELSE status END AS status,
+      redaction_count, redaction_summary_json, manifest_sha256, chain_previous_hash, chain_event_hash, timestamp_authority, safety_scan_sha256, safety_scan_policy, safety_scan_completed_at, created_by, created_at, approved_by, approved_at,
+      (SELECT expires_at FROM retention_holds WHERE evidence_id = evidence_artifacts.id AND expires_at > ?) AS retention_hold_expires_at
+    FROM evidence_artifacts ORDER BY captured_at DESC LIMIT ?`).bind(new Date().toISOString(), new Date().toISOString(), Math.min(Math.max(limit, 1), 250)).all<Record<string, unknown>>()).results;
   return rows.map((row: Record<string, unknown>) => ({ ...row, redaction_summary: JSON.parse(String(row.redaction_summary_json || "[]")), tags: JSON.parse(String(row.tags_json || "[]")), mapped_controls: JSON.parse(String(row.mapped_controls_json || "[]")), redaction_summary_json: undefined, tags_json: undefined, mapped_controls_json: undefined }));
 }
 
@@ -98,6 +101,7 @@ export async function readEvidenceBytes(id: string): Promise<{ bytes: Uint8Array
   const env = getEnv();
   const row = await env.DB.prepare("SELECT * FROM evidence_artifacts WHERE id = ?").bind(id).first<Record<string, unknown>>();
   if (!row) return null;
+  if (String(row.status) === "purged" || new Date(String(row.expires_at)).getTime() <= Date.now()) throw new Response(JSON.stringify({ error: "This evidence has expired and is no longer available." }), { status: 410, headers: { "content-type": "application/json" } });
   const object = await env.EVIDENCE_BUCKET.get(String(row.r2_key));
   if (!object) throw new Error("Encrypted evidence object is missing.");
   const associatedData = stableJson({ id: row.id, controlId: row.control_id, source: row.source, capturedAt: row.captured_at });
@@ -110,13 +114,14 @@ export async function approveEvidence(id: string, actor: AuthenticatedUser, revi
   const expectedSha256 = review.expectedSha256.trim().toLowerCase();
   const rationale = review.rationale.trim();
   if (!/^[a-f0-9]{64}$/.test(expectedSha256) || rationale.length < 20 || rationale.length > 1_000) throw new Response(JSON.stringify({ error: "Approval requires the full artifact digest and a 20–1,000 character review rationale." }), { status: 400, headers: { "content-type": "application/json" } });
-  const artifact = await getEnv().DB.prepare("SELECT id, sha256, created_by, status FROM evidence_artifacts WHERE id = ?").bind(id).first<{ id: string; sha256: string; created_by: string; status: string }>();
+  const artifact = await getEnv().DB.prepare("SELECT id, sha256, created_by, status, expires_at FROM evidence_artifacts WHERE id = ?").bind(id).first<{ id: string; sha256: string; created_by: string; status: string; expires_at: string }>();
   if (!artifact) throw new Response(JSON.stringify({ error: "Evidence not found" }), { status: 404, headers: { "content-type": "application/json" } });
+  if (new Date(artifact.expires_at).getTime() <= Date.now() || artifact.status === "purged") throw new Response(JSON.stringify({ error: "Expired evidence cannot be approved." }), { status: 410, headers: { "content-type": "application/json" } });
   if (artifact.created_by === actor.id) throw new Response(JSON.stringify({ error: "Collectors and uploaders cannot approve their own evidence." }), { status: 403, headers: { "content-type": "application/json" } });
   if (artifact.sha256 !== expectedSha256) throw new Response(JSON.stringify({ error: "The reviewed artifact digest changed. Reload and inspect the evidence again." }), { status: 409, headers: { "content-type": "application/json" } });
   const approvedAt = new Date().toISOString();
   const [result] = await executeAuditedBatch(actor, "evidence.approved", "evidence", id, { artifactSha256: expectedSha256, rationale }, [
-    getEnv().DB.prepare("UPDATE evidence_artifacts SET status = 'approved', approved_by = ?, approved_at = ? WHERE id = ? AND sha256 = ? AND created_by != ? AND status IN ('needs_review', 'expiring')").bind(actor.id, approvedAt, id, expectedSha256, actor.id),
+    getEnv().DB.prepare("UPDATE evidence_artifacts SET status = 'approved', approved_by = ?, approved_at = ? WHERE id = ? AND sha256 = ? AND created_by != ? AND status IN ('needs_review', 'expiring') AND expires_at > ?").bind(actor.id, approvedAt, id, expectedSha256, actor.id, approvedAt),
   ], { sql: "EXISTS (SELECT 1 FROM evidence_artifacts WHERE id = ? AND approved_by = ? AND approved_at = ?)", bindings: [id, actor.id, approvedAt] });
   if (!result.meta.changes) return false;
   return true;

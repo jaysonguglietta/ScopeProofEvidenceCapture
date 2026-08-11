@@ -63,7 +63,7 @@ The Mac app can build a local approved-only assessor ZIP filtered by framework a
 
 Jira Cloud uses hosted OAuth 2.0 authorization-code flow with rotating refresh tokens. OAuth tokens are encrypted under a Jira-specific key and never enter the Mac app; user-bound state, fixed Atlassian API hosts, site matching, project allowlists, and optimistic refresh leases constrain the connection. Operators connect Jira under **Connections**, approve an artifact locally, upload those exact bytes to Scopeproof, obtain hosted reviewer approval, and explicitly choose **Search Evidence… → Upload to Jira Cloud…**. The server revalidates both approvals, the issue, allowlist, PNG hash, safety state, and lifecycle chain before reserving an idempotent attachment operation and recording a signed immutable receipt. Ambiguous Jira outcomes stop for reconciliation instead of blindly retrying. **Copy Jira Comment** and manual attachment remain available as a fallback; uploads never run automatically.
 
-The app includes **Help & How to Use…**, recent capture history, offline retry, configurable retention, Launch at Login, Screen Recording recovery, and secure release checks.
+The app includes **Help & How to Use…**, recent capture history, offline retry, configurable retention, Launch at Login, Screen Recording recovery, and secure release checks. Device credentials are bound to the exact compiled-in backend origin; preference tampering and redirects cannot move an Authorization header to another host.
 
 ## Configuration
 
@@ -78,7 +78,7 @@ Required platform secrets:
 
 Provider-specific values are documented in `.env.example`. Browser capture additionally requires `BROWSER_OCR_ENDPOINT`, `BROWSER_OCR_TOKEN`, and an exact `BROWSER_OCR_ALLOWED_HOSTS` allowlist; the OCR service must return the submitted PNG digest, recognized text, and a policy version. Use read-only, least-privilege credentials and limit browser targets to dedicated evidence URLs that do not expose cardholder data.
 
-Native release values are `MACOS_LATEST_VERSION`, `MACOS_RELEASE_URL`, `MACOS_RELEASE_SHA256`, and `MACOS_RELEASE_NOTES`. RFC 3161 requires the TSA and pinned-verifier settings documented in `.env.example`; configuring only a TSA URL does not create trusted time. Device enrollment and revocation are managed in **Connections → Mac capture devices**.
+Native updates use `MACOS_RELEASE_MANIFEST_JSON`, `MACOS_RELEASE_SIGNATURE_DER_BASE64`, and `MACOS_RELEASE_ALLOWED_HOSTS`. The signed manifest binds the version, monotonic sequence, URL, digest, size, validity window, release key, Developer ID team, and designated requirement. The Mac downloads without credentials or redirects and locally verifies the signature, digest, code identity, Gatekeeper acceptance, and stapled notarization before opening the local ZIP. RFC 3161 requires the TSA and pinned-verifier settings documented in `.env.example`; configuring only a TSA URL does not create trusted time. Device enrollment and revocation are managed in **Connections → Mac capture devices**.
 
 Jira Cloud requires `JIRA_OAUTH_CLIENT_ID`, `JIRA_OAUTH_CLIENT_SECRET`, an exact `JIRA_OAUTH_CALLBACK_URL`, and a distinct base64-encoded 32-byte `JIRA_OAUTH_TOKEN_ENCRYPTION_KEY`. Create one OAuth 2.0 (3LO) integration in the Atlassian developer console with `read:jira-work` and `write:jira-work`; Scopeproof requests `offline_access` for rotating refresh tokens.
 
@@ -112,5 +112,8 @@ See the [development guide](docs/DEVELOPMENT.md) for repository layout, migratio
 - Arbitrary manual binary uploads remain rejected. The authenticated native route accepts only PNGs produced by a reviewed Scopeproof capture manifest after local OCR/redaction.
 - Packages include at most 100 approved artifacts and 25 MB of decrypted evidence, and expire after seven days.
 - Provider pagination and collection breadth are intentionally bounded to resist API and memory exhaustion.
+- API mutations and expensive reads have database-backed per-principal and IP quotas; multipart bodies require a bounded `Content-Length`. Provider calls have 60-second and response-byte limits, and collection jobs use expiring atomic leases.
+- Evidence is unavailable immediately at expiry. The scheduler deletes expired encrypted objects and packages; an administrator may create a reasoned, owned, time-bounded legal hold before expiry through `PUT /api/evidence/:id/retention` and release it through `DELETE`.
+- CSV files are presentation aids with formula-trigger prefixes neutralized. Signed JSON manifests remain authoritative.
 - Rotate encryption and signing keys through a documented key-rotation process before replacing them; existing artifacts require their original key version to remain decryptable.
-- Developer ID signing, Apple notarization, a hosted release URL, and an external RFC 3161 service require production credentials and are not part of an ad-hoc local build.
+- Developer ID signing, Apple notarization, an offline P-256 update key whose public key is compiled into `Info.plist`, a hosted release URL, and an external RFC 3161 service require production credentials and are not part of an ad-hoc local build.

@@ -72,6 +72,8 @@ export const collectionJobs = sqliteTable("collection_jobs", {
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
   startedAt: text("started_at"),
   completedAt: text("completed_at"),
+  leaseId: text("lease_id"),
+  leaseExpiresAt: text("lease_expires_at"),
 }, (table) => [index("idx_jobs_status_next_attempt").on(table.status, table.nextAttemptAt), index("idx_jobs_collector_created").on(table.collectorId, table.createdAt)]);
 
 export const evidenceArtifacts = sqliteTable("evidence_artifacts", {
@@ -104,7 +106,7 @@ export const evidenceArtifacts = sqliteTable("evidence_artifacts", {
   encryptionVersion: integer("encryption_version").notNull().default(1),
   capturedAt: text("captured_at").notNull(),
   expiresAt: text("expires_at").notNull(),
-  status: text("status", { enum: ["needs_review", "approved", "expiring", "rejected"] }).notNull().default("needs_review"),
+  status: text("status", { enum: ["needs_review", "approved", "expiring", "rejected", "expired", "purged"] }).notNull().default("needs_review"),
   redactionCount: integer("redaction_count").notNull().default(0),
   manualRedactions: integer("manual_redactions").notNull().default(0),
   redactionSummaryJson: text("redaction_summary_json").notNull().default("[]"),
@@ -120,6 +122,9 @@ export const evidenceArtifacts = sqliteTable("evidence_artifacts", {
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
   approvedBy: text("approved_by"),
   approvedAt: text("approved_at"),
+  purgedAt: text("purged_at"),
+  purgeAttempts: integer("purge_attempts").notNull().default(0),
+  purgeError: text("purge_error"),
 }, (table) => [
   uniqueIndex("idx_evidence_sha_source_control").on(table.sha256, table.source, table.controlId),
   index("idx_evidence_status_created").on(table.status, table.createdAt),
@@ -130,6 +135,22 @@ export const evidenceArtifacts = sqliteTable("evidence_artifacts", {
   index("idx_evidence_session").on(table.sessionId),
   index("idx_evidence_jira_issue").on(table.jiraIssueKey),
 ]);
+
+export const retentionHolds = sqliteTable("retention_holds", {
+  evidenceId: text("evidence_id").primaryKey(),
+  ownerId: text("owner_id").notNull(),
+  reason: text("reason").notNull(),
+  expiresAt: text("expires_at").notNull(),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [index("idx_retention_holds_expiry").on(table.expiresAt)]);
+
+export const rateLimitBuckets = sqliteTable("rate_limit_buckets", {
+  keyHash: text("key_hash").primaryKey(),
+  windowStart: integer("window_start").notNull(),
+  requestCount: integer("request_count").notNull().default(0),
+  expiresAt: integer("expires_at").notNull(),
+}, (table) => [index("idx_rate_limit_expiry").on(table.expiresAt)]);
 
 export const nativeEvidenceManifests = sqliteTable("native_evidence_manifests", {
   id: text("id").primaryKey(),

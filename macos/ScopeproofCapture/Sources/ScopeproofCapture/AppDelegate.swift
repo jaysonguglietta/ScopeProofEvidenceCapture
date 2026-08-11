@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let preferences = CapturePreferences()
     private lazy var captureService = CaptureService(preferences: preferences)
     private let uploadService = UploadService()
+    private let updateService = UpdateService()
     private let helpController = HelpController()
     private let evidenceSearchController = EvidenceSearchController()
     private let logger = Logger(subsystem: "com.scopeproof.capture", category: "application")
@@ -20,7 +21,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         configureStatusItem()
         rebuildMenu()
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
-        if KeychainStore.readToken() != nil, Date().timeIntervalSince(preferences.lastUpdateCheck ?? .distantPast) > 86_400 { checkForUpdates(silent: true) }
+        if let server = BackendTrust.normalizedOrigin(preferences.serverURL), KeychainStore.readToken(for: server) != nil, Date().timeIntervalSince(preferences.lastUpdateCheck ?? .distantPast) > 86_400 { checkForUpdates(silent: true) }
     }
 
     func menuWillOpen(_ menu: NSMenu) { rebuildMenu() }
@@ -122,7 +123,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         safety.isEnabled = false
         menu.addItem(safety)
         let upload = NSMenuItem(title: uploadStatusTitle(), action: nil, keyEquivalent: "")
-        upload.state = preferences.autoUpload && KeychainStore.readToken() != nil ? .on : .off
+        upload.state = preferences.autoUpload && BackendTrust.normalizedOrigin(preferences.serverURL).flatMap(KeychainStore.readToken(for:)) != nil ? .on : .off
         upload.isEnabled = false
         menu.addItem(upload)
         menu.addItem(.separator())
@@ -515,7 +516,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.addButton(withTitle: "Cancel")
         let server = NSTextField(string: preferences.serverURL?.absoluteString ?? "")
         let token = NSSecureTextField(string: "")
-        token.placeholderString = KeychainStore.readToken() == nil ? "Paste one-time spdev_ token" : "Token saved — leave blank to keep it"
+        let currentAudience = BackendTrust.normalizedOrigin(preferences.serverURL)
+        token.placeholderString = currentAudience.flatMap(KeychainStore.readToken(for:)) == nil ? "Paste one-time spdev_ token" : "Token saved — leave blank to keep it"
         let auto = NSButton(checkboxWithTitle: "Upload reviewed captures automatically", target: nil, action: nil)
         auto.state = preferences.autoUpload ? .on : .off
         let retention = NSPopUpButton(); retention.addItems(withTitles: ["30 days", "90 days", "180 days", "365 days", "1095 days"]); retention.selectItem(withTitle: "\(preferences.retentionDays) days")
@@ -538,7 +540,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         grid.rowSpacing = 10; grid.columnSpacing = 12; grid.column(at: 0).xPlacement = .trailing; grid.column(at: 1).xPlacement = .fill
         alert.accessoryView = grid
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        guard let url = URL(string: server.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)), isAllowedServerURL(url) else { showError(UploadFailure.invalidServer); return }
+        guard let candidate = URL(string: server.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)), let url = BackendTrust.normalizedOrigin(candidate) else { showError(UploadFailure.invalidServer); return }
         let jiraSiteValue = jiraSite.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         let jiraProjectValue = jiraProject.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
         if !jiraSiteValue.isEmpty {
@@ -548,44 +550,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard JiraHandoff.isValidProjectKey(jiraProjectValue) else { showError(NSError(domain: "Scopeproof", code: 22, userInfo: [NSLocalizedDescriptionKey: "The Jira project key must start with a letter and contain only uppercase letters, numbers, or underscores."])); return }
         let newToken = token.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard newToken.isEmpty || newToken.hasPrefix("spdev_dev_") else { showError(NSError(domain: "Scopeproof", code: 2, userInfo: [NSLocalizedDescriptionKey: "The device token must begin with spdev_dev_."])); return }
+        if newToken.isEmpty, KeychainStore.tokenAudience() != url.absoluteString { showError(NSError(domain: "Scopeproof", code: 23, userInfo: [NSLocalizedDescriptionKey: "Changing the Scopeproof server requires a new device token issued for that exact server."])); return }
         let selectedMode = JiraAttachmentMode(rawValue: attachmentMode.titleOfSelectedItem ?? "") ?? .evidenceSet
+        if !newToken.isEmpty {
+            do { try KeychainStore.saveToken(newToken, audience: url) } catch { showError(error); return }
+        }
         preferences.serverURL = url
         preferences.autoUpload = auto.state == .on
         preferences.retentionDays = Int(retention.titleOfSelectedItem?.split(separator: " ").first ?? "365") ?? 365
         preferences.jiraHandoff = JiraHandoffSettings(baseURL: jiraSiteValue, projectKey: jiraProjectValue, attachmentMode: selectedMode, includeGuideInPackages: includeGuide.state == .on, customInstructions: String(instructions.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).prefix(2_000)))
-        if !newToken.isEmpty {
-            do { try KeychainStore.saveToken(newToken) } catch { showError(error); return }
-        }
         setReady("Capture and Jira settings saved")
-    }
-
-    private func isAllowedServerURL(_ url: URL) -> Bool {
-        guard let scheme = url.scheme?.lowercased(), let host = url.host?.lowercased() else { return false }
-        if scheme == "https" { return true }
-        return scheme == "http" && ["localhost", "127.0.0.1", "::1"].contains(host)
     }
 
     @objc private func checkForUpdatesAction() { checkForUpdates(silent: false) }
     private func checkForUpdates(silent: Bool) {
         Task {
             do {
-                let release = try await uploadService.checkForUpdates(serverURL: preferences.serverURL)
+                guard let release = try await updateService.check(serverURL: preferences.serverURL) else {
+                    if !silent { await MainActor.run { self.setReady("Scopeproof Capture is up to date") } }
+                    return
+                }
                 await MainActor.run {
                     self.preferences.lastUpdateCheck = Date()
-                    let installedVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.3.2"
-                    guard self.isNewer(release.version, than: installedVersion) else { if !silent { self.setReady("Scopeproof Capture is up to date") }; return }
                     let alert = NSAlert(); alert.messageText = "Scopeproof Capture \(release.version) is available"; alert.informativeText = release.notes
-                    alert.addButton(withTitle: release.downloadUrl == nil ? "OK" : "Open Download"); alert.addButton(withTitle: "Later")
-                    if alert.runModal() == .alertFirstButtonReturn, let url = release.downloadUrl { NSWorkspace.shared.open(url) }
+                    alert.addButton(withTitle: "Download and Verify"); alert.addButton(withTitle: "Later")
+                    guard alert.runModal() == .alertFirstButtonReturn else { return }
+                    self.setBusy("Downloading and verifying update…")
+                    Task {
+                        do {
+                            let local = try await self.updateService.downloadAndVerify(release)
+                            await MainActor.run { self.setReady("Verified update ready"); NSWorkspace.shared.open(local) }
+                        } catch { await MainActor.run { self.showError(error) } }
+                    }
                 }
             } catch { if !silent { await MainActor.run { self.showError(error) } } }
         }
-    }
-
-    private func isNewer(_ candidate: String, than current: String) -> Bool {
-        let left = candidate.split(separator: ".").map { Int($0) ?? 0 }; let right = current.split(separator: ".").map { Int($0) ?? 0 }
-        for index in 0..<max(left.count, right.count) { let l = index < left.count ? left[index] : 0; let r = index < right.count ? right[index] : 0; if l != r { return l > r } }
-        return false
     }
 
     @objc private func showHelp() { helpController.show(outputDirectory: captureService.outputDirectory) }
@@ -593,7 +592,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func quitApp() { NSApplication.shared.terminate(nil) }
 
     private func uploadStatusTitle() -> String {
-        guard KeychainStore.readToken() != nil else { return "Web upload: Not connected" }
+        guard let server = BackendTrust.normalizedOrigin(preferences.serverURL), KeychainStore.readToken(for: server) != nil else { return "Web upload: Not connected" }
         return preferences.autoUpload ? "Web upload: Automatic" : "Web upload: Manual retry"
     }
 

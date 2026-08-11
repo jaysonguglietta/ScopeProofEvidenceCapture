@@ -6,13 +6,14 @@ import { storeEvidence } from "../../../../lib/server/evidence";
 import { getEnv } from "../../../../lib/server/env";
 import { NativeManifestError, parseNativeManifest, validatePng } from "../../../../lib/server/native-manifest";
 import { requestTrustedTimestamp } from "../../../../lib/server/timestamp";
+import { enforceRateLimit, requireBoundedContentLength } from "../../../../lib/server/rate-limit";
 
 export async function POST(request: Request) {
   try {
     const { device, actor, verifyUploadSignature } = await requireCaptureDevice(request);
     assertPermission(actor, "collect_evidence");
-    const contentLength = Number(request.headers.get("content-length") || 0);
-    if (!Number.isFinite(contentLength) || contentLength <= 0 || contentLength > 16 * 1024 * 1024) return Response.json({ error: "Capture payload size is invalid." }, { status: 413 });
+    await enforceRateLimit(request, device.id, "native:evidence", 30, 3_600);
+    requireBoundedContentLength(request, 16 * 1024 * 1024);
     const form = await request.formData();
     if (Array.from(form.keys()).some((name) => name !== "screenshot" && name !== "manifest")) return Response.json({ error: "Capture metadata must come only from the signed manifest." }, { status: 422 });
     const screenshot = form.get("screenshot");

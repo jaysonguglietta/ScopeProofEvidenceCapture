@@ -3,10 +3,12 @@ import { collectorConfiguration, type CollectorProvider } from "../../../lib/ser
 import { getEnv } from "../../../lib/server/env";
 import { ensureDefaultCollectors } from "../../../lib/server/jobs";
 import { executeAuditedBatch } from "../../../lib/server/audit";
+import { enforceRateLimit, requireBoundedContentLength } from "../../../lib/server/rate-limit";
 
 export async function GET(request: Request) {
   try {
     const user = await requireApiUser(request);
+    await enforceRateLimit(request, user.id, "collector:list", 120, 60);
     await ensureDefaultCollectors(user);
     const rows = (await getEnv().DB.prepare("SELECT id, provider, display_name, enabled, schedule_cron, status, last_run_at, last_error FROM collectors ORDER BY provider").all<Record<string, unknown>>()).results;
     return Response.json({ collectors: rows.map((row: Record<string, unknown>) => ({ ...row, configuration: collectorConfiguration(String(row.provider) as CollectorProvider) })) });
@@ -17,6 +19,8 @@ export async function PATCH(request: Request) {
   try {
     requireSameOrigin(request);
     const user = await requireApiPermission(request, "manage_collectors");
+    await enforceRateLimit(request, user.id, "collector:update", 30, 3_600);
+    requireBoundedContentLength(request, 16 * 1024);
     const body = await request.json() as { id?: string; enabled?: boolean; scheduleCron?: string };
     if (!body.id || (body.scheduleCron && !/^(\*|\d{1,2}) (\*|\d{1,2}) \* \* (\*|[0-6])$/.test(body.scheduleCron))) return Response.json({ error: "Collector id and a supported five-field UTC cron are required." }, { status: 400 });
     const updatedAt = new Date().toISOString();

@@ -4,6 +4,7 @@ import { executeAuditedBatch } from "./audit";
 import { decryptEvidence, encryptEvidence, randomId, sha256, signPackage, stableJson } from "./crypto";
 import { getEnv } from "./env";
 import { readEvidenceBytes } from "./evidence";
+import { csvCell } from "./csv";
 
 function safeName(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "evidence";
@@ -18,8 +19,6 @@ function extension(contentType: string): string {
   if (contentType.includes("yaml")) return "yaml";
   return "txt";
 }
-
-function csv(value: unknown): string { return `"${String(value ?? "").replaceAll('"', '""')}"`; }
 
 function escapePdf(value: string): string { return value.replace(/[\\()]/g, "\\$&").replace(/[^\x20-\x7e]/g, "?"); }
 
@@ -56,10 +55,10 @@ export async function buildAssessorPackage(actor: AuthenticatedUser): Promise<{ 
     env.DB.prepare("INSERT INTO export_packages (id, requested_by) VALUES (?, ?)").bind(id, actor.id),
   ]);
   try {
-    const rows = (await env.DB.prepare(`SELECT id, control_id, framework, catalog_version, title, description, type, source, system, environment, assessment_period, evidence_owner, tags_json, expected_evidence, mapped_controls_json, jira_issue_key, jira_issue_url, content_type, byte_size, sha256, captured_at, expires_at, redaction_count, manual_redactions, safety_scan_sha256, safety_scan_policy, safety_scan_completed_at, approved_by, approved_at
-      FROM evidence_artifacts WHERE status = 'approved' ORDER BY control_id, captured_at DESC LIMIT 100`).all<Record<string, unknown>>()).results;
-    if (!rows.length) throw new Error("No approved evidence is available for export.");
     const generatedAt = new Date().toISOString();
+    const rows = (await env.DB.prepare(`SELECT id, control_id, framework, catalog_version, title, description, type, source, system, environment, assessment_period, evidence_owner, tags_json, expected_evidence, mapped_controls_json, jira_issue_key, jira_issue_url, content_type, byte_size, sha256, captured_at, expires_at, redaction_count, manual_redactions, safety_scan_sha256, safety_scan_policy, safety_scan_completed_at, approved_by, approved_at
+      FROM evidence_artifacts WHERE status = 'approved' AND expires_at > ? ORDER BY control_id, captured_at DESC LIMIT 100`).bind(generatedAt).all<Record<string, unknown>>()).results;
+    if (!rows.length) throw new Error("No approved evidence is available for export.");
     const files: Record<string, Uint8Array> = {};
     let totalEvidenceBytes = 0;
     for (const row of rows) {
@@ -72,8 +71,8 @@ export async function buildAssessorPackage(actor: AuthenticatedUser): Promise<{ 
     const frameworks = [...new Set(rows.map((row) => String(row.framework || "PCI DSS 4.0.1")))].sort();
     const periods = [...new Set(rows.map((row) => String(row.assessment_period || "Unspecified")))].sort();
     const indexRows = [
-      ["Evidence ID", "Framework", "Control", "Jira issue", "Jira URL", "Title", "System", "Environment", "Assessment period", "Owner", "Captured at", "Approved at", "Redactions", "SHA-256"].map(csv).join(","),
-      ...rows.map((row) => [row.id, row.framework || "PCI DSS 4.0.1", row.control_id, row.jira_issue_key, row.jira_issue_url, row.title, row.system, row.environment, row.assessment_period, row.evidence_owner, row.captured_at, row.approved_at, Number(row.redaction_count || 0) + Number(row.manual_redactions || 0), row.sha256].map(csv).join(",")),
+      ["Evidence ID", "Framework", "Control", "Jira issue", "Jira URL", "Title", "System", "Environment", "Assessment period", "Owner", "Captured at", "Approved at", "Redactions", "SHA-256"].map(csvCell).join(","),
+      ...rows.map((row) => [row.id, row.framework || "PCI DSS 4.0.1", row.control_id, row.jira_issue_key, row.jira_issue_url, row.title, row.system, row.environment, row.assessment_period, row.evidence_owner, row.captured_at, row.approved_at, Number(row.redaction_count || 0) + Number(row.manual_redactions || 0), row.sha256].map(csvCell).join(",")),
     ];
     files["01-Evidence-Index.csv"] = strToU8(`${indexRows.join("\n")}\n`);
     files["00-READ-ME.txt"] = strToU8(`SCOPEPROOF EXTERNAL ASSESSOR PACKAGE\n\nPackage ID: ${id}\nGenerated: ${generatedAt}\nPrepared by: ${actor.email}\nFrameworks: ${frameworks.join(", ")}\nAssessment periods: ${periods.join(", ")}\nApproved evidence: ${rows.length}\n\nSTART HERE\n1. Open 01-Evidence-Index.csv to browse the evidence by framework and control.\n2. Review artifacts under evidence/<framework>/<control>/.\n3. Use manifest.json and VERIFY.txt to validate SHA-256 hashes and the ECDSA signature.\n4. Follow 02-Jira-Handoff.txt before attaching artifacts to Jira.\n\nOnly evidence approved through Scopeproof review is included. Cross-framework mappings are informational and require assessor validation.\n`);

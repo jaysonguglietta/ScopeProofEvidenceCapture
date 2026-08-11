@@ -6,6 +6,18 @@ import Testing
 
 @Suite("Sensitive data scanner")
 struct SensitiveDataScannerTests {
+    @Test("Neutralizes spreadsheet formulas after whitespace and control prefixes", arguments: [
+        ("=1+1", "\"'=1+1\""),
+        (" +cmd|' /C calc'!A0", "\"' +cmd|' /C calc'!A0\""),
+        ("\t@SUM(A1:A2)", "\"'\t@SUM(A1:A2)\""),
+        ("-42", "\"'-42\""),
+        ("ordinary", "\"ordinary\""),
+        ("quoted \"value\"", "\"quoted \"\"value\"\"\""),
+    ])
+    func neutralizesSpreadsheetFormulas(value: String, expected: String) {
+        #expect(CSVSerializer.cell(value) == expected)
+    }
+
     @Test("Detects Luhn-valid PANs and ignores invalid card-like values")
     func detectsLuhnValidPANAndIgnoresInvalidNumber() {
         #expect(SensitiveDataScanner.detectedKinds(in: "Card 4111 1111 1111 1111").contains(.pan))
@@ -20,7 +32,8 @@ struct SensitiveDataScannerTests {
     }
 
     @Test("Requires HTTPS except for loopback development servers", arguments: [
-        ("https://scopeproof.example", true),
+        ("https://scopeproof-pci.jayson-guglietta.chatgpt.site", true),
+        ("https://scopeproof.example", false),
         ("http://localhost:3000", true),
         ("http://127.0.0.1:3000", true),
         ("http://scopeproof.example", false),
@@ -28,6 +41,30 @@ struct SensitiveDataScannerTests {
     ])
     func validatesServerTransport(value: String, expected: Bool) {
         #expect(UploadService.isAllowedServerURL(URL(string: value)!) == expected)
+    }
+
+    @Test("Accepts responses only from the credential audience origin")
+    func validatesResponseAudience() {
+        let origin = URL(string: "https://scopeproof-pci.jayson-guglietta.chatgpt.site")!
+        #expect(BackendTrust.sameOrigin(URL(string: "https://scopeproof-pci.jayson-guglietta.chatgpt.site/api/native/evidence"), origin))
+        #expect(!BackendTrust.sameOrigin(URL(string: "https://attacker.example/api/native/evidence"), origin))
+        #expect(BackendTrust.normalizedOrigin(URL(string: "https://scopeproof-pci.jayson-guglietta.chatgpt.site/redirect")) == nil)
+    }
+
+    @Test("Verifies signed update metadata and rejects tampering and rollback")
+    func verifiesSignedUpdatesAndRejectsTampering() throws {
+        let privateKey = P256.Signing.PrivateKey()
+        let formatter = ISO8601DateFormatter()
+        let now = Date()
+        let manifest = ReleaseManifest(schemaVersion: 1, version: "99.0.0", sequence: 42, downloadUrl: URL(string: "https://github.com/scopeproof/releases/download/v99/Scopeproof-Capture.zip")!, sha256: String(repeating: "a", count: 64), byteSize: 1_024, publishedAt: formatter.string(from: now.addingTimeInterval(-60)), expiresAt: formatter.string(from: now.addingTimeInterval(86_400)), minimumSystemVersion: "14.0", teamIdentifier: "ABCDE12345", designatedRequirement: "identifier \"com.scopeproof.capture\" and anchor apple generic", keyId: "release-2026", notes: "Security update")
+        let signature = try privateKey.signature(for: manifest.signingPayload)
+        let envelope = ReleaseEnvelope(manifest: manifest, signatureDERBase64: signature.derRepresentation.base64EncodedString())
+        let trusted = TrustedUpdateKey(keyId: "release-2026", publicKeyX963Base64: privateKey.publicKey.x963Representation.base64EncodedString(), notBefore: now.addingTimeInterval(-3_600), notAfter: now.addingTimeInterval(172_800))
+        #expect(try ReleaseVerifier.verify(envelope, keys: [trusted], expectedTeamIdentifier: manifest.teamIdentifier, expectedDesignatedRequirement: manifest.designatedRequirement, installedVersion: "1.3.2", highestSequence: 41).sequence == 42)
+        #expect(throws: UpdateFailure.self) { try ReleaseVerifier.verify(envelope, keys: [trusted], expectedTeamIdentifier: manifest.teamIdentifier, expectedDesignatedRequirement: manifest.designatedRequirement, installedVersion: "1.3.2", highestSequence: 43) }
+        let tampered = ReleaseManifest(schemaVersion: 1, version: "99.0.1", sequence: 42, downloadUrl: manifest.downloadUrl, sha256: manifest.sha256, byteSize: manifest.byteSize, publishedAt: manifest.publishedAt, expiresAt: manifest.expiresAt, minimumSystemVersion: manifest.minimumSystemVersion, teamIdentifier: manifest.teamIdentifier, designatedRequirement: manifest.designatedRequirement, keyId: manifest.keyId, notes: manifest.notes)
+        #expect(throws: UpdateFailure.self) { try ReleaseVerifier.verify(ReleaseEnvelope(manifest: tampered, signatureDERBase64: envelope.signatureDERBase64), keys: [trusted], expectedTeamIdentifier: manifest.teamIdentifier, expectedDesignatedRequirement: manifest.designatedRequirement, installedVersion: "1.3.2", highestSequence: 41) }
+        #expect(throws: UpdateFailure.self) { try ReleaseVerifier.verify(envelope, keys: [trusted], expectedTeamIdentifier: "WRONG12345", expectedDesignatedRequirement: manifest.designatedRequirement, installedVersion: "1.3.2", highestSequence: 41) }
     }
 
     @Test("Adds a full-width header above captured pixels")

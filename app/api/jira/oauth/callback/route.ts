@@ -1,5 +1,6 @@
 import { requireApiPermission } from "../../../../../lib/server/auth";
 import { completeJiraOAuth } from "../../../../../lib/server/jira";
+import { enforceRateLimit } from "../../../../../lib/server/rate-limit";
 
 function destination(request: Request, status: "connected" | "error", reason?: string): URL {
   const url = new URL("/", request.url);
@@ -15,6 +16,7 @@ export async function GET(request: Request) {
   const code = url.searchParams.get("code") || "";
   try {
     const actor = await requireApiPermission(request, "manage_jira");
+    await enforceRateLimit(request, actor.id, "jira:oauth-callback", 20, 3_600);
     await completeJiraOAuth(actor, state, code);
     return Response.redirect(destination(request, "connected"), 303);
   } catch (error) {

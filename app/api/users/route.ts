@@ -1,12 +1,14 @@
 import { executeAuditedBatch } from "../../../lib/server/audit";
 import { jsonError, requireApiPermission, requireApiUser, requireSameOrigin, type Role } from "../../../lib/server/auth";
 import { getEnv } from "../../../lib/server/env";
+import { enforceRateLimit, requireBoundedContentLength } from "../../../lib/server/rate-limit";
 
 const roles: Role[] = ["admin", "compliance_lead", "reviewer", "auditor"];
 
 export async function GET(request: Request) {
   try {
-    await requireApiUser(request, "compliance_lead");
+    const actor = await requireApiUser(request, "compliance_lead");
+    await enforceRateLimit(request, actor.id, "user:list", 120, 60);
     const users = (await getEnv().DB.prepare("SELECT id, email, display_name, role, created_at, last_seen_at FROM users ORDER BY email").all<Record<string, unknown>>()).results;
     return Response.json({ users });
   } catch (error) { return jsonError(error); }
@@ -16,6 +18,8 @@ export async function PATCH(request: Request) {
   try {
     requireSameOrigin(request);
     const actor = await requireApiPermission(request, "manage_users");
+    await enforceRateLimit(request, actor.id, "user:role", 30, 3_600);
+    requireBoundedContentLength(request, 8 * 1024);
     const body = await request.json() as { userId?: string; role?: Role };
     if (!body.userId || !body.role || !roles.includes(body.role)) return Response.json({ error: "A valid user and role are required." }, { status: 400 });
     const target = await getEnv().DB.prepare("SELECT id, email, role FROM users WHERE id = ?").bind(body.userId).first<{ id: string; email: string; role: Role }>();

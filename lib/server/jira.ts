@@ -2,6 +2,7 @@ import { assertPermission, type AuthenticatedUser } from "./auth";
 import { executeAuditedBatch } from "./audit";
 import { bytesToBase64, decryptSecret, encryptSecret, hmac, randomId, sha256, stableJson } from "./crypto";
 import { getEnv, requireEnv } from "./env";
+import { boundedFetch } from "./outbound";
 
 const tokenKeyName = "JIRA_OAUTH_TOKEN_ENCRYPTION_KEY";
 const oauthScopes = ["offline_access", "read:jira-work", "write:jira-work"];
@@ -140,21 +141,19 @@ async function responseJson<T>(response: Response, maximumBytes = 1_000_000): Pr
 }
 
 async function tokenExchange(body: Record<string, string>): Promise<AtlassianTokenResponse> {
-  const response = await fetch("https://auth.atlassian.com/oauth/token", {
+  const response = await boundedFetch("https://auth.atlassian.com/oauth/token", {
     method: "POST",
     headers: { "content-type": "application/json", accept: "application/json" },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(20_000),
-  });
+  }, { label: "Atlassian OAuth", allowedOrigins: ["https://auth.atlassian.com"], maximumBytes: 1_000_000, timeoutMs: 20_000 });
   if (!response.ok) throw new OAuthTokenExchangeError(response.status);
   return responseJson<AtlassianTokenResponse>(response);
 }
 
 async function accessibleResources(accessToken: string): Promise<AtlassianResource[]> {
-  const response = await fetch("https://api.atlassian.com/oauth/token/accessible-resources", {
+  const response = await boundedFetch("https://api.atlassian.com/oauth/token/accessible-resources", {
     headers: { authorization: `Bearer ${accessToken}`, accept: "application/json" },
-    signal: AbortSignal.timeout(20_000),
-  });
+  }, { label: "Atlassian resources", allowedOrigins: ["https://api.atlassian.com"], maximumBytes: 1_000_000, timeoutMs: 20_000 });
   if (!response.ok) throw new Error(`Atlassian site access check failed (${response.status}).`);
   const resources = await responseJson<unknown>(response);
   if (!Array.isArray(resources)) throw new Error("Atlassian returned an invalid site list.");
@@ -287,7 +286,7 @@ async function jiraRequest(row: JiraConnectionRow, path: string, init: RequestIn
   const headers = new Headers(init.headers);
   headers.set("authorization", `Bearer ${token}`);
   headers.set("accept", "application/json");
-  return fetch(url, { ...init, headers, signal: AbortSignal.timeout(60_000) });
+  return boundedFetch(url, { ...init, headers }, { label: "Jira Cloud API", allowedOrigins: ["https://api.atlassian.com"], maximumBytes: 2 * 1024 * 1024, timeoutMs: 60_000 });
 }
 
 function assertAllowedIssue(row: JiraConnectionRow, rawKey: string): string {

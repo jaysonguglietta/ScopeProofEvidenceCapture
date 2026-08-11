@@ -1,5 +1,6 @@
 import { base64ToBytes, bytesToBase64, sha256, stableJson } from "./crypto";
 import { getEnv } from "./env";
+import { boundedFetch } from "./outbound";
 
 function derLength(length: number): Uint8Array {
   if (length < 0x80) return Uint8Array.of(length);
@@ -99,17 +100,17 @@ export async function requestTrustedTimestamp(digestSha256: string): Promise<{ a
   const tsaUrl = new URL(env.RFC3161_TSA_URL);
   if (tsaUrl.protocol !== "https:" || tsaUrl.username || tsaUrl.password || tsaUrl.hash) throw new Error("RFC3161_TSA_URL must use HTTPS without credentials or fragments.");
   const request = timestampRequest(digestSha256);
-  const response = await fetch(tsaUrl, { method: "POST", headers: { "content-type": "application/timestamp-query", accept: "application/timestamp-reply" }, body: arrayBuffer(request.body), signal: AbortSignal.timeout(30_000) });
+  const response = await boundedFetch(tsaUrl, { method: "POST", headers: { "content-type": "application/timestamp-query", accept: "application/timestamp-reply" }, body: arrayBuffer(request.body) }, { label: "RFC 3161 TSA", allowedOrigins: [tsaUrl.origin], maximumBytes: 256 * 1024, timeoutMs: 30_000 });
   if (!response.ok) throw new Error(`Timestamp authority returned HTTP ${response.status}.`);
   const token = new Uint8Array(await response.arrayBuffer());
   if (token.length < 16 || token.length > 256 * 1024) throw new Error("Timestamp authority returned an invalid-size RFC 3161 response.");
   const tokenSha256 = await sha256(token);
   const verifierUrl = verifierEndpoint();
   if (!env.RFC3161_VERIFIER_TOKEN) throw new Error("RFC 3161 verifier token is not configured.");
-  const verificationResponse = await fetch(verifierUrl, {
-    method: "POST", headers: { authorization: `Bearer ${env.RFC3161_VERIFIER_TOKEN}`, "content-type": "application/json", accept: "application/json" }, signal: AbortSignal.timeout(30_000),
+  const verificationResponse = await boundedFetch(verifierUrl, {
+    method: "POST", headers: { authorization: `Bearer ${env.RFC3161_VERIFIER_TOKEN}`, "content-type": "application/json", accept: "application/json" },
     body: JSON.stringify({ version: 1, digestSha256, nonceHex: request.nonceHex, tsaOrigin: tsaUrl.origin, tokenBase64: bytesToBase64(token) }),
-  });
+  }, { label: "RFC 3161 verifier", allowedOrigins: [verifierUrl.origin], maximumBytes: 32 * 1024, timeoutMs: 30_000 });
   if (!verificationResponse.ok) throw new Error(`RFC 3161 verifier returned HTTP ${verificationResponse.status}.`);
   const verificationText = await verificationResponse.text();
   if (verificationText.length > 32 * 1024) throw new Error("RFC 3161 verifier response is too large.");

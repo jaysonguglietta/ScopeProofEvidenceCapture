@@ -2,6 +2,52 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { redactText } from "../lib/server/redaction.ts";
+import { csvCell } from "../lib/server/csv.ts";
+import { configuredMacRelease, releaseSigningPayload } from "../lib/server/releases.ts";
+import type { ScopeproofEnv } from "../lib/server/env.ts";
+
+test("neutralizes spreadsheet formulas in every server CSV cell", () => {
+  for (const value of ["=1+1", "+cmd|' /C calc'!A0", "-42", "@SUM(A1:A2)", " \t=HYPERLINK(\"https://evil\")", "\u0000@payload"]) {
+    assert.ok(csvCell(value).startsWith("\"'"));
+  }
+  assert.equal(csvCell('safe "quoted" value'), '"safe ""quoted"" value"');
+});
+
+test("strictly validates signed release envelopes and approved download hosts", () => {
+  const now = new Date("2026-08-11T12:00:00Z");
+  const manifest = { schemaVersion: 1 as const, version: "2.0.0", sequence: 20, downloadUrl: "https://downloads.example.test/Scopeproof-Capture.zip", sha256: "a".repeat(64), byteSize: 1024, publishedAt: "2026-08-11T11:00:00.000Z", expiresAt: "2026-09-01T12:00:00.000Z", minimumSystemVersion: "14.0", teamIdentifier: "ABCDE12345", designatedRequirement: 'identifier "com.scopeproof.capture" and anchor apple generic', keyId: "release-2026", notes: "Security release" };
+  const env = { MACOS_RELEASE_MANIFEST_JSON: JSON.stringify(manifest), MACOS_RELEASE_SIGNATURE_DER_BASE64: "A".repeat(96), MACOS_RELEASE_ALLOWED_HOSTS: "downloads.example.test" } as ScopeproofEnv;
+  assert.deepEqual(configuredMacRelease(env, now).manifest, manifest);
+  assert.match(releaseSigningPayload(manifest), /^scopeproof-update-manifest-v1\n1\n2\.0\.0\n20\n/);
+  assert.throws(() => configuredMacRelease({ ...env, MACOS_RELEASE_ALLOWED_HOSTS: "other.example.test" }, now));
+});
+
+test("production hardening bounds abuse, claims jobs atomically, and enforces retention", async () => {
+  const [rateLimit, jobs, collectors, outbound, retention, evidence, packages, migration, backend, updater, releaseRoute] = await Promise.all([
+    readFile(new URL("../lib/server/rate-limit.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/server/jobs.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/server/collectors.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/server/outbound.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/server/retention.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/server/evidence.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/server/packages.ts", import.meta.url), "utf8"),
+    readFile(new URL("../drizzle/0009_chubby_martin_li.sql", import.meta.url), "utf8"),
+    readFile(new URL("../macos/ScopeproofCapture/Sources/ScopeproofCapture/BackendTrust.swift", import.meta.url), "utf8"),
+    readFile(new URL("../macos/ScopeproofCapture/Sources/ScopeproofCapture/UpdateService.swift", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/native/releases/latest/route.ts", import.meta.url), "utf8"),
+  ]);
+  assert.match(rateLimit, /principal:/); assert.match(rateLimit, /address:/); assert.match(rateLimit, /Content-Length header is required/);
+  assert.match(jobs, /lease_id = \?/); assert.match(jobs, /LEASE_LOST/); assert.match(jobs, /lease_expires_at < \?/);
+  assert.match(collectors, /AbortSignal\.timeout\(60_000\)/); assert.match(collectors, /PROVIDER_RESPONSE_TOO_LARGE/); assert.match(collectors, /redirect: "error"/);
+  assert.match(outbound, /allowedOrigins/); assert.match(outbound, /maximumBytes/); assert.match(outbound, /redirect: "error"/);
+  assert.match(retention, /retention\.purge_started/); assert.match(retention, /evidence\.purged/); assert.match(retention, /retention_holds/);
+  assert.match(evidence, /This evidence has expired/); assert.match(evidence, /Expired evidence cannot be approved/);
+  assert.match(packages, /status = 'approved' AND expires_at > \?/); assert.match(packages, /csvCell/);
+  for (const table of ["rate_limit_buckets", "retention_holds"]) assert.ok(migration.includes(`CREATE TABLE \`${table}\``));
+  assert.match(backend, /productionOrigins/); assert.match(backend, /completionHandler\(nil\)/); assert.match(backend, /sameOrigin/);
+  assert.match(updater, /isValidSignature/); assert.match(updater, /codesign/); assert.match(updater, /TeamIdentifier/); assert.match(updater, /stapler/); assert.match(updater, /highestUpdateSequence/);
+  assert.match(releaseRoute, /configuredMacRelease/);
+});
 
 test("redacts Luhn-valid PANs while preserving invalid numeric identifiers", () => {
   const result = redactText("card=4111 1111 1111 1111 order=4111111111111112");

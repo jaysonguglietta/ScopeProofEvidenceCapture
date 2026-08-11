@@ -1,10 +1,12 @@
 import { jsonError, requireApiUser } from "../../../../lib/server/auth";
 import { appendAuditEvent } from "../../../../lib/server/audit";
 import { readAssessorPackage } from "../../../../lib/server/packages";
+import { enforceRateLimit } from "../../../../lib/server/rate-limit";
 
 export async function GET(request: Request, context: { params: Promise<{ id: string }> }) {
   try {
     const user = await requireApiUser(request);
+    await enforceRateLimit(request, user.id, "package:download", 30, 3_600);
     const { id } = await context.params;
     const result = await readAssessorPackage(id, user);
     if (!result) return Response.json({ error: "Package not found" }, { status: 404 });

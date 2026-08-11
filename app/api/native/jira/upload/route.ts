@@ -4,6 +4,7 @@ import { requireCaptureDevice } from "../../../../../lib/server/devices";
 import { getEnv } from "../../../../../lib/server/env";
 import { assertJiraOperator, normalizeJiraIssueKey, uploadJiraEvidence } from "../../../../../lib/server/jira";
 import { NativeManifestError, parseNativeManifest, validatePng } from "../../../../../lib/server/native-manifest";
+import { enforceRateLimit, requireBoundedContentLength } from "../../../../../lib/server/rate-limit";
 
 type LifecycleEvent = { sequence?: unknown; occurredAt?: unknown; actor?: unknown; action?: unknown; note?: unknown; previousHash?: unknown; eventHash?: unknown };
 type Lifecycle = { evidenceID?: unknown; status?: unknown; events?: unknown };
@@ -39,8 +40,8 @@ export async function POST(request: Request) {
   try {
     const { device, actor, verifyUploadSignature } = await requireCaptureDevice(request);
     assertJiraOperator(actor);
-    const contentLength = Number(request.headers.get("content-length") || 0);
-    if (Number.isFinite(contentLength) && contentLength > 17 * 1024 * 1024) return Response.json({ error: "Jira evidence payload is too large." }, { status: 413 });
+    await enforceRateLimit(request, device.id, "native-jira-upload", 20, 3_600);
+    requireBoundedContentLength(request, 17 * 1024 * 1024);
     const form = await request.formData();
     const screenshot = form.get("screenshot");
     const manifestFile = jsonFile(form, "manifest", 256 * 1024);
@@ -67,8 +68,8 @@ export async function POST(request: Request) {
       JOIN evidence_artifacts e ON e.id = n.artifact_id
       WHERE n.device_id = ? AND n.local_evidence_id = ? AND n.image_sha256 = ? AND n.manifest_sha256 = ? AND n.jira_issue_key = ?
         AND e.device_id = n.device_id AND e.created_by = ? AND e.sha256 = n.image_sha256 AND e.manifest_sha256 = n.manifest_sha256
-        AND e.jira_issue_key = n.jira_issue_key`)
-      .bind(device.id, evidenceId, imageSha256, manifestSha256, issueKey, actor.id).first<{ id: string; status: string; timestamp_token: string | null }>();
+        AND e.jira_issue_key = n.jira_issue_key AND e.expires_at > ?`)
+      .bind(device.id, evidenceId, imageSha256, manifestSha256, issueKey, actor.id, Date.now()).first<{ id: string; status: string; timestamp_token: string | null }>();
     if (!hosted) return Response.json({ error: "Upload this exact evidence set to Scopeproof before sending it to Jira Cloud." }, { status: 409 });
     if (hosted.status !== "approved") return Response.json({ error: "An authenticated Scopeproof reviewer must approve the hosted evidence before Jira disclosure." }, { status: 409 });
     if (!hosted.timestamp_token || hosted.timestamp_token.length > 256 * 1024) return Response.json({ error: "The hosted evidence is missing a valid signed Scopeproof attestation." }, { status: 409 });

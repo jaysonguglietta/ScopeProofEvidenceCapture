@@ -3,11 +3,17 @@ import LocalAuthentication
 import Security
 
 enum KeychainStore {
+    private struct DeviceCredential: Codable {
+        let schemaVersion: Int
+        let audience: String
+        let token: String
+    }
     private static let service = "com.scopeproof.capture"
     private static let account = "capture-device-token"
     private static let packageSigningAccount = "assessor-package-signing-key-v2-user-presence"
+    private static let updateSequenceAccount = "verified-update-highest-sequence-v1"
 
-    static func readToken() -> String? {
+    private static func readCredential() -> DeviceCredential? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -18,11 +24,19 @@ enum KeychainStore {
         var item: CFTypeRef?
         guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
               let data = item as? Data else { return nil }
-        return String(data: data, encoding: .utf8)
+        guard let credential = try? JSONDecoder().decode(DeviceCredential.self, from: data), credential.schemaVersion == 1 else { return nil }
+        return credential
     }
 
-    static func saveToken(_ token: String) throws {
-        let data = Data(token.utf8)
+    static func readToken(for audience: URL) -> String? {
+        guard let credential = readCredential(), credential.audience == audience.absoluteString else { return nil }
+        return credential.token
+    }
+
+    static func tokenAudience() -> String? { readCredential()?.audience }
+
+    static func saveToken(_ token: String, audience: URL) throws {
+        let data = try JSONEncoder().encode(DeviceCredential(schemaVersion: 1, audience: audience.absoluteString, token: token))
         let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account]
         let attributes: [String: Any] = [kSecValueData as String: data, kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly]
         let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
@@ -37,6 +51,26 @@ enum KeychainStore {
     }
 
     static func deleteToken() { SecItemDelete([kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account] as CFDictionary) }
+
+    static func highestUpdateSequence() -> Int {
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: updateSequenceAccount, kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess, let data = item as? Data, let text = String(data: data, encoding: .utf8), let value = Int(text) else { return 0 }
+        return value
+    }
+
+    static func saveHighestUpdateSequence(_ sequence: Int) throws {
+        guard sequence >= highestUpdateSequence() else { return }
+        let data = Data(String(sequence).utf8)
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: updateSequenceAccount]
+        let attributes: [String: Any] = [kSecValueData as String: data, kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly]
+        let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        if status == errSecItemNotFound {
+            var create = query; attributes.forEach { create[$0.key] = $0.value }
+            let createStatus = SecItemAdd(create as CFDictionary, nil)
+            guard createStatus == errSecSuccess else { throw NSError(domain: NSOSStatusErrorDomain, code: Int(createStatus)) }
+        } else if status != errSecSuccess { throw NSError(domain: NSOSStatusErrorDomain, code: Int(status)) }
+    }
 
     static func readPackageSigningKey() -> Data? {
         let context = LAContext()

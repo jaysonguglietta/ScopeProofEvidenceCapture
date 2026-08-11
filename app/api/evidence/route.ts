@@ -1,8 +1,9 @@
 import { jsonError, requireApiPermission, requireApiUser, requireSameOrigin } from "../../../lib/server/auth";
 import { listEvidence, storeEvidence, type ArtifactType } from "../../../lib/server/evidence";
+import { enforceRateLimit, requireBoundedContentLength } from "../../../lib/server/rate-limit";
 
 export async function GET(request: Request) {
-  try { await requireApiUser(request); return Response.json({ evidence: await listEvidence() }); }
+  try { const user = await requireApiUser(request); await enforceRateLimit(request, user.id, "evidence:list", 120, 60); return Response.json({ evidence: await listEvidence() }); }
   catch (error) { return jsonError(error); }
 }
 
@@ -10,6 +11,8 @@ export async function POST(request: Request) {
   try {
     requireSameOrigin(request);
     const user = await requireApiPermission(request, "collect_evidence");
+    await enforceRateLimit(request, user.id, "evidence:create", 20, 3_600);
+    requireBoundedContentLength(request, 11 * 1024 * 1024);
     const form = await request.formData();
     const title = String(form.get("title") || "").trim().slice(0, 180);
     const controlId = String(form.get("control") || "").trim().slice(0, 32);

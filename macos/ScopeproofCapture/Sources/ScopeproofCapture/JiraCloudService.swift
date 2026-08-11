@@ -60,23 +60,23 @@ actor JiraCloudService {
     private var appVersion: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.3.2" }
 
     func connection(serverURL: URL?) async throws -> JiraCloudConnection {
-        let request = try authorizedRequest(serverURL: serverURL, path: "api/native/jira/status")
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (request, audience) = try authorizedRequest(serverURL: serverURL, path: "api/native/jira/status")
+        let (data, response) = try await BackendHTTP.data(for: request, audience: audience)
         return try decode(ConnectionEnvelope.self, data: data, response: response).connection
     }
 
     func issue(_ issueKey: String, serverURL: URL?) async throws -> JiraCloudIssue {
-        var request = try authorizedRequest(serverURL: serverURL, path: "api/native/jira/issue")
+        var (request, audience) = try authorizedRequest(serverURL: serverURL, path: "api/native/jira/issue")
         request.httpMethod = "POST"
         request.timeoutInterval = 30
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: ["issueKey": issueKey])
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await BackendHTTP.data(for: request, audience: audience)
         return try decode(IssueEnvelope.self, data: data, response: response).issue
     }
 
     func upload(entry: CaptureHistoryEntry, serverURL: URL?) async throws -> URL {
-        guard let token = KeychainStore.readToken(), !token.isEmpty else { throw JiraCloudFailure.notConnected }
+        guard let audience = BackendTrust.normalizedOrigin(serverURL), let token = KeychainStore.readToken(for: audience), !token.isEmpty else { throw JiraCloudFailure.notConnected }
         let lifecycleURL = EvidenceLifecycleStore.url(for: entry.manifestURL)
         let screenshot = try Data(contentsOf: entry.imageURL)
         let manifest = try Data(contentsOf: entry.manifestURL)
@@ -87,13 +87,13 @@ actor JiraCloudService {
             ("lifecycle", lifecycleURL.lastPathComponent, "application/json", lifecycle),
         ]
         let boundary = "ScopeproofJiraBoundary\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))"
-        var request = try authorizedRequest(serverURL: serverURL, path: "api/native/jira/upload")
+        var (request, requestAudience) = try authorizedRequest(serverURL: serverURL, path: "api/native/jira/upload")
         request.httpMethod = "POST"
         request.timeoutInterval = 90
         request.setValue(UploadService.uploadSignature(token: token, manifest: manifest, image: screenshot), forHTTPHeaderField: "X-Scopeproof-Upload-Signature")
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         request.httpBody = multipart(boundary: boundary, files: files)
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await BackendHTTP.data(for: request, audience: requestAudience)
         _ = try decode(ReceiptEnvelope.self, data: data, response: response)
         let receiptURL = entry.jiraReceiptURL
         try data.write(to: receiptURL, options: [.atomic, .completeFileProtection])
@@ -101,14 +101,14 @@ actor JiraCloudService {
         return receiptURL
     }
 
-    private func authorizedRequest(serverURL: URL?, path: String) throws -> URLRequest {
-        guard let token = KeychainStore.readToken(), !token.isEmpty else { throw JiraCloudFailure.notConnected }
-        guard let serverURL, UploadService.isAllowedServerURL(serverURL) else { throw JiraCloudFailure.invalidServer }
+    private func authorizedRequest(serverURL: URL?, path: String) throws -> (URLRequest, URL) {
+        guard let serverURL = BackendTrust.normalizedOrigin(serverURL) else { throw JiraCloudFailure.invalidServer }
+        guard let token = KeychainStore.readToken(for: serverURL), !token.isEmpty else { throw JiraCloudFailure.notConnected }
         var request = URLRequest(url: serverURL.appendingPathComponent(path))
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue(appVersion, forHTTPHeaderField: "X-Scopeproof-Version")
         request.timeoutInterval = 20
-        return request
+        return (request, serverURL)
     }
 
     private func decode<T: Decodable>(_ type: T.Type, data: Data, response: URLResponse) throws -> T {

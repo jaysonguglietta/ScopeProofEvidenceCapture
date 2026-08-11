@@ -26,7 +26,7 @@ Treat the package as sensitive. Store it only in an approved assessment workspac
 | `05-Jira-Handoff.txt` | Optional Jira handling policy and mapped issue keys. |
 | `Evidence/<framework>/<control>/` | Approved PNGs plus capture manifests, lifecycle records, and available upload receipts. |
 
-Hosted exports contain `00-READ-ME.txt`, `01-Evidence-Index.csv`, `02-Jira-Handoff.txt`, `assessor-report.pdf`, `manifest.json`, `VERIFY.txt`, and the approved artifacts organized under `evidence/<framework>/<control>/`.
+Hosted exports contain `00-READ-ME.txt`, `01-Evidence-Index.csv`, `02-Jira-Handoff.txt`, `assessor-report.pdf`, `manifest.json`, `VERIFY.txt`, and the approved artifacts organized under `evidence/<framework>/<control>/`. CSV files neutralize spreadsheet formula prefixes but remain presentation aids; the signed JSON manifest is the authoritative index.
 
 ## Verification sequence
 
