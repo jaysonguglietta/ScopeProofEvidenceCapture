@@ -1,10 +1,11 @@
 import Foundation
+import LocalAuthentication
 import Security
 
 enum KeychainStore {
     private static let service = "com.scopeproof.capture"
     private static let account = "capture-device-token"
-    private static let packageSigningAccount = "assessor-package-signing-key-v1"
+    private static let packageSigningAccount = "assessor-package-signing-key-v2-user-presence"
 
     static func readToken() -> String? {
         let query: [String: Any] = [
@@ -37,30 +38,34 @@ enum KeychainStore {
 
     static func deleteToken() { SecItemDelete([kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account] as CFDictionary) }
 
-    static func readPackageSigningKey() -> Data? { readData(account: packageSigningAccount) }
-    static func savePackageSigningKey(_ data: Data) throws { try saveData(data, account: packageSigningAccount) }
-
-    private static func readData(account: String) -> Data? {
+    static func readPackageSigningKey() -> Data? {
+        let context = LAContext()
+        context.localizedReason = "Approve use of the Scopeproof assessor-package signing identity"
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
+            kSecAttrAccount as String: packageSigningAccount,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne,
+            kSecUseAuthenticationContext as String: context,
         ]
         var item: CFTypeRef?
         guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess else { return nil }
         return item as? Data
     }
 
-    private static func saveData(_ data: Data, account: String) throws {
-        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account]
-        let attributes: [String: Any] = [kSecValueData as String: data, kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly]
-        let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
-        if status == errSecItemNotFound {
-            var create = query; attributes.forEach { create[$0.key] = $0.value }
-            let createStatus = SecItemAdd(create as CFDictionary, nil)
-            guard createStatus == errSecSuccess else { throw NSError(domain: NSOSStatusErrorDomain, code: Int(createStatus)) }
-        } else if status != errSecSuccess { throw NSError(domain: NSOSStatusErrorDomain, code: Int(status)) }
+    static func savePackageSigningKey(_ data: Data) throws {
+        var error: Unmanaged<CFError>?
+        guard let access = SecAccessControlCreateWithFlags(kCFAllocatorDefault, kSecAttrAccessibleWhenUnlockedThisDeviceOnly, [.userPresence], &error) else {
+            throw error?.takeRetainedValue() ?? NSError(domain: NSOSStatusErrorDomain, code: Int(errSecParam))
+        }
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: packageSigningAccount]
+        SecItemDelete(query as CFDictionary)
+        var create = query
+        create[kSecValueData as String] = data
+        create[kSecAttrAccessControl as String] = access
+        let status = SecItemAdd(create as CFDictionary, nil)
+        guard status == errSecSuccess else { throw NSError(domain: NSOSStatusErrorDomain, code: Int(status)) }
     }
+
 }

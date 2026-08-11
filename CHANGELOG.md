@@ -10,6 +10,9 @@ All notable Scopeproof changes are recorded here. Dates use the repository’s r
 - Native manifest schema 6 binds the saved screenshot digest to the local scanner policy and completion time; older upload manifests now fail closed.
 - Hosted browser capture scans the single immutable screenshot through an allowlisted, digest-binding OCR service and fails closed on scanner errors, sensitive pixels, or digest mismatch.
 - Source URLs recorded by the Mac client exclude credentials, query parameters, and fragments.
+- Local approval state is derived from digest/policy-bound lifecycle events, and package signing now requires local Keychain user presence.
+- Security-sensitive database mutations and audit events commit atomically; Jira external effects retain durable intent/result state.
+- RFC 3161 responses receive trusted status only after nonce, imprint, CMS, TSA certificate/EKU/path, trust-anchor, validity, and revocation validation by a pinned verifier.
 
 ## 1.3.1 — 2026-08-11
 

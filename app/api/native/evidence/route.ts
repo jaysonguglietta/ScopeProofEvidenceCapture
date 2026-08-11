@@ -1,4 +1,4 @@
-import { appendAuditEvent } from "../../../../lib/server/audit";
+import { executeAuditedBatch } from "../../../../lib/server/audit";
 import { assertPermission, jsonError } from "../../../../lib/server/auth";
 import { sha256, signPackage, stableJson } from "../../../../lib/server/crypto";
 import { requireCaptureDevice } from "../../../../lib/server/devices";
@@ -66,9 +66,10 @@ export async function POST(request: Request) {
     const manifestIdentity = `${device.id}:${manifest.evidenceID}`;
     const existingManifest = await getEnv().DB.prepare("SELECT artifact_id, manifest_sha256, image_sha256, jira_issue_key FROM native_evidence_manifests WHERE id = ?").bind(manifestIdentity).first<{ artifact_id: string; manifest_sha256: string; image_sha256: string; jira_issue_key: string | null }>();
     if (existingManifest && (existingManifest.artifact_id !== result.id || existingManifest.manifest_sha256 !== attestationBody.manifestSha256 || existingManifest.image_sha256 !== imageDigest || String(existingManifest.jira_issue_key || "") !== jiraIssueKey)) return Response.json({ error: "This local evidence identity is already bound to different hosted evidence." }, { status: 409 });
-    if (!existingManifest) await getEnv().DB.prepare("INSERT INTO native_evidence_manifests (id, device_id, local_evidence_id, artifact_id, manifest_sha256, image_sha256, jira_issue_key) VALUES (?, ?, ?, ?, ?, ?, ?)")
-      .bind(manifestIdentity, device.id, manifest.evidenceID, result.id, attestationBody.manifestSha256, imageDigest, jiraIssueKey || null).run();
-    await appendAuditEvent(actor, "capture_device.uploaded", "evidence", result.id, { deviceId: device.id, sessionId, complianceArea, controlId, jiraIssueKey: jiraIssueKey || null, imageSha256: imageDigest, safetyScanSha256: manifest.safetyScanSha256, safetyScanPolicy: manifest.safetyScanPolicy, clientSafetyClaim: manifest.safetyStatus, redactionCount: localFindings.reduce((sum, item) => sum + item.count, 0) });
+    if (!existingManifest) await executeAuditedBatch(actor, "capture_device.uploaded", "evidence", result.id, { deviceId: device.id, sessionId, complianceArea, controlId, jiraIssueKey: jiraIssueKey || null, imageSha256: imageDigest, safetyScanSha256: manifest.safetyScanSha256, safetyScanPolicy: manifest.safetyScanPolicy, clientSafetyClaim: manifest.safetyStatus, redactionCount: localFindings.reduce((sum, item) => sum + item.count, 0) }, [
+      getEnv().DB.prepare("INSERT INTO native_evidence_manifests (id, device_id, local_evidence_id, artifact_id, manifest_sha256, image_sha256, jira_issue_key) VALUES (?, ?, ?, ?, ?, ?, ?)")
+        .bind(manifestIdentity, device.id, manifest.evidenceID, result.id, attestationBody.manifestSha256, imageDigest, jiraIssueKey || null),
+    ]);
     return Response.json({ ...result, receipt: { evidenceId: result.id, deviceId: device.id, attestation: { ...attestationBody, signature: signed.signature, publicKeySpkiBase64: signed.publicKey, algorithm: "ECDSA-P256-SHA256", trustedTimestamp, trustedTimestampError } } }, { status: result.deduplicated ? 200 : 201 });
   } catch (error) {
     if (error instanceof NativeManifestError) return Response.json({ error: error.message }, { status: 422 });

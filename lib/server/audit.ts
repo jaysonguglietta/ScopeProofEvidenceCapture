@@ -2,7 +2,7 @@ import type { AuthenticatedUser } from "./auth";
 import { hmac, randomId, sha256, stableJson } from "./crypto";
 import { getEnv } from "./env";
 
-export async function appendAuditEvent(actor: AuthenticatedUser, action: string, resourceType: string, resourceId: string, details: Record<string, unknown> = {}): Promise<void> {
+export async function executeAuditedBatch(actor: AuthenticatedUser, action: string, resourceType: string, resourceId: string, details: Record<string, unknown>, mutations: D1PreparedStatement[], auditCondition?: { sql: string; bindings: unknown[] }): Promise<D1Result[]> {
   const env = getEnv();
   for (let attempt = 0; attempt < 3; attempt += 1) {
     const previous = await env.DB.prepare("SELECT event_hash FROM audit_events ORDER BY sequence DESC LIMIT 1").first<{ event_hash: string }>();
@@ -13,13 +13,26 @@ export async function appendAuditEvent(actor: AuthenticatedUser, action: string,
     const eventHash = await sha256(canonical);
     const signature = await hmac(eventHash);
     try {
-      await env.DB.prepare(`INSERT INTO audit_events (id, occurred_at, actor_id, actor_email, action, resource_type, resource_id, details_json, previous_hash, event_hash, signature)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(id, occurredAt, actor.id, actor.email, action, resourceType, resourceId, stableJson(details), previousHash, eventHash, signature).run();
-      return;
+      const auditSql = auditCondition
+        ? `INSERT INTO audit_events (id, occurred_at, actor_id, actor_email, action, resource_type, resource_id, details_json, previous_hash, event_hash, signature)
+          SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${auditCondition.sql}`
+        : `INSERT INTO audit_events (id, occurred_at, actor_id, actor_email, action, resource_type, resource_id, details_json, previous_hash, event_hash, signature)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+      const results = await env.DB.batch([
+        ...mutations,
+        env.DB.prepare(auditSql).bind(id, occurredAt, actor.id, actor.email, action, resourceType, resourceId, stableJson(details), previousHash, eventHash, signature, ...(auditCondition?.bindings || [])),
+      ]);
+      return results.slice(0, mutations.length);
     } catch (error) {
+      console.error("scopeproof_audited_batch_failure", { action, resourceType, resourceId, attempt: attempt + 1, retryable: String(error).includes("audit chain head changed") });
       if (attempt === 2 || !String(error).includes("audit chain head changed")) throw error;
     }
   }
+  throw new Error("Audited database batch exhausted its retry budget.");
+}
+
+export async function appendAuditEvent(actor: AuthenticatedUser, action: string, resourceType: string, resourceId: string, details: Record<string, unknown> = {}): Promise<void> {
+  await executeAuditedBatch(actor, action, resourceType, resourceId, details, []);
 }
 
 export type AuditChainVerification = { valid: boolean; checked: number; failedAt?: number; failureReason?: "invalid_details_json" | "non_canonical_details" | "chain_mismatch" };

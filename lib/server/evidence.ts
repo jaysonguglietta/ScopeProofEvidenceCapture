@@ -1,5 +1,5 @@
 import type { AuthenticatedUser } from "./auth";
-import { appendAuditEvent } from "./audit";
+import { executeAuditedBatch } from "./audit";
 import { decryptEvidence, encryptEvidence, randomId, sha256, stableJson } from "./crypto";
 import { getEnv } from "./env";
 import { redactText, type RedactionFinding } from "./redaction";
@@ -70,7 +70,7 @@ export async function storeEvidence(input: EvidenceInput): Promise<{ id: string;
   const r2Key = `evidence/${capturedAt.slice(0, 7)}/${id}.enc`;
   await env.EVIDENCE_BUCKET.put(r2Key, encrypted.ciphertext, { customMetadata: { evidenceId: id, sha256: digest, encryptionVersion: "1" }, httpMetadata: { contentType: "application/octet-stream" } });
   try {
-    await env.DB.prepare(`INSERT INTO evidence_artifacts
+    const insert = env.DB.prepare(`INSERT INTO evidence_artifacts
       (id, control_id, framework, catalog_version, title, description, type, source, system, environment, assessment_period, evidence_owner, tags_json, expected_evidence, mapped_controls_json, jira_issue_key, jira_issue_url, manual_redactions, collector_id, job_id, session_id, device_id, r2_key, content_type, byte_size, sha256, encryption_iv, captured_at, expires_at, redaction_count, redaction_summary_json, manifest_sha256, chain_previous_hash, chain_event_hash, timestamp_authority, timestamp_token, safety_scan_sha256, safety_scan_policy, safety_scan_completed_at, created_by)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(
       id, input.controlId, input.framework || "PCI DSS 4.0.1", input.catalogVersion || null, input.title, input.description, input.type, input.source, input.system,
@@ -79,12 +79,12 @@ export async function storeEvidence(input: EvidenceInput): Promise<{ id: string;
       input.sessionId || null, input.deviceId || null, r2Key, input.contentType, bytes.byteLength, digest, encrypted.iv, capturedAt, expiresAt, redactionCount, stableJson(findings),
       input.manifestSha256 || null, input.chainPreviousHash || null, input.chainEventHash || null, input.timestampAuthority || null, input.timestampToken || null,
       input.safetyScanSha256 || null, input.safetyScanPolicy || null, input.safetyScanCompletedAt || null, input.createdBy.id,
-    ).run();
+    );
+    await executeAuditedBatch(input.createdBy, "evidence.created", "evidence", id, { controlId: input.controlId, source: input.source, jiraIssueKey: input.jiraIssueKey || null, sha256: digest, redactionCount, byteSize: bytes.byteLength }, [insert]);
   } catch (error) {
     await env.EVIDENCE_BUCKET.delete(r2Key);
     throw error;
   }
-  await appendAuditEvent(input.createdBy, "evidence.created", "evidence", id, { controlId: input.controlId, source: input.source, jiraIssueKey: input.jiraIssueKey || null, sha256: digest, redactionCount, byteSize: bytes.byteLength });
   return { id, deduplicated: false, redactionCount };
 }
 
@@ -114,8 +114,10 @@ export async function approveEvidence(id: string, actor: AuthenticatedUser, revi
   if (!artifact) throw new Response(JSON.stringify({ error: "Evidence not found" }), { status: 404, headers: { "content-type": "application/json" } });
   if (artifact.created_by === actor.id) throw new Response(JSON.stringify({ error: "Collectors and uploaders cannot approve their own evidence." }), { status: 403, headers: { "content-type": "application/json" } });
   if (artifact.sha256 !== expectedSha256) throw new Response(JSON.stringify({ error: "The reviewed artifact digest changed. Reload and inspect the evidence again." }), { status: 409, headers: { "content-type": "application/json" } });
-  const result = await getEnv().DB.prepare("UPDATE evidence_artifacts SET status = 'approved', approved_by = ?, approved_at = ? WHERE id = ? AND sha256 = ? AND created_by != ? AND status IN ('needs_review', 'expiring')").bind(actor.id, new Date().toISOString(), id, expectedSha256, actor.id).run();
+  const approvedAt = new Date().toISOString();
+  const [result] = await executeAuditedBatch(actor, "evidence.approved", "evidence", id, { artifactSha256: expectedSha256, rationale }, [
+    getEnv().DB.prepare("UPDATE evidence_artifacts SET status = 'approved', approved_by = ?, approved_at = ? WHERE id = ? AND sha256 = ? AND created_by != ? AND status IN ('needs_review', 'expiring')").bind(actor.id, approvedAt, id, expectedSha256, actor.id),
+  ], { sql: "EXISTS (SELECT 1 FROM evidence_artifacts WHERE id = ? AND approved_by = ? AND approved_at = ?)", bindings: [id, actor.id, approvedAt] });
   if (!result.meta.changes) return false;
-  await appendAuditEvent(actor, "evidence.approved", "evidence", id, { artifactSha256: expectedSha256, rationale });
   return true;
 }

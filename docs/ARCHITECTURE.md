@@ -49,8 +49,8 @@ Scopeproof combines a private Cloudflare-hosted evidence console with a local ma
 ## Lifecycle and integrity model
 
 - Capture manifests are immutable records of the final PNG and capture context.
-- Local lifecycle decisions are separate from the capture manifest and hash-chained from `GENESIS`.
-- Hosted audit events contain the previous event hash, a canonical event hash, and an HMAC. Database triggers block update/delete and reject a stale chain head.
+- Local lifecycle schema 2 stores only hash-chained events. Status, owner, reviewer, rationale, tags, supersession, and update time are projections of the final verified event; each event also binds the artifact digest and review/scanner policy versions. Inconsistent or obsolete sidecars are never package eligible.
+- Hosted audit events contain the previous event hash, a canonical event hash, and an HMAC. Database triggers block update/delete and reject a stale chain head. State mutations and their required audit insert share one D1 transactional batch, so either both commit or both roll back.
 - Package signatures authenticate the canonical manifest with an ECDSA P-256 signing key. The embedded public key enables verification; the fingerprint must be confirmed out of band.
 - Hashes and signatures detect alteration. They do not replace source-system access controls, accurate scoping, reviewer judgment, or trusted endpoint security.
 

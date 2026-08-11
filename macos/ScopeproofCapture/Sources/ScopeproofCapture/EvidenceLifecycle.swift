@@ -16,7 +16,15 @@ struct EvidenceLifecycleEvent: Codable, Sendable {
     let occurredAt: String
     let actor: String
     let action: String
-    let note: String
+    let status: EvidenceReviewStatus
+    let owner: String
+    let reviewer: String
+    let reviewNotes: String
+    let tags: [String]
+    let supersedesEvidenceID: String?
+    let artifactSha256: String
+    let policyVersion: String
+    let safetyScanPolicy: String
     let previousHash: String
     let eventHash: String
 }
@@ -24,68 +32,114 @@ struct EvidenceLifecycleEvent: Codable, Sendable {
 struct EvidenceLifecycleRecord: Codable, Sendable {
     let schemaVersion: Int
     let evidenceID: String
-    var status: EvidenceReviewStatus
-    var owner: String
-    var reviewer: String
-    var reviewNotes: String
-    var tags: [String]
-    var supersedesEvidenceID: String?
-    var updatedAt: String
-    var events: [EvidenceLifecycleEvent]
+    let events: [EvidenceLifecycleEvent]
+
+    var status: EvidenceReviewStatus { events.last?.status ?? .draft }
+    var owner: String { events.last?.owner ?? "" }
+    var reviewer: String { events.last?.reviewer ?? "" }
+    var reviewNotes: String { events.last?.reviewNotes ?? "" }
+    var tags: [String] { events.last?.tags ?? [] }
+    var supersedesEvidenceID: String? { events.last?.supersedesEvidenceID }
+    var updatedAt: String { events.last?.occurredAt ?? "" }
+}
+
+enum EvidenceLifecycleFailure: LocalizedError {
+    case integrityFailure
+
+    var errorDescription: String? {
+        "The existing review history is invalid or uses an obsolete unbound format. It cannot be changed or exported; recapture the evidence and review the new artifact."
+    }
 }
 
 enum EvidenceLifecycleStore {
+    static let policyVersion = "scopeproof-local-review-v2"
+
     static func url(for manifestURL: URL) -> URL {
         manifestURL.deletingPathExtension().appendingPathExtension("review.json")
     }
 
     static func load(for entry: CaptureHistoryEntry) -> EvidenceLifecycleRecord {
         let sidecar = url(for: entry.manifestURL)
-        if let data = try? Data(contentsOf: sidecar), let record = try? JSONDecoder().decode(EvidenceLifecycleRecord.self, from: data), record.evidenceID == entry.manifest.evidenceID {
-            return record
+        guard let data = try? Data(contentsOf: sidecar),
+              let record = try? JSONDecoder().decode(EvidenceLifecycleRecord.self, from: data),
+              record.evidenceID == entry.manifest.evidenceID,
+              verify(record, artifactSha256: entry.manifest.sha256) else {
+            return EvidenceLifecycleRecord(schemaVersion: 0, evidenceID: entry.manifest.evidenceID, events: [])
         }
-        let contextOwner = entry.manifest.evidenceOwner ?? ""
-        let contextTags = entry.manifest.tags ?? []
-        return EvidenceLifecycleRecord(schemaVersion: 1, evidenceID: entry.manifest.evidenceID, status: .draft, owner: contextOwner, reviewer: "", reviewNotes: entry.manifest.reviewerNote ?? "", tags: contextTags, supersedesEvidenceID: nil, updatedAt: entry.manifest.capturedAt, events: [])
+        return record
     }
 
     @discardableResult
     static func update(entry: CaptureHistoryEntry, status: EvidenceReviewStatus, owner: String, reviewer: String, notes: String, tags: [String], supersedesEvidenceID: String? = nil) throws -> EvidenceLifecycleRecord {
+        let sidecar = url(for: entry.manifestURL)
+        let exists = FileManager.default.fileExists(atPath: sidecar.path)
         var record = load(for: entry)
+        if exists && !verify(record, artifactSha256: entry.manifest.sha256) { throw EvidenceLifecycleFailure.integrityFailure }
+        if !exists { record = EvidenceLifecycleRecord(schemaVersion: 2, evidenceID: entry.manifest.evidenceID, events: []) }
         let now = ISO8601DateFormatter().string(from: Date())
-        let cleanTags = Array(Set(tags.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }.filter { !$0.isEmpty })).sorted()
-        let actor = reviewer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? NSFullUserName() : reviewer.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanOwner = String(owner.trimmingCharacters(in: .whitespacesAndNewlines).prefix(160))
+        let cleanReviewer = String((reviewer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? NSFullUserName() : reviewer.trimmingCharacters(in: .whitespacesAndNewlines)).prefix(160))
+        let cleanNotes = String(notes.trimmingCharacters(in: .whitespacesAndNewlines).prefix(4_000))
+        let cleanTags = Array(Set(tags.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }.filter { !$0.isEmpty })).sorted().prefix(30)
+        let cleanSupersedes = supersedesEvidenceID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
         let previousHash = record.events.last?.eventHash ?? "GENESIS"
         let sequence = record.events.count + 1
         let action = "status.\(status.rawValue.lowercased().replacingOccurrences(of: " ", with: "_"))"
-        let canonical = "\(previousHash)|\(entry.manifest.evidenceID)|\(sequence)|\(now)|\(actor)|\(action)|\(notes)"
-        let eventHash = SHA256.hash(data: Data(canonical.utf8)).map { String(format: "%02x", $0) }.joined()
-        record.status = status
-        record.owner = String(owner.trimmingCharacters(in: .whitespacesAndNewlines).prefix(160))
-        record.reviewer = String(actor.prefix(160))
-        record.reviewNotes = String(notes.trimmingCharacters(in: .whitespacesAndNewlines).prefix(4_000))
-        record.tags = Array(cleanTags.prefix(30))
-        record.supersedesEvidenceID = supersedesEvidenceID?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty
-        record.updatedAt = now
-        record.events.append(EvidenceLifecycleEvent(sequence: sequence, occurredAt: now, actor: actor, action: action, note: record.reviewNotes, previousHash: previousHash, eventHash: eventHash))
+        let safetyScanPolicy = entry.manifest.safetyScanPolicy ?? "legacy-unbound"
+        let payload = eventPayload(
+            evidenceID: entry.manifest.evidenceID, sequence: sequence, occurredAt: now, actor: cleanReviewer, action: action, status: status,
+            owner: cleanOwner, reviewer: cleanReviewer, reviewNotes: cleanNotes, tags: Array(cleanTags), supersedesEvidenceID: cleanSupersedes,
+            artifactSha256: entry.manifest.sha256, policyVersion: policyVersion, safetyScanPolicy: safetyScanPolicy, previousHash: previousHash
+        )
+        let eventHash = digest(payload)
+        let event = EvidenceLifecycleEvent(
+            sequence: sequence, occurredAt: now, actor: cleanReviewer, action: action, status: status, owner: cleanOwner, reviewer: cleanReviewer,
+            reviewNotes: cleanNotes, tags: Array(cleanTags), supersedesEvidenceID: cleanSupersedes, artifactSha256: entry.manifest.sha256,
+            policyVersion: policyVersion, safetyScanPolicy: safetyScanPolicy, previousHash: previousHash, eventHash: eventHash
+        )
+        record = EvidenceLifecycleRecord(schemaVersion: 2, evidenceID: record.evidenceID, events: record.events + [event])
+        guard verify(record, artifactSha256: entry.manifest.sha256) else { throw EvidenceLifecycleFailure.integrityFailure }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        let target = url(for: entry.manifestURL)
-        try encoder.encode(record).write(to: target, options: [.atomic, .completeFileProtection])
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target.path)
+        try encoder.encode(record).write(to: sidecar, options: [.atomic, .completeFileProtection])
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: sidecar.path)
         return record
     }
 
-    static func verify(_ record: EvidenceLifecycleRecord) -> Bool {
+    static func verify(_ record: EvidenceLifecycleRecord, artifactSha256: String? = nil) -> Bool {
+        guard record.schemaVersion == 2, !record.events.isEmpty else { return false }
         var previous = "GENESIS"
+        var previousOccurredAt: Date?
+        var seenHashes = Set<String>()
         for (index, event) in record.events.enumerated() {
-            guard event.sequence == index + 1, event.previousHash == previous else { return false }
-            let canonical = "\(previous)|\(record.evidenceID)|\(event.sequence)|\(event.occurredAt)|\(event.actor)|\(event.action)|\(event.note)"
-            let expected = SHA256.hash(data: Data(canonical.utf8)).map { String(format: "%02x", $0) }.joined()
-            guard expected == event.eventHash else { return false }
+            guard event.sequence == index + 1, event.previousHash == previous, event.actor == event.reviewer,
+                  event.action == "status.\(event.status.rawValue.lowercased().replacingOccurrences(of: " ", with: "_"))",
+                  event.policyVersion == policyVersion, event.artifactSha256.count == 64,
+                  event.artifactSha256.allSatisfy({ $0.isHexDigit && !$0.isUppercase }),
+                  artifactSha256.map({ $0 == event.artifactSha256 }) ?? true,
+                  !seenHashes.contains(event.eventHash), let occurredAt = ISO8601DateFormatter().date(from: event.occurredAt),
+                  previousOccurredAt.map({ occurredAt >= $0 }) ?? true else { return false }
+            let payload = eventPayload(
+                evidenceID: record.evidenceID, sequence: event.sequence, occurredAt: event.occurredAt, actor: event.actor, action: event.action,
+                status: event.status, owner: event.owner, reviewer: event.reviewer, reviewNotes: event.reviewNotes, tags: event.tags,
+                supersedesEvidenceID: event.supersedesEvidenceID, artifactSha256: event.artifactSha256, policyVersion: event.policyVersion,
+                safetyScanPolicy: event.safetyScanPolicy, previousHash: event.previousHash
+            )
+            guard digest(payload) == event.eventHash else { return false }
+            seenHashes.insert(event.eventHash)
             previous = event.eventHash
+            previousOccurredAt = occurredAt
         }
         return true
+    }
+
+    private static func eventPayload(evidenceID: String, sequence: Int, occurredAt: String, actor: String, action: String, status: EvidenceReviewStatus, owner: String, reviewer: String, reviewNotes: String, tags: [String], supersedesEvidenceID: String?, artifactSha256: String, policyVersion: String, safetyScanPolicy: String, previousHash: String) -> Data {
+        let values = [previousHash, evidenceID, String(sequence), occurredAt, actor, action, status.rawValue, owner, reviewer, reviewNotes, tags.joined(separator: "\u{001f}"), supersedesEvidenceID ?? "", artifactSha256, policyVersion, safetyScanPolicy]
+        return Data(values.map { "\($0.utf8.count):\($0)" }.joined(separator: "|").utf8)
+    }
+
+    private static func digest(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 }
 

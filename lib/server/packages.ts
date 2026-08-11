@@ -1,6 +1,6 @@
 import { strToU8, zipSync } from "fflate";
 import type { AuthenticatedUser } from "./auth";
-import { appendAuditEvent } from "./audit";
+import { executeAuditedBatch } from "./audit";
 import { decryptEvidence, encryptEvidence, randomId, sha256, signPackage, stableJson } from "./crypto";
 import { getEnv } from "./env";
 import { readEvidenceBytes } from "./evidence";
@@ -51,7 +51,10 @@ function buildPdf(lines: string[]): Uint8Array {
 export async function buildAssessorPackage(actor: AuthenticatedUser): Promise<{ id: string; evidenceCount: number; sha256: string; signature: string }> {
   const env = getEnv();
   const id = randomId("pkg");
-  await env.DB.prepare("INSERT INTO export_packages (id, requested_by) VALUES (?, ?)").bind(id, actor.id).run();
+  let pendingR2Key: string | null = null;
+  await executeAuditedBatch(actor, "package.requested", "export_package", id, {}, [
+    env.DB.prepare("INSERT INTO export_packages (id, requested_by) VALUES (?, ?)").bind(id, actor.id),
+  ]);
   try {
     const rows = (await env.DB.prepare(`SELECT id, control_id, framework, catalog_version, title, description, type, source, system, environment, assessment_period, evidence_owner, tags_json, expected_evidence, mapped_controls_json, jira_issue_key, jira_issue_url, content_type, byte_size, sha256, captured_at, expires_at, redaction_count, manual_redactions, safety_scan_sha256, safety_scan_policy, safety_scan_completed_at, approved_by, approved_at
       FROM evidence_artifacts WHERE status = 'approved' ORDER BY control_id, captured_at DESC LIMIT 100`).all<Record<string, unknown>>()).results;
@@ -103,14 +106,19 @@ export async function buildAssessorPackage(actor: AuthenticatedUser): Promise<{ 
     const associatedData = stableJson({ id, type: "assessor_package" });
     const encrypted = await encryptEvidence(zip, associatedData);
     const r2Key = `exports/${id}.zip.enc`;
+    pendingR2Key = r2Key;
     await env.EVIDENCE_BUCKET.put(r2Key, encrypted.ciphertext, { customMetadata: { packageId: id, sha256: digest, encryptionIv: encrypted.iv, encryptionVersion: "1" } });
     const completedAt = new Date().toISOString();
     const expiresAt = new Date(Date.now() + 7 * 86_400_000).toISOString();
-    await env.DB.prepare("UPDATE export_packages SET status = 'ready', r2_key = ?, sha256 = ?, signature = ?, evidence_count = ?, byte_size = ?, completed_at = ?, expires_at = ?, error_message = NULL WHERE id = ?").bind(r2Key, digest, signature, rows.length, zip.byteLength, completedAt, expiresAt, id).run();
-    await appendAuditEvent(actor, "package.created", "export_package", id, { evidenceCount: rows.length, sha256: digest, byteSize: zip.byteLength, expiresAt });
+    await executeAuditedBatch(actor, "package.created", "export_package", id, { evidenceCount: rows.length, sha256: digest, byteSize: zip.byteLength, expiresAt }, [
+      env.DB.prepare("UPDATE export_packages SET status = 'ready', r2_key = ?, sha256 = ?, signature = ?, evidence_count = ?, byte_size = ?, completed_at = ?, expires_at = ?, error_message = NULL WHERE id = ? AND status = 'building'").bind(r2Key, digest, signature, rows.length, zip.byteLength, completedAt, expiresAt, id),
+    ], { sql: "EXISTS (SELECT 1 FROM export_packages WHERE id = ? AND status = 'ready' AND sha256 = ?)", bindings: [id, digest] });
     return { id, evidenceCount: rows.length, sha256: digest, signature };
   } catch (error) {
-    await env.DB.prepare("UPDATE export_packages SET status = 'failed', error_message = ?, completed_at = ? WHERE id = ?").bind(error instanceof Error ? error.message.slice(0, 1000) : "Package generation failed", new Date().toISOString(), id).run();
+    if (pendingR2Key) await env.EVIDENCE_BUCKET.delete(pendingR2Key);
+    await executeAuditedBatch(actor, "package.failed", "export_package", id, { errorCode: "PACKAGE_GENERATION_FAILED" }, [
+      env.DB.prepare("UPDATE export_packages SET status = 'failed', error_message = ?, completed_at = ? WHERE id = ? AND status = 'building'").bind(error instanceof Error ? error.message.slice(0, 1000) : "Package generation failed", new Date().toISOString(), id),
+    ]);
     throw error;
   }
 }

@@ -1,5 +1,5 @@
 import type { AuthenticatedUser, Role } from "./auth";
-import { appendAuditEvent } from "./audit";
+import { executeAuditedBatch } from "./audit";
 import { bytesToBase64, randomId, sha256 } from "./crypto";
 import { getEnv } from "./env";
 
@@ -37,9 +37,10 @@ export async function createCaptureDevice(actor: AuthenticatedUser, displayName:
   const secret = base64url(crypto.getRandomValues(new Uint8Array(32)));
   const token = `spdev_${id}.${secret}`;
   const device: CaptureDevice = { id, displayName, platform: "macOS", ownerId: actor.id, status: "active" };
-  await getEnv().DB.prepare("INSERT INTO capture_devices (id, display_name, platform, token_hash, owner_id) VALUES (?, ?, ?, ?, ?)")
-    .bind(id, displayName, device.platform, await sha256(token), actor.id).run();
-  await appendAuditEvent(actor, "capture_device.enrolled", "capture_device", id, { displayName, platform: device.platform });
+  await executeAuditedBatch(actor, "capture_device.enrolled", "capture_device", id, { displayName, platform: device.platform }, [
+    getEnv().DB.prepare("INSERT INTO capture_devices (id, display_name, platform, token_hash, owner_id) VALUES (?, ?, ?, ?, ?)")
+      .bind(id, displayName, device.platform, await sha256(token), actor.id),
+  ]);
   return { device, token };
 }
 
@@ -56,8 +57,11 @@ export async function revokeCaptureDevice(actor: AuthenticatedUser, id: string):
   if (!device) return false;
   if (device.owner_id !== actor.id && roleRank[actor.role] < roleRank.compliance_lead) throw new Response(JSON.stringify({ error: "You cannot revoke this device." }), { status: 403, headers: { "content-type": "application/json" } });
   if (device.status === "revoked") return false;
-  await getEnv().DB.prepare("UPDATE capture_devices SET status = 'revoked', revoked_at = CURRENT_TIMESTAMP WHERE id = ?").bind(id).run();
-  await appendAuditEvent(actor, "capture_device.revoked", "capture_device", id, { displayName: device.display_name });
+  const revokedAt = new Date().toISOString();
+  const [result] = await executeAuditedBatch(actor, "capture_device.revoked", "capture_device", id, { displayName: device.display_name }, [
+    getEnv().DB.prepare("UPDATE capture_devices SET status = 'revoked', revoked_at = ? WHERE id = ? AND status = 'active'").bind(revokedAt, id),
+  ], { sql: "EXISTS (SELECT 1 FROM capture_devices WHERE id = ? AND status = 'revoked' AND revoked_at = ?)", bindings: [id, revokedAt] });
+  if (!result.meta.changes) return false;
   return true;
 }
 

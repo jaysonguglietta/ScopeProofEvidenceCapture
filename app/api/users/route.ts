@@ -1,4 +1,4 @@
-import { appendAuditEvent } from "../../../lib/server/audit";
+import { executeAuditedBatch } from "../../../lib/server/audit";
 import { jsonError, requireApiPermission, requireApiUser, requireSameOrigin, type Role } from "../../../lib/server/auth";
 import { getEnv } from "../../../lib/server/env";
 
@@ -24,8 +24,10 @@ export async function PATCH(request: Request) {
       const admins = await getEnv().DB.prepare("SELECT COUNT(*) AS count FROM users WHERE role = 'admin'").first<{ count: number }>();
       if (Number(admins?.count || 0) <= 1) return Response.json({ error: "The final administrator cannot be demoted." }, { status: 409 });
     }
-    await getEnv().DB.prepare("UPDATE users SET role = ? WHERE id = ?").bind(body.role, body.userId).run();
-    await appendAuditEvent(actor, "user.role_changed", "user", body.userId, { email: target.email, previousRole: target.role, newRole: body.role });
+    const [result] = await executeAuditedBatch(actor, "user.role_changed", "user", body.userId, { email: target.email, previousRole: target.role, newRole: body.role }, [
+      getEnv().DB.prepare("UPDATE users SET role = ? WHERE id = ? AND role = ?").bind(body.role, body.userId, target.role),
+    ], { sql: "EXISTS (SELECT 1 FROM users WHERE id = ? AND role = ?)", bindings: [body.userId, body.role] });
+    if (!result.meta.changes) return Response.json({ error: "The user's role changed concurrently. Reload and try again." }, { status: 409 });
     return Response.json({ updated: true });
   } catch (error) { return jsonError(error); }
 }

@@ -31,6 +31,7 @@ Never reuse one value for multiple purposes. Record key ownership, creation date
 | Okta | `OKTA_BASE_URL`, `OKTA_API_TOKEN` | Read-only policy and group inventory. |
 | Cloudflare | `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, optional `CLOUDFLARE_ZONE_IDS` | Zone and managed-ruleset read access. |
 | Browser Rendering | Cloudflare variables, `BROWSER_CAPTURE_URLS`, `BROWSER_OCR_ENDPOINT`, `BROWSER_OCR_TOKEN`, `BROWSER_OCR_ALLOWED_HOSTS` | Dedicated HTTPS evidence URLs and a contractually approved OCR processor. The OCR response must echo the exact PNG SHA-256 and a policy version. |
+| RFC 3161 timestamping | `RFC3161_TSA_URL`, `RFC3161_VERIFIER_URL`, `RFC3161_VERIFIER_TOKEN`, `RFC3161_VERIFIER_PUBLIC_KEYS`, `RFC3161_VERIFIER_ALLOWED_HOSTS`, `RFC3161_TSA_TRUST_ANCHOR_SHA256` | Approved TSA plus a separately deployed standards-compliant verifier. Pin one to five comma-separated P-256 SPKI keys and the allowed TSA root fingerprints. |
 
 Missing variables leave the corresponding collector in **Not configured**. Authentication and unsafe-content failures require operator action; transient rate-limit/server failures can retry up to three times.
 
@@ -67,6 +68,14 @@ Apply migrations through `drizzle/0008_real_nebula.sql`. Migration 0007 records 
 6. Enroll each Mac separately from **Connections**. Revoke devices when reassigned, lost, or retired.
 
 The development build is ad-hoc signed with a stable designated requirement for `com.scopeproof.capture`; it is not a notarized production release.
+
+## RFC 3161 verifier contract
+
+Scopeproof does not parse CMS itself. The configured verifier must use a maintained RFC 3161/CMS/X.509 implementation and reject non-granted status, wrong SHA-256 imprint or nonce, invalid CMS signatures, missing `id-kp-timeStamping` EKU, untrusted/expired chains, and failed revocation policy. Its response is a bounded JSON attestation signed over RFC 8785 JCS bytes with the pinned ECDSA P-256 verifier key; `signatureBase64` uses the 64-byte IEEE P1363 `r || s` form expected by WebCrypto. The attestation includes the token digest, request digest/nonce, TSA origin, generation/verification times, signer and trust-anchor fingerprints, chain fingerprints/expiry, revocation status, policy OID, and serial number.
+
+Maintain at least two verifier public keys during a controlled rotation window by deploying application support before switching the verifier signer. Update TSA trust-anchor fingerprints only after out-of-band validation, document the change, and retain prior verification metadata with existing evidence. If any verifier setting is absent or validation fails, Scopeproof records signed server time but never labels the RFC 3161 response trusted.
+
+Alert on repeated `scopeproof_audited_batch_failure` events and any sustained Jira operation in `unknown`, collector `action_needed`, or package `failed` state. Database state and its required audit event are committed in one D1 batch; external Jira/R2 work uses durable intent/state records so uncertain outcomes can be reconciled instead of replayed blindly.
 
 ## Jira Cloud OAuth deployment
 

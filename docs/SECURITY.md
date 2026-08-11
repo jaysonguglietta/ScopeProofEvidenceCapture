@@ -28,7 +28,7 @@ Scopeproof handles security and compliance evidence that may expose sensitive co
 - Native screenshots never write the unreviewed source pixels to disk. Local OCR/redaction runs before and after stamping, the reviewed PNG is encoded in memory and scanned again, and the manifest binds the exact saved digest, scanner policy, and completion time. The client HMAC-authenticates the exact manifest/PNG digest pair; the server requires schema 6, validates the scan binding and capture chain, and fully parses/decompresses bounded PNG data before storage. Local scan results remain explicitly labeled as client claims.
 - Evidence and generated packages are encrypted with AES-256-GCM in R2.
 - D1 contains metadata, object references, IVs, and integrity digests rather than evidence plaintext.
-- Audit events are canonicalized, hash-chained, HMAC-authenticated, and protected from update/delete by D1 triggers.
+- Audit events are canonicalized, hash-chained, HMAC-authenticated, and protected from update/delete by D1 triggers. Security-sensitive D1 mutations and their audit event execute in one transactional batch; a stale audit head rolls the entire batch back and retries. Repeated failures emit `scopeproof_audited_batch_failure` for alerting without event details.
 - Assessor manifests are ECDSA P-256/SHA-256 signed and include independent artifact hashes.
 - Jira URLs require HTTPS, issue keys are format-restricted, and native Jira metadata must match the immutable manifest.
 - Jira API calls use fixed Atlassian hosts and server-selected cloud IDs. OAuth state is random, user-bound, stored only as a hash, single-use, and expires after ten minutes. Requested sites must end in `.atlassian.net`, match Atlassian’s accessible resources, and use configured project allowlists.
@@ -57,7 +57,8 @@ Scopeproof handles security and compliance evidence that may expose sensitive co
 
 - OCR and pattern matching cannot guarantee detection of every sensitive value. Native operator preview remains mandatory, and browser OCR services require independent security/privacy review because captured pixels are disclosed to that processor.
 - A compromised endpoint can display falsified source content or capture manipulated pixels.
-- Local timestamps depend on the Mac clock. Hosted receipts add signed server time; RFC 3161 requires an independently configured authority.
+- Local timestamps depend on the Mac clock. Hosted receipts add signed server time. A third-party timestamp is labeled verified only after a pinned verifier attests the RFC 3161 success status, SHA-256 message imprint, request nonce, CMS signature, TSA `timeStamping` EKU, certificate path, configured trust anchor, validity window, and revocation status; otherwise the receipt retains only Scopeproof server time and a bounded diagnostic.
+- Local lifecycle schema 2 derives all projected state from the final verified event. Every event binds reviewer identity, time, artifact digest, review policy, scanner policy, owner, rationale, tags, and supersession state. Obsolete/unbound or inconsistent sidecars are draft/ineligible and require recapture. The package-signing identity rotates to a user-presence-protected Keychain item.
 - The package’s embedded public key must be fingerprint-verified out of band to establish signer continuity.
 - Jira permissions, issue security, marketplace apps, notifications, backups, exports, retention, and downstream sharing remain outside Scopeproof’s control. Timeout failures can leave an ambiguous attachment outcome that must be inspected before retry.
 - Provider coverage is intentionally bounded and may require additional collection for large environments.
