@@ -29,6 +29,12 @@ async function importAesKey(): Promise<CryptoKey> {
   return crypto.subtle.importKey("raw", asArrayBuffer(raw), "AES-GCM", false, ["encrypt", "decrypt"]);
 }
 
+async function importNamedAesKey(base64: string, name: string): Promise<CryptoKey> {
+  const raw = base64ToBytes(base64);
+  if (raw.byteLength !== 32) throw new Error(`${name} must be a base64-encoded 32-byte key.`);
+  return crypto.subtle.importKey("raw", asArrayBuffer(raw), "AES-GCM", false, ["encrypt", "decrypt"]);
+}
+
 export async function encryptEvidence(plain: Uint8Array, associatedData: string): Promise<{ ciphertext: Uint8Array; iv: string }> {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const key = await importAesKey();
@@ -40,6 +46,19 @@ export async function decryptEvidence(ciphertext: Uint8Array, iv: string, associ
   const key = await importAesKey();
   const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv: asArrayBuffer(base64ToBytes(iv)), additionalData: asArrayBuffer(encoder.encode(associatedData)), tagLength: 128 }, key, asArrayBuffer(ciphertext));
   return new Uint8Array(decrypted);
+}
+
+export async function encryptSecret(value: string, keyBase64: string, keyName: string, associatedData: string): Promise<{ ciphertext: string; iv: string }> {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await importNamedAesKey(keyBase64, keyName);
+  const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv: asArrayBuffer(iv), additionalData: asArrayBuffer(encoder.encode(associatedData)), tagLength: 128 }, key, asArrayBuffer(encoder.encode(value)));
+  return { ciphertext: bytesToBase64(new Uint8Array(encrypted)), iv: bytesToBase64(iv) };
+}
+
+export async function decryptSecret(ciphertext: string, iv: string, keyBase64: string, keyName: string, associatedData: string): Promise<string> {
+  const key = await importNamedAesKey(keyBase64, keyName);
+  const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv: asArrayBuffer(base64ToBytes(iv)), additionalData: asArrayBuffer(encoder.encode(associatedData)), tagLength: 128 }, key, asArrayBuffer(base64ToBytes(ciphertext)));
+  return new TextDecoder().decode(decrypted);
 }
 
 export async function hmac(value: string): Promise<string> {

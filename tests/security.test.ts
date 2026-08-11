@@ -40,15 +40,21 @@ test("native capture migration stores revocable device identities and chain-of-c
   assert.match(migration, /ADD `timestamp_token` text/);
 });
 
-test("native upload route enforces image integrity and local safety review", async () => {
-  const source = await readFile(new URL("../app/api/native/evidence/route.ts", import.meta.url), "utf8");
+test("native upload route derives metadata from a signed manifest and strictly decodes PNG", async () => {
+  const [source, devices, client] = await Promise.all([
+    readFile(new URL("../app/api/native/evidence/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/server/devices.ts", import.meta.url), "utf8"),
+    readFile(new URL("../macos/ScopeproofCapture/Sources/ScopeproofCapture/UploadService.swift", import.meta.url), "utf8"),
+  ]);
   assert.match(source, /manifest\.sha256 !== imageDigest/);
-  assert.match(source, /\["passed", "redacted"\]\.includes\(safetyStatus\)/);
-  assert.match(source, /Only PNG capture evidence is accepted/);
+  assert.match(source, /parseNativeManifest/);
+  assert.match(source, /validatePng/);
+  assert.match(source, /verifyUploadSignature/);
+  assert.match(source, /metadata must come only from the signed manifest/);
+  assert.match(source, /clientSafetyClaim/);
   assert.match(source, /requireCaptureDevice/);
-  assert.match(source, /Jira issue key is invalid/);
-  assert.match(source, /Jira issue URL must use HTTPS/);
-  assert.match(source, /Jira metadata does not match the immutable capture manifest/);
+  assert.match(devices, /scopeproof-native-upload-v1/);
+  assert.match(client, /HMAC<SHA256>/);
 });
 
 test("assessor metadata migration and package preserve framework organization", async () => {
@@ -76,4 +82,46 @@ test("Jira handoff metadata is migrated, searchable, and packaged with safe inst
   assert.match(evidenceSource, /jira_issue_key, jira_issue_url/);
   assert.match(packageSource, /02-Jira-Handoff\.txt/);
   assert.match(packageSource, /DO NOT ATTACH/);
+});
+
+test("Jira Cloud OAuth and attachment upload enforce trust boundaries", async () => {
+  const [migration, provenanceMigration, concurrencyMigration, jiraSource, uploadRoute, nativeEvidenceRoute] = await Promise.all([
+    readFile(new URL("../drizzle/0004_cheerful_tombstone.sql", import.meta.url), "utf8"),
+    readFile(new URL("../drizzle/0005_nappy_alice.sql", import.meta.url), "utf8"),
+    readFile(new URL("../drizzle/0006_first_madelyne_pryor.sql", import.meta.url), "utf8"),
+    readFile(new URL("../lib/server/jira.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/native/jira/upload/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/native/evidence/route.ts", import.meta.url), "utf8"),
+  ]);
+  assert.match(migration, /CREATE TABLE `jira_connections`/);
+  assert.match(migration, /CREATE TABLE `jira_oauth_states`/);
+  assert.match(migration, /CREATE TABLE `jira_upload_receipts`/);
+  assert.match(migration, /jira_upload_receipts_no_update/);
+  assert.match(migration, /jira_upload_receipts_no_delete/);
+  assert.match(provenanceMigration, /CREATE TABLE `native_evidence_manifests`/);
+  assert.match(concurrencyMigration, /CREATE TABLE `jira_upload_operations`/);
+  assert.match(concurrencyMigration, /ADD `token_version` integer/);
+  assert.match(concurrencyMigration, /ADD `refresh_lease_id` text/);
+  assert.match(jiraSource, /https:\/\/auth\.atlassian\.com\/authorize/);
+  assert.match(jiraSource, /https:\/\/api\.atlassian\.com/);
+  assert.match(jiraSource, /JIRA_OAUTH_TOKEN_ENCRYPTION_KEY/);
+  assert.match(jiraSource, /stateHash = await sha256\(state\)/);
+  assert.match(jiraSource, /host\.endsWith\("\.atlassian\.net"\)/);
+  assert.match(jiraSource, /is not in this connection's allowlist/);
+  assert.match(jiraSource, /Atlassian did not grant the required Jira read and write scopes/);
+  assert.match(jiraSource, /Reviewer access is required for Jira Cloud evidence disclosure/);
+  assert.match(jiraSource, /X-Atlassian-Token/);
+  assert.match(jiraSource, /status = 'uploading'/);
+  assert.match(jiraSource, /status = 'unknown'/);
+  assert.match(jiraSource, /token_version = token_version \+ 1/);
+  assert.match(jiraSource, /refresh_lease_id = \?/);
+  assert.match(uploadRoute, /Screenshot integrity does not match its immutable manifest/);
+  assert.match(uploadRoute, /valid hash-chained Approved lifecycle record/);
+  assert.match(uploadRoute, /e\.created_by = \?/);
+  assert.match(uploadRoute, /e\.sha256 = n\.image_sha256/);
+  assert.match(uploadRoute, /authenticated Scopeproof reviewer must approve/);
+  assert.match(uploadRoute, /new File\(\[hosted\.timestamp_token\]/);
+  assert.match(nativeEvidenceRoute, /Matching evidence already exists under different hosted provenance/);
+  assert.match(uploadRoute, /requireCaptureDevice/);
+  assert.match(uploadRoute, /verifyUploadSignature/);
 });

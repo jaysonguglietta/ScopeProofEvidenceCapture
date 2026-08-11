@@ -13,6 +13,7 @@ Scopeproof combines a private Cloudflare-hosted evidence console with a local ma
 | Provider collectors | Bounded read-only collection from AWS, GitHub, Okta, Cloudflare, and Cloudflare Browser Rendering. |
 | Scopeproof Capture | Explicit ScreenCaptureKit capture, local Vision OCR/redaction, visible stamping, manifests, lifecycle records, local search, Jira handoff, and local package export. |
 | macOS Keychain | Native device token and device-bound local package signing key. |
+| Jira Cloud OAuth | User-consented issue lookup and explicit evidence attachment through Atlassian’s fixed API gateway. |
 
 ## Trust boundaries
 
@@ -22,6 +23,7 @@ Scopeproof combines a private Cloudflare-hosted evidence console with a local ma
 4. **macOS screen → Scopeproof Capture:** ScreenCaptureKit provides pixels only after macOS permission and an explicit user action. OCR and initial redaction remain local.
 5. **Mac → native upload endpoint:** a revocable bearer token identifies the device. The server verifies PNG type/size, local safety status, screenshot digest, Jira/manifest consistency, and capture context before storage.
 6. **Scopeproof → assessor/Jira:** exports leave the system through an operator-controlled handoff. Hashes, signatures, visible stamps, and package instructions support independent verification, but destination authorization remains an organizational responsibility.
+7. **Scopeproof → Atlassian:** the hosted service exchanges OAuth codes, encrypts rotating tokens with a Jira-specific key, resolves the consented cloud ID, and calls only `api.atlassian.com`. A user/device may access only its own connection and configured project allowlist. The Mac sends approved evidence to Scopeproof, never Atlassian credentials.
 
 ## Native capture data flow
 

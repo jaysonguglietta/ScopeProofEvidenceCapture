@@ -20,16 +20,19 @@ Scopeproof handles security and compliance evidence that may expose sensitive co
 - The last administrator cannot be demoted.
 - Mutation endpoints enforce same-origin requests.
 - macOS devices use revocable random bearer tokens; only SHA-256 token hashes are stored server-side and the Mac stores its token in Keychain.
+- Jira Cloud uses OAuth 2.0 authorization-code flow. Rotating access and refresh tokens are AES-256-GCM encrypted with a dedicated hosted key and bound to a Scopeproof user and connection identity.
 
 ### Data protection and integrity
 
 - Textual evidence is scanned for Luhn-valid PAN and supported secret/token families before persistence.
-- Native screenshots run local OCR/redaction and must have a reviewed safety state and matching manifest digest.
+- Native screenshots run local OCR/redaction. The client HMAC-authenticates the exact manifest and PNG digests with its enrolled device credential; the server accepts metadata only from the versioned manifest, validates capture-chain hashes, and fully parses/decompresses bounded PNG data before storage. Local scan results remain explicitly labeled as client claims.
 - Evidence and generated packages are encrypted with AES-256-GCM in R2.
 - D1 contains metadata, object references, IVs, and integrity digests rather than evidence plaintext.
 - Audit events are canonicalized, hash-chained, HMAC-authenticated, and protected from update/delete by D1 triggers.
 - Assessor manifests are ECDSA P-256/SHA-256 signed and include independent artifact hashes.
 - Jira URLs require HTTPS, issue keys are format-restricted, and native Jira metadata must match the immutable manifest.
+- Jira API calls use fixed Atlassian hosts and server-selected cloud IDs. OAuth state is random, user-bound, stored only as a hash, single-use, and expires after ten minutes. Requested sites must end in `.atlassian.net`, match Atlassian’s accessible resources, and use configured project allowlists.
+- Jira uploads require explicit confirmation and revalidate the device, issue, project, PNG digest, redaction safety state, Approved lifecycle chain, and attachment limits. A durable idempotency reservation prevents concurrent duplicate attachment sets; ambiguous network/provider outcomes require reconciliation instead of automatic replay. OAuth refresh-token rotation is serialized with an expiring lease and optimistic token version. Signed upload receipts and audit events exclude token material.
 
 ### Abuse resistance
 
@@ -56,7 +59,7 @@ Scopeproof handles security and compliance evidence that may expose sensitive co
 - A compromised endpoint can display falsified source content or capture manipulated pixels.
 - Local timestamps depend on the Mac clock. Hosted receipts add signed server time; RFC 3161 requires an independently configured authority.
 - The package’s embedded public key must be fingerprint-verified out of band to establish signer continuity.
-- Jira handoff is manual. Scopeproof cannot enforce Jira authorization, retention, or downstream sharing.
+- Jira permissions, issue security, marketplace apps, notifications, backups, exports, retention, and downstream sharing remain outside Scopeproof’s control. Timeout failures can leave an ambiguous attachment outcome that must be inspected before retry.
 - Provider coverage is intentionally bounded and may require additional collection for large environments.
 - Key rotation is not automatic; replacing an encryption key without a migration can make prior evidence undecryptable.
 - An ad-hoc local macOS build is not notarized and does not provide a Developer ID trust chain.

@@ -398,7 +398,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func openHistoryEntry(_ sender: NSMenuItem) { if let path = sender.representedObject as? String { NSWorkspace.shared.open(URL(fileURLWithPath: path)) } }
-    @objc private func searchEvidence() { evidenceSearchController.show(evidenceRoot: captureService.outputDirectory, jiraSettings: preferences.jiraHandoff) }
+    @objc private func searchEvidence() { evidenceSearchController.show(evidenceRoot: captureService.outputDirectory, jiraSettings: preferences.jiraHandoff, serverURL: preferences.serverURL) }
 
     @objc private func applyPreset(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String, let preset = preferences.presets.first(where: { $0.id == id }) else { return }
@@ -510,7 +510,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func openSettings() {
         let alert = NSAlert()
         alert.messageText = "Scopeproof Capture & Jira Settings"
-        alert.informativeText = "Jira settings create ticket-ready labels and instructions; Scopeproof never stores Jira credentials or uploads attachments automatically. Device tokens remain protected in your login Keychain."
+        alert.informativeText = "Jira handoff defaults create ticket-ready labels. Authorize Jira Cloud in the Scopeproof web console under Connections; the Mac never stores Atlassian credentials. Device tokens remain protected in your login Keychain."
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Cancel")
         let server = NSTextField(string: preferences.serverURL?.absoluteString ?? "")
@@ -529,7 +529,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let instructions = NSTextField(string: jira.customInstructions)
         instructions.placeholderString = "Optional: project, issue type, reviewers, retention, or internal handling steps"
         for field in [server, token, jiraSite, jiraProject, instructions] { field.frame.size.width = 430 }
-        let section = NSTextField(labelWithString: "Jira handoff (no Jira credentials required)"); section.font = .systemFont(ofSize: 12, weight: .semibold); section.textColor = .secondaryLabelColor
+        let section = NSTextField(labelWithString: "Jira handoff defaults (OAuth: web Connections)"); section.font = .systemFont(ofSize: 12, weight: .semibold); section.textColor = .secondaryLabelColor
         let grid = NSGridView(views: [
             [label("Server URL"), server], [label("Device token"), token], [label("Local retention"), retention], [NSTextField(labelWithString: ""), auto],
             [NSTextField(labelWithString: ""), section], [label("Jira site URL"), jiraSite], [label("Default project"), jiraProject],

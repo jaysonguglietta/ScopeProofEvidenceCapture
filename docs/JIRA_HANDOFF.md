@@ -1,10 +1,23 @@
-# Jira evidence handoff
+# Jira Cloud evidence handoff
 
-Scopeproof provides a controlled, manual Jira handoff. It does not store Jira credentials and does not upload attachments automatically. This keeps the operator in control of the destination ticket, project permissions, and final disclosure decision.
+Scopeproof supports an explicit Jira Cloud attachment workflow through Atlassian OAuth 2.0 (3LO). OAuth tokens are encrypted in the hosted service and never enter the Mac app. Evidence is never sent automatically: the operator must approve an artifact, select the destination issue, review a confirmation containing the live issue summary, and choose **Upload to Jira Cloud**.
+
+The manual **Copy Jira Comment** and attachment workflow remains available when OAuth is unavailable or organizational policy requires a separate transfer channel.
+
+## Connect Jira Cloud
+
+1. Ask the Scopeproof platform administrator to configure the Atlassian OAuth client and apply the Jira database migration.
+2. In the Scopeproof web console, open **Connections → Jira Cloud**.
+3. Enter the root site URL, such as `https://company.atlassian.net`.
+4. Enter 1–20 project keys allowed to receive evidence, such as `GRC, PCI`.
+5. Choose **Connect Jira Cloud**, select the intended site on Atlassian’s consent screen, and approve access.
+6. Return to **Connections** and choose **Test connection**.
+
+Scopeproof rejects non-Atlassian hosts, embedded credentials, non-root paths, sites that do not match the requested site, and issues outside the configured project allowlist. Each user authorizes their own Jira access; Jira permissions still constrain every request.
 
 ## Configure Jira routing
 
-Open **Scopeproof shield → Capture & Jira Settings…** and configure:
+Open **Scopeproof shield → Capture & Jira Settings…** and configure local handoff defaults:
 
 - **Jira site URL:** the organization’s HTTPS Jira base URL, for example `https://company.atlassian.net`.
 - **Default project:** an uppercase project key such as `GRC` or `PCI`.
@@ -12,7 +25,7 @@ Open **Scopeproof shield → Capture & Jira Settings…** and configure:
 - **Include Jira handoff guide:** adds `05-Jira-Handoff.txt` to local assessor packages.
 - **Organization instructions:** approved issue type, reviewers, classification, retention, or internal routing requirements.
 
-These settings contain routing and procedure information only. Do not enter a Jira API token, password, cookie, or recovery code.
+These Mac settings contain routing and procedure information only. Jira Cloud authentication is configured in the web console. Do not enter a Jira API token, password, cookie, or recovery code into the Mac app.
 
 ## Associate a capture with a ticket
 
@@ -27,7 +40,18 @@ Enter an issue key such as `GRC-123` in the capture-classification dialog. Scope
 
 The issue key is optional because some organizations create the Jira work item after evidence review. If the ticket is created later, do not rename or rewrite an existing immutable evidence set. Record the relationship in approved workpapers or recapture with the correct issue if policy requires the visible association.
 
-## Prepare the attachment
+## Upload approved evidence from the Mac
+
+1. Open **Search Evidence…** and select an artifact with a Jira issue key.
+2. Upload that exact evidence set to Scopeproof if it is still local-only.
+3. In the web console, have an authenticated reviewer approve the hosted artifact. Confirm its local lifecycle status is also **Approved** and its review rationale is complete.
+4. Choose **Upload to Jira Cloud…**. Scopeproof retrieves the live issue and displays its key, summary, and status.
+5. Confirm the destination. Scopeproof sends the redacted PNG, immutable capture manifest, Approved lifecycle record, and server receipt when available.
+6. Keep the resulting `.jira.json` receipt beside the evidence set. The hosted audit chain records the Jira attachment IDs and receipt hash.
+
+Before disclosure, the backend independently checks the device token, Jira OAuth grant, requested site, project allowlist, issue visibility, attachment permission, PNG signature and SHA-256, manifest safety state, Jira key consistency, lifecycle status, and every lifecycle chain hash.
+
+## Manual fallback
 
 1. Open **Search Evidence…** and select the artifact.
 2. Confirm its status is **Approved** and that its framework, control, system, assessment period, owner, redactions, and Jira key are correct.
@@ -58,6 +82,6 @@ Review the text before posting. Jira permissions, notification recipients, autom
 
 If any check fails, do not attach the evidence. Correct the Jira access model or create a safer handoff channel first.
 
-## Current limitation
+## Current limitations
 
-Scopeproof 1.3.1 does not create Jira issues, query Jira, change ticket fields, or upload files through the Jira API. A future integration should use organization-approved OAuth, project allowlists, attachment size limits, explicit operator confirmation, immutable upload receipts, and narrowly scoped permissions.
+Scopeproof does not create Jira issues, change fields, delete attachments, or upload assessor ZIPs through the Jira API. A Jira request that times out after Atlassian receives it can have an ambiguous outcome; inspect the issue before retrying to avoid a duplicate attachment. Disconnecting Scopeproof deletes its encrypted OAuth tokens but does not revoke consent inside Atlassian or remove existing attachments.

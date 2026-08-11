@@ -35,7 +35,7 @@ npm test
 git diff --check
 ```
 
-`npm test` builds the production Worker bundle, verifies the rendered application/API surface, and runs security regression tests for redaction, audit immutability, native upload validation, assessor packaging, and Jira metadata.
+`npm test` builds the production Worker bundle, verifies the rendered application/API surface, and runs security regression tests for redaction, audit immutability, native upload validation, assessor packaging, Jira metadata, OAuth boundaries, and approved-evidence attachment controls.
 
 Native tests:
 

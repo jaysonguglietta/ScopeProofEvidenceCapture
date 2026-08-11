@@ -46,6 +46,7 @@ enum JiraHandoff {
         let lifecycle = entry.lifecycle
         let issueKey = manifest.jiraIssueKey ?? "Not assigned"
         let receipt = FileManager.default.fileExists(atPath: entry.receiptURL.path) ? entry.receiptURL.lastPathComponent : "Not available (local-only or upload pending)"
+        let jiraReceipt = FileManager.default.fileExists(atPath: entry.jiraReceiptURL.path) ? entry.jiraReceiptURL.lastPathComponent : "Not available (not uploaded through Scopeproof Jira Cloud)"
         let lifecycleName = EvidenceLifecycleStore.url(for: entry.manifestURL).lastPathComponent
         let issueURL = manifest.jiraIssueURL ?? settings.issueURL(for: issueKey)?.absoluteString ?? "Not configured"
         return """
@@ -68,6 +69,7 @@ enum JiraHandoff {
         - \(entry.manifestURL.lastPathComponent) — immutable capture and integrity manifest
         - \(lifecycleName) — review status and hash-chained decision history
         - \(receipt) — signed server receipt when available
+        - \(jiraReceipt) — signed Jira Cloud upload receipt when available
 
         What this proves
         \(manifest.description.isEmpty ? (manifest.expectedEvidence ?? "See the screenshot and control context.") : manifest.description)
