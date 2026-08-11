@@ -55,6 +55,8 @@ struct CaptureManifest: Codable, Sendable {
     let mappedControls: [ControlMapping]?
     let manualRedactions: Int?
     let reviewerNote: String?
+    let jiraIssueKey: String?
+    let jiraIssueURL: String?
     let chainPreviousHash: String
     let chainEventHash: String
 }
@@ -252,7 +254,9 @@ final class CaptureService {
         try fileManager.createDirectory(at: evidenceDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let controlFile = ComplianceCatalog.safeFileBase(context.controlID)
         let customFile = ComplianceCatalog.safeFileBase(context.resolvedCustomFileName)
-        let baseName = "\(framework.fileCode)_\(controlFile)_\(customFile)_\(filenameFormatter.string(from: now))_\(evidenceID)"
+        let jiraIssueKey = JiraHandoff.normalizedIssueKey(context.jiraIssueKey ?? "")
+        let jiraFile = jiraIssueKey.isEmpty ? "" : "_\(ComplianceCatalog.safeFileBase(jiraIssueKey))"
+        let baseName = "\(framework.fileCode)_\(controlFile)\(jiraFile)_\(customFile)_\(filenameFormatter.string(from: now))_\(evidenceID)"
         let imageURL = evidenceDirectory.appendingPathComponent(baseName).appendingPathExtension("png")
         let manifestURL = evidenceDirectory.appendingPathComponent(baseName).appendingPathExtension("json")
         let localTimestamp = localFormatter.string(from: now)
@@ -260,7 +264,8 @@ final class CaptureService {
         let sourceLabel = rawSourceLabel.count > 220 ? "\(rawSourceLabel.prefix(219))…" : rawSourceLabel
         let controlLabel = context.resolvedControlTitle.isEmpty ? context.controlID : "\(context.controlID) — \(context.resolvedControlTitle)"
         let ownerLabel = context.resolvedEvidenceOwner.isEmpty ? "UNASSIGNED" : context.resolvedEvidenceOwner
-        let stamp = "SCOPEPROOF EVIDENCE  •  CAPTURED \(localTimestamp)  •  \(evidenceID)\n\(framework.name.uppercased())  •  CONTROL \(controlLabel)\nEVIDENCE \(context.title)  •  OWNER \(ownerLabel)\n\(context.system) / \(context.environment)  •  \(context.assessmentPeriod)  •  SOURCE \(browser) — \(sourceLabel)"
+        let jiraLabel = jiraIssueKey.isEmpty ? "" : "  •  JIRA \(jiraIssueKey)"
+        let stamp = "SCOPEPROOF EVIDENCE  •  CAPTURED \(localTimestamp)  •  \(evidenceID)\n\(framework.name.uppercased())  •  CONTROL \(controlLabel)\(jiraLabel)\nEVIDENCE \(context.title)  •  OWNER \(ownerLabel)\n\(context.system) / \(context.environment)  •  \(context.assessmentPeriod)  •  SOURCE \(browser) — \(sourceLabel)"
         let dimensions = try stampImage(source: review.image, destination: imageURL, stamp: stamp)
         let imageData = try Data(contentsOf: imageURL, options: [.mappedIfSafe])
         let digest = sha256(imageData)
@@ -269,7 +274,7 @@ final class CaptureService {
         let safetyStatus = scan.redactedRegions + review.manualRedactions > 0 ? "redacted" : "passed"
         let mappings = ComplianceCatalog.mappings(frameworkName: framework.name, controlID: context.controlID)
         let manifest = CaptureManifest(
-            schemaVersion: 4, evidenceID: evidenceID, capturedAt: capturedAt, localTimestamp: localTimestamp, timezone: TimeZone.current.identifier,
+            schemaVersion: 5, evidenceID: evidenceID, capturedAt: capturedAt, localTimestamp: localTimestamp, timezone: TimeZone.current.identifier,
             sourceURL: sourceURL?.absoluteString, sourceHost: sourceURL?.host, browser: browser, windowTitle: windowTitle, screenshotFilename: imageURL.lastPathComponent,
             sha256: digest, pixelWidth: dimensions.width, pixelHeight: dimensions.height, captureMethod: method,
             timestampAuthority: "Local macOS clock; signed Scopeproof server attestation is stored in the upload receipt",
@@ -279,6 +284,7 @@ final class CaptureService {
             complianceArea: framework.name, controlTitle: context.resolvedControlTitle, customFileName: context.resolvedCustomFileName,
             catalogVersion: framework.version ?? ComplianceCatalog.catalogVersion, evidenceOwner: context.resolvedEvidenceOwner, tags: context.resolvedTags,
             expectedEvidence: context.expectedEvidence, mappedControls: mappings, manualRedactions: review.manualRedactions, reviewerNote: review.reviewerNote,
+            jiraIssueKey: jiraIssueKey.isEmpty ? nil : jiraIssueKey, jiraIssueURL: preferences.jiraHandoff.issueURL(for: jiraIssueKey)?.absoluteString,
             chainPreviousHash: previousHash, chainEventHash: eventHash
         )
         let encoder = JSONEncoder()

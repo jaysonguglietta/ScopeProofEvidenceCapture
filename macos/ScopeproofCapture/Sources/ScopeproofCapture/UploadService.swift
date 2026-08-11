@@ -24,7 +24,7 @@ enum UploadFailure: LocalizedError {
 }
 
 actor UploadService {
-    private var appVersion: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.3.0" }
+    private var appVersion: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.3.1" }
 
     func upload(_ capture: CaptureResult, serverURL: URL?) async throws -> URL {
         guard let token = KeychainStore.readToken(), !token.isEmpty else { throw UploadFailure.notConfigured }
@@ -53,6 +53,8 @@ actor UploadService {
             "expectedEvidence": manifestModel.expectedEvidence ?? "",
             "mappedControls": String(data: try JSONEncoder().encode(manifestModel.mappedControls ?? []), encoding: .utf8) ?? "[]",
             "manualRedactions": String(manifestModel.manualRedactions ?? 0),
+            "jiraIssueKey": manifestModel.jiraIssueKey ?? "",
+            "jiraIssueURL": manifestModel.jiraIssueURL ?? "",
             "chainPreviousHash": capture.chainPreviousHash,
             "chainEventHash": capture.chainEventHash,
         ]

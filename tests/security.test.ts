@@ -46,6 +46,9 @@ test("native upload route enforces image integrity and local safety review", asy
   assert.match(source, /\["passed", "redacted"\]\.includes\(safetyStatus\)/);
   assert.match(source, /Only PNG capture evidence is accepted/);
   assert.match(source, /requireCaptureDevice/);
+  assert.match(source, /Jira issue key is invalid/);
+  assert.match(source, /Jira issue URL must use HTTPS/);
+  assert.match(source, /Jira metadata does not match the immutable capture manifest/);
 });
 
 test("assessor metadata migration and package preserve framework organization", async () => {
@@ -59,4 +62,18 @@ test("assessor metadata migration and package preserve framework organization", 
   assert.match(packageSource, /evidence\/\$\{safeName\(String\(row\.framework/);
   assert.match(packageSource, /01-Evidence-Index\.csv/);
   assert.match(packageSource, /ECDSA-P256-SHA256/);
+});
+
+test("Jira handoff metadata is migrated, searchable, and packaged with safe instructions", async () => {
+  const [migration, evidenceSource, packageSource] = await Promise.all([
+    readFile(new URL("../drizzle/0003_cooing_rhino.sql", import.meta.url), "utf8"),
+    readFile(new URL("../lib/server/evidence.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/server/packages.ts", import.meta.url), "utf8"),
+  ]);
+  assert.match(migration, /ADD `jira_issue_key` text/);
+  assert.match(migration, /ADD `jira_issue_url` text/);
+  assert.match(migration, /idx_evidence_jira_issue/);
+  assert.match(evidenceSource, /jira_issue_key, jira_issue_url/);
+  assert.match(packageSource, /02-Jira-Handoff\.txt/);
+  assert.match(packageSource, /DO NOT ATTACH/);
 });

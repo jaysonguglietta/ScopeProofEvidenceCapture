@@ -1,8 +1,8 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "995236f7-f3e3-4131-aec0-13d6a45a50e6",
-  "prevId": "5405d27e-f1da-4c58-a7ab-a9308bd42e15",
+  "id": "b465541b-44b0-477f-8a9b-d3112d3af7b6",
+  "prevId": "995236f7-f3e3-4131-aec0-13d6a45a50e6",
   "tables": {
     "audit_events": {
       "name": "audit_events",
@@ -683,6 +683,20 @@
           "autoincrement": false,
           "default": "'[]'"
         },
+        "jira_issue_key": {
+          "name": "jira_issue_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "jira_issue_url": {
+          "name": "jira_issue_url",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "collector_id": {
           "name": "collector_id",
           "type": "text",
@@ -918,6 +932,13 @@
           "name": "idx_evidence_session",
           "columns": [
             "session_id"
+          ],
+          "isUnique": false
+        },
+        "idx_evidence_jira_issue": {
+          "name": "idx_evidence_jira_issue",
+          "columns": [
+            "jira_issue_key"
           ],
           "isUnique": false
         }

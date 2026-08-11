@@ -155,7 +155,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         login.target = self
         menu.addItem(login)
-        addItem("Capture Settings…", action: #selector(openSettings), key: ",", modifiers: [.command])
+        addItem("Capture & Jira Settings…", action: #selector(openSettings), key: ",", modifiers: [.command])
         addItem("Check for Updates…", action: #selector(checkForUpdatesAction))
         addItem("Help & How to Use…", action: #selector(showHelp), key: "?", modifiers: [.command, .shift])
         addItem("Screen Recording Settings…", action: #selector(openPermissionSettings))
@@ -192,6 +192,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var ownerValue = previous?.evidenceOwner ?? NSFullUserName()
         var tagsValue = previous?.tags?.joined(separator: ", ") ?? ""
         var expectedValue = previous?.expectedEvidence ?? ""
+        var jiraIssueValue = previous?.jiraIssueKey ?? ""
         var missingFields: [String] = []
 
         while true {
@@ -223,6 +224,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let owner = NSTextField(string: ownerValue)
             let tags = NSTextField(string: tagsValue)
             let expected = NSTextField(string: expectedValue)
+            let jiraIssue = NSTextField(string: jiraIssueValue)
             control.placeholderString = "Select or type a control ID"
             fileName.placeholderString = "e.g. Production-MFA-Settings"
             title.placeholderString = "e.g. Production MFA settings"
@@ -231,6 +233,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             owner.placeholderString = "Control owner or evidence custodian"
             tags.placeholderString = "identity, quarterly, production"
             expected.placeholderString = "What should an assessor verify in this artifact?"
+            jiraIssue.placeholderString = preferences.jiraHandoff.projectKey.isEmpty ? "Optional, e.g. GRC-123" : "Optional, e.g. \(preferences.jiraHandoff.projectKey)-123"
             let preview = NSTextField(wrappingLabelWithString: "")
             preview.textColor = .secondaryLabelColor
             preview.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
@@ -239,7 +242,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             mappings.textColor = .secondaryLabelColor
             mappings.font = .systemFont(ofSize: 10)
             mappings.maximumNumberOfLines = 2
-            for field in [fileName, sessionName, title, system, period, description, owner, tags, expected] { field.frame.size.width = 400 }
+            for field in [fileName, sessionName, title, system, period, description, owner, tags, expected, jiraIssue] { field.frame.size.width = 400 }
             control.frame.size.width = 400
             framework.frame.size.width = 400
             preview.frame.size.width = 400
@@ -248,16 +251,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 [label("Compliance area *"), framework], [label("Control *"), control], [label("File name *"), fileName], [label("Saved as"), preview],
                 [label("Evidence title *"), title], [label("System or asset *"), system], [label("Environment *"), environment],
                 [label("Assessment period *"), period], [label("Session name *"), sessionName], [label("Evidence owner"), owner],
-                [label("Tags"), tags], [label("Expected evidence"), expected], [label("What this proves"), description], [label("Related controls"), mappings],
+                [label("Jira issue"), jiraIssue], [label("Tags"), tags], [label("Expected evidence"), expected], [label("What this proves"), description], [label("Related controls"), mappings],
             ])
             grid.column(at: 0).xPlacement = .trailing
             grid.column(at: 1).xPlacement = .fill
             grid.rowSpacing = 10
             grid.columnSpacing = 12
-            grid.frame = NSRect(x: 0, y: 0, width: 560, height: 500)
+            grid.frame = NSRect(x: 0, y: 0, width: 560, height: 535)
             alert.accessoryView = grid
             let coordinator = CaptureMetadataCoordinator(
-                frameworkPopup: framework, controlCombo: control, filenameField: fileName, periodField: period,
+                frameworkPopup: framework, controlCombo: control, filenameField: fileName, periodField: period, jiraIssueField: jiraIssue,
                 previewLabel: preview, preferredControlID: controlValue, mappingLabel: mappings
             )
             alert.window.initialFirstResponder = missingFields.contains("control") ? control : (missingFields.contains("file name") ? fileName : (missingFields.contains("evidence title") ? title : control))
@@ -275,15 +278,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             ownerValue = owner.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             tagsValue = tags.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             expectedValue = expected.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            jiraIssueValue = JiraHandoff.normalizedIssueKey(jiraIssue.stringValue)
             let missing = [("compliance area", frameworkValue), ("control", controlValue), ("file name", filenameValue), ("session name", sessionValue), ("evidence title", titleValue), ("system or asset", systemValue), ("environment", environmentValue), ("assessment period", periodValue)].filter { $0.1.isEmpty }.map(\.0)
             guard missing.isEmpty else { missingFields = missing; continue }
+            guard JiraHandoff.isValidIssueKey(jiraIssueValue) else { missingFields = ["a Jira issue key such as GRC-123 (or leave it blank)"]; continue }
             let context = CaptureContext(
                 sessionID: previous?.sessionID ?? "session_\(UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased())",
                 sessionName: sessionValue, controlID: controlValue, title: titleValue, system: systemValue,
                 environment: environmentValue, assessmentPeriod: periodValue,
                 description: descriptionValue, complianceArea: frameworkValue,
                 controlTitle: coordinator.controlTitle, customFileName: filenameValue,
-                evidenceOwner: ownerValue, tags: tagsValue.split(separator: ",").map(String.init), expectedEvidence: expectedValue
+                evidenceOwner: ownerValue, tags: tagsValue.split(separator: ",").map(String.init), expectedEvidence: expectedValue, jiraIssueKey: jiraIssueValue
             )
             preferences.activeContext = context
             setReady("Session \(context.sessionName) ready")
@@ -384,7 +389,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             var completed = 0
             for entry in pending {
                 let capture = CaptureResult(imageURL: entry.imageURL, manifestURL: entry.manifestURL, evidenceID: entry.manifest.evidenceID,
-                    context: CaptureContext(sessionID: entry.manifest.sessionID, sessionName: entry.manifest.sessionName, controlID: entry.manifest.controlID, title: entry.manifest.title, system: entry.manifest.system, environment: entry.manifest.environment, assessmentPeriod: entry.manifest.assessmentPeriod, description: entry.manifest.description, complianceArea: entry.manifest.complianceArea, controlTitle: entry.manifest.controlTitle, customFileName: entry.manifest.customFileName, evidenceOwner: entry.manifest.evidenceOwner, tags: entry.manifest.tags, expectedEvidence: entry.manifest.expectedEvidence),
+                    context: CaptureContext(sessionID: entry.manifest.sessionID, sessionName: entry.manifest.sessionName, controlID: entry.manifest.controlID, title: entry.manifest.title, system: entry.manifest.system, environment: entry.manifest.environment, assessmentPeriod: entry.manifest.assessmentPeriod, description: entry.manifest.description, complianceArea: entry.manifest.complianceArea, controlTitle: entry.manifest.controlTitle, customFileName: entry.manifest.customFileName, evidenceOwner: entry.manifest.evidenceOwner, tags: entry.manifest.tags, expectedEvidence: entry.manifest.expectedEvidence, jiraIssueKey: entry.manifest.jiraIssueKey),
                     capturedAt: entry.manifest.capturedAt, safetyStatus: entry.manifest.safetyStatus, findings: entry.manifest.redactionFindings, sha256: entry.manifest.sha256, chainPreviousHash: entry.manifest.chainPreviousHash, chainEventHash: entry.manifest.chainEventHash)
                 if (try? await uploadService.upload(capture, serverURL: preferences.serverURL)) != nil { completed += 1 }
             }
@@ -393,7 +398,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func openHistoryEntry(_ sender: NSMenuItem) { if let path = sender.representedObject as? String { NSWorkspace.shared.open(URL(fileURLWithPath: path)) } }
-    @objc private func searchEvidence() { evidenceSearchController.show(evidenceRoot: captureService.outputDirectory) }
+    @objc private func searchEvidence() { evidenceSearchController.show(evidenceRoot: captureService.outputDirectory, jiraSettings: preferences.jiraHandoff) }
 
     @objc private func applyPreset(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String, let preset = preferences.presets.first(where: { $0.id == id }) else { return }
@@ -403,7 +408,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             sessionName: source.sessionName, controlID: source.controlID, title: source.title, system: source.system,
             environment: source.environment, assessmentPeriod: source.assessmentPeriod, description: source.description,
             complianceArea: source.complianceArea, controlTitle: source.controlTitle, customFileName: source.customFileName,
-            evidenceOwner: source.evidenceOwner, tags: source.tags, expectedEvidence: source.expectedEvidence
+            evidenceOwner: source.evidenceOwner, tags: source.tags, expectedEvidence: source.expectedEvidence, jiraIssueKey: source.jiraIssueKey
         )
         preferences.activeContext = context
         setReady("Preset \(preset.name) applied")
@@ -466,7 +471,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let save = NSSavePanel(); save.title = "Save Assessor Package"; save.allowedContentTypes = [.zip]; save.nameFieldStringValue = "Scopeproof-Assessor-Package-\(ComplianceCatalog.safeFileBase(name.stringValue)).zip"
         guard save.runModal() == .OK, let destination = save.url else { return }
         do {
-            let result = try AssessorPackageExporter.export(entries: selected, to: destination, preparedBy: preparedBy.stringValue, packageName: name.stringValue)
+            let result = try AssessorPackageExporter.export(entries: selected, to: destination, preparedBy: preparedBy.stringValue, packageName: name.stringValue, jiraSettings: preferences.jiraHandoff)
             setReady("Exported \(result.evidenceCount) approved evidence items")
             NSWorkspace.shared.activateFileViewerSelecting([result.zipURL, result.checksumURL])
             notify(title: "Assessor package ready", body: "\(result.evidenceCount) approved artifacts were validated and packaged.")
@@ -504,8 +509,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func openSettings() {
         let alert = NSAlert()
-        alert.messageText = "Scopeproof Capture Settings"
-        alert.informativeText = "Device tokens are stored in your login Keychain. Create or revoke tokens in the Scopeproof Connections view."
+        alert.messageText = "Scopeproof Capture & Jira Settings"
+        alert.informativeText = "Jira settings create ticket-ready labels and instructions; Scopeproof never stores Jira credentials or uploads attachments automatically. Device tokens remain protected in your login Keychain."
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Cancel")
         let server = NSTextField(string: preferences.serverURL?.absoluteString ?? "")
@@ -514,21 +519,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let auto = NSButton(checkboxWithTitle: "Upload reviewed captures automatically", target: nil, action: nil)
         auto.state = preferences.autoUpload ? .on : .off
         let retention = NSPopUpButton(); retention.addItems(withTitles: ["30 days", "90 days", "180 days", "365 days", "1095 days"]); retention.selectItem(withTitle: "\(preferences.retentionDays) days")
-        server.frame.size.width = 430; token.frame.size.width = 430
-        let grid = NSGridView(views: [[label("Server URL"), server], [label("Device token"), token], [label("Local retention"), retention], [NSTextField(labelWithString: ""), auto]])
+        let jira = preferences.jiraHandoff
+        let jiraSite = NSTextField(string: jira.baseURL)
+        jiraSite.placeholderString = "https://your-company.atlassian.net"
+        let jiraProject = NSTextField(string: jira.projectKey)
+        jiraProject.placeholderString = "e.g. GRC"
+        let attachmentMode = NSPopUpButton(); attachmentMode.addItems(withTitles: JiraAttachmentMode.allCases.map(\.rawValue)); attachmentMode.selectItem(withTitle: jira.attachmentMode.rawValue)
+        let includeGuide = NSButton(checkboxWithTitle: "Include Jira handoff guide in assessor packages", target: nil, action: nil); includeGuide.state = jira.includeGuideInPackages ? .on : .off
+        let instructions = NSTextField(string: jira.customInstructions)
+        instructions.placeholderString = "Optional: project, issue type, reviewers, retention, or internal handling steps"
+        for field in [server, token, jiraSite, jiraProject, instructions] { field.frame.size.width = 430 }
+        let section = NSTextField(labelWithString: "Jira handoff (no Jira credentials required)"); section.font = .systemFont(ofSize: 12, weight: .semibold); section.textColor = .secondaryLabelColor
+        let grid = NSGridView(views: [
+            [label("Server URL"), server], [label("Device token"), token], [label("Local retention"), retention], [NSTextField(labelWithString: ""), auto],
+            [NSTextField(labelWithString: ""), section], [label("Jira site URL"), jiraSite], [label("Default project"), jiraProject],
+            [label("Attachment set"), attachmentMode], [NSTextField(labelWithString: ""), includeGuide], [label("Organization instructions"), instructions],
+        ])
         grid.rowSpacing = 10; grid.columnSpacing = 12; grid.column(at: 0).xPlacement = .trailing; grid.column(at: 1).xPlacement = .fill
         alert.accessoryView = grid
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         guard let url = URL(string: server.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)), isAllowedServerURL(url) else { showError(UploadFailure.invalidServer); return }
+        let jiraSiteValue = jiraSite.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let jiraProjectValue = jiraProject.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        if !jiraSiteValue.isEmpty {
+            let candidate = JiraHandoffSettings(baseURL: jiraSiteValue, projectKey: jiraProjectValue, attachmentMode: .evidenceSet, includeGuideInPackages: true, customInstructions: "")
+            guard candidate.validatedBaseURL != nil else { showError(NSError(domain: "Scopeproof", code: 21, userInfo: [NSLocalizedDescriptionKey: "The Jira site must be a complete HTTPS URL without a query, fragment, or embedded credentials."])); return }
+        }
+        guard JiraHandoff.isValidProjectKey(jiraProjectValue) else { showError(NSError(domain: "Scopeproof", code: 22, userInfo: [NSLocalizedDescriptionKey: "The Jira project key must start with a letter and contain only uppercase letters, numbers, or underscores."])); return }
+        let newToken = token.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard newToken.isEmpty || newToken.hasPrefix("spdev_dev_") else { showError(NSError(domain: "Scopeproof", code: 2, userInfo: [NSLocalizedDescriptionKey: "The device token must begin with spdev_dev_."])); return }
+        let selectedMode = JiraAttachmentMode(rawValue: attachmentMode.titleOfSelectedItem ?? "") ?? .evidenceSet
         preferences.serverURL = url
         preferences.autoUpload = auto.state == .on
         preferences.retentionDays = Int(retention.titleOfSelectedItem?.split(separator: " ").first ?? "365") ?? 365
-        let newToken = token.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        preferences.jiraHandoff = JiraHandoffSettings(baseURL: jiraSiteValue, projectKey: jiraProjectValue, attachmentMode: selectedMode, includeGuideInPackages: includeGuide.state == .on, customInstructions: String(instructions.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).prefix(2_000)))
         if !newToken.isEmpty {
-            guard newToken.hasPrefix("spdev_dev_") else { showError(NSError(domain: "Scopeproof", code: 2, userInfo: [NSLocalizedDescriptionKey: "The device token must begin with spdev_dev_."])); return }
             do { try KeychainStore.saveToken(newToken) } catch { showError(error); return }
         }
-        setReady("Capture settings saved")
+        setReady("Capture and Jira settings saved")
     }
 
     private func isAllowedServerURL(_ url: URL) -> Bool {
@@ -544,7 +572,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 let release = try await uploadService.checkForUpdates(serverURL: preferences.serverURL)
                 await MainActor.run {
                     self.preferences.lastUpdateCheck = Date()
-                    let installedVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.3.0"
+                    let installedVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.3.1"
                     guard self.isNewer(release.version, than: installedVersion) else { if !silent { self.setReady("Scopeproof Capture is up to date") }; return }
                     let alert = NSAlert(); alert.messageText = "Scopeproof Capture \(release.version) is available"; alert.informativeText = release.notes
                     alert.addButton(withTitle: release.downloadUrl == nil ? "OK" : "Open Download"); alert.addButton(withTitle: "Later")

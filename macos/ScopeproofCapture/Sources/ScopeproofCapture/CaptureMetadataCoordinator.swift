@@ -6,6 +6,7 @@ final class CaptureMetadataCoordinator: NSObject, NSTextFieldDelegate, NSComboBo
     let controlCombo: NSComboBox
     let filenameField: NSTextField
     let periodField: NSTextField
+    let jiraIssueField: NSTextField?
     let previewLabel: NSTextField
     let mappingLabel: NSTextField?
 
@@ -14,6 +15,7 @@ final class CaptureMetadataCoordinator: NSObject, NSTextFieldDelegate, NSComboBo
         controlCombo: NSComboBox,
         filenameField: NSTextField,
         periodField: NSTextField,
+        jiraIssueField: NSTextField? = nil,
         previewLabel: NSTextField,
         preferredControlID: String,
         mappingLabel: NSTextField? = nil
@@ -22,6 +24,7 @@ final class CaptureMetadataCoordinator: NSObject, NSTextFieldDelegate, NSComboBo
         self.controlCombo = controlCombo
         self.filenameField = filenameField
         self.periodField = periodField
+        self.jiraIssueField = jiraIssueField
         self.previewLabel = previewLabel
         self.mappingLabel = mappingLabel
         super.init()
@@ -30,6 +33,7 @@ final class CaptureMetadataCoordinator: NSObject, NSTextFieldDelegate, NSComboBo
         controlCombo.delegate = self
         filenameField.delegate = self
         periodField.delegate = self
+        jiraIssueField?.delegate = self
         populateControls(preferredControlID: preferredControlID)
         updatePreview()
     }
@@ -67,7 +71,8 @@ final class CaptureMetadataCoordinator: NSObject, NSTextFieldDelegate, NSComboBo
             frameworkName: frameworkName,
             controlID: controlID,
             customName: filenameField.stringValue,
-            assessmentPeriod: periodField.stringValue
+            assessmentPeriod: periodField.stringValue,
+            jiraIssueKey: jiraIssueField?.stringValue ?? ""
         )
         let mappings = ComplianceCatalog.mappings(frameworkName: frameworkName, controlID: controlID)
         mappingLabel?.stringValue = mappings.isEmpty

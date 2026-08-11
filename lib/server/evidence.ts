@@ -20,6 +20,8 @@ export interface EvidenceInput {
   tags?: string[];
   expectedEvidence?: string;
   mappedControls?: Array<{ framework: string; controlID: string; relationship: string }>;
+  jiraIssueKey?: string;
+  jiraIssueURL?: string;
   manualRedactions?: number;
   contentType: string;
   bytes: Uint8Array;
@@ -64,11 +66,11 @@ export async function storeEvidence(input: EvidenceInput): Promise<{ id: string;
   await env.EVIDENCE_BUCKET.put(r2Key, encrypted.ciphertext, { customMetadata: { evidenceId: id, sha256: digest, encryptionVersion: "1" }, httpMetadata: { contentType: "application/octet-stream" } });
   try {
     await env.DB.prepare(`INSERT INTO evidence_artifacts
-      (id, control_id, framework, catalog_version, title, description, type, source, system, environment, assessment_period, evidence_owner, tags_json, expected_evidence, mapped_controls_json, manual_redactions, collector_id, job_id, session_id, device_id, r2_key, content_type, byte_size, sha256, encryption_iv, captured_at, expires_at, redaction_count, redaction_summary_json, manifest_sha256, chain_previous_hash, chain_event_hash, timestamp_authority, timestamp_token, created_by)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(
+      (id, control_id, framework, catalog_version, title, description, type, source, system, environment, assessment_period, evidence_owner, tags_json, expected_evidence, mapped_controls_json, jira_issue_key, jira_issue_url, manual_redactions, collector_id, job_id, session_id, device_id, r2_key, content_type, byte_size, sha256, encryption_iv, captured_at, expires_at, redaction_count, redaction_summary_json, manifest_sha256, chain_previous_hash, chain_event_hash, timestamp_authority, timestamp_token, created_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(
       id, input.controlId, input.framework || "PCI DSS 4.0.1", input.catalogVersion || null, input.title, input.description, input.type, input.source, input.system,
       input.environment || null, input.assessmentPeriod || null, input.evidenceOwner || null, stableJson(input.tags || []), input.expectedEvidence || null,
-      stableJson(input.mappedControls || []), Math.max(0, Math.min(input.manualRedactions || 0, 10_000)), input.collectorId || null, input.jobId || null,
+      stableJson(input.mappedControls || []), input.jiraIssueKey || null, input.jiraIssueURL || null, Math.max(0, Math.min(input.manualRedactions || 0, 10_000)), input.collectorId || null, input.jobId || null,
       input.sessionId || null, input.deviceId || null, r2Key, input.contentType, bytes.byteLength, digest, encrypted.iv, capturedAt, expiresAt, redactionCount, stableJson(findings),
       input.manifestSha256 || null, input.chainPreviousHash || null, input.chainEventHash || null, input.timestampAuthority || null, input.timestampToken || null, input.createdBy.id,
     ).run();
@@ -76,12 +78,12 @@ export async function storeEvidence(input: EvidenceInput): Promise<{ id: string;
     await env.EVIDENCE_BUCKET.delete(r2Key);
     throw error;
   }
-  await appendAuditEvent(input.createdBy, "evidence.created", "evidence", id, { controlId: input.controlId, source: input.source, sha256: digest, redactionCount, byteSize: bytes.byteLength });
+  await appendAuditEvent(input.createdBy, "evidence.created", "evidence", id, { controlId: input.controlId, source: input.source, jiraIssueKey: input.jiraIssueKey || undefined, sha256: digest, redactionCount, byteSize: bytes.byteLength });
   return { id, deduplicated: false, redactionCount };
 }
 
 export async function listEvidence(limit = 100): Promise<Array<Record<string, unknown>>> {
-  const rows = (await getEnv().DB.prepare(`SELECT id, control_id, framework, catalog_version, title, description, type, source, system, environment, assessment_period, evidence_owner, tags_json, expected_evidence, mapped_controls_json, manual_redactions, collector_id, job_id, session_id, device_id, content_type, byte_size, sha256, captured_at, expires_at, status, redaction_count, redaction_summary_json, manifest_sha256, chain_previous_hash, chain_event_hash, timestamp_authority, created_by, created_at, approved_by, approved_at
+  const rows = (await getEnv().DB.prepare(`SELECT id, control_id, framework, catalog_version, title, description, type, source, system, environment, assessment_period, evidence_owner, tags_json, expected_evidence, mapped_controls_json, jira_issue_key, jira_issue_url, manual_redactions, collector_id, job_id, session_id, device_id, content_type, byte_size, sha256, captured_at, expires_at, status, redaction_count, redaction_summary_json, manifest_sha256, chain_previous_hash, chain_event_hash, timestamp_authority, created_by, created_at, approved_by, approved_at
     FROM evidence_artifacts ORDER BY captured_at DESC LIMIT ?`).bind(Math.min(Math.max(limit, 1), 250)).all<Record<string, unknown>>()).results;
   return rows.map((row: Record<string, unknown>) => ({ ...row, redaction_summary: JSON.parse(String(row.redaction_summary_json || "[]")), tags: JSON.parse(String(row.tags_json || "[]")), mapped_controls: JSON.parse(String(row.mapped_controls_json || "[]")), redaction_summary_json: undefined, tags_json: undefined, mapped_controls_json: undefined }));
 }

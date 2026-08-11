@@ -29,6 +29,7 @@ struct CaptureContext: Codable, Sendable {
     var evidenceOwner: String? = nil
     var tags: [String]? = nil
     var expectedEvidence: String? = nil
+    var jiraIssueKey: String? = nil
 
     var isValid: Bool {
         !sessionID.isEmpty && !sessionName.isEmpty && !resolvedComplianceArea.isEmpty && !controlID.isEmpty && !resolvedCustomFileName.isEmpty && !title.isEmpty && !system.isEmpty && !environment.isEmpty && !assessmentPeriod.isEmpty
@@ -59,7 +60,8 @@ struct CaptureContext: Codable, Sendable {
             customFileName: "",
             evidenceOwner: NSFullUserName(),
             tags: [],
-            expectedEvidence: ""
+            expectedEvidence: "",
+            jiraIssueKey: ""
         )
     }
 }
@@ -89,6 +91,7 @@ final class CapturePreferences {
         static let lastUpdateCheck = "capture.lastUpdateCheck"
         static let chainHead = "capture.chainHead"
         static let presets = "capture.presets"
+        static let jiraHandoff = "capture.jiraHandoff"
     }
 
     var browser: BrowserChoice {
@@ -157,6 +160,14 @@ final class CapturePreferences {
             return value.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
         }
         set { defaults.set(try? JSONEncoder().encode(Array(newValue.prefix(50))), forKey: Key.presets) }
+    }
+
+    var jiraHandoff: JiraHandoffSettings {
+        get {
+            guard let data = defaults.data(forKey: Key.jiraHandoff), let value = try? JSONDecoder().decode(JiraHandoffSettings.self, from: data) else { return .defaults }
+            return value
+        }
+        set { defaults.set(try? JSONEncoder().encode(newValue), forKey: Key.jiraHandoff) }
     }
 
     func savePreset(name: String, context: CaptureContext) {

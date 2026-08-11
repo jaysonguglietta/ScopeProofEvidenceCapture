@@ -11,6 +11,11 @@ const redactionKinds = new Set<RedactionKind>(["pan", "aws_access_key", "github_
 
 function field(form: FormData, name: string, maximum: number): string { return String(form.get(name) || "").trim().slice(0, maximum); }
 
+function validHttpsURL(value: string): boolean {
+  if (!value) return true;
+  try { const url = new URL(value); return url.protocol === "https:" && Boolean(url.hostname) && !url.username && !url.password && !url.search && !url.hash; } catch { return false; }
+}
+
 function findings(value: string): RedactionFinding[] {
   try {
     const parsed = JSON.parse(value) as Array<{ kind?: string; count?: number }>;
@@ -46,6 +51,14 @@ export async function POST(request: Request) {
     const evidenceOwner = field(form, "evidenceOwner", 160);
     const catalogVersion = field(form, "catalogVersion", 80);
     const expectedEvidence = field(form, "expectedEvidence", 1000);
+    const jiraIssueKey = field(form, "jiraIssueKey", 80).toUpperCase();
+    const jiraIssueURL = field(form, "jiraIssueURL", 500);
+    if (jiraIssueKey && !/^[A-Z][A-Z0-9_]{1,31}-[1-9][0-9]*$/.test(jiraIssueKey)) return Response.json({ error: "Jira issue key is invalid." }, { status: 400 });
+    if (!validHttpsURL(jiraIssueURL)) return Response.json({ error: "Jira issue URL must use HTTPS without embedded credentials, a query, or a fragment." }, { status: 400 });
+    if (jiraIssueURL && (!jiraIssueKey || !new URL(jiraIssueURL).pathname.endsWith(`/browse/${jiraIssueKey}`))) return Response.json({ error: "Jira issue URL must match the submitted issue key." }, { status: 400 });
+    const manifestJiraIssueKey = String(manifest.jiraIssueKey || "").trim().toUpperCase();
+    const manifestJiraIssueURL = String(manifest.jiraIssueURL || "").trim();
+    if (manifestJiraIssueKey !== jiraIssueKey || manifestJiraIssueURL !== jiraIssueURL) return Response.json({ error: "Jira metadata does not match the immutable capture manifest." }, { status: 422 });
     const manualRedactions = Math.max(0, Math.min(Number(field(form, "manualRedactions", 8)) || 0, 10_000));
     const parseArray = (name: string, maximum: number): unknown[] => { try { const value = JSON.parse(field(form, name, maximum)); return Array.isArray(value) ? value : []; } catch { return []; } };
     const tags = parseArray("tags", 4000).filter((item): item is string => typeof item === "string").map((item) => item.trim().slice(0, 80)).filter(Boolean).slice(0, 30);
@@ -60,7 +73,7 @@ export async function POST(request: Request) {
     const attestationBody = {
       version: 1, evidenceId: String(manifest.evidenceID || ""), imageSha256: imageDigest, manifestSha256: await sha256(manifestBytes),
       chainPreviousHash: field(form, "chainPreviousHash", 128) || "GENESIS", chainEventHash: field(form, "chainEventHash", 128),
-      deviceId: device.id, capturedAt, receivedAt: new Date().toISOString(), complianceArea, controlId, system, environment, assessmentPeriod,
+      deviceId: device.id, capturedAt, receivedAt: new Date().toISOString(), complianceArea, controlId, system, environment, assessmentPeriod, jiraIssueKey: jiraIssueKey || null, jiraIssueURL: jiraIssueURL || null,
     };
     const signed = await signPackage(stableJson(attestationBody));
     let trustedTimestamp: Awaited<ReturnType<typeof requestTrustedTimestamp>> = null;
@@ -70,12 +83,12 @@ export async function POST(request: Request) {
     const timestampToken = JSON.stringify({ ...attestationBody, signature: signed.signature, publicKeySpkiBase64: signed.publicKey, algorithm: "ECDSA-P256-SHA256", trustedTimestamp, trustedTimestampError });
     const result = await storeEvidence({
       controlId, framework: complianceArea, catalogVersion, title, description: field(form, "description", 2000), type: "screenshot", source: `Scopeproof Capture / ${device.displayName} / ${complianceArea}`, system,
-      environment, assessmentPeriod, evidenceOwner, tags, expectedEvidence, mappedControls, manualRedactions,
+      environment, assessmentPeriod, evidenceOwner, tags, expectedEvidence, mappedControls, jiraIssueKey, jiraIssueURL, manualRedactions,
       contentType: "image/png", bytes: image, sessionId, deviceId: device.id, capturedAt, createdBy: actor, preflightFindings: localFindings,
       manifestSha256: attestationBody.manifestSha256, chainPreviousHash: attestationBody.chainPreviousHash, chainEventHash: attestationBody.chainEventHash,
       timestampAuthority, timestampToken,
     });
-    await appendAuditEvent(actor, "capture_device.uploaded", "evidence", result.id, { deviceId: device.id, sessionId, complianceArea, controlId, imageSha256: imageDigest, safetyStatus, redactionCount: localFindings.reduce((sum, item) => sum + item.count, 0) });
+    await appendAuditEvent(actor, "capture_device.uploaded", "evidence", result.id, { deviceId: device.id, sessionId, complianceArea, controlId, jiraIssueKey: jiraIssueKey || undefined, imageSha256: imageDigest, safetyStatus, redactionCount: localFindings.reduce((sum, item) => sum + item.count, 0) });
     return Response.json({ ...result, receipt: { evidenceId: result.id, deviceId: device.id, attestation: { ...attestationBody, signature: signed.signature, publicKeySpkiBase64: signed.publicKey, algorithm: "ECDSA-P256-SHA256", trustedTimestamp, trustedTimestampError } } }, { status: result.deduplicated ? 200 : 201 });
   } catch (error) { return jsonError(error); }
 }

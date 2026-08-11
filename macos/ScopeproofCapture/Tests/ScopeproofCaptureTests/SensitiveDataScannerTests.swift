@@ -59,6 +59,11 @@ struct SensitiveDataScannerTests {
         #expect(ComplianceCatalog.safePathComponent("../../HIPAA/records") == "HIPAA-records")
         let preview = ComplianceCatalog.filenamePreview(frameworkName: "HIPAA Security Rule", controlID: "164.312(b)", customName: "Audit controls", assessmentPeriod: "2026 Q3")
         #expect(preview.contains("HIPAA / 164.312-b / 2026-Q3 / HIPAA_164.312-b_Audit-controls"))
+        let jiraPreview = ComplianceCatalog.filenamePreview(frameworkName: "HIPAA Security Rule", controlID: "164.312(b)", customName: "Audit controls", assessmentPeriod: "2026 Q3", jiraIssueKey: "grc-42")
+        #expect(jiraPreview.contains("HIPAA_164.312-b_GRC-42_Audit-controls"))
+        #expect(JiraHandoff.isValidIssueKey("GRC-42"))
+        #expect(!JiraHandoff.isValidIssueKey("../../GRC-42"))
+        #expect(JiraHandoffSettings(baseURL: "https://example.atlassian.net", projectKey: "GRC", attachmentMode: .evidenceSet, includeGuideInPackages: true, customInstructions: "").issueURL(for: "GRC-42")?.absoluteString == "https://example.atlassian.net/browse/GRC-42")
     }
 
     @Test("Finds legacy and current evidence recursively")
@@ -76,7 +81,7 @@ struct SensitiveDataScannerTests {
             safetyStatus: "passed", redactionFindings: [], redactedRegions: 0, sessionID: "session_test", sessionName: "Legacy",
             controlID: "164.312(b)", title: "Audit controls", system: "EHR", environment: "Production", assessmentPeriod: "2026 Q3", description: "",
             complianceArea: nil, controlTitle: nil, customFileName: nil, catalogVersion: nil, evidenceOwner: nil, tags: nil, expectedEvidence: nil,
-            mappedControls: nil, manualRedactions: nil, reviewerNote: nil, chainPreviousHash: "GENESIS", chainEventHash: "event"
+            mappedControls: nil, manualRedactions: nil, reviewerNote: nil, jiraIssueKey: nil, jiraIssueURL: nil, chainPreviousHash: "GENESIS", chainEventHash: "event"
         )
         var object = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(manifest)) as? [String: Any])
         object.removeValue(forKey: "complianceArea")
@@ -109,6 +114,7 @@ struct SensitiveDataScannerTests {
             complianceArea: "PCI DSS 4.0.1", controlTitle: "Strong authentication", customFileName: "MFA",
             catalogVersion: ComplianceCatalog.catalogVersion, evidenceOwner: "Control Owner", tags: ["identity"], expectedEvidence: "MFA status",
             mappedControls: ComplianceCatalog.mappings(frameworkName: "PCI DSS 4.0.1", controlID: "8.3.1"), manualRedactions: 0, reviewerNote: nil,
+            jiraIssueKey: "GRC-42", jiraIssueURL: "https://example.atlassian.net/browse/GRC-42",
             chainPreviousHash: "GENESIS", chainEventHash: "event"
         )
         let manifestURL = root.appendingPathComponent("approved.json")
@@ -122,5 +128,8 @@ struct SensitiveDataScannerTests {
         #expect(package.evidenceCount == 1)
         #expect(FileManager.default.fileExists(atPath: package.zipURL.path))
         #expect(FileManager.default.fileExists(atPath: package.checksumURL.path))
+        let comment = JiraHandoff.comment(for: entry, settings: .defaults)
+        #expect(comment.contains("GRC-42"))
+        #expect(comment.contains(digest))
     }
 }

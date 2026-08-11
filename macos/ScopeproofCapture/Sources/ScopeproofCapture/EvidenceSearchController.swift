@@ -4,6 +4,7 @@
 final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
     private var window: NSWindow?
     private var evidenceRoot: URL?
+    private var jiraSettings: JiraHandoffSettings = .defaults
     private var allEntries: [CaptureHistoryEntry] = []
     private var filteredEntries: [CaptureHistoryEntry] = []
     private let frameworkPopup = NSPopUpButton()
@@ -17,10 +18,12 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
     private let openButton = NSButton(title: "Open Screenshot", target: nil, action: nil)
     private let revealButton = NSButton(title: "Reveal in Finder", target: nil, action: nil)
     private let reviewButton = NSButton(title: "Review Status…", target: nil, action: nil)
+    private let jiraButton = NSButton(title: "Copy Jira Comment", target: nil, action: nil)
     private let detailsLabel = NSTextField(wrappingLabelWithString: "")
 
-    func show(evidenceRoot: URL) {
+    func show(evidenceRoot: URL, jiraSettings: JiraHandoffSettings = .defaults) {
         self.evidenceRoot = evidenceRoot
+        self.jiraSettings = jiraSettings
         allEntries = CaptureHistory.entries(in: evidenceRoot)
         if window == nil { buildWindow() }
         populateFrameworks()
@@ -57,7 +60,7 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
         controlPopup.target = self
         controlPopup.action = #selector(filtersChanged)
         controlPopup.setAccessibilityLabel("Control number filter")
-        searchField.placeholderString = "Search filename, title, evidence ID, system, or description"
+        searchField.placeholderString = "Search filename, Jira issue, title, evidence ID, system, or description"
         searchField.delegate = self
         searchField.target = self
         searchField.action = #selector(filtersChanged)
@@ -82,7 +85,7 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
 
         let columns: [(String, String, CGFloat)] = [
             ("preview", "", 64), ("captured", "Captured", 145), ("framework", "Compliance area", 155), ("control", "Control", 100),
-            ("evidence", "Evidence", 220), ("system", "System / asset", 150), ("status", "Review", 90), ("owner", "Owner", 120), ("upload", "Stored", 65),
+            ("jira", "Jira", 95), ("evidence", "Evidence", 220), ("system", "System / asset", 150), ("status", "Review", 90), ("owner", "Owner", 120), ("upload", "Stored", 65),
         ]
         for (identifier, title, width) in columns {
             let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(identifier))
@@ -119,11 +122,15 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
         reviewButton.target = self
         reviewButton.action = #selector(reviewSelected)
         reviewButton.bezelStyle = .rounded
+        jiraButton.target = self
+        jiraButton.action = #selector(copyJiraComment)
+        jiraButton.bezelStyle = .rounded
+        jiraButton.toolTip = "Copy a ticket-ready summary and attachment checklist"
         detailsLabel.textColor = .secondaryLabelColor
         detailsLabel.font = .systemFont(ofSize: 11)
         detailsLabel.maximumNumberOfLines = 2
         let spacer = NSView()
-        let actions = NSStackView(views: [statusLabel, spacer, reviewButton, revealButton, openButton])
+        let actions = NSStackView(views: [statusLabel, spacer, jiraButton, reviewButton, revealButton, openButton])
         actions.orientation = .horizontal
         actions.alignment = .centerY
         actions.spacing = 9
@@ -212,7 +219,7 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
             guard selectedSystem == nil || selectedSystem == manifest.system else { return false }
             if let cutoff, let captured = ISO8601DateFormatter().date(from: manifest.capturedAt), captured < cutoff { return false }
             guard !query.isEmpty else { return true }
-            return [entry.imageURL.lastPathComponent, manifest.evidenceID, manifest.title, manifest.system, manifest.sessionName, manifest.description, manifest.controlID, manifest.customFileName ?? "", manifest.controlTitle ?? "", lifecycle.owner, lifecycle.reviewer, lifecycle.reviewNotes, lifecycle.tags.joined(separator: " ")]
+            return [entry.imageURL.lastPathComponent, manifest.evidenceID, manifest.title, manifest.system, manifest.sessionName, manifest.description, manifest.controlID, manifest.customFileName ?? "", manifest.controlTitle ?? "", manifest.jiraIssueKey ?? "", manifest.jiraIssueURL ?? "", lifecycle.owner, lifecycle.reviewer, lifecycle.reviewNotes, lifecycle.tags.joined(separator: " ")]
                 .joined(separator: " ").lowercased().contains(query)
         }
         tableView.reloadData()
@@ -237,6 +244,7 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
         case "captured": value = manifest.localTimestamp
         case "framework": value = manifest.complianceArea ?? "PCI DSS 4.0.1"
         case "control": value = manifest.controlID
+        case "jira": value = manifest.jiraIssueKey ?? "—"
         case "evidence": value = manifest.customFileName?.isEmpty == false ? manifest.customFileName! : manifest.title
         case "system": value = manifest.system
         case "status": value = entry.lifecycle.status.rawValue
@@ -258,11 +266,13 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
         openButton.isEnabled = hasSelection
         revealButton.isEnabled = hasSelection
         reviewButton.isEnabled = hasSelection
+        jiraButton.isEnabled = hasSelection
         statusLabel.stringValue = filteredEntries.isEmpty ? "No screenshots match these filters." : "\(filteredEntries.count) screenshot\(filteredEntries.count == 1 ? "" : "s") found"
         if let entry = selectedEntry {
             let lifecycle = entry.lifecycle
             let mappings = entry.manifest.mappedControls?.map { "\(ComplianceCatalog.framework(named: $0.framework).fileCode) \($0.controlID)" }.joined(separator: ", ") ?? "None curated"
-            detailsLabel.stringValue = "\(entry.manifest.evidenceID) · \(lifecycle.status.rawValue) · tags: \(lifecycle.tags.isEmpty ? "none" : lifecycle.tags.joined(separator: ", ")) · mapped controls: \(mappings)"
+            let jira = entry.manifest.jiraIssueKey?.isEmpty == false ? entry.manifest.jiraIssueKey! : "not assigned"
+            detailsLabel.stringValue = "\(entry.manifest.evidenceID) · \(lifecycle.status.rawValue) · Jira: \(jira) · tags: \(lifecycle.tags.isEmpty ? "none" : lifecycle.tags.joined(separator: ", ")) · mapped controls: \(mappings)"
         } else { detailsLabel.stringValue = "Select evidence to review its lifecycle, ownership, tags, and cross-framework mappings." }
     }
 
@@ -273,6 +283,13 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
 
     @objc private func openSelected() { if let entry = selectedEntry { NSWorkspace.shared.open(entry.imageURL) } }
     @objc private func revealSelected() { if let entry = selectedEntry { NSWorkspace.shared.activateFileViewerSelecting([entry.imageURL]) } }
+
+    @objc private func copyJiraComment() {
+        guard let entry = selectedEntry else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(JiraHandoff.comment(for: entry, settings: jiraSettings), forType: .string)
+        statusLabel.stringValue = "Jira comment copied for \(entry.manifest.jiraIssueKey ?? entry.manifest.evidenceID). Attach only the listed reviewed files."
+    }
 
     @objc private func reviewSelected() {
         guard let entry = selectedEntry else { return }

@@ -84,6 +84,8 @@ export const evidenceArtifacts = sqliteTable("evidence_artifacts", {
   tagsJson: text("tags_json").notNull().default("[]"),
   expectedEvidence: text("expected_evidence"),
   mappedControlsJson: text("mapped_controls_json").notNull().default("[]"),
+  jiraIssueKey: text("jira_issue_key"),
+  jiraIssueURL: text("jira_issue_url"),
   collectorId: text("collector_id"),
   jobId: text("job_id"),
   sessionId: text("session_id"),
@@ -117,6 +119,7 @@ export const evidenceArtifacts = sqliteTable("evidence_artifacts", {
   index("idx_evidence_job").on(table.jobId),
   index("idx_evidence_device_captured").on(table.deviceId, table.capturedAt),
   index("idx_evidence_session").on(table.sessionId),
+  index("idx_evidence_jira_issue").on(table.jiraIssueKey),
 ]);
 
 export const auditEvents = sqliteTable("audit_events", {

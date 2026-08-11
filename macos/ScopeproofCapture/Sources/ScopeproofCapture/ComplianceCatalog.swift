@@ -234,11 +234,13 @@ enum ComplianceCatalog {
         return readable.replacingOccurrences(of: " ", with: "-")
     }
 
-    static func filenamePreview(frameworkName: String, controlID: String, customName: String, assessmentPeriod: String) -> String {
+    static func filenamePreview(frameworkName: String, controlID: String, customName: String, assessmentPeriod: String, jiraIssueKey: String = "") -> String {
         let framework = framework(named: frameworkName)
         let control = safeFileBase(controlID)
         let name = safeFileBase(customName)
         let period = safeFileBase(assessmentPeriod)
-        return "\(framework.folderName) / \(control) / \(period) / \(framework.fileCode)_\(control)_\(name)_<date>_<evidence-id>.png"
+        let jira = JiraHandoff.normalizedIssueKey(jiraIssueKey)
+        let jiraComponent = jira.isEmpty ? "" : "_\(safeFileBase(jira))"
+        return "\(framework.folderName) / \(control) / \(period) / \(framework.fileCode)_\(control)\(jiraComponent)_\(name)_<date>_<evidence-id>.png"
     }
 }

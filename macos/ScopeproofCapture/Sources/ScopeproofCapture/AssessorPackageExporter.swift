@@ -23,7 +23,7 @@ enum AssessorPackageFailure: LocalizedError {
 }
 
 enum AssessorPackageExporter {
-    static func export(entries: [CaptureHistoryEntry], to destination: URL, preparedBy: String, packageName: String) throws -> AssessorPackageResult {
+    static func export(entries: [CaptureHistoryEntry], to destination: URL, preparedBy: String, packageName: String, jiraSettings: JiraHandoffSettings = .defaults) throws -> AssessorPackageResult {
         let approved = entries.filter { $0.lifecycle.status.isPackageEligible }
         guard !approved.isEmpty else { throw AssessorPackageFailure.noApprovedEvidence }
         let fileManager = FileManager.default
@@ -37,7 +37,7 @@ enum AssessorPackageExporter {
         defer { try? fileManager.removeItem(at: temporaryRoot) }
 
         var artifactIndex: [[String: Any]] = []
-        var csvRows = ["Evidence ID,Framework,Control,Control title,Evidence title,System,Environment,Assessment period,Captured at,Owner,Status,Tags,Redactions,SHA-256,File"]
+        var csvRows = ["Evidence ID,Framework,Control,Control title,Jira issue,Jira URL,Evidence title,System,Environment,Assessment period,Captured at,Owner,Status,Tags,Redactions,SHA-256,File"]
         for entry in approved {
             let imageData = try Data(contentsOf: entry.imageURL, options: [.mappedIfSafe])
             guard sha256(imageData) == entry.manifest.sha256, EvidenceLifecycleStore.verify(entry.lifecycle) else { throw AssessorPackageFailure.integrityMismatch(entry.manifest.evidenceID) }
@@ -60,6 +60,7 @@ enum AssessorPackageExporter {
             artifactIndex.append([
                 "evidenceId": entry.manifest.evidenceID, "framework": frameworkName, "catalogVersion": entry.manifest.catalogVersion ?? "legacy",
                 "controlId": entry.manifest.controlID, "controlTitle": entry.manifest.controlTitle ?? "", "title": entry.manifest.title,
+                "jiraIssueKey": entry.manifest.jiraIssueKey ?? "", "jiraIssueURL": entry.manifest.jiraIssueURL ?? "",
                 "system": entry.manifest.system, "environment": entry.manifest.environment, "assessmentPeriod": entry.manifest.assessmentPeriod,
                 "capturedAt": entry.manifest.capturedAt, "owner": lifecycle.owner, "reviewer": lifecycle.reviewer, "status": lifecycle.status.rawValue,
                 "tags": lifecycle.tags, "redactions": entry.manifest.redactedRegions + (entry.manifest.manualRedactions ?? 0),
@@ -69,7 +70,7 @@ enum AssessorPackageExporter {
             ])
             let relativeImage = "Evidence/\(framework.folderName)/\(ComplianceCatalog.safePathComponent(entry.manifest.controlID))/\(entry.imageURL.lastPathComponent)"
             csvRows.append([
-                entry.manifest.evidenceID, frameworkName, entry.manifest.controlID, entry.manifest.controlTitle ?? "", entry.manifest.title,
+                entry.manifest.evidenceID, frameworkName, entry.manifest.controlID, entry.manifest.controlTitle ?? "", entry.manifest.jiraIssueKey ?? "", entry.manifest.jiraIssueURL ?? "", entry.manifest.title,
                 entry.manifest.system, entry.manifest.environment, entry.manifest.assessmentPeriod, entry.manifest.capturedAt, lifecycle.owner,
                 lifecycle.status.rawValue, lifecycle.tags.joined(separator: "; "), String(entry.manifest.redactedRegions + (entry.manifest.manualRedactions ?? 0)), entry.manifest.sha256, relativeImage,
             ].map(csv).joined(separator: ","))
@@ -105,6 +106,7 @@ enum AssessorPackageExporter {
         3. Open Evidence/<framework>/<control>/ to review the PNG and adjacent metadata.
         4. Each PNG has an immutable capture manifest (.json), review lifecycle (.review.json), and—when uploaded—a signed server receipt (.receipt.json).
         5. Follow 04-Verification.txt to validate file hashes and the package signature.
+        6. When present, follow 05-Jira-Handoff.txt before attaching files to a Jira issue.
 
         PACKAGE POLICY
         Only evidence marked Approved is included. Draft, In Review, Rejected, and Superseded artifacts are excluded. Automated and manual redactions are irreversible; original unredacted pixels are not retained. Cross-framework mappings are informational and require assessor validation.
@@ -116,14 +118,22 @@ enum AssessorPackageExporter {
         try coverageData.write(to: packageRoot.appendingPathComponent("01-Control-Coverage.csv"), options: [.atomic])
         try indexData.write(to: packageRoot.appendingPathComponent("02-Evidence-Index.csv"), options: [.atomic])
 
+        let jiraGuideData = Data(JiraHandoff.packageGuide(settings: jiraSettings, entries: approved).utf8)
+        if jiraSettings.includeGuideInPackages {
+            try jiraGuideData.write(to: packageRoot.appendingPathComponent("05-Jira-Handoff.txt"), options: [.atomic])
+        }
+
+        var administrativeFiles: [[String: String]] = [
+            ["path": "00-READ-ME.txt", "sha256": sha256(readmeData)],
+            ["path": "01-Control-Coverage.csv", "sha256": sha256(coverageData)],
+            ["path": "02-Evidence-Index.csv", "sha256": sha256(indexData)],
+        ]
+        if jiraSettings.includeGuideInPackages { administrativeFiles.append(["path": "05-Jira-Handoff.txt", "sha256": sha256(jiraGuideData)]) }
+
         let unsigned: [String: Any] = [
             "schemaVersion": 1, "packageId": packageID, "packageName": safePackageName, "generatedAt": generatedAt, "preparedBy": safePreparedBy,
             "frameworks": frameworks, "assessmentPeriods": periods, "policy": ["includedStatus": "Approved", "excludedStatuses": ["Draft", "In Review", "Rejected", "Superseded"]],
-            "administrativeFiles": [
-                ["path": "00-READ-ME.txt", "sha256": sha256(readmeData)],
-                ["path": "01-Control-Coverage.csv", "sha256": sha256(coverageData)],
-                ["path": "02-Evidence-Index.csv", "sha256": sha256(indexData)],
-            ],
+            "administrativeFiles": administrativeFiles,
             "evidence": artifactIndex,
         ]
         let canonical = try JSONSerialization.data(withJSONObject: unsigned, options: [.sortedKeys, .withoutEscapingSlashes])

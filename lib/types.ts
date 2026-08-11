@@ -25,6 +25,8 @@ export interface Evidence {
   environment?: string;
   assessmentPeriod?: string;
   mappedControls?: Array<{ framework: string; controlID: string; relationship: string }>;
+  jiraIssueKey?: string;
+  jiraIssueURL?: string;
 }
 
 export interface Control {
