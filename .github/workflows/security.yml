@@ -1,0 +1,36 @@
+name: Security verification
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 8 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.13.0"
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm test
+      - name: Block High and Critical dependency advisories
+        run: npm audit --audit-level=high
+      - name: Verify the production dependency graph independently
+        run: npm audit --omit=dev --audit-level=high
+      - name: Generate CycloneDX SBOM
+        run: npm sbom --sbom-format=cyclonedx > scopeproof-sbom.cdx.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: scopeproof-sbom
+          path: scopeproof-sbom.cdx.json
+          if-no-files-found: error
+          retention-days: 30

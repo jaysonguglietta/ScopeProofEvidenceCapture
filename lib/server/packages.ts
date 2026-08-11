@@ -82,14 +82,22 @@ export async function buildAssessorPackage(actor: AuthenticatedUser): Promise<{ 
       ...rows.map((row: Record<string, unknown>) => `${String(row.framework || "PCI DSS 4.0.1").slice(0, 18)} | ${row.control_id} | ${row.id} | ${String(row.title).slice(0, 36)}`),
     ];
     files["assessor-report.pdf"] = buildPdf(reportLines);
-    const evidence = rows.map((row) => ({ ...row, package_path: `evidence/${safeName(String(row.framework || "PCI DSS 4.0.1"))}/${safeName(String(row.control_id))}/${String(row.id)}-${safeName(String(row.title))}.${extension(String(row.content_type))}`, tags: JSON.parse(String(row.tags_json || "[]")), mappedControls: JSON.parse(String(row.mapped_controls_json || "[]")), tags_json: undefined, mapped_controls_json: undefined }));
+    const evidence = rows.map((row) => {
+      const { tags_json: tagsJson, mapped_controls_json: mappedControlsJson, ...signedFields } = row;
+      return {
+        ...signedFields,
+        package_path: `evidence/${safeName(String(row.framework || "PCI DSS 4.0.1"))}/${safeName(String(row.control_id))}/${String(row.id)}-${safeName(String(row.title))}.${extension(String(row.content_type))}`,
+        tags: JSON.parse(String(tagsJson || "[]")),
+        mappedControls: JSON.parse(String(mappedControlsJson || "[]")),
+      };
+    });
     const manifest = { schemaVersion: 3, packageId: id, frameworks, assessmentPeriods: periods, generatedAt, generatedBy: actor.email, inclusionPolicy: { status: "approved", maximumArtifacts: 100 }, readme: { filename: "00-READ-ME.txt", sha256: await sha256(files["00-READ-ME.txt"]) }, report: { filename: "assessor-report.pdf", sha256: await sha256(files["assessor-report.pdf"]) }, index: { filename: "01-Evidence-Index.csv", sha256: await sha256(files["01-Evidence-Index.csv"]) }, jiraHandoff: { filename: "02-Jira-Handoff.txt", sha256: await sha256(files["02-Jira-Handoff.txt"]) }, evidence };
     const manifestCanonical = stableJson(manifest);
     const signed = await signPackage(manifestCanonical);
     const signature = signed.signature;
-    const signedManifest = { ...manifest, signature: { algorithm: "ECDSA-P256-SHA256", value: signature, publicKeySpkiBase64: signed.publicKey, canonicalization: "Scopeproof stable JSON v1" } };
+    const signedManifest = { ...manifest, signature: { algorithm: "ECDSA-P256-SHA256", value: signature, publicKeySpkiBase64: signed.publicKey, canonicalization: "RFC 8785 JCS" } };
     files["manifest.json"] = strToU8(JSON.stringify(signedManifest, null, 2));
-    files["VERIFY.txt"] = strToU8(`Scopeproof External Assessor Evidence Package\nPackage ID: ${id}\nManifest algorithm: ECDSA-P256-SHA256\nCanonicalization: Scopeproof stable JSON v1\nPublic key (SPKI base64): ${signed.publicKey}\nManifest signature: ${signature}\nArtifact integrity: verify every evidence file against its manifest.json SHA-256 value.\n`);
+    files["VERIFY.txt"] = strToU8(`Scopeproof External Assessor Evidence Package\nPackage ID: ${id}\nManifest algorithm: ECDSA-P256-SHA256\nCanonicalization: RFC 8785 JCS\nPublic key (SPKI base64): ${signed.publicKey}\nManifest signature: ${signature}\nArtifact integrity: verify every evidence file against its manifest.json SHA-256 value.\n`);
     const zip = zipSync(files, { level: 6 });
     const digest = await sha256(zip);
     const associatedData = stableJson({ id, type: "assessor_package" });
