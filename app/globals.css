@@ -354,11 +354,21 @@ select { height: 35px; padding: 0 30px 0 10px; }
 .drawer-scroll > h2 { margin: 0; color: #253249; font-size: 19px; line-height: 1.3; }
 .drawer-description { margin: 7px 0 16px; color: #69778b; font-size: 10.5px; line-height: 1.6; }
 .drawer-scroll .screen-preview, .drawer-scroll .code-preview { border: 1px solid #dfe5ed; border-radius: 8px; }
+.actual-evidence { min-height: 180px; max-height: 420px; display: grid; place-items: center; overflow: auto; border: 1px solid #dfe5ed; border-radius: 8px; background: #f4f6f9; }
+.actual-evidence img { display: block; width: 100%; height: auto; object-fit: contain; }
+.actual-evidence pre { align-self: stretch; width: 100%; margin: 0; padding: 16px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: #253249; background: #f8fafc; font: 10px/1.55 var(--font-geist-mono), monospace; }
+.artifact-state { padding: 28px; color: #64748b; font-size: 10px; text-align: center; }
+.artifact-state.error, .review-blocked { color: #a33b3b; }
 .integrity-banner { margin: 13px 0; padding: 10px 12px; display: flex; align-items: center; gap: 9px; border: 1px solid #cee7dd; border-radius: 7px; background: #f0faf6; }
 .integrity-banner > span, .check-row > span { width: 21px; height: 21px; display: grid; place-items: center; border-radius: 50%; background: #d8f1e7; color: #218064; font-size: 9px; font-weight: 750; }
 .integrity-banner strong, .integrity-banner p { display: block; }
 .integrity-banner strong { color: #346957; font-size: 9.5px; }
 .integrity-banner p { margin: 2px 0 0; color: #789687; font: 8px var(--font-geist-mono), monospace; }
+.integrity-banner.pending { border-color: #dfe5ed; background: #f7f9fc; }
+.review-attestation { padding: 14px; border: 1px solid #d9e0ea; border-radius: 8px; background: #f8fafc; }
+.review-attestation .field { margin-top: 10px; }
+.review-attestation .checkbox-line { margin-top: 10px; align-items: flex-start; line-height: 1.45; }
+.review-blocked { margin: 8px 0 0; font-size: 10px; line-height: 1.5; }
 .detail-section { padding: 15px 0; border-bottom: 1px solid #edf0f4; }
 .detail-section h3 { margin: 0 0 12px; color: #415068; font-size: 9.5px; text-transform: uppercase; letter-spacing: .07em; }
 .detail-section dl { margin: 0; display: grid; gap: 9px; }

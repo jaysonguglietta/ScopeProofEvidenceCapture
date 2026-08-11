@@ -14,11 +14,11 @@ Scopeproof handles security and compliance evidence that may expose sensitive co
 
 ### Identity and authorization
 
-- Private Sites identity headers authenticate web users.
-- Server-side roles are ordered `auditor`, `reviewer`, `compliance_lead`, and `admin`.
-- Reviewers can submit/approve evidence and enroll their capture devices; compliance leads can operate collectors, build packages, and view broader administration; admins can change roles.
-- The last administrator cannot be demoted.
-- Mutation endpoints enforce same-origin requests.
+- Private Sites identity headers authenticate web users only on exact HTTPS origins in `TRUSTED_APP_ORIGINS`. Direct Worker, preview, alternate-domain, and misrouted requests fail before identity headers are consumed; the private Sites dispatcher must strip client-supplied identity headers and inject authenticated values.
+- Server-side permissions separate review from collection: reviewers inspect/approve, compliance leads collect/enroll/disclose, and administrators manage roles. An identity can never approve evidence it created or uploaded.
+- Initial administration requires a non-empty explicit email allowlist. A D1 invariant and atomic batch permit one bootstrap claim, bind its audit event, and preserve the final administrator at the database layer.
+- Mutation endpoints require an exact same-origin `Origin` and reject conflicting Fetch Metadata.
+- Reviewers receive the actual decrypted, digest-verified artifact rather than a generated placeholder. Approval requires a matching full digest, a review rationale, and explicit scope/freshness/redaction confirmation.
 - macOS devices use revocable random bearer tokens; only SHA-256 token hashes are stored server-side and the Mac stores its token in Keychain.
 - Jira Cloud uses OAuth 2.0 authorization-code flow. Rotating access and refresh tokens are AES-256-GCM encrypted with a dedicated hosted key and bound to a Scopeproof user and connection identity.
 
@@ -43,7 +43,7 @@ Scopeproof handles security and compliance evidence that may expose sensitive co
 ## Secure operating requirements
 
 1. Use a private Sites access policy and grant the minimum role required.
-2. Configure `BOOTSTRAP_ADMIN_EMAILS` before the first sign-in. Without it, the first user becomes administrator.
+2. Configure `BOOTSTRAP_ADMIN_EMAILS` and the exact canonical `TRUSTED_APP_ORIGINS` before any sign-in. Missing or unsafe values make authenticated APIs unavailable by design.
 3. Use distinct, high-entropy encryption, audit, and signing keys. Store them only in the hosted secret manager.
 4. Use least-privilege, read-only provider credentials and dedicated accounts where supported.
 5. Restrict browser capture URLs to an explicit approved list and avoid pages containing cardholder or customer data.

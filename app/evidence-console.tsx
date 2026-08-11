@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
+import Image from "next/image";
 import { controls, evidence as seedEvidence, findings, requirementCoverage, runs as seedRuns } from "../lib/data";
 import type { CollectionRun, Evidence, EvidenceStatus } from "../lib/types";
 
@@ -51,10 +52,10 @@ function mapApiEvidence(row: Record<string, unknown>): Evidence {
     owner: String(row.evidence_owner || "Unassigned"), environment: String(row.environment || "Unspecified"), assessmentPeriod: String(row.assessment_period || "Unspecified"),
     mappedControls: Array.isArray(row.mapped_controls) ? row.mapped_controls as Evidence["mappedControls"] : [],
     jiraIssueKey: row.jira_issue_key ? String(row.jira_issue_key) : undefined, jiraIssueURL: String(row.jira_issue_url || "").startsWith("https://") ? String(row.jira_issue_url) : undefined,
-    collector: String(row.collector_id || "Manual submission"), checksum: `sha256:${String(row.sha256).slice(0, 12)}…`, description: String(row.description || ""),
+    collector: String(row.collector_id || "Manual submission"), checksum: `sha256:${String(row.sha256)}`, sha256: String(row.sha256), createdBy: String(row.created_by || ""), approvedBy: row.approved_by ? String(row.approved_by) : undefined, description: String(row.description || ""),
     code: ["Code", "Configuration"].includes(type) ? "Encrypted artifact\nIntegrity verified on access\nOpen or export to inspect contents" : undefined,
     language: type === "Code" ? "Protected source" : type === "Configuration" ? "Protected config" : undefined,
-    accent: redactionCount ? "amber" : "emerald", tags: [...sourceTags, "Encrypted", "Server-backed", redactionCount ? `${redactionCount + Number(row.manual_redactions || 0)} value(s) redacted` : "Sensitive-data scan passed"],
+    accent: redactionCount ? "amber" : "emerald", tags: [...sourceTags, "Encrypted", "Server-backed", row.device_id ? "Client scan claim recorded" : "Scan metadata recorded", redactionCount ? `${redactionCount + Number(row.manual_redactions || 0)} value(s) redacted` : "No redactions reported"],
   };
 }
 
@@ -139,9 +140,9 @@ export function EvidenceConsole() {
         setRunItems((runData.runs as Array<Record<string, unknown>>).map(mapApiRun));
         setCollectorItems(collectorData.collectors);
         setAuditIntegrity(auditData?.integrity || null);
-        const deviceResponse = await fetch("/api/devices");
-        if (deviceResponse.ok) setDeviceItems(((await deviceResponse.json()) as { devices: ApiDevice[] }).devices);
-        if (["reviewer", "compliance_lead", "admin"].includes(me.user.role)) {
+        if (["compliance_lead", "admin"].includes(me.user.role)) {
+          const deviceResponse = await fetch("/api/devices");
+          if (deviceResponse.ok) setDeviceItems(((await deviceResponse.json()) as { devices: ApiDevice[] }).devices);
           const jiraResponse = await fetch("/api/jira/connection");
           if (jiraResponse.ok) setJiraConnection(((await jiraResponse.json()) as { connection: ApiJiraConnection }).connection);
         }
@@ -192,10 +193,10 @@ export function EvidenceConsole() {
     setView(next); setSidebarOpen(false); setSearch("");
   }
 
-  async function approveEvidence(item: Evidence) {
+  async function approveEvidence(item: Evidence, rationale: string) {
     setBusy(true);
     try {
-      const response = await fetch(`/api/evidence/${encodeURIComponent(item.id)}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ action: "approve" }) });
+      const response = await fetch(`/api/evidence/${encodeURIComponent(item.id)}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ action: "approve", expectedSha256: item.sha256, rationale, confirmedActualArtifact: true }) });
       if (!response.ok) throw new Error(await apiError(response));
       const next = evidenceItems.map((entry) => entry.id === item.id ? { ...entry, status: "Approved" as EvidenceStatus } : entry);
       setEvidenceItems(next); setSelectedEvidence({ ...item, status: "Approved" }); setToast(`${item.id} approved and written to the immutable audit chain.`);
@@ -315,6 +316,10 @@ export function EvidenceConsole() {
     finally { setBusy(false); }
   }
 
+  const canCollect = ["compliance_lead", "admin"].includes(currentUser?.role || "");
+  const canExport = ["reviewer", "compliance_lead", "admin"].includes(currentUser?.role || "");
+  const canManageOperations = ["compliance_lead", "admin"].includes(currentUser?.role || "");
+
   return (
     <div className="app-shell">
       <a className="skip-link" href="#main-content">Skip to content</a>
@@ -338,25 +343,25 @@ export function EvidenceConsole() {
           <div className="breadcrumbs"><span>Acme Commerce</span><b>/</b><strong>{view}</strong></div>
           <div className="top-actions">
             <button className="icon-button" aria-label="Notifications" onClick={() => setToast("You’re all caught up. No new notifications.")}>♢<i /></button>
-            <button className="button secondary" onClick={() => setModal("export")}>↓ <span>Export package</span></button>
-            <button className="button primary" onClick={() => setModal("run")}>＋ <span>Run collection</span></button>
+            <button className="button secondary" disabled={!canExport} title={!canExport ? "Reviewer or evidence-operations access is required." : undefined} onClick={() => setModal("export")}>↓ <span>Export package</span></button>
+            <button className="button primary" disabled={!canCollect} title={!canCollect ? "Evidence-operations access is required." : undefined} onClick={() => setModal("run")}>＋ <span>Run collection</span></button>
           </div>
         </header>
 
         <section className="page-wrap">
           <div className={cls("security-strip", backendState)}><span>{backendState === "live" ? "✓" : backendState === "loading" ? "↻" : "!"}</span><div><strong>{backendState === "live" ? "Protected evidence workspace" : backendState === "loading" ? "Connecting to protected storage…" : "Protected services unavailable"}</strong><p>{backendState === "live" ? `AES-256-GCM storage · ${currentUser?.role?.replaceAll("_", " ")} access · audit chain ${auditIntegrity?.valid ? `verified (${auditIntegrity.checked} events)` : "pending"}` : backendState === "unavailable" ? "The interface is showing non-authoritative sample data until authenticated storage reconnects." : "Authenticating and verifying storage bindings."}</p></div></div>
-          {view === "Overview" && <Overview evidenceItems={evidenceItems} runItems={runItems} onNavigate={navigate} onSelect={setSelectedEvidence} onRun={() => setModal("run")} />}
+          {view === "Overview" && <Overview evidenceItems={evidenceItems} runItems={runItems} canCollect={canCollect} onNavigate={navigate} onSelect={setSelectedEvidence} onRun={() => setModal("run")} />}
           {view === "Controls" && <ControlsView onNavigate={navigate} />}
-          {view === "Evidence" && <EvidenceView items={filteredEvidence} search={search} setSearch={setSearch} status={statusFilter} setStatus={setStatusFilter} type={typeFilter} setType={setTypeFilter} onSelect={setSelectedEvidence} onAdd={() => setModal("add")} />}
-          {view === "Collection runs" && <RunsView items={runItems} onRun={() => setModal("run")} onToast={setToast} />}
+          {view === "Evidence" && <EvidenceView items={filteredEvidence} canCollect={canCollect} search={search} setSearch={setSearch} status={statusFilter} setStatus={setStatusFilter} type={typeFilter} setType={setTypeFilter} onSelect={setSelectedEvidence} onAdd={() => setModal("add")} />}
+          {view === "Collection runs" && <RunsView items={runItems} canCollect={canCollect} onRun={() => setModal("run")} onToast={setToast} />}
           {view === "Findings" && <FindingsView />}
-          {view === "Connections" && <ConnectionsView collectors={collectorItems} devices={deviceItems} jira={jiraConnection} canManageJira={["reviewer", "compliance_lead", "admin"].includes(currentUser?.role || "")} busy={busy} onConnectJira={connectJira} onTestJira={testJira} onDisconnectJira={disconnectJiraConnection} onEnroll={() => { setDeviceToken(null); setModal("device"); }} onRevoke={revokeDevice} onToast={setToast} />}
+          {view === "Connections" && <ConnectionsView collectors={collectorItems} devices={deviceItems} jira={jiraConnection} canManageJira={canManageOperations} busy={busy} onConnectJira={connectJira} onTestJira={testJira} onDisconnectJira={disconnectJiraConnection} onEnroll={() => { setDeviceToken(null); setModal("device"); }} onRevoke={revokeDevice} onToast={setToast} />}
           {view === "Settings" && <SettingsView redaction={redaction} setRedaction={setRedaction} notifications={notifications} setNotifications={setNotifications} auditIntegrity={auditIntegrity} role={currentUser?.role || "auditor"} onToast={setToast} />}
           {view === "Help" && <HelpView onNavigate={navigate} />}
         </section>
       </main>
 
-      {selectedEvidence && <EvidenceDrawer item={selectedEvidence} onClose={() => setSelectedEvidence(null)} onApprove={approveEvidence} onToast={setToast} />}
+      {selectedEvidence && <EvidenceDrawer key={selectedEvidence.id} item={selectedEvidence} currentUser={currentUser} onClose={() => setSelectedEvidence(null)} onApprove={approveEvidence} onToast={setToast} />}
       {modal && <Modal type={modal} collectors={collectorItems} deviceToken={deviceToken} onClose={() => !busy && setModal(null)} onRun={handleRun} onAdd={handleAdd} onExport={exportPackage} onDevice={enrollDevice} busy={busy} />}
       {toast && <div className="toast" role="status"><span>✓</span>{toast}</div>}
     </div>
@@ -367,10 +372,10 @@ function PageTitle({ eyebrow, title, description, actions }: { eyebrow?: string;
   return <div className="page-title"><div>{eyebrow && <span className="eyebrow">{eyebrow}</span>}<h1>{title}</h1><p>{description}</p></div>{actions && <div className="page-actions">{actions}</div>}</div>;
 }
 
-function Overview({ evidenceItems, runItems, onNavigate, onSelect, onRun }: { evidenceItems: Evidence[]; runItems: CollectionRun[]; onNavigate: (view: View) => void; onSelect: (item: Evidence) => void; onRun: () => void }) {
+function Overview({ evidenceItems, runItems, canCollect, onNavigate, onSelect, onRun }: { evidenceItems: Evidence[]; runItems: CollectionRun[]; canCollect: boolean; onNavigate: (view: View) => void; onSelect: (item: Evidence) => void; onRun: () => void }) {
   const queue = evidenceItems.filter((item) => item.status !== "Approved");
   return <>
-    <PageTitle eyebrow="Friday, August 7" title="Good morning, Maya" description="Your PCI evidence program is healthy. Here’s what needs attention before the next review." actions={<><button className="button secondary mobile-hide" onClick={() => onNavigate("Evidence")}>Review evidence</button><button className="button primary mobile-hide" onClick={onRun}>＋ Run collection</button></>} />
+    <PageTitle eyebrow="Friday, August 7" title="Good morning, Maya" description="Your PCI evidence program is healthy. Here’s what needs attention before the next review." actions={<><button className="button secondary mobile-hide" onClick={() => onNavigate("Evidence")}>Review evidence</button><button className="button primary mobile-hide" disabled={!canCollect} title={!canCollect ? "Evidence-operations access is required." : undefined} onClick={onRun}>＋ Run collection</button></>} />
     <div className="attention-banner"><span>!</span><div><strong>{queue.length + 5} items need attention</strong><p>4 evidence items are awaiting review, 2 controls have gaps, and 1 connection requires action.</p></div><button onClick={() => onNavigate("Evidence")}>Open review queue <b>→</b></button></div>
     <div className="metrics-grid">
       <article className="metric-card featured"><Ring value={82} label="readiness" /><div><span>Assessment readiness</span><strong>On track for Q3</strong><p><b>↑ 6%</b> since last week</p></div></article>
@@ -384,7 +389,7 @@ function Overview({ evidenceItems, runItems, onNavigate, onSelect, onRun }: { ev
       </section>
       <section className="panel activity-panel"><div className="panel-head"><div><h2>Collection activity</h2><p>Latest automation runs</p></div><button onClick={() => onNavigate("Collection runs")}>View all →</button></div>
         <div className="activity-list">{runItems.slice(0, 4).map((run) => <div className="activity-item" key={run.id}><div className={cls("source-dot", run.status.toLowerCase())}>{run.source.slice(0, 2).toUpperCase()}</div><div><strong>{run.source}</strong><span>{run.artifacts ? `${run.artifacts} artifacts · ` : ""}{run.startedAt}</span></div><StatusPill status={run.status} /></div>)}</div>
-        <button className="full-button" onClick={onRun}>＋ Run a new collection</button>
+        <button className="full-button" disabled={!canCollect} title={!canCollect ? "Evidence-operations access is required." : undefined} onClick={onRun}>＋ Run a new collection</button>
       </section>
     </div>
     <section className="panel recent-panel"><div className="panel-head"><div><h2>Recent evidence</h2><p>New artifacts collected across your environment</p></div><button onClick={() => onNavigate("Evidence")}>View evidence library →</button></div>
@@ -405,8 +410,8 @@ function ControlsView({ onNavigate }: { onNavigate: (view: View) => void }) {
   </>;
 }
 
-function EvidenceView({ items, search, setSearch, status, setStatus, type, setType, onSelect, onAdd }: { items: Evidence[]; search: string; setSearch: (v: string) => void; status: string; setStatus: (v: string) => void; type: string; setType: (v: string) => void; onSelect: (item: Evidence) => void; onAdd: () => void }) {
-  return <><PageTitle eyebrow="Evidence library" title="Collected evidence" description="Review, validate, and trace every artifact back to its source and PCI requirement." actions={<button className="button primary" onClick={onAdd}>＋ Add evidence</button>} />
+function EvidenceView({ items, canCollect, search, setSearch, status, setStatus, type, setType, onSelect, onAdd }: { items: Evidence[]; canCollect: boolean; search: string; setSearch: (v: string) => void; status: string; setStatus: (v: string) => void; type: string; setType: (v: string) => void; onSelect: (item: Evidence) => void; onAdd: () => void }) {
+  return <><PageTitle eyebrow="Evidence library" title="Collected evidence" description="Review, validate, and trace every artifact back to its source and PCI requirement." actions={<button className="button primary" disabled={!canCollect} title={!canCollect ? "Evidence-operations access is required." : undefined} onClick={onAdd}>＋ Add evidence</button>} />
     <section className="panel evidence-library"><div className="toolbar"><label className="search-box wide"><span>⌕</span><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search evidence, control, system, or tag…" /></label><select aria-label="Filter by evidence type" value={type} onChange={(e) => setType(e.target.value)}><option>All types</option><option>Screenshot</option><option>Code</option><option>Configuration</option><option>Report</option></select><select aria-label="Filter by review status" value={status} onChange={(e) => setStatus(e.target.value)}><option>All statuses</option><option>Approved</option><option>Needs review</option><option>Expiring</option><option>Failed</option></select></div>
       <div className="library-subhead"><span>{items.length} artifacts</span><span>Sorted by <b>most recent</b></span></div>
       {items.length ? <div className="library-grid">{items.map((item) => <button className="library-card" key={item.id} onClick={() => onSelect(item)}><EvidenceVisual item={item} /><div className="library-body"><div><span className="type-label">{item.type}</span><StatusPill status={item.status} /></div><h3>{item.title}</h3><p>{item.description}</p><div className="artifact-meta"><span><b>{item.control}</b> · {item.requirement}</span><span>{item.source} / {item.system}</span><span>{item.capturedAt}</span></div></div></button>)}</div> : <EmptyState message="No evidence matches these filters." action="Clear filters" onAction={() => { setSearch(""); setStatus("All statuses"); setType("All types"); }} />}
@@ -414,8 +419,8 @@ function EvidenceView({ items, search, setSearch, status, setStatus, type, setTy
   </>;
 }
 
-function RunsView({ items, onRun, onToast }: { items: CollectionRun[]; onRun: () => void; onToast: (message: string) => void }) {
-  return <><PageTitle eyebrow="Automation" title="Collection runs" description="Monitor scheduled and on-demand collectors, captured artifacts, and failures." actions={<button className="button primary" onClick={onRun}>＋ Run collection</button>} />
+function RunsView({ items, canCollect, onRun, onToast }: { items: CollectionRun[]; canCollect: boolean; onRun: () => void; onToast: (message: string) => void }) {
+  return <><PageTitle eyebrow="Automation" title="Collection runs" description="Monitor scheduled and on-demand collectors, captured artifacts, and failures." actions={<button className="button primary" disabled={!canCollect} title={!canCollect ? "Evidence-operations access is required." : undefined} onClick={onRun}>＋ Run collection</button>} />
     {items[0]?.status === "Running" && <div className="running-banner"><span className="spinner" /><div><strong>Collection in progress</strong><p>Authenticating sources and capturing evidence. You can safely leave this page.</p></div><b>Running</b></div>}
     <section className="panel table-panel"><div className="panel-head padded"><div><h2>Run history</h2><p>90-day operational record</p></div><select aria-label="Filter run history"><option>All sources</option><option>AWS</option><option>GitHub</option><option>Okta</option></select></div>
       <div className="data-table runs-table"><div className="table-header"><span>Run</span><span>Status</span><span>Artifacts</span><span>Controls</span><span>Duration</span><span /></div>{items.map((run) => <div className="table-row" key={run.id}><div><strong>{run.source}</strong><small>{run.id} · {run.startedAt}</small></div><div><StatusPill status={run.status} />{run.note && <small>{run.note}</small>}</div><strong>{run.artifacts || "—"}</strong><span>{run.controls || "—"}</span><span>{run.duration}</span><button aria-label={`More options for ${run.id}`} onClick={() => onToast(`${run.id} log and artifact manifest opened.`)}>•••</button></div>)}</div>
@@ -442,10 +447,10 @@ function ConnectionsView({ collectors, devices, jira, canManageJira, busy, onCon
     {attention.length > 0 && <div className="connection-alert"><span>!</span><div><strong>{attention.length} collector{attention.length === 1 ? "" : "s"} need configuration</strong><p>Provider credentials are missing or the latest live API call failed. Scheduled collection remains paused for affected sources.</p></div><button onClick={() => onToast("Open hosted environment settings to add the missing secret values from .env.example.")}>Configuration guide</button></div>}
     <div className="connections-grid">{cards.map((source) => <article className="connection-card" key={source.name}><div className="connection-head"><span>{source.mark}</span><button aria-label={`Options for ${source.name}`} onClick={() => onToast(`${source.name} runs ${collectors.find((item) => item.id === source.id)?.schedule_cron || "without a schedule"} in UTC.`)}>•••</button></div><h3>{source.name}</h3><p>{source.detail}</p><StatusPill status={source.status} /><div><span>Last successful run</span><b>{source.lastRun}</b></div><button onClick={() => onToast(source.status === "Healthy" ? `${source.name} is configured. Use Run collection to execute a live test.` : `${source.name}: ${source.error || source.detail}`)}>Inspect configuration</button></article>)}</div>
     <section className="panel jira-cloud-panel"><div className="panel-head"><div><h2>Jira Cloud</h2><p>OAuth connection used by enrolled Macs for explicit, approved evidence uploads</p></div>{jira?.connected ? <StatusPill status="Connected" /> : jira?.status === "reauthorization_required" ? <StatusPill status="Action needed" /> : <StatusPill status="Not connected" />}</div>
-      {!canManageJira ? <div className="jira-access-note"><strong>Reviewer access required</strong><p>An administrator, compliance lead, or reviewer must connect Jira Cloud. Auditors retain read-only access.</p></div> : jira?.connected ? <div className="jira-connected"><div className="jira-site-mark">JI</div><div><strong>{jira.siteName}</strong><a href={jira.siteUrl} target="_blank" rel="noreferrer">{jira.siteUrl} ↗</a><small>Allowed projects: {jira.allowedProjects?.join(", ") || "None"} · {jira.lastTestedAt ? `Tested ${formatDate(jira.lastTestedAt)}` : "Not tested yet"}</small></div><div className="jira-actions"><button className="button secondary" disabled={busy} onClick={onTestJira}>{busy ? "Testing…" : "Test connection"}</button><button className="button secondary danger" disabled={busy} onClick={onDisconnectJira}>Disconnect</button></div></div> : <form className="jira-connect-form" onSubmit={onConnectJira}><label className="field"><span>Jira Cloud site URL</span><input name="siteUrl" type="url" required defaultValue={jira?.siteUrl || ""} placeholder="https://your-company.atlassian.net" autoComplete="url" /></label><label className="field"><span>Allowed project keys</span><input name="allowedProjects" required defaultValue={jira?.allowedProjects?.join(", ") || ""} placeholder="GRC, PCI" autoCapitalize="characters" /><small>Only these projects may receive evidence from Scopeproof.</small></label><div className="jira-connect-copy"><strong>Secure OAuth connection</strong><p>You will continue to Atlassian to choose the site and approve access. Scopeproof stores encrypted rotating tokens in the hosted service; Jira credentials never enter the Mac app.</p></div><button className="button primary" disabled={busy || jira?.configured === false}>{busy ? "Preparing Atlassian authorization…" : "Connect Jira Cloud"}</button>{jira?.configured === false && <p className="field-error">A platform administrator must configure the four JIRA_OAUTH_* hosted secrets first.</p>}</form>}
+      {!canManageJira ? <div className="jira-access-note"><strong>Evidence-operations access required</strong><p>An administrator or compliance lead must connect Jira Cloud. Reviewers remain independent from collection and disclosure operations.</p></div> : jira?.connected ? <div className="jira-connected"><div className="jira-site-mark">JI</div><div><strong>{jira.siteName}</strong><a href={jira.siteUrl} target="_blank" rel="noreferrer">{jira.siteUrl} ↗</a><small>Allowed projects: {jira.allowedProjects?.join(", ") || "None"} · {jira.lastTestedAt ? `Tested ${formatDate(jira.lastTestedAt)}` : "Not tested yet"}</small></div><div className="jira-actions"><button className="button secondary" disabled={busy} onClick={onTestJira}>{busy ? "Testing…" : "Test connection"}</button><button className="button secondary danger" disabled={busy} onClick={onDisconnectJira}>Disconnect</button></div></div> : <form className="jira-connect-form" onSubmit={onConnectJira}><label className="field"><span>Jira Cloud site URL</span><input name="siteUrl" type="url" required defaultValue={jira?.siteUrl || ""} placeholder="https://your-company.atlassian.net" autoComplete="url" /></label><label className="field"><span>Allowed project keys</span><input name="allowedProjects" required defaultValue={jira?.allowedProjects?.join(", ") || ""} placeholder="GRC, PCI" autoCapitalize="characters" /><small>Only these projects may receive evidence from Scopeproof.</small></label><div className="jira-connect-copy"><strong>Secure OAuth connection</strong><p>You will continue to Atlassian to choose the site and approve access. Scopeproof stores encrypted rotating tokens in the hosted service; Jira credentials never enter the Mac app.</p></div><button className="button primary" disabled={busy || jira?.configured === false}>{busy ? "Preparing Atlassian authorization…" : "Connect Jira Cloud"}</button>{jira?.configured === false && <p className="field-error">A platform administrator must configure the four JIRA_OAUTH_* hosted secrets first.</p>}</form>}
     </section>
-    <section className="panel device-panel"><div className="panel-head"><div><h2>Mac capture devices</h2><p>Revocable device identities for locally reviewed screenshot uploads</p></div><button className="button primary" onClick={onEnroll}>＋ Enroll Mac</button></div>
-      {devices.length ? <div className="device-list">{devices.map((device) => <div className="device-row" key={device.id}><span className="device-icon">⌘</span><div><strong>{device.display_name}</strong><small>{device.platform} · {device.app_version ? `v${device.app_version}` : "Not connected yet"} · {device.last_seen_at ? `Seen ${formatDate(device.last_seen_at)}` : "Awaiting first upload"}</small></div><StatusPill status={titleCase(device.status)} /><button className="button secondary" disabled={device.status === "revoked"} onClick={() => onRevoke(device.id)}>{device.status === "revoked" ? "Revoked" : "Revoke"}</button></div>)}</div> : <EmptyState message="No Mac capture devices are enrolled. Create a one-time token, then paste it into Scopeproof Capture & Jira Settings." action="Enroll first Mac" onAction={onEnroll} />}
+    <section className="panel device-panel"><div className="panel-head"><div><h2>Mac capture devices</h2><p>Revocable device identities for locally reviewed screenshot uploads</p></div><button className="button primary" disabled={!canManageJira} title={!canManageJira ? "Evidence-operations access is required." : undefined} onClick={onEnroll}>＋ Enroll Mac</button></div>
+      {!canManageJira ? <div className="jira-access-note"><strong>Independent reviewer boundary</strong><p>Reviewers can inspect and approve evidence but cannot enroll collection devices.</p></div> : devices.length ? <div className="device-list">{devices.map((device) => <div className="device-row" key={device.id}><span className="device-icon">⌘</span><div><strong>{device.display_name}</strong><small>{device.platform} · {device.app_version ? `v${device.app_version}` : "Not connected yet"} · {device.last_seen_at ? `Seen ${formatDate(device.last_seen_at)}` : "Awaiting first upload"}</small></div><StatusPill status={titleCase(device.status)} /><button className="button secondary" disabled={device.status === "revoked"} onClick={() => onRevoke(device.id)}>{device.status === "revoked" ? "Revoked" : "Revoke"}</button></div>)}</div> : <EmptyState message="No Mac capture devices are enrolled. Create a one-time token, then paste it into Scopeproof Capture & Jira Settings." action="Enroll first Mac" onAction={onEnroll} />}
     </section>
   </>;
 }
@@ -472,8 +477,51 @@ function HelpView({ onNavigate }: { onNavigate: (view: View) => void }) {
   </>;
 }
 
-function EvidenceDrawer({ item, onClose, onApprove, onToast }: { item: Evidence; onClose: () => void; onApprove: (item: Evidence) => void; onToast: (message: string) => void }) {
-  return <><button className="drawer-scrim" aria-label="Close evidence details" onClick={onClose} /><aside className="drawer" aria-label="Evidence details"><div className="drawer-head"><div><span>{item.id}</span><StatusPill status={item.status} /></div><button aria-label="Close evidence details" onClick={onClose}>×</button></div><div className="drawer-scroll"><span className="eyebrow">{item.type} evidence</span><h2>{item.title}</h2><p className="drawer-description">{item.description}</p><EvidenceVisual item={item} /><div className="integrity-banner"><span>✓</span><div><strong>Integrity verified</strong><p>{item.checksum} · Source unchanged</p></div></div><section className="detail-section"><h3>Evidence mapping</h3><dl><div><dt>Compliance control</dt><dd>{item.framework || item.requirement} · {item.control}</dd></div>{item.jiraIssueKey ? <div><dt>Jira issue</dt><dd>{item.jiraIssueURL ? <a href={item.jiraIssueURL} target="_blank" rel="noreferrer">{item.jiraIssueKey} ↗</a> : item.jiraIssueKey}</dd></div> : null}<div><dt>Source</dt><dd>{item.source} / {item.system}</dd></div><div><dt>Owner</dt><dd>{item.owner || "Unassigned"}</dd></div><div><dt>Scope</dt><dd>{item.environment || "Unspecified"} · {item.assessmentPeriod || "Unspecified"}</dd></div><div><dt>Captured</dt><dd>{item.capturedAt}</dd></div><div><dt>Valid until</dt><dd>{item.expiresAt}</dd></div><div><dt>Collector</dt><dd>{item.collector}</dd></div></dl></section>{item.mappedControls?.length ? <section className="detail-section"><h3>Related controls</h3><div className="tag-row">{item.mappedControls.map((mapping) => <span key={`${mapping.framework}-${mapping.controlID}`}>{mapping.framework} · {mapping.controlID}</span>)}</div></section> : null}<section className="detail-section"><h3>Protection checks</h3><div className="check-row"><span>✓</span><div><strong>Secret scan passed</strong><p>No credentials or access tokens detected</p></div></div><div className="check-row"><span>✓</span><div><strong>Cardholder data scan passed</strong><p>No PAN or sensitive authentication data detected</p></div></div></section><section className="detail-section"><h3>Tags</h3><div className="tag-row">{item.tags.map((tag) => <span key={tag}>{tag}</span>)}</div></section></div><div className="drawer-actions"><button className="button secondary" onClick={() => onToast(`${item.id} flagged for follow-up.`)}>Flag issue</button><button className="button primary" disabled={item.status === "Approved"} onClick={() => onApprove(item)}>{item.status === "Approved" ? "✓ Approved" : "Approve evidence"}</button></div></aside></>;
+function EvidenceDrawer({ item, currentUser, onClose, onApprove, onToast }: { item: Evidence; currentUser: ApiUser | null; onClose: () => void; onApprove: (item: Evidence, rationale: string) => void; onToast: (message: string) => void }) {
+  const [artifact, setArtifact] = useState<{ state: "loading" | "ready" | "error"; url?: string; text?: string; error?: string }>({ state: "loading" });
+  const [rationale, setRationale] = useState("");
+  const [confirmed, setConfirmed] = useState(false);
+  useEffect(() => {
+    let cancelled = false;
+    let objectUrl: string | undefined;
+    void fetch(`/api/evidence/${encodeURIComponent(item.id)}?view=inline`, { cache: "no-store" }).then(async (response) => {
+      if (!response.ok) throw new Error(await apiError(response));
+      const serverDigest = response.headers.get("x-scopeproof-sha256");
+      if (!item.sha256 || serverDigest !== item.sha256) throw new Error("The server returned an unexpected artifact digest.");
+      const blob = await response.blob();
+      if (cancelled) return;
+      if (item.type === "Screenshot") {
+        objectUrl = URL.createObjectURL(blob);
+        setArtifact({ state: "ready", url: objectUrl });
+      } else {
+        const value = await blob.text();
+        if (!cancelled) setArtifact({ state: "ready", text: value.slice(0, 1_000_000) });
+      }
+    }).catch((error) => { if (!cancelled) setArtifact({ state: "error", error: error instanceof Error ? error.message : "Artifact could not be loaded." }); });
+    return () => { cancelled = true; if (objectUrl) URL.revokeObjectURL(objectUrl); };
+  }, [item.id, item.sha256, item.type]);
+  const roleMayApprove = currentUser ? ["reviewer", "admin"].includes(currentUser.role) : false;
+  const independentReviewer = Boolean(currentUser && item.createdBy && currentUser.id !== item.createdBy);
+  const canApprove = roleMayApprove && independentReviewer && artifact.state === "ready" && confirmed && rationale.trim().length >= 20 && item.status !== "Approved";
+  return <>
+    <button className="drawer-scrim" aria-label="Close evidence details" onClick={onClose} />
+    <aside className="drawer" aria-label="Evidence details">
+      <div className="drawer-head"><div><span>{item.id}</span><StatusPill status={item.status} /></div><button aria-label="Close evidence details" onClick={onClose}>×</button></div>
+      <div className="drawer-scroll">
+        <span className="eyebrow">{item.type} evidence</span><h2>{item.title}</h2><p className="drawer-description">{item.description}</p>
+        <div className="actual-evidence" aria-live="polite">
+          {artifact.state === "loading" ? <div className="artifact-state">Decrypting and verifying the actual artifact…</div> : artifact.state === "error" ? <div className="artifact-state error">{artifact.error}</div> : item.type === "Screenshot" && artifact.url ? <Image src={artifact.url} alt={`Actual evidence artifact for ${item.title}`} width={1600} height={900} unoptimized /> : <pre>{artifact.text}</pre>}
+        </div>
+        <div className={cls("integrity-banner", artifact.state !== "ready" && "pending")}><span>{artifact.state === "ready" ? "✓" : "↻"}</span><div><strong>{artifact.state === "ready" ? "Stored bytes decrypted and digest verified" : "Artifact verification required"}</strong><p>{item.checksum}</p></div></div>
+        <section className="detail-section"><h3>Evidence mapping</h3><dl><div><dt>Compliance control</dt><dd>{item.framework || item.requirement} · {item.control}</dd></div>{item.jiraIssueKey ? <div><dt>Jira issue</dt><dd>{item.jiraIssueURL ? <a href={item.jiraIssueURL} target="_blank" rel="noreferrer">{item.jiraIssueKey} ↗</a> : item.jiraIssueKey}</dd></div> : null}<div><dt>Source</dt><dd>{item.source} / {item.system}</dd></div><div><dt>Owner</dt><dd>{item.owner || "Unassigned"}</dd></div><div><dt>Scope</dt><dd>{item.environment || "Unspecified"} · {item.assessmentPeriod || "Unspecified"}</dd></div><div><dt>Captured</dt><dd>{item.capturedAt}</dd></div><div><dt>Valid until</dt><dd>{item.expiresAt}</dd></div><div><dt>Collector</dt><dd>{item.collector}</dd></div></dl></section>
+        {item.mappedControls?.length ? <section className="detail-section"><h3>Related controls</h3><div className="tag-row">{item.mappedControls.map((mapping) => <span key={`${mapping.framework}-${mapping.controlID}`}>{mapping.framework} · {mapping.controlID}</span>)}</div></section> : null}
+        <section className="detail-section"><h3>Safety evidence</h3><div className="check-row"><span>i</span><div><strong>Scan results are supporting claims</strong><p>Inspect the actual pixels or text above. Client and collector scans do not replace reviewer judgment.</p></div></div></section>
+        <section className="detail-section"><h3>Tags</h3><div className="tag-row">{item.tags.map((tag) => <span key={tag}>{tag}</span>)}</div></section>
+        {item.status !== "Approved" && <section className="detail-section review-attestation"><h3>Independent review attestation</h3>{!roleMayApprove ? <p className="review-blocked">A reviewer or administrator role is required to approve evidence.</p> : !independentReviewer ? <p className="review-blocked">You collected or uploaded this artifact. A different reviewer must approve it.</p> : <><label className="field"><span>Review rationale</span><textarea value={rationale} onChange={(event) => setRationale(event.target.value)} minLength={20} maxLength={1000} rows={4} placeholder="Explain what you inspected, what this proves, and why the scope and redactions are acceptable." /></label><label className="checkbox-line"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /> I inspected the actual artifact above, confirmed its digest, scope, freshness, and redactions, and understand this approval is audited.</label></>}</section>}
+      </div>
+      <div className="drawer-actions"><button className="button secondary" onClick={() => onToast(`${item.id} flagged for follow-up.`)}>Flag issue</button><button className="button primary" disabled={!canApprove} onClick={() => onApprove(item, rationale.trim())}>{item.status === "Approved" ? "✓ Approved" : artifact.state !== "ready" ? "Verify artifact first" : "Approve evidence"}</button></div>
+    </aside>
+  </>;
 }
 
 function Modal({ type, collectors, deviceToken, onClose, onRun, onAdd, onExport, onDevice, busy }: { type: Exclude<Modal, null>; collectors: ApiCollector[]; deviceToken: string | null; onClose: () => void; onRun: (e: React.FormEvent<HTMLFormElement>) => void; onAdd: (e: React.FormEvent<HTMLFormElement>) => void; onExport: () => void; onDevice: (e: React.FormEvent<HTMLFormElement>) => void; busy: boolean }) {

@@ -7,6 +7,9 @@ All notable Scopeproof changes are recorded here. Dates use the repository’s r
 ### Added
 
 - One-command local macOS build, per-user installation, and launch through `./Scripts/run_macos_capture.sh`.
+- Explicit, one-time administrator bootstrap with an immutable database invariant and allowlisted application origins for trusted identity headers.
+- Capability-based collection, administration, export, and review permissions with independent evidence approval.
+- Digest-bound review attestations that require reviewers to inspect the decrypted artifact rather than relying on collection-time scan claims.
 - Jira Cloud OAuth 2.0 connection management, encrypted rotating tokens, site/project restrictions, issue validation, explicit approved-evidence upload, and signed immutable upload receipts.
 - Jira handoff settings for HTTPS site, default project, attachment preference, package guide, and organization instructions.
 - Optional Jira issue key in capture classification, visible screenshot banners, filenames, manifests, search, hosted metadata, audit details, and assessor indexes.
@@ -21,6 +24,7 @@ All notable Scopeproof changes are recorded here. Dates use the repository’s r
 - Native app version advanced to 1.3.1 (build 8).
 - Native upload metadata now comes exclusively from a versioned device-authenticated manifest, with strict PNG decode, dimension, digest, and capture-chain validation.
 - Jira attachment uploads now use durable idempotency reservations, explicit unknown-outcome reconciliation, and serialized OAuth refresh-token rotation.
+- Hosted responses now deny framing, apply a restrictive content security policy, and require exact same-origin proof for mutations.
 
 ## 1.3.0 — 2026-08-11
 

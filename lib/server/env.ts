@@ -8,6 +8,7 @@ export interface ScopeproofEnv {
   PACKAGE_SIGNING_PRIVATE_KEY?: string;
   PACKAGE_SIGNING_PUBLIC_KEY?: string;
   BOOTSTRAP_ADMIN_EMAILS?: string;
+  TRUSTED_APP_ORIGINS?: string;
   AWS_ACCESS_KEY_ID?: string;
   AWS_SECRET_ACCESS_KEY?: string;
   AWS_SESSION_TOKEN?: string;

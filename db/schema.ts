@@ -10,6 +10,12 @@ export const users = sqliteTable("users", {
   lastSeenAt: text("last_seen_at").notNull().default(sql`CURRENT_TIMESTAMP`),
 }, (table) => [uniqueIndex("idx_users_email").on(table.email)]);
 
+export const securityInvariants = sqliteTable("security_invariants", {
+  key: text("key").primaryKey(),
+  value: text("value").notNull(),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+});
+
 export const captureDevices = sqliteTable("capture_devices", {
   id: text("id").primaryKey(),
   displayName: text("display_name").notNull(),

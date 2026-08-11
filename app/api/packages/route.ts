@@ -1,4 +1,4 @@
-import { jsonError, requireApiUser, requireSameOrigin } from "../../../lib/server/auth";
+import { jsonError, requireApiPermission, requireApiUser, requireSameOrigin } from "../../../lib/server/auth";
 import { getEnv } from "../../../lib/server/env";
 import { buildAssessorPackage } from "../../../lib/server/packages";
 
@@ -13,7 +13,7 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   try {
     requireSameOrigin(request);
-    const user = await requireApiUser(request, "compliance_lead");
+    const user = await requireApiPermission(request, "export_packages");
     return Response.json({ package: await buildAssessorPackage(user) }, { status: 201 });
   } catch (error) { return jsonError(error); }
 }

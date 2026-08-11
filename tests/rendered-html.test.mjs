@@ -32,7 +32,7 @@ test("keeps evidence models, product UI, and starter cleanup explicit", async ()
   assert.match(consoleSource, /fetch\("\/api\/evidence"/);
   assert.doesNotMatch(consoleSource, /localStorage/);
   assert.match(consoleSource, /SHA-256|sha256/);
-  assert.match(consoleSource, /Cardholder data scan passed/);
+  assert.match(consoleSource, /Scan results are supporting claims/);
   assert.match(consoleSource, /Approve evidence/);
   assert.match(data, /PCI control|control:/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);

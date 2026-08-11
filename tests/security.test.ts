@@ -109,7 +109,7 @@ test("Jira Cloud OAuth and attachment upload enforce trust boundaries", async ()
   assert.match(jiraSource, /host\.endsWith\("\.atlassian\.net"\)/);
   assert.match(jiraSource, /is not in this connection's allowlist/);
   assert.match(jiraSource, /Atlassian did not grant the required Jira read and write scopes/);
-  assert.match(jiraSource, /Reviewer access is required for Jira Cloud evidence disclosure/);
+  assert.match(jiraSource, /assertPermission\(actor, "manage_jira"\)/);
   assert.match(jiraSource, /X-Atlassian-Token/);
   assert.match(jiraSource, /status = 'uploading'/);
   assert.match(jiraSource, /status = 'unknown'/);
@@ -124,4 +124,33 @@ test("Jira Cloud OAuth and attachment upload enforce trust boundaries", async ()
   assert.match(nativeEvidenceRoute, /Matching evidence already exists under different hosted provenance/);
   assert.match(uploadRoute, /requireCaptureDevice/);
   assert.match(uploadRoute, /verifyUploadSignature/);
+});
+
+test("identity bootstrap and independent approval fail closed", async () => {
+  const [migration, auth, evidence, route, config, consoleSource] = await Promise.all([
+    readFile(new URL("../drizzle/0007_greedy_nextwave.sql", import.meta.url), "utf8"),
+    readFile(new URL("../lib/server/auth.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/server/evidence.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/evidence/[id]/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../next.config.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/evidence-console.tsx", import.meta.url), "utf8"),
+  ]);
+  assert.match(migration, /CREATE TABLE `security_invariants`/);
+  assert.match(migration, /security_invariants_no_update/);
+  assert.match(migration, /users_preserve_last_admin/);
+  assert.match(migration, /users_preserve_last_admin_delete/);
+  assert.match(auth, /Administrator bootstrap allowlist is not safely configured/);
+  assert.match(auth, /NOT EXISTS \(SELECT 1 FROM security_invariants WHERE key = 'admin_bootstrap'\)/);
+  assert.match(auth, /user\.bootstrap_admin_granted/);
+  assert.match(auth, /TRUSTED_APP_ORIGINS/);
+  assert.match(auth, /This origin is not authorized for Scopeproof identity headers/);
+  assert.match(auth, /Same-origin mutation proof is required/);
+  assert.match(evidence, /Collectors and uploaders cannot approve their own evidence/);
+  assert.match(evidence, /created_by != \?/);
+  assert.match(route, /confirmedActualArtifact/);
+  assert.match(route, /x-scopeproof-sha256/);
+  assert.match(config, /frame-ancestors 'none'/);
+  assert.match(config, /X-Frame-Options/);
+  assert.match(consoleSource, /Independent review attestation/);
+  assert.match(consoleSource, /actual decrypted, digest-verified artifact|Decrypting and verifying the actual artifact/);
 });

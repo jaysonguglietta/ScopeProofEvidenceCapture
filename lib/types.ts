@@ -16,6 +16,9 @@ export interface Evidence {
   status: EvidenceStatus;
   collector: string;
   checksum: string;
+  sha256?: string;
+  createdBy?: string;
+  approvedBy?: string;
   description: string;
   code?: string;
   language?: string;

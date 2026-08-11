@@ -1,4 +1,4 @@
-import type { AuthenticatedUser } from "./auth";
+import { assertPermission, type AuthenticatedUser } from "./auth";
 import { appendAuditEvent } from "./audit";
 import { bytesToBase64, decryptSecret, encryptSecret, hmac, randomId, sha256, stableJson } from "./crypto";
 import { getEnv, requireEnv } from "./env";
@@ -130,7 +130,7 @@ export function normalizeJiraIssueKey(value: string): string | null {
 }
 
 export function assertJiraOperator(actor: AuthenticatedUser): void {
-  if (actor.role === "auditor") throw new Response(JSON.stringify({ error: "Reviewer access is required for Jira Cloud evidence disclosure." }), { status: 403, headers: { "content-type": "application/json" } });
+  assertPermission(actor, "manage_jira");
 }
 
 async function responseJson<T>(response: Response, maximumBytes = 1_000_000): Promise<T> {

@@ -1,4 +1,4 @@
-import { jsonError, requireApiUser, requireSameOrigin } from "../../../lib/server/auth";
+import { jsonError, requireApiPermission, requireApiUser, requireSameOrigin } from "../../../lib/server/auth";
 import { collectorConfiguration, type CollectorProvider } from "../../../lib/server/collectors";
 import { getEnv } from "../../../lib/server/env";
 import { ensureDefaultCollectors } from "../../../lib/server/jobs";
@@ -16,7 +16,7 @@ export async function GET(request: Request) {
 export async function PATCH(request: Request) {
   try {
     requireSameOrigin(request);
-    const user = await requireApiUser(request, "compliance_lead");
+    const user = await requireApiPermission(request, "manage_collectors");
     const body = await request.json() as { id?: string; enabled?: boolean; scheduleCron?: string };
     if (!body.id || (body.scheduleCron && !/^(\*|\d{1,2}) (\*|\d{1,2}) \* \* (\*|[0-6])$/.test(body.scheduleCron))) return Response.json({ error: "Collector id and a supported five-field UTC cron are required." }, { status: 400 });
     await getEnv().DB.prepare("UPDATE collectors SET enabled = COALESCE(?, enabled), schedule_cron = COALESCE(?, schedule_cron), updated_at = CURRENT_TIMESTAMP WHERE id = ?").bind(typeof body.enabled === "boolean" ? Number(body.enabled) : null, body.scheduleCron || null, body.id).run();

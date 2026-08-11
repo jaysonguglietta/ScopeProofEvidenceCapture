@@ -1,4 +1,4 @@
-import { requireApiUser } from "../../../../../lib/server/auth";
+import { requireApiPermission } from "../../../../../lib/server/auth";
 import { completeJiraOAuth } from "../../../../../lib/server/jira";
 
 function destination(request: Request, status: "connected" | "error", reason?: string): URL {
@@ -14,7 +14,7 @@ export async function GET(request: Request) {
   const state = url.searchParams.get("state") || "";
   const code = url.searchParams.get("code") || "";
   try {
-    const actor = await requireApiUser(request, "reviewer");
+    const actor = await requireApiPermission(request, "manage_jira");
     await completeJiraOAuth(actor, state, code);
     return Response.redirect(destination(request, "connected"), 303);
   } catch (error) {
