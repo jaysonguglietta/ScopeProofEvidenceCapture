@@ -1,0 +1,15 @@
+# Scopeproof documentation
+
+Scopeproof documentation is organized by the person performing the work.
+
+| Guide | Primary audience | Purpose |
+| --- | --- | --- |
+| [Operator guide](OPERATOR_GUIDE.md) | Evidence collectors and reviewers | Capture, classify, redact, review, search, upload, retain, and export evidence. |
+| [Jira evidence handoff](JIRA_HANDOFF.md) | GRC coordinators and control owners | Associate evidence with Jira and transfer it without breaking integrity or exposing secrets. |
+| [Assessor guide](ASSESSOR_GUIDE.md) | External assessors and assessment leads | Navigate a package and independently verify hashes, signatures, scope, and review status. |
+| [Deployment guide](DEPLOYMENT.md) | Platform and security administrators | Configure identity, roles, secrets, storage, collectors, macOS releases, and production operations. |
+| [Security guide](SECURITY.md) | Security engineering and risk teams | Understand trust boundaries, protections, residual risks, and incident actions. |
+| [Architecture](ARCHITECTURE.md) | Engineers and technical assessors | Understand components, data flows, persistence, and integrity design. |
+| [Development guide](DEVELOPMENT.md) | Contributors and release managers | Build, test, migrate, package, and release the web and macOS applications. |
+
+Versioned product changes are recorded in the repository [changelog](../CHANGELOG.md). Native application details are also available in the [macOS README](../macos/ScopeproofCapture/README.md) and inside the app under **Help & How to Use…**.

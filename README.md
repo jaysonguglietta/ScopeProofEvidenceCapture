@@ -1,6 +1,25 @@
 # Scopeproof
 
-Scopeproof is a private PCI DSS evidence-operations application. It collects live configuration evidence from AWS, GitHub, Okta, Cloudflare, and browser-rendered administration pages; scans sensitive content; encrypts artifacts; records an append-only audit chain; and produces independently verifiable assessor packages.
+Scopeproof is a private, multi-framework compliance evidence-operations application with first-class PCI DSS workflows. It collects live configuration evidence from AWS, GitHub, Okta, Cloudflare, and browser-rendered administration pages; scans sensitive content; encrypts artifacts; records an append-only audit chain; and produces independently verifiable assessor packages.
+
+The repository contains two coordinated products:
+
+- A private web console for collection orchestration, review, encrypted storage, audit history, and signed exports.
+- **Scopeproof Capture 1.3.1** for macOS, a menu-bar application for explicitly initiated, timestamped, redacted, control-mapped screenshots and Jira handoff.
+
+## Documentation
+
+| Audience | Guide |
+| --- | --- |
+| Evidence collectors and reviewers | [Operator guide](docs/OPERATOR_GUIDE.md) |
+| Jira/GRC coordinators | [Jira evidence handoff](docs/JIRA_HANDOFF.md) |
+| External assessors | [Assessor package and verification guide](docs/ASSESSOR_GUIDE.md) |
+| Platform administrators | [Deployment and administration](docs/DEPLOYMENT.md) |
+| Security and risk teams | [Security model and operating controls](docs/SECURITY.md) |
+| Engineers and maintainers | [Architecture](docs/ARCHITECTURE.md) and [development guide](docs/DEVELOPMENT.md) |
+| Release managers | [Changelog](CHANGELOG.md) |
+
+The native-specific build and usage reference remains in [macos/ScopeproofCapture/README.md](macos/ScopeproofCapture/README.md). The macOS application also includes **Help & How to Use…** in its shield menu.
 
 ## Security architecture
 
@@ -32,7 +51,7 @@ The Mac app can build a local approved-only assessor ZIP filtered by framework a
 
 **Capture & Jira Settings…** stores only routing and procedure metadata: Jira HTTPS site, default project key, preferred attachment set, and organization-specific instructions. Scopeproof does not store Jira credentials or upload evidence automatically. Operators approve the artifact, use **Search Evidence… → Copy Jira Comment**, attach the full evidence set or signed ZIP/checksum to the authorized ticket, then download and verify SHA-256. Jira project permissions, data classification, external-auditor access, and retention must be approved before evidence is attached.
 
-The app includes **Help & How to Use…**, recent capture history, offline retry, configurable retention, Launch at Login, Screen Recording recovery, and secure release checks. See `macos/ScopeproofCapture/README.md` for the operator workflow.
+The app includes **Help & How to Use…**, recent capture history, offline retry, configurable retention, Launch at Login, Screen Recording recovery, and secure release checks.
 
 ## Configuration
 
@@ -71,6 +90,8 @@ Build the local menu-bar app with:
 ```bash
 ./Scripts/build_macos_capture.sh
 ```
+
+See the [development guide](docs/DEVELOPMENT.md) for repository layout, migrations, validation, and release practices.
 
 ## Operational limits
 

@@ -1,0 +1,72 @@
+# Scopeproof operator guide
+
+This guide is for evidence collectors, control owners, and reviewers. It describes the normal evidence lifecycle from a live system to an assessor-ready artifact.
+
+## Before collecting evidence
+
+1. Confirm the system, environment, assessment period, framework, and control are in scope.
+2. Confirm the source view shows the minimum information needed to prove the control.
+3. Remove unrelated customer, employee, authentication, or cardholder data from the view where possible.
+4. For Jira-linked work, confirm the destination issue and project are approved for the evidence classification.
+5. Confirm **Scopeproof Capture** is enabled under macOS **System Settings → Privacy & Security → Screen & System Audio Recording**.
+
+## Capture a screenshot on macOS
+
+1. Open **Scopeproof Capture** from `/Applications`, then select its shield in the menu bar.
+2. Choose **Capture Frontmost Browser Window**, **Choose Browser Window…**, **Open URL & Capture…**, or **Capture Entire Display**.
+3. In the classification dialog, select the compliance area and control. Enter a meaningful evidence filename, title, system/asset, environment, assessment period, and evidence owner.
+4. Optionally enter a Jira issue key such as `GRC-123`, tags, expected-evidence guidance, and a concise explanation of what the artifact proves.
+5. Inspect the **Saved as** preview. The final path is organized as `<Compliance area>/<Control>/<Assessment period>`.
+6. Inspect the review workspace. Confirm the correct window, scope, timestamp context, and automatic redactions. Drag over any additional sensitive value to apply an irreversible manual mask.
+7. Save the reviewed capture. Scopeproof never saves the temporary unredacted capture.
+
+Each saved item can contain:
+
+- `.png`: stamped, redacted screenshot.
+- `.json`: immutable capture manifest, metadata, SHA-256, and capture-chain hashes.
+- `.review.json`: hash-chained lifecycle decisions and review notes.
+- `.receipt.json`: server evidence identity and signed timestamp receipt, when uploaded.
+
+Files are stored under `~/Pictures/Scopeproof Evidence` and are private to the current macOS account.
+
+## Review and approve
+
+1. Choose **Search Evidence…**.
+2. Filter by framework, control, system, date, lifecycle status, or keyword. Jira issue keys are searchable.
+3. Open the screenshot and confirm the control mapping, source, period, system, redactions, and visible timestamp banner.
+4. Choose **Review Status…** and assign the owner/reviewer, useful tags, a decision, and a rationale.
+5. Use **Approved** only when the artifact is current, complete, correctly scoped, and safe to disclose. Use **Superseded** for replaced evidence and **Rejected** for unsuitable evidence.
+
+Approval, rejection, and supersession require a note. Lifecycle changes are written to the sidecar record; the original capture manifest is not rewritten.
+
+## Upload and retry
+
+Enroll the Mac from **Connections → Mac capture devices**, then paste the one-time device token into **Capture & Jira Settings…**. The token is stored in the macOS Keychain. Automatic upload is optional.
+
+If an upload fails, local evidence remains available. Correct the network, server URL, or revoked-token issue and choose **Retry Pending Uploads**. Never send a device token in email, Jira, chat, or an evidence package.
+
+## Export for an assessor
+
+1. Complete lifecycle review first; only **Approved** evidence is eligible.
+2. Choose **Export Assessor Package…** and select the framework and assessment period.
+3. Name the package and identify the preparer.
+4. Transfer the resulting ZIP and its separate `.sha256.txt` file through an approved secure channel.
+5. Send the signing-key fingerprint to the assessor through a separate trusted channel.
+
+Detailed validation steps are in the [assessor guide](ASSESSOR_GUIDE.md). Jira-specific transfer steps are in the [Jira handoff guide](JIRA_HANDOFF.md).
+
+## Retention and disposal
+
+**Apply Local Retention…** moves expired local evidence to Trash; it does not delete hosted evidence. Confirm legal hold, assessment status, regulatory retention, contractual obligations, and organizational policy before disposing of evidence. Empty the Trash only when the deletion is authorized.
+
+## Troubleshooting
+
+| Symptom | Action |
+| --- | --- |
+| Screen capture permission error | Enable Scopeproof Capture in Screen & System Audio Recording, fully quit the app, and reopen it. |
+| Wrong browser window | Use **Choose Browser Window…** and select the exact titled window. |
+| Capture context dialog repeats | Complete every field marked `*`; if a Jira key is present it must look like `GRC-123`. |
+| No Jira key in filename/banner | Edit capture defaults, enter the issue key, then recapture; existing immutable evidence is not renamed. |
+| Upload remains pending | Verify the HTTPS server URL and active device token, then retry pending uploads. |
+| Package export is unavailable | Approve at least one artifact in the selected framework/period and resolve any integrity failure. |
+| Evidence cannot be found | Search all frameworks and periods, or use **Open Evidence Folder**. |
