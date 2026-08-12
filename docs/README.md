@@ -4,6 +4,7 @@ Scopeproof documentation is organized by the person performing the work.
 
 | Guide | Primary audience | Purpose |
 | --- | --- | --- |
+| [macOS installation](MACOS_INSTALLATION.md) | Mac users and endpoint administrators | Install, launch, update, verify, and troubleshoot the local-first menu-bar application. |
 | [Operator guide](OPERATOR_GUIDE.md) | Evidence collectors and reviewers | Capture, classify, redact, review, search, upload, retain, and export evidence. |
 | [Jira evidence handoff](JIRA_HANDOFF.md) | GRC coordinators and control owners | Associate evidence with Jira and transfer it without breaking integrity or exposing secrets. |
 | [Assessor guide](ASSESSOR_GUIDE.md) | External assessors and assessment leads | Navigate a package and independently verify hashes, signatures, scope, and review status. |

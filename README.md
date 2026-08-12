@@ -5,12 +5,13 @@ Scopeproof is a private, multi-framework compliance evidence-operations applicat
 The repository contains two coordinated products:
 
 - A private web console for collection orchestration, review, encrypted storage, audit history, and signed exports.
-- **Scopeproof Capture 1.3.2** for macOS, a menu-bar application for explicitly initiated, timestamped, redacted, control-mapped screenshots and Jira handoff.
+- **Scopeproof Capture 1.4.0** for macOS, a local-first menu-bar application with a private evidence console, explicitly initiated timestamped/redacted screenshots, assessor packaging, optional hosted synchronization, and Jira handoff.
 
 ## Documentation
 
 | Audience | Guide |
 | --- | --- |
+| Mac users and endpoint administrators | [macOS installation and updates](docs/MACOS_INSTALLATION.md) |
 | Evidence collectors and reviewers | [Operator guide](docs/OPERATOR_GUIDE.md) |
 | Jira/GRC coordinators | [Jira evidence handoff](docs/JIRA_HANDOFF.md) |
 | External assessors | [Assessor package and verification guide](docs/ASSESSOR_GUIDE.md) |
@@ -29,7 +30,7 @@ On macOS 14 or newer, run this from the repository root:
 ./Scripts/run_macos_capture.sh
 ```
 
-The command builds Scopeproof Capture, installs it in your personal `~/Applications` folder, and launches it. It does not require an administrator password. Look for the shield in the menu bar.
+The command builds Scopeproof Capture, installs it in your personal `~/Applications` folder, and launches it. It does not require an administrator password. The app starts a loopback-only Local Console and opens it in your browser; no hosted login or device token is required for local capture, search, lifecycle review, or assessor export. Look for the shield in the menu bar to reopen the console or capture evidence.
 
 The first time you capture, macOS may ask for Screen Recording access. Allow **Scopeproof Capture** under **System Settings → Privacy & Security → Screen & System Audio Recording**, then quit and reopen the app. If the command reports that Swift is missing, run `xcode-select --install`, complete Apple’s installer, and run the command again.
 
@@ -42,6 +43,7 @@ The first time you capture, macOS may ask for Screen Recording access. Allow **S
 - Assessor ZIPs embed approved artifacts, a PDF index, SHA-256 hashes, and an ECDSA P-256 signed manifest with its public verification key.
 - Mutating routes enforce same-origin requests. Worker responses add CSP, HSTS, no-sniff, referrer, and permissions headers.
 - Revocable Mac device tokens are stored as SHA-256 hashes server-side. Native uploads use a device-token HMAC over the exact manifest and PNG digests; the server derives metadata from the signed manifest and strictly decodes the PNG before storage.
+- The native Local Console binds only to `127.0.0.1`, requires an ephemeral HttpOnly SameSite session, rejects cross-origin mutations and path input, verifies artifact hashes, and maintains a disposable SQLite index plus an immutable Keychain-HMAC-authenticated local audit chain.
 
 ## Provider evidence
 
@@ -63,7 +65,7 @@ The Mac app can build a local approved-only assessor ZIP filtered by framework a
 
 Jira Cloud uses hosted OAuth 2.0 authorization-code flow with rotating refresh tokens. OAuth tokens are encrypted under a Jira-specific key and never enter the Mac app; user-bound state, fixed Atlassian API hosts, site matching, project allowlists, and optimistic refresh leases constrain the connection. Operators connect Jira under **Connections**, approve an artifact locally, upload those exact bytes to Scopeproof, obtain hosted reviewer approval, and explicitly choose **Search Evidence… → Upload to Jira Cloud…**. The server revalidates both approvals, the issue, allowlist, PNG hash, safety state, and lifecycle chain before reserving an idempotent attachment operation and recording a signed immutable receipt. Ambiguous Jira outcomes stop for reconciliation instead of blindly retrying. **Copy Jira Comment** and manual attachment remain available as a fallback; uploads never run automatically.
 
-The app includes **Help & How to Use…**, recent capture history, offline retry, configurable retention, Launch at Login, Screen Recording recovery, and secure release checks. Device credentials are bound to the exact compiled-in backend origin; preference tampering and redirects cannot move an Authorization header to another host.
+The app opens its **Local Console** at launch by default. The console provides overview metrics, preview cards, framework/control/status filters, lifecycle review, evidence reveal, local workspace status, and Help. The original PNG/manifests/lifecycle sidecars remain authoritative; SQLite is only a rebuildable search/audit index. Hosted upload remains optional. The app also includes native search, recent history, offline retry, configurable retention, Launch at Login, Screen Recording recovery, and secure release checks.
 
 ## Configuration
 

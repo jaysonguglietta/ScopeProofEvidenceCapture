@@ -11,8 +11,9 @@ Scopeproof combines a private Cloudflare-hosted evidence console with a local ma
 | D1 | Users, devices, sessions, collector/job state, evidence metadata, lifecycle status, package metadata, and append-only audit events. |
 | R2 | AES-256-GCM encrypted evidence objects and encrypted assessor packages. |
 | Provider collectors | Bounded read-only collection from AWS, GitHub, Okta, Cloudflare, and Cloudflare Browser Rendering. |
-| Scopeproof Capture | Explicit ScreenCaptureKit capture, local Vision OCR/redaction, visible stamping, manifests, lifecycle records, local search, Jira handoff, and local package export. |
-| macOS Keychain | Native device token and device-bound local package signing key. |
+| Scopeproof Capture | Explicit ScreenCaptureKit capture, local Vision OCR/redaction, visible stamping, manifests, lifecycle records, loopback Local Console, native search, Jira handoff, and local package export. |
+| Local Console / SQLite | A `127.0.0.1`-only authenticated browser UI and rebuildable metadata index for local overview, search, preview, filtering, review, and HMAC-authenticated audit events. |
+| macOS Keychain | Native device token, local-console audit key, and device-bound local package signing key. |
 | Jira Cloud OAuth | User-consented issue lookup and explicit evidence attachment through Atlassian’s fixed API gateway. |
 
 ## Trust boundaries
@@ -21,9 +22,10 @@ Scopeproof combines a private Cloudflare-hosted evidence console with a local ma
 2. **Worker → provider APIs:** hosted secrets authorize bounded evidence reads. Provider data is untrusted input and is scanned before encrypted persistence.
 3. **Worker → D1/R2:** D1 holds metadata and digests; R2 holds ciphertext. Encryption uses artifact-specific IVs and authenticated associated data.
 4. **macOS screen → Scopeproof Capture:** ScreenCaptureKit provides pixels only after macOS permission and an explicit user action. Unreviewed pixels stay in memory; local OCR covers source pixels, the rendered header, and the exact final encoded artifact before persistence.
-5. **Mac → native upload endpoint:** a revocable bearer token identifies the device and HMAC-authenticates the exact manifest/image digest pair. The server derives metadata only from the versioned manifest and strictly validates PNG structure, decompression bounds, dimensions, digest, and capture-chain consistency before storage.
-6. **Scopeproof → assessor/Jira:** exports leave the system through an operator-controlled handoff. Hashes, signatures, visible stamps, and package instructions support independent verification, but destination authorization remains an organizational responsibility.
-7. **Scopeproof → Atlassian:** the hosted service exchanges OAuth codes, encrypts rotating tokens with a Jira-specific key, resolves the consented cloud ID, and calls only `api.atlassian.com`. A user/device may access only its own connection and configured project allowlist. The Mac sends approved evidence to Scopeproof, never Atlassian credentials.
+5. **Browser → native Local Console:** an ephemeral launch URL establishes an HttpOnly SameSite session. The server binds only to `127.0.0.1`, validates the exact Host/Origin/Fetch Metadata boundary, accepts no filesystem paths, and resolves artifacts exclusively by validated evidence ID.
+6. **Mac → native upload endpoint:** a revocable bearer token identifies the device and HMAC-authenticates the exact manifest/image digest pair. The server derives metadata only from the versioned manifest and strictly validates PNG structure, decompression bounds, dimensions, digest, and capture-chain consistency before storage.
+7. **Scopeproof → assessor/Jira:** exports leave the system through an operator-controlled handoff. Hashes, signatures, visible stamps, and package instructions support independent verification, but destination authorization remains an organizational responsibility.
+8. **Scopeproof → Atlassian:** the hosted service exchanges OAuth codes, encrypts rotating tokens with a Jira-specific key, resolves the consented cloud ID, and calls only `api.atlassian.com`. A user/device may access only its own connection and configured project allowlist. The Mac sends approved evidence to Scopeproof, never Atlassian credentials.
 
 ## Native capture data flow
 

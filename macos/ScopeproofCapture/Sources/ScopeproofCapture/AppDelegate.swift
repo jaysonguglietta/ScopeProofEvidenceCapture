@@ -16,15 +16,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let evidenceSearchController = EvidenceSearchController()
     private let logger = Logger(subsystem: "com.scopeproof.capture", category: "application")
     private var statusMenuItem = NSMenuItem(title: "Ready to capture", action: nil, keyEquivalent: "")
+    private lazy var localConsole = LocalConsoleServer(evidenceRoot: captureService.outputDirectory, preferences: preferences) { [weak self] in
+        self?.chooseBrowserWindow()
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         configureStatusItem()
         rebuildMenu()
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         if let server = BackendTrust.normalizedOrigin(preferences.serverURL), KeychainStore.readToken(for: server) != nil, Date().timeIntervalSince(preferences.lastUpdateCheck ?? .distantPast) > 86_400 { checkForUpdates(silent: true) }
+        if preferences.openLocalConsoleAtLaunch { openLocalConsole() }
     }
 
     func menuWillOpen(_ menu: NSMenu) { rebuildMenu() }
+
+    func applicationWillTerminate(_ notification: Notification) { localConsole.stop() }
 
     private func configureStatusItem() {
         if let button = statusItem.button {
@@ -128,6 +134,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(upload)
         menu.addItem(.separator())
 
+        addItem("Open Local Console", action: #selector(openLocalConsole), key: "l", modifiers: [.command, .shift])
         addItem("Search Evidence…", action: #selector(searchEvidence), key: "f", modifiers: [.command, .shift])
         addItem("Export Assessor Package…", action: #selector(exportAssessorPackage), key: "x", modifiers: [.command, .shift])
         let historyItem = NSMenuItem(title: "Recent Captures", action: nil, keyEquivalent: "")
@@ -361,6 +368,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         switch result {
         case .success(let capture):
             setReady("Saved \(capture.evidenceID)")
+            try? localConsole.syncIndex(action: "capture.saved")
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(capture.imageURL.path, forType: .string)
             notify(title: "Compliance evidence captured", body: "\(capture.context.resolvedComplianceArea) \(capture.context.controlID) was saved. The file path is on your clipboard.")
@@ -400,6 +408,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func openHistoryEntry(_ sender: NSMenuItem) { if let path = sender.representedObject as? String { NSWorkspace.shared.open(URL(fileURLWithPath: path)) } }
     @objc private func searchEvidence() { evidenceSearchController.show(evidenceRoot: captureService.outputDirectory, jiraSettings: preferences.jiraHandoff, serverURL: preferences.serverURL) }
+    @objc private func openLocalConsole() {
+        setBusy("Opening local console…")
+        Task {
+            do { try await localConsole.open(); setReady("Local console ready") }
+            catch { setReady("Local console unavailable"); showError(error) }
+        }
+    }
 
     @objc private func applyPreset(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? String, let preset = preferences.presets.first(where: { $0.id == id }) else { return }
@@ -511,7 +526,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func openSettings() {
         let alert = NSAlert()
         alert.messageText = "Scopeproof Capture & Jira Settings"
-        alert.informativeText = "Jira handoff defaults create ticket-ready labels. Authorize Jira Cloud in the Scopeproof web console under Connections; the Mac never stores Atlassian credentials. Device tokens remain protected in your login Keychain."
+        alert.informativeText = "Local mode works without a server or device token. Hosted sync and Jira Cloud are optional; when enabled, device tokens remain protected in your login Keychain and Atlassian credentials stay on the hosted service."
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Cancel")
         let server = NSTextField(string: preferences.serverURL?.absoluteString ?? "")
@@ -520,6 +535,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         token.placeholderString = currentAudience.flatMap(KeychainStore.readToken(for:)) == nil ? "Paste one-time spdev_ token" : "Token saved — leave blank to keep it"
         let auto = NSButton(checkboxWithTitle: "Upload reviewed captures automatically", target: nil, action: nil)
         auto.state = preferences.autoUpload ? .on : .off
+        let openLocal = NSButton(checkboxWithTitle: "Open Local Console when Scopeproof launches", target: nil, action: nil)
+        openLocal.state = preferences.openLocalConsoleAtLaunch ? .on : .off
         let retention = NSPopUpButton(); retention.addItems(withTitles: ["30 days", "90 days", "180 days", "365 days", "1095 days"]); retention.selectItem(withTitle: "\(preferences.retentionDays) days")
         let jira = preferences.jiraHandoff
         let jiraSite = NSTextField(string: jira.baseURL)
@@ -533,14 +550,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for field in [server, token, jiraSite, jiraProject, instructions] { field.frame.size.width = 430 }
         let section = NSTextField(labelWithString: "Jira handoff defaults (OAuth: web Connections)"); section.font = .systemFont(ofSize: 12, weight: .semibold); section.textColor = .secondaryLabelColor
         let grid = NSGridView(views: [
-            [label("Server URL"), server], [label("Device token"), token], [label("Local retention"), retention], [NSTextField(labelWithString: ""), auto],
+            [NSTextField(labelWithString: ""), openLocal], [label("Server URL"), server], [label("Device token"), token], [label("Local retention"), retention], [NSTextField(labelWithString: ""), auto],
             [NSTextField(labelWithString: ""), section], [label("Jira site URL"), jiraSite], [label("Default project"), jiraProject],
             [label("Attachment set"), attachmentMode], [NSTextField(labelWithString: ""), includeGuide], [label("Organization instructions"), instructions],
         ])
         grid.rowSpacing = 10; grid.columnSpacing = 12; grid.column(at: 0).xPlacement = .trailing; grid.column(at: 1).xPlacement = .fill
         alert.accessoryView = grid
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        guard let candidate = URL(string: server.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)), let url = BackendTrust.normalizedOrigin(candidate) else { showError(UploadFailure.invalidServer); return }
+        let serverValue = server.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let url = serverValue.isEmpty ? nil : URL(string: serverValue).flatMap(BackendTrust.normalizedOrigin)
+        if !serverValue.isEmpty && url == nil { showError(UploadFailure.invalidServer); return }
         let jiraSiteValue = jiraSite.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         let jiraProjectValue = jiraProject.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
         if !jiraSiteValue.isEmpty {
@@ -550,16 +569,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard JiraHandoff.isValidProjectKey(jiraProjectValue) else { showError(NSError(domain: "Scopeproof", code: 22, userInfo: [NSLocalizedDescriptionKey: "The Jira project key must start with a letter and contain only uppercase letters, numbers, or underscores."])); return }
         let newToken = token.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard newToken.isEmpty || newToken.hasPrefix("spdev_dev_") else { showError(NSError(domain: "Scopeproof", code: 2, userInfo: [NSLocalizedDescriptionKey: "The device token must begin with spdev_dev_."])); return }
-        if newToken.isEmpty, KeychainStore.tokenAudience() != url.absoluteString { showError(NSError(domain: "Scopeproof", code: 23, userInfo: [NSLocalizedDescriptionKey: "Changing the Scopeproof server requires a new device token issued for that exact server."])); return }
+        if let url, newToken.isEmpty, KeychainStore.tokenAudience() != nil, KeychainStore.tokenAudience() != url.absoluteString { showError(NSError(domain: "Scopeproof", code: 23, userInfo: [NSLocalizedDescriptionKey: "Changing the hosted Scopeproof server requires a new device token issued for that exact server. Clear the Server URL to use local-only mode."])); return }
         let selectedMode = JiraAttachmentMode(rawValue: attachmentMode.titleOfSelectedItem ?? "") ?? .evidenceSet
-        if !newToken.isEmpty {
+        if !newToken.isEmpty, let url {
             do { try KeychainStore.saveToken(newToken, audience: url) } catch { showError(error); return }
         }
         preferences.serverURL = url
-        preferences.autoUpload = auto.state == .on
+        preferences.autoUpload = url != nil && auto.state == .on
+        preferences.openLocalConsoleAtLaunch = openLocal.state == .on
         preferences.retentionDays = Int(retention.titleOfSelectedItem?.split(separator: " ").first ?? "365") ?? 365
         preferences.jiraHandoff = JiraHandoffSettings(baseURL: jiraSiteValue, projectKey: jiraProjectValue, attachmentMode: selectedMode, includeGuideInPackages: includeGuide.state == .on, customInstructions: String(instructions.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).prefix(2_000)))
-        setReady("Capture and Jira settings saved")
+        setReady(url == nil ? "Local-only settings saved" : "Capture and Jira settings saved")
     }
 
     @objc private func checkForUpdatesAction() { checkForUpdates(silent: false) }

@@ -12,6 +12,7 @@ enum KeychainStore {
     private static let account = "capture-device-token"
     private static let packageSigningAccount = "assessor-package-signing-key-v2-user-presence"
     private static let updateSequenceAccount = "verified-update-highest-sequence-v1"
+    private static let localAuditAccount = "local-console-audit-hmac-v1"
 
     private static func readCredential() -> DeviceCredential? {
         let query: [String: Any] = [
@@ -51,6 +52,37 @@ enum KeychainStore {
     }
 
     static func deleteToken() { SecItemDelete([kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account] as CFDictionary) }
+
+    static func localAuditKey() throws -> Data {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: localAuditAccount,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var item: CFTypeRef?
+        let existingStatus = SecItemCopyMatching(query as CFDictionary, &item)
+        if existingStatus == errSecSuccess, let data = item as? Data, data.count == 32 { return data }
+        guard existingStatus == errSecItemNotFound else { throw NSError(domain: NSOSStatusErrorDomain, code: Int(existingStatus)) }
+
+        var bytes = Data(count: 32)
+        let randomStatus = bytes.withUnsafeMutableBytes { buffer in
+            SecRandomCopyBytes(kSecRandomDefault, buffer.count, buffer.baseAddress!)
+        }
+        guard randomStatus == errSecSuccess else { throw NSError(domain: NSOSStatusErrorDomain, code: Int(randomStatus)) }
+        let create: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: localAuditAccount,
+            kSecValueData as String: bytes,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+        ]
+        let createStatus = SecItemAdd(create as CFDictionary, nil)
+        if createStatus == errSecDuplicateItem { return try localAuditKey() }
+        guard createStatus == errSecSuccess else { throw NSError(domain: NSOSStatusErrorDomain, code: Int(createStatus)) }
+        return bytes
+    }
 
     static func highestUpdateSequence() -> Int {
         let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: updateSequenceAccount, kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]

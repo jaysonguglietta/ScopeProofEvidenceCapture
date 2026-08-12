@@ -60,15 +60,19 @@ Apply migrations through `drizzle/0009_chubby_martin_li.sql`. Migration 0009 add
 
 ## macOS device deployment
 
+For a single-user local installation built from source, follow the [macOS installation guide](MACOS_INSTALLATION.md). It installs into `~/Applications`, opens the loopback Local Console, and requires no hosted enrollment.
+
+For managed distribution:
+
 1. Build with `./Scripts/build_macos_capture.sh`.
 2. For managed production distribution, set `SCOPEPROOF_CODESIGN_IDENTITY` to a trusted Developer ID Application identity.
 3. Set `SCOPEPROOF_NOTARY_PROFILE` to a Keychain profile created for `xcrun notarytool` when notarization is required.
 4. Generate an offline P-256 release key, compile its X9.63 public key and validity window into `ScopeproofUpdatePublicKeys` in `Info.plist`, and keep the private key outside the repository.
 5. Set the `SCOPEPROOF_UPDATE_*` and `SCOPEPROOF_RELEASE_*` variables required by `./Scripts/publish_release.sh`. The script refuses unsigned, non-notarized, identity-mismatched, or key-mismatched releases and emits `DerivedData/macos-release-envelope.json`.
 6. Publish the exact ZIP to its final HTTPS origin. Store only the envelope's `manifest` as `MACOS_RELEASE_MANIFEST_JSON`, its `signatureDERBase64` as `MACOS_RELEASE_SIGNATURE_DER_BASE64`, and configure the exact hostname in `MACOS_RELEASE_ALLOWED_HOSTS`.
-7. Enroll each Mac separately from **Connections**. Revoke devices when reassigned, lost, or retired.
+7. If hosted synchronization is enabled, enroll each Mac separately from **Connections**. Revoke devices when reassigned, lost, or retired. Leave the native Server URL blank when policy requires local-only operation.
 
-The development build is ad-hoc signed with a stable designated requirement for `com.scopeproof.capture`; it is not a notarized production release.
+The development build is ad-hoc signed with a stable designated requirement for `com.scopeproof.capture`; it is not a notarized production release. The Local Console is embedded in the native process, binds to a random loopback-only port, and stops when the app quits. It does not require or deploy the hosted Sites application.
 
 ## RFC 3161 verifier contract
 
