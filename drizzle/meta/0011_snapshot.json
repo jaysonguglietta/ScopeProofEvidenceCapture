@@ -1217,12 +1217,13 @@
         }
       },
       "indexes": {
-        "idx_evidence_sha_source_control": {
-          "name": "idx_evidence_sha_source_control",
+        "idx_evidence_sha_source_control_assessment": {
+          "name": "idx_evidence_sha_source_control_assessment",
           "columns": [
             "sha256",
             "source",
-            "control_id"
+            "control_id",
+            "assessment_id"
           ],
           "isUnique": true
         },
