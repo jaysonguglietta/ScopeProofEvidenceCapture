@@ -4,7 +4,14 @@ export interface ScopeproofEnv {
   DB: D1Database;
   EVIDENCE_BUCKET: R2Bucket;
   EVIDENCE_ENCRYPTION_KEY?: string;
+  EVIDENCE_ACTIVE_KEY_ID?: string;
+  EVIDENCE_KEYRING_JSON?: string;
   AUDIT_HMAC_KEY?: string;
+  AUDIT_ACTIVE_KEY_ID?: string;
+  AUDIT_KEYRING_JSON?: string;
+  AUDIT_CHECKPOINT_ENDPOINT?: string;
+  AUDIT_CHECKPOINT_ALLOWED_HOSTS?: string;
+  AUDIT_CHECKPOINT_TOKEN?: string;
   PACKAGE_SIGNING_PRIVATE_KEY?: string;
   PACKAGE_SIGNING_PUBLIC_KEY?: string;
   BOOTSTRAP_ADMIN_EMAILS?: string;
@@ -38,6 +45,8 @@ export interface ScopeproofEnv {
   JIRA_OAUTH_CLIENT_SECRET?: string;
   JIRA_OAUTH_CALLBACK_URL?: string;
   JIRA_OAUTH_TOKEN_ENCRYPTION_KEY?: string;
+  JIRA_OAUTH_ACTIVE_KEY_ID?: string;
+  JIRA_OAUTH_KEYRING_JSON?: string;
 }
 
 export function getEnv(): ScopeproofEnv {

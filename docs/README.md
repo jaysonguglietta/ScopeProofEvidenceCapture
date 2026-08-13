@@ -10,6 +10,7 @@ Scopeproof documentation is organized by the person performing the work.
 | [Assessor guide](ASSESSOR_GUIDE.md) | External assessors and assessment leads | Navigate a package and independently verify hashes, signatures, scope, and review status. |
 | [Deployment guide](DEPLOYMENT.md) | Platform and security administrators | Configure identity, roles, secrets, storage, collectors, macOS releases, and production operations. |
 | [Security guide](SECURITY.md) | Security engineering and risk teams | Understand trust boundaries, protections, residual risks, and incident actions. |
+| [Key management](KEY_MANAGEMENT.md) | Security and platform administrators | Rotate encryption/HMAC keys, retain historical keys safely, and verify independent audit checkpoints. |
 | [Architecture](ARCHITECTURE.md) | Engineers and technical assessors | Understand components, data flows, persistence, and integrity design. |
 | [Development guide](DEVELOPMENT.md) | Contributors and release managers | Build, test, migrate, package, and release the web and macOS applications. |
 

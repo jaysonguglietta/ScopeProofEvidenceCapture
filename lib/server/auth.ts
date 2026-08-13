@@ -1,4 +1,4 @@
-import { hmac, randomId, sha256, stableJson } from "./crypto";
+import { activeAuditKeyId, hmac, randomId, sha256, stableJson } from "./crypto";
 import { getEnv } from "./env";
 
 export type Role = "admin" | "compliance_lead" | "reviewer" | "auditor";
@@ -77,7 +77,8 @@ export async function requireApiUser(request: Request, minimumRole: Role = "audi
       const details = { email, method: "explicit_allowlist" };
       const canonical = stableJson({ id: auditId, occurredAt, actorId: id, actorEmail: email, action: "user.bootstrap_admin_granted", resourceType: "user", resourceId: id, details, previousHash });
       const eventHash = await sha256(canonical);
-      const signature = await hmac(eventHash);
+      const hmacKeyId = activeAuditKeyId();
+      const signature = await hmac(eventHash, hmacKeyId);
       try {
         await env.DB.batch([
           env.DB.prepare(`INSERT OR IGNORE INTO users (id, email, display_name, role)
@@ -85,11 +86,11 @@ export async function requireApiUser(request: Request, minimumRole: Role = "audi
             .bind(id, email, displayName, configuredAdmins.has(email) ? 1 : 0),
           env.DB.prepare(`INSERT OR IGNORE INTO security_invariants (key, value)
             SELECT 'admin_bootstrap', id FROM users WHERE id = ? AND role = 'admin'`).bind(id),
-          env.DB.prepare(`INSERT INTO audit_events (id, occurred_at, actor_id, actor_email, action, resource_type, resource_id, details_json, previous_hash, event_hash, signature)
-            SELECT ?, ?, ?, ?, 'user.bootstrap_admin_granted', 'user', ?, ?, ?, ?, ?
+          env.DB.prepare(`INSERT INTO audit_events (id, occurred_at, actor_id, actor_email, action, resource_type, resource_id, details_json, previous_hash, event_hash, signature, hmac_key_id)
+            SELECT ?, ?, ?, ?, 'user.bootstrap_admin_granted', 'user', ?, ?, ?, ?, ?, ?
             WHERE EXISTS (SELECT 1 FROM users WHERE id = ? AND role = 'admin')
               AND NOT EXISTS (SELECT 1 FROM audit_events WHERE action = 'user.bootstrap_admin_granted' AND resource_type = 'user' AND resource_id = ?)`)
-            .bind(auditId, occurredAt, id, email, id, stableJson(details), previousHash, eventHash, signature, id, id),
+            .bind(auditId, occurredAt, id, email, id, stableJson(details), previousHash, eventHash, signature, hmacKeyId, id, id),
         ]);
         break;
       } catch (error) {

@@ -1,5 +1,5 @@
 import type { AuthenticatedUser } from "./auth";
-import { hmac, randomId, sha256, stableJson } from "./crypto";
+import { activeAuditKeyId, hmac, randomId, sha256, stableJson } from "./crypto";
 import { getEnv } from "./env";
 
 export async function executeAuditedBatch(actor: AuthenticatedUser, action: string, resourceType: string, resourceId: string, details: Record<string, unknown>, mutations: D1PreparedStatement[], auditCondition?: { sql: string; bindings: unknown[] }): Promise<D1Result[]> {
@@ -11,16 +11,17 @@ export async function executeAuditedBatch(actor: AuthenticatedUser, action: stri
     const previousHash = previous?.event_hash || "GENESIS";
     const canonical = stableJson({ id, occurredAt, actorId: actor.id, actorEmail: actor.email, action, resourceType, resourceId, details, previousHash });
     const eventHash = await sha256(canonical);
-    const signature = await hmac(eventHash);
+    const hmacKeyId = activeAuditKeyId();
+    const signature = await hmac(eventHash, hmacKeyId);
     try {
       const auditSql = auditCondition
-        ? `INSERT INTO audit_events (id, occurred_at, actor_id, actor_email, action, resource_type, resource_id, details_json, previous_hash, event_hash, signature)
-          SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${auditCondition.sql}`
-        : `INSERT INTO audit_events (id, occurred_at, actor_id, actor_email, action, resource_type, resource_id, details_json, previous_hash, event_hash, signature)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
+        ? `INSERT INTO audit_events (id, occurred_at, actor_id, actor_email, action, resource_type, resource_id, details_json, previous_hash, event_hash, signature, hmac_key_id)
+          SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${auditCondition.sql}`
+        : `INSERT INTO audit_events (id, occurred_at, actor_id, actor_email, action, resource_type, resource_id, details_json, previous_hash, event_hash, signature, hmac_key_id)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
       const results = await env.DB.batch([
         ...mutations,
-        env.DB.prepare(auditSql).bind(id, occurredAt, actor.id, actor.email, action, resourceType, resourceId, stableJson(details), previousHash, eventHash, signature, ...(auditCondition?.bindings || [])),
+        env.DB.prepare(auditSql).bind(id, occurredAt, actor.id, actor.email, action, resourceType, resourceId, stableJson(details), previousHash, eventHash, signature, hmacKeyId, ...(auditCondition?.bindings || [])),
       ]);
       return results.slice(0, mutations.length);
     } catch (error) {
@@ -37,26 +38,33 @@ export async function appendAuditEvent(actor: AuthenticatedUser, action: string,
 
 export type AuditChainVerification = { valid: boolean; checked: number; failedAt?: number; failureReason?: "invalid_details_json" | "non_canonical_details" | "chain_mismatch" | "verification_limit_exceeded" };
 
-export async function verifyAuditChain(maximumEvents = 10_000): Promise<AuditChainVerification> {
+export async function verifyAuditChain(maximumEvents = 100_000): Promise<AuditChainVerification> {
   const env = getEnv();
   const count = await env.DB.prepare("SELECT COUNT(*) AS count FROM audit_events").first<{ count: number }>();
   if (Number(count?.count || 0) > maximumEvents) return { valid: false, checked: 0, failureReason: "verification_limit_exceeded" };
-  const rows = (await env.DB.prepare("SELECT sequence, id, occurred_at, actor_id, actor_email, action, resource_type, resource_id, details_json, previous_hash, event_hash, signature FROM audit_events ORDER BY sequence ASC LIMIT ?").bind(maximumEvents).all<Record<string, unknown>>()).results;
   let previousHash = "GENESIS";
-  for (const row of rows) {
+  let checked = 0;
+  let afterSequence = 0;
+  while (checked < maximumEvents) {
+    const rows = (await env.DB.prepare("SELECT sequence, id, occurred_at, actor_id, actor_email, action, resource_type, resource_id, details_json, previous_hash, event_hash, signature, hmac_key_id FROM audit_events WHERE sequence > ? ORDER BY sequence ASC LIMIT 500").bind(afterSequence).all<Record<string, unknown>>()).results;
+    if (!rows.length) break;
+    for (const row of rows) {
     let details: unknown;
     try { details = JSON.parse(String(row.details_json || "{}")); }
-    catch { return { valid: false, checked: Number(row.sequence) - 1, failedAt: Number(row.sequence), failureReason: "invalid_details_json" }; }
+    catch { return { valid: false, checked, failedAt: Number(row.sequence), failureReason: "invalid_details_json" }; }
     try {
-      if (stableJson(details) !== String(row.details_json)) return { valid: false, checked: Number(row.sequence) - 1, failedAt: Number(row.sequence), failureReason: "non_canonical_details" };
+      if (stableJson(details) !== String(row.details_json)) return { valid: false, checked, failedAt: Number(row.sequence), failureReason: "non_canonical_details" };
     } catch {
-      return { valid: false, checked: Number(row.sequence) - 1, failedAt: Number(row.sequence), failureReason: "non_canonical_details" };
+      return { valid: false, checked, failedAt: Number(row.sequence), failureReason: "non_canonical_details" };
     }
     const canonical = stableJson({ id: row.id, occurredAt: row.occurred_at, actorId: row.actor_id, actorEmail: row.actor_email, action: row.action, resourceType: row.resource_type, resourceId: row.resource_id, details, previousHash: row.previous_hash });
     const eventHash = await sha256(canonical);
-    const signature = await hmac(eventHash);
-    if (row.previous_hash !== previousHash || row.event_hash !== eventHash || row.signature !== signature) return { valid: false, checked: Number(row.sequence) - 1, failedAt: Number(row.sequence), failureReason: "chain_mismatch" };
+    let signature: string; try { signature = await hmac(eventHash, String(row.hmac_key_id || "legacy-v1")); } catch { return { valid: false, checked, failedAt: Number(row.sequence), failureReason: "chain_mismatch" }; }
+    if (row.previous_hash !== previousHash || row.event_hash !== eventHash || row.signature !== signature) return { valid: false, checked, failedAt: Number(row.sequence), failureReason: "chain_mismatch" };
     previousHash = eventHash;
+    afterSequence = Number(row.sequence);
+    checked += 1;
+    }
   }
-  return { valid: true, checked: rows.length };
+  return { valid: true, checked };
 }

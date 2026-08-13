@@ -121,6 +121,7 @@ export const evidenceArtifacts = sqliteTable("evidence_artifacts", {
   sha256: text("sha256").notNull(),
   encryptionIv: text("encryption_iv").notNull(),
   encryptionVersion: integer("encryption_version").notNull().default(1),
+  encryptionKeyId: text("encryption_key_id").notNull().default("legacy-v1"),
   capturedAt: text("captured_at").notNull(),
   expiresAt: text("expires_at").notNull(),
   status: text("status", { enum: ["needs_review", "approved", "expiring", "rejected", "expired", "purged"] }).notNull().default("needs_review"),
@@ -200,6 +201,7 @@ export const auditEvents = sqliteTable("audit_events", {
   previousHash: text("previous_hash").notNull(),
   eventHash: text("event_hash").notNull(),
   signature: text("signature").notNull(),
+  hmacKeyId: text("hmac_key_id").notNull().default("legacy-v1"),
 }, (table) => [uniqueIndex("idx_audit_id").on(table.id), uniqueIndex("idx_audit_event_hash").on(table.eventHash), index("idx_audit_resource").on(table.resourceType, table.resourceId), index("idx_audit_occurred").on(table.occurredAt)]);
 
 export const exportPackages = sqliteTable("export_packages", {
@@ -218,6 +220,7 @@ export const exportPackages = sqliteTable("export_packages", {
   assessmentId: text("assessment_id"),
   selectionJson: text("selection_json").notNull().default("{}"),
   excludedCount: integer("excluded_count").notNull().default(0),
+  encryptionKeyId: text("encryption_key_id").notNull().default("legacy-v1"),
 }, (table) => [index("idx_exports_requested_created").on(table.requestedBy, table.createdAt), index("idx_exports_assessment_created").on(table.assessmentId, table.createdAt)]);
 
 export const jiraConnections = sqliteTable("jira_connections", {
@@ -235,6 +238,7 @@ export const jiraConnections = sqliteTable("jira_connections", {
   scopes: text("scopes").notNull(),
   status: text("status", { enum: ["active", "reauthorization_required"] }).notNull().default("active"),
   tokenVersion: integer("token_version").notNull().default(1),
+  tokenKeyId: text("token_key_id").notNull().default("legacy-v1"),
   refreshLeaseId: text("refresh_lease_id"),
   refreshLeaseExpiresAt: text("refresh_lease_expires_at"),
   lastTestedAt: text("last_tested_at"),
@@ -264,11 +268,27 @@ export const jiraUploadReceipts = sqliteTable("jira_upload_receipts", {
   attachmentsJson: text("attachments_json").notNull(),
   receiptSha256: text("receipt_sha256").notNull(),
   signature: text("signature").notNull(),
+  hmacKeyId: text("hmac_key_id").notNull().default("legacy-v1"),
 }, (table) => [
   uniqueIndex("idx_jira_upload_receipts_target").on(table.connectionId, table.evidenceId, table.issueKey),
   uniqueIndex("idx_jira_upload_receipts_sha").on(table.receiptSha256),
   index("idx_jira_upload_receipts_user_created").on(table.userId, table.uploadedAt),
 ]);
+
+export const auditCheckpoints = sqliteTable("audit_checkpoints", {
+  id: text("id").primaryKey(),
+  sequence: integer("sequence").notNull(),
+  eventHash: text("event_hash").notNull(),
+  eventCount: integer("event_count").notNull(),
+  hmacKeyId: text("hmac_key_id").notNull(),
+  checkpointSha256: text("checkpoint_sha256").notNull(),
+  signature: text("signature").notNull(),
+  publicKeyFingerprint: text("public_key_fingerprint").notNull(),
+  r2Key: text("r2_key").notNull(),
+  externalStatus: text("external_status", { enum: ["delivered", "not_configured", "failed"] }).notNull(),
+  externalReceipt: text("external_receipt"),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [uniqueIndex("idx_audit_checkpoints_sequence").on(table.sequence), uniqueIndex("idx_audit_checkpoints_sha").on(table.checkpointSha256)]);
 
 export const jiraUploadOperations = sqliteTable("jira_upload_operations", {
   id: text("id").primaryKey(),

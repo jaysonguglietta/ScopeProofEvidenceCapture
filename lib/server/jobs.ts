@@ -1,8 +1,10 @@
 import type { AuthenticatedUser } from "./auth";
 import { executeAuditedBatch } from "./audit";
 import { collectorConfiguration, CollectorError, runCollector, type CollectorProvider } from "./collectors";
+import { createAuditCheckpoint } from "./checkpoints";
 import { randomId } from "./crypto";
 import { getEnv } from "./env";
+import { rotateStoredKeys } from "./key-operations";
 import { storeEvidence } from "./evidence";
 import { purgeRateLimitBuckets } from "./rate-limit";
 import { purgeExpiredEvidence } from "./retention";
@@ -95,6 +97,8 @@ export async function processDueWork(now = new Date()): Promise<void> {
     const jobId = await queueCollection(collector.id, systemActor, "scheduled", assessment.id);
     await processJob(jobId, systemActor);
   }
+  await rotateStoredKeys(systemActor, 5);
+  await createAuditCheckpoint(now);
 }
 
 function isCronDue(expression: string, now: Date, lastRun: Date | null): boolean {

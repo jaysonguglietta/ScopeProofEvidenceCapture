@@ -78,6 +78,13 @@
       "when": 1786641052917,
       "tag": "0010_tearful_goblin_queen",
       "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "6",
+      "when": 1786641866494,
+      "tag": "0011_easy_vision",
+      "breakpoints": true
     }
   ]
 }
