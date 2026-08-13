@@ -8,7 +8,7 @@
 | `lib/server/` | Authentication, audit, crypto, collectors, jobs, evidence, devices, timestamps, and packages. |
 | `db/schema.ts` | Drizzle/D1 schema. |
 | `drizzle/` | Ordered SQL migrations and snapshots. |
-| `macos/ScopeproofCapture/` | Swift Package for the macOS menu-bar app and native tests. |
+| `macos/ScopeproofCapture/` | Swift Package for the macOS menu-bar app, embedded Local Console, SQLite index, and native tests. |
 | `scripts/` and `Scripts/` | macOS build entry points retained for compatibility. |
 | `tests/` | Rendered-product and security regression tests. |
 | `.openai/hosting.json` | Logical Sites project, D1, and R2 declarations. |
@@ -46,6 +46,8 @@ swift test
 
 On machines with multiple developer toolchains, select the full Xcode toolchain through `DEVELOPER_DIR`.
 
+The native Local Console is served directly by Scopeproof Capture. It is not the React development server and should remain usable with no hosted environment variables. When changing the console, verify its focused tests, release build, loopback-only listener, per-launch authentication, and unauthorized-request behavior.
+
 ## Change discipline
 
 - Preserve server-side authorization; hiding a control in React is not an access-control decision.
@@ -72,5 +74,6 @@ The app is produced at `DerivedData/Scopeproof Capture.app`. Update `macos/Scope
 2. Run web lint, type checking, production build/tests, native tests, and whitespace validation.
 3. Confirm migrations and `.openai/hosting.json` package correctly.
 4. Commit the exact validated source.
-5. Push to the intended GitHub repository and deploy the same commit to the private Sites project.
-6. Verify the deployed application loads and record the release outcome.
+5. Push to the intended GitHub repository.
+6. For hosted-service changes, deploy the same commit to the private Sites project and verify the deployment. Native-only changes do not require a Sites deployment.
+7. For native changes, install the exact release build, verify the menu-bar process and Local Console, and record the release outcome.

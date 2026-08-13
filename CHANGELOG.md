@@ -2,6 +2,21 @@
 
 All notable Scopeproof changes are recorded here. Dates use the repository’s release timezone.
 
+## 1.4.0 — 2026-08-12
+
+### Added
+
+- Local-first browser console bundled into the macOS menu-bar app and opened automatically at launch.
+- Loopback-only evidence overview, previews, framework/control/status search, lifecycle review, folder reveal, capture handoff, workspace status, and Help.
+- Rebuildable SQLite evidence index and append-only local audit chain authenticated by a device-only Keychain HMAC key.
+- Local-only settings mode that requires no hosted URL, account, or device-enrollment token.
+- Dedicated macOS installation, update, verification, and troubleshooting documentation for local and managed deployments.
+
+### Security
+
+- The Local Console binds only to `127.0.0.1`, creates an ephemeral 256-bit HttpOnly SameSite browser session, applies a restrictive CSP, requires exact same-origin proof for mutations, rejects ambiguous HTTP inputs, and never accepts filesystem paths from the browser.
+- Evidence previews are resolved by validated evidence ID and served only after PNG signature, size, path-containment, and SHA-256 verification.
+
 ## 1.3.2 — 2026-08-11
 
 ### Security

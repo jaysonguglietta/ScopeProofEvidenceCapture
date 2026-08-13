@@ -1,8 +1,8 @@
 # Scopeproof Capture for macOS
 
-Scopeproof Capture 1.3.2 is a local menu-bar companion for producing timestamped PCI DSS, HIPAA, FedRAMP, SOC 2, ISO 27001, and custom compliance evidence screenshots.
+Scopeproof Capture 1.4.0 is a local-first menu-bar application for producing, finding, reviewing, and packaging timestamped PCI DSS, HIPAA, FedRAMP, SOC 2, ISO 27001, and custom compliance evidence screenshots.
 
-Related guides: [operator workflow](../../docs/OPERATOR_GUIDE.md), [Jira handoff](../../docs/JIRA_HANDOFF.md), [assessor verification](../../docs/ASSESSOR_GUIDE.md), and [security model](../../docs/SECURITY.md).
+Related guides: [installation and updates](../../docs/MACOS_INSTALLATION.md), [operator workflow](../../docs/OPERATOR_GUIDE.md), [Jira handoff](../../docs/JIRA_HANDOFF.md), [assessor verification](../../docs/ASSESSOR_GUIDE.md), and [security model](../../docs/SECURITY.md).
 
 ## Run locally
 
@@ -12,7 +12,13 @@ Requirements: macOS 14 or newer and Apple’s Swift toolchain. From the reposito
 ./Scripts/run_macos_capture.sh
 ```
 
-This single command builds the app, installs it in `~/Applications`, and launches it without requiring an administrator password. Look for the shield in the menu bar.
+This single command builds the app, installs it in `~/Applications`, and launches it without requiring an administrator password. Scopeproof opens a private Local Console in the browser automatically. No hosted login or enrollment token is required for local workflows. Look for the shield in the menu bar to capture evidence or reopen the console.
+
+## Local Console
+
+The embedded console provides local overview metrics, preview cards, framework/control/status filters, lifecycle review, evidence reveal, workspace status, and Help. It binds only to `127.0.0.1`, uses a per-launch authenticated browser session, and stops when Scopeproof quits. Browser requests identify artifacts only by evidence ID; the server resolves and verifies the corresponding local files.
+
+Scopeproof maintains a rebuildable SQLite search index under the current user's Application Support folder. Immutable PNG manifests and `.review.json` lifecycle records remain authoritative. A separate append-only SQLite audit chain is HMAC-authenticated with a device-only Keychain key. Hosted synchronization and Jira Cloud remain optional.
 
 When you make the first capture, allow **Scopeproof Capture** under **System Settings → Privacy & Security → Screen & System Audio Recording**. Quit and reopen the app once after granting access. If Swift is unavailable, run `xcode-select --install`, finish the installation, and retry the command.
 
@@ -40,7 +46,7 @@ Use **Export Assessor Package…** after review. The exporter includes only Appr
 
 The app never captures on a timer or in the background without an explicit menu action. OCR runs on the Mac and recognized text is not retained. Device credentials are stored in the macOS Keychain, not preferences or screenshot metadata.
 
-## Connect to Scopeproof
+## Optional hosted synchronization
 
 1. In the web app, open **Connections → Mac capture devices → Enroll device**.
 2. Copy the one-time token immediately; only its hash is retained by the server.

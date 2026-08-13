@@ -92,6 +92,7 @@ final class CapturePreferences {
         static let chainHead = "capture.chainHead"
         static let presets = "capture.presets"
         static let jiraHandoff = "capture.jiraHandoff"
+        static let openLocalConsoleAtLaunch = "capture.openLocalConsoleAtLaunch"
     }
 
     var browser: BrowserChoice {
@@ -127,13 +128,21 @@ final class CapturePreferences {
     }
 
     var serverURL: URL? {
-        get { URL(string: defaults.string(forKey: Key.serverURL) ?? "https://scopeproof-pci.jayson-guglietta.chatgpt.site") }
-        set { defaults.set(newValue?.absoluteString, forKey: Key.serverURL) }
+        get {
+            if defaults.object(forKey: Key.serverURL) == nil { return URL(string: "https://scopeproof-pci.jayson-guglietta.chatgpt.site") }
+            return defaults.string(forKey: Key.serverURL).flatMap(URL.init(string:))
+        }
+        set { defaults.set(newValue?.absoluteString ?? "", forKey: Key.serverURL) }
     }
 
     var autoUpload: Bool {
         get { defaults.object(forKey: Key.autoUpload) == nil ? false : defaults.bool(forKey: Key.autoUpload) }
         set { defaults.set(newValue, forKey: Key.autoUpload) }
+    }
+
+    var openLocalConsoleAtLaunch: Bool {
+        get { defaults.object(forKey: Key.openLocalConsoleAtLaunch) == nil ? true : defaults.bool(forKey: Key.openLocalConsoleAtLaunch) }
+        set { defaults.set(newValue, forKey: Key.openLocalConsoleAtLaunch) }
     }
 
     var retentionDays: Int {

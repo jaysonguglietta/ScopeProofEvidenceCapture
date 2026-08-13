@@ -10,9 +10,11 @@ From the repository root, run:
 ./Scripts/run_macos_capture.sh
 ```
 
-The command builds Scopeproof Capture, installs it for the current user in `~/Applications`, and launches it. No administrator password is required. If Swift is missing, run `xcode-select --install`, complete the installation, and try again.
+The command builds Scopeproof Capture, installs it for the current user in `~/Applications`, and launches it. No administrator password is required. If Swift is missing, run `xcode-select --install`, complete the installation, and try again. See the [macOS installation guide](MACOS_INSTALLATION.md) for permission, update, verification, and troubleshooting details.
 
 Look for the Scopeproof shield in the menu bar. On the first capture, allow **Scopeproof Capture** under **System Settings → Privacy & Security → Screen & System Audio Recording**, then quit and reopen the app once.
+
+Scopeproof opens its **Local Console** in your browser at launch. This console runs only while the menu-bar app is running, listens only on the Mac loopback interface, and does not require a hosted account or device token. Use it to search, preview, filter, and review local evidence. Choose **Open Local Console** from the shield menu if you close the browser tab.
 
 ## Before collecting evidence
 
@@ -43,7 +45,7 @@ Files are stored under `~/Pictures/Scopeproof Evidence` and are private to the c
 
 ## Review and approve
 
-1. Choose **Search Evidence…**.
+1. Use **Evidence library** in the Local Console or choose **Search Evidence…** for the native review window.
 2. Filter by framework, control, system, date, lifecycle status, or keyword. Jira issue keys are searchable.
 3. Open the screenshot and confirm the control mapping, source, period, system, redactions, and visible timestamp banner.
 4. Choose **Review Status…** and assign the owner/reviewer, useful tags, a decision, and a rationale.
@@ -53,7 +55,7 @@ Approval, rejection, and supersession require a note. Lifecycle changes are writ
 
 ## Upload and retry
 
-Enroll the Mac from **Connections → Mac capture devices**, then paste the one-time device token into **Capture & Jira Settings…**. The token is stored in the macOS Keychain. Automatic upload is optional.
+Local operation requires no enrollment. To add optional hosted synchronization, enroll the Mac from **Connections → Mac capture devices**, then paste the one-time device token into **Capture & Jira Settings…**. The token is stored in the macOS Keychain. Leave Server URL blank for local-only mode.
 
 If an upload fails, local evidence remains available. Correct the network, server URL, or revoked-token issue and choose **Retry Pending Uploads**. Never send a device token in email, Jira, chat, or an evidence package.
 
@@ -82,6 +84,7 @@ Detailed validation steps are in the [assessor guide](ASSESSOR_GUIDE.md). Jira-s
 | Symptom | Action |
 | --- | --- |
 | Screen capture permission error | Enable Scopeproof Capture in Screen & System Audio Recording, fully quit the app, and reopen it. |
+| Local Console does not open | Choose **Open Local Console** from the shield menu. If the session expired, fully quit and reopen Scopeproof Capture. |
 | Wrong browser window | Use **Choose Browser Window…** and select the exact titled window. |
 | Capture context dialog repeats | Complete every field marked `*`; if a Jira key is present it must look like `GRC-123`. |
 | No Jira key in filename/banner | Edit capture defaults, enter the issue key, then recapture; existing immutable evidence is not renamed. |

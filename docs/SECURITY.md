@@ -20,6 +20,7 @@ Scopeproof handles security and compliance evidence that may expose sensitive co
 - Mutation endpoints require an exact same-origin `Origin` and reject conflicting Fetch Metadata.
 - Reviewers receive the actual decrypted, digest-verified artifact rather than a generated placeholder. Approval requires a matching full digest, a review rationale, and explicit scope/freshness/redaction confirmation.
 - macOS devices use revocable random bearer tokens; only SHA-256 token hashes are stored server-side and the Mac stores its token in Keychain.
+- Local mode requires no web identity or device token. The embedded console binds only to `127.0.0.1`, uses a per-launch 256-bit HttpOnly SameSite session, rejects cross-origin mutations and transfer-encoded/ambiguous requests, and never accepts browser-supplied filesystem paths.
 - Jira Cloud uses OAuth 2.0 authorization-code flow. Rotating access and refresh tokens are AES-256-GCM encrypted with a dedicated hosted key and bound to a Scopeproof user and connection identity.
 
 ### Data protection and integrity
@@ -29,6 +30,7 @@ Scopeproof handles security and compliance evidence that may expose sensitive co
 - Evidence and generated packages are encrypted with AES-256-GCM in R2.
 - D1 contains metadata, object references, IVs, and integrity digests rather than evidence plaintext.
 - Audit events are canonicalized, hash-chained, HMAC-authenticated, and protected from update/delete by D1 triggers. Security-sensitive D1 mutations and their audit event execute in one transactional batch; a stale audit head rolls the entire batch back and retries. Repeated failures emit `scopeproof_audited_batch_failure` for alerting without event details.
+- The local SQLite index is non-authoritative and rebuildable from manifests. Its audit table is hash-chained, authenticated with a device-only Keychain key, verified before every append, and protected from update/delete by SQLite triggers. Local evidence files use macOS complete file protection and account-only permissions; managed endpoints should also enforce FileVault.
 - Assessor manifests are ECDSA P-256/SHA-256 signed and include independent artifact hashes.
 - Jira URLs require HTTPS, issue keys are format-restricted, and native Jira metadata must match the immutable manifest.
 - Jira API calls use fixed Atlassian hosts and server-selected cloud IDs. OAuth state is random, user-bound, stored only as a hash, single-use, and expires after ten minutes. Requested sites must end in `.atlassian.net`, match Atlassian’s accessible resources, and use configured project allowlists.
