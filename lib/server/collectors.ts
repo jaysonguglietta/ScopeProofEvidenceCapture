@@ -33,15 +33,18 @@ async function collectLinkedJson<T>(url: string, init: RequestInit, label: strin
   const items: T[] = [];
   let next: string | null = url;
   let pages = 0;
+  let truncatedWithinPage = false;
   while (next && pages < MAX_PROVIDER_PAGES && items.length < itemLimit) {
     const response = await providerFetch(next, init, `${label} page ${pages + 1}`);
     const page = await response.json() as T[];
     if (!Array.isArray(page)) throw new CollectorError(`${label} returned an invalid collection.`, "PROVIDER_INVALID_RESPONSE", false);
-    items.push(...page.slice(0, itemLimit - items.length));
+    const remaining = itemLimit - items.length;
+    if (page.length > remaining) truncatedWithinPage = true;
+    items.push(...page.slice(0, remaining));
     next = nextLink(response);
     pages += 1;
   }
-  return { items, pages, complete: !next, next };
+  return { items, pages, complete: !next && !truncatedWithinPage, next: next || (truncatedWithinPage ? "item-limit-reached" : null) };
 }
 
 function coverage(provider: CollectorProvider, requestedScope: string, returnedCount: number, pageCount: number, complete: boolean, omissions: string[] = [], providerTotal?: number, apiVersion = "provider-current"): CollectorCoverage {

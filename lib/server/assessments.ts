@@ -42,3 +42,24 @@ export async function getAssessment(id: string): Promise<Record<string, unknown>
   if (!row) return null;
   return { ...row, systems: JSON.parse(String(row.systems_json || "[]")), controls: JSON.parse(String(row.controls_json || "[]")), systems_json: undefined, controls_json: undefined };
 }
+
+export async function updateAssessment(actor: AuthenticatedUser, input: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const id = String(input.id || "");
+  const current = await getAssessment(id);
+  if (!current) throw new Response(JSON.stringify({ error: "Assessment not found." }), { status: 404, headers: { "content-type": "application/json" } });
+  if (current.status === "closed") throw new Response(JSON.stringify({ error: "Closed assessments are immutable." }), { status: 409, headers: { "content-type": "application/json" } });
+  const status = String(input.status || current.status) as AssessmentStatus;
+  if (!['draft', 'active', 'closed'].includes(status)) throw new Response(JSON.stringify({ error: "Assessment status is invalid." }), { status: 400, headers: { "content-type": "application/json" } });
+  const existingSystems = current.systems as string[];
+  const existingControls = current.controls as string[];
+  const systems = input.systems === undefined ? existingSystems : boundedList(input.systems, 250, /^[\p{L}\p{N} ._:/-]+$/u);
+  const controls = input.controls === undefined ? existingControls : boundedList(input.controls, 500, /^[A-Za-z0-9 ._:-]+$/);
+  if ((existingSystems.length && systems.some((item) => !existingSystems.includes(item))) || (existingControls.length && controls.some((item) => !existingControls.includes(item)))) {
+    throw new Response(JSON.stringify({ error: "An active assessment may be narrowed, but not expanded. Create a new assessment for broader scope." }), { status: 409, headers: { "content-type": "application/json" } });
+  }
+  const updatedAt = new Date().toISOString();
+  await executeAuditedBatch(actor, status === "closed" ? "assessment.closed" : "assessment.scope_narrowed", "assessment", id, { previousStatus: current.status, status, systems, controls }, [
+    getEnv().DB.prepare("UPDATE assessments SET systems_json = ?, controls_json = ?, status = ?, updated_at = ? WHERE id = ? AND status != 'closed'").bind(stableJson(systems), stableJson(controls), status, updatedAt, id),
+  ]);
+  return { ...current, systems, controls, status, updated_at: updatedAt };
+}

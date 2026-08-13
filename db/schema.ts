@@ -146,7 +146,7 @@ export const evidenceArtifacts = sqliteTable("evidence_artifacts", {
   coverageStatus: text("coverage_status", { enum: ["complete", "partial", "not_applicable"] }).notNull().default("not_applicable"),
   coverageJson: text("coverage_json").notNull().default("{}"),
 }, (table) => [
-  uniqueIndex("idx_evidence_sha_source_control").on(table.sha256, table.source, table.controlId),
+  uniqueIndex("idx_evidence_sha_source_control_assessment").on(table.sha256, table.source, table.controlId, table.assessmentId),
   index("idx_evidence_status_created").on(table.status, table.createdAt),
   index("idx_evidence_control_captured").on(table.controlId, table.capturedAt),
   index("idx_evidence_framework_control").on(table.framework, table.controlId),
