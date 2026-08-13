@@ -32,6 +32,7 @@ Run before every publication:
 npm run lint
 npx tsc --noEmit
 npm test
+./Scripts/verify_migrations.sh
 git diff --check
 ```
 
@@ -72,7 +73,7 @@ The app is produced at `DerivedData/Scopeproof Capture.app`. Update `macos/Scope
 
 1. Review the complete diff and confirm no evidence or secrets are present.
 2. Run web lint, type checking, production build/tests, native tests, and whitespace validation.
-3. Confirm migrations and `.openai/hosting.json` package correctly.
+3. Replay all migrations into a fresh database and confirm `.openai/hosting.json` packages correctly.
 4. Commit the exact validated source.
 5. Push to the intended GitHub repository.
 6. For hosted-service changes, deploy the same commit to the private Sites project and verify the deployment. Native-only changes do not require a Sites deployment.

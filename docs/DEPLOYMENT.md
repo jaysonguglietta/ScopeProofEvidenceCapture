@@ -20,6 +20,8 @@ The logical hosted bindings are declared in `.openai/hosting.json`. Do not place
 | `BOOTSTRAP_ADMIN_EMAILS` | Comma-separated lowercase administrator emails configured before first sign-in. |
 | `TRUSTED_APP_ORIGINS` | Comma-separated exact HTTPS Sites origins allowed to carry platform identity headers; no paths or wildcards. |
 
+Use versioned keyrings for production rotation. See the [key-management guide](KEY_MANAGEMENT.md). Configure `AUDIT_CHECKPOINT_ENDPOINT` to an organization-controlled append-only service in a different administrative boundary, and `SECURITY_EVENT_ENDPOINT` to the monitoring ingress described in the [production-operations runbook](PRODUCTION_OPERATIONS.md).
+
 Never reuse one value for multiple purposes. Record key ownership, creation date, rotation version, recovery escrow, and destruction approval outside the repository.
 
 ## Optional provider configuration
@@ -56,7 +58,7 @@ Inspect generated SQL for destructive operations, unintended nullability changes
 
 Review role assignments regularly. Use separate named accounts; do not share administrator sessions.
 
-Apply migrations through `drizzle/0009_chubby_martin_li.sql`. Migration 0009 adds collection leases, persistent rate-limit buckets, retention holds, and purge state. Production fails closed when `BOOTSTRAP_ADMIN_EMAILS` or `TRUSTED_APP_ORIGINS` is unsafe. Browser collection remains unavailable until its OCR endpoint, token, and exact host allowlist are all configured.
+Apply migrations through `drizzle/0011_easy_vision.sql`. Migration 0010 adds authoritative assessment scope and collector coverage; migration 0011 adds versioned encryption/HMAC key references and signed audit checkpoints. Production fails closed when `BOOTSTRAP_ADMIN_EMAILS` or `TRUSTED_APP_ORIGINS` is unsafe. Browser collection remains unavailable until its OCR endpoint, token, and exact host allowlist are all configured.
 
 ## macOS device deployment
 
@@ -68,6 +70,7 @@ For managed distribution:
 2. For managed production distribution, set `SCOPEPROOF_CODESIGN_IDENTITY` to a trusted Developer ID Application identity.
 3. Set `SCOPEPROOF_NOTARY_PROFILE` to a Keychain profile created for `xcrun notarytool` when notarization is required.
 4. Generate an offline P-256 release key, compile its X9.63 public key and validity window into `ScopeproofUpdatePublicKeys` in `Info.plist`, and keep the private key outside the repository.
+   `./Scripts/configure_macos_release_identity.sh` validates and writes the public release identity from `SCOPEPROOF_UPDATE_*` and `SCOPEPROOF_RELEASE_*` variables. Review and commit only that public metadata.
 5. Set the `SCOPEPROOF_UPDATE_*` and `SCOPEPROOF_RELEASE_*` variables required by `./Scripts/publish_release.sh`. The script refuses unsigned, non-notarized, identity-mismatched, or key-mismatched releases and emits `DerivedData/macos-release-envelope.json`.
 6. Publish the exact ZIP to its final HTTPS origin. Store only the envelope's `manifest` as `MACOS_RELEASE_MANIFEST_JSON`, its `signatureDERBase64` as `MACOS_RELEASE_SIGNATURE_DER_BASE64`, and configure the exact hostname in `MACOS_RELEASE_ALLOWED_HOSTS`.
 7. If hosted synchronization is enabled, enroll each Mac separately from **Connections**. Revoke devices when reassigned, lost, or retired. Leave the native Server URL blank when policy requires local-only operation.
@@ -116,3 +119,5 @@ Run the native tests with the Xcode Swift toolchain, build the `.app`, confirm i
 - Hosted packages expire after seven days; preserve the original evidence rather than depending on package objects as the system of record.
 - Local retention moves files to Trash and does not remove hosted evidence.
 - Place evidence under legal hold before applying deletion when an assessment, investigation, dispute, or regulatory requirement is active.
+
+The full backup manifest, monitoring, quarterly restore-drill, incident-response, and launch-authorization procedures are in [Production operations](PRODUCTION_OPERATIONS.md). A production deployment is not approved until named owners have executed and recorded those controls.

@@ -15,22 +15,58 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: "22.13.0"
           cache: npm
       - run: npm ci --ignore-scripts
       - run: npm test
+      - name: Replay database migrations
+        run: ./Scripts/verify_migrations.sh
       - name: Block High and Critical dependency advisories
         run: npm audit --audit-level=high
       - name: Verify the production dependency graph independently
         run: npm audit --omit=dev --audit-level=high
       - name: Generate CycloneDX SBOM
         run: npm sbom --sbom-format=cyclonedx > scopeproof-sbom.cdx.json
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: scopeproof-sbom
           path: scopeproof-sbom.cdx.json
           if-no-files-found: error
           retention-days: 30
+
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      id-token: write
+      contents: read
+      attestations: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: Test native application
+        working-directory: macos/ScopeproofCapture
+        run: swift test --disable-sandbox
+      - name: Build development application
+        run: ./Scripts/build_macos_capture.sh
+      - name: Verify bundle metadata and signature
+        run: |
+          codesign --verify --deep --strict "DerivedData/Scopeproof Capture.app"
+          test "$(defaults read "$PWD/DerivedData/Scopeproof Capture.app/Contents/Info" CFBundleIdentifier)" = "com.scopeproof.capture"
+          ditto -c -k --sequesterRsrc --keepParent "DerivedData/Scopeproof Capture.app" "DerivedData/Scopeproof-Capture-development.zip"
+          shasum -a 256 "DerivedData/Scopeproof-Capture-development.zip" > "DerivedData/Scopeproof-Capture-development.zip.sha256"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: scopeproof-macos-development
+          path: |
+            DerivedData/Scopeproof-Capture-development.zip
+            DerivedData/Scopeproof-Capture-development.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
+      - name: Attest development build provenance
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: DerivedData/Scopeproof-Capture-development.zip

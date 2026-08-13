@@ -5,6 +5,7 @@ import { createAuditCheckpoint } from "./checkpoints";
 import { randomId } from "./crypto";
 import { getEnv } from "./env";
 import { rotateStoredKeys } from "./key-operations";
+import { publishOperationalHealth } from "./monitoring";
 import { storeEvidence } from "./evidence";
 import { purgeRateLimitBuckets } from "./rate-limit";
 import { purgeExpiredEvidence } from "./retention";
@@ -99,6 +100,8 @@ export async function processDueWork(now = new Date()): Promise<void> {
   }
   await rotateStoredKeys(systemActor, 5);
   await createAuditCheckpoint(now);
+  try { await publishOperationalHealth(now); }
+  catch (error) { console.error("scopeproof_operational_health_delivery_failure", { error: error instanceof Error ? error.message : String(error) }); }
 }
 
 function isCronDue(expression: string, now: Date, lastRun: Date | null): boolean {
