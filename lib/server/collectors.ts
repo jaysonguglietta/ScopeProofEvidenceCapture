@@ -4,6 +4,7 @@ import { getEnv, type ScopeproofEnv } from "./env";
 import type { EvidenceInput } from "./evidence";
 import { validatePng } from "./native-manifest";
 import { redactText } from "./redaction";
+import { decodeXmlText } from "./xml";
 
 export type CollectorProvider = "aws" | "github" | "okta" | "cloudflare" | "browser";
 export class CollectorError extends Error {
@@ -12,6 +13,7 @@ export class CollectorError extends Error {
 
 type Artifact = Omit<EvidenceInput, "createdBy" | "collectorId" | "jobId">;
 type CollectorContext = { actor: AuthenticatedUser; config: Record<string, unknown> };
+
 export type CollectorCoverage = { provider: CollectorProvider; complete: boolean; requestedScope: string; returnedCount: number; providerTotal?: number; pageCount: number; omissions: string[]; apiVersion: string; collectedAt: string };
 export type CollectorResult = { artifacts: Artifact[]; coverage: CollectorCoverage };
 
@@ -241,7 +243,7 @@ async function awsCollector(env: ScopeproofEnv): Promise<CollectorResult> {
     const xml: string = await ec2Response.text();
     securityGroupPages.push(xml);
     const match: RegExpMatchArray | null = xml.match(/<nextToken>([^<]+)<\/nextToken>/i);
-    token = match ? match[1].replaceAll("&amp;", "&").replaceAll("&lt;", "<").replaceAll("&gt;", ">") : null;
+    token = match ? decodeXmlText(match[1]) : null;
     if (token && securityGroupPages.length >= MAX_PROVIDER_PAGES) { complete = false; break; }
   } while (token);
   const omissions = complete ? [] : [`EC2 security-group pagination exceeded ${MAX_PROVIDER_PAGES} pages.`];

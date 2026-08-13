@@ -1,8 +1,14 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { decodeXmlText } from "../lib/server/xml.ts";
 
 const read = (path: string) => readFile(new URL(`../${path}`, import.meta.url), "utf8");
+
+test("AWS pagination token XML decoding is single-pass", () => {
+  assert.equal(decodeXmlText("a&amp;b&lt;c&#x2f;d"), "a&b<c/d");
+  assert.equal(decodeXmlText("&amp;lt;script&amp;gt;"), "&lt;script&gt;");
+});
 
 test("production console fails closed without demo compliance claims", async () => {
   const consoleSource = await read("app/evidence-console.tsx");
