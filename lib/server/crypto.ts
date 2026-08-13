@@ -1,4 +1,4 @@
-import { requireEnv } from "./env";
+import { getEnv, requireEnv } from "./env";
 
 const encoder = new TextEncoder();
 
@@ -23,8 +23,33 @@ export async function sha256(data: Uint8Array | string): Promise<string> {
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-async function importAesKey(): Promise<CryptoKey> {
-  const raw = base64ToBytes(requireEnv("EVIDENCE_ENCRYPTION_KEY"));
+function parseKeyring(json: string | undefined, legacy: string | undefined, activeId: string | undefined, label: string): { activeId: string; values: Record<string, string> } {
+  let values: Record<string, string> = {};
+  if (json) {
+    let parsed: unknown; try { parsed = JSON.parse(json); } catch { throw new Error(`${label} keyring is not valid JSON.`); }
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error(`${label} keyring must be a JSON object.`);
+    values = Object.fromEntries(Object.entries(parsed as Record<string, unknown>).map(([id, value]) => {
+      if (!/^[A-Za-z0-9._-]{1,64}$/.test(id) || typeof value !== "string" || !value) throw new Error(`${label} keyring contains an invalid entry.`);
+      return [id, value];
+    }));
+  }
+  if (legacy) values["legacy-v1"] ||= legacy;
+  const selected = activeId || "legacy-v1";
+  if (!values[selected]) throw new Error(`${label} active key ${selected} is not present in the retained keyring.`);
+  return { activeId: selected, values };
+}
+
+function evidenceKeyring() { const env = getEnv(); return parseKeyring(env.EVIDENCE_KEYRING_JSON, env.EVIDENCE_ENCRYPTION_KEY, env.EVIDENCE_ACTIVE_KEY_ID, "Evidence encryption"); }
+function auditKeyring() { const env = getEnv(); return parseKeyring(env.AUDIT_KEYRING_JSON, env.AUDIT_HMAC_KEY, env.AUDIT_ACTIVE_KEY_ID, "Audit HMAC"); }
+
+export function activeEvidenceKeyId(): string { return evidenceKeyring().activeId; }
+export function availableEvidenceKeyIds(): string[] { return Object.keys(evidenceKeyring().values).sort(); }
+export function availableAuditKeyIds(): string[] { return Object.keys(auditKeyring().values).sort(); }
+
+async function importAesKey(keyId: string): Promise<CryptoKey> {
+  const value = evidenceKeyring().values[keyId];
+  if (!value) throw new Error(`Evidence encryption key ${keyId} is unavailable; retained evidence cannot be decrypted.`);
+  const raw = base64ToBytes(value);
   if (raw.byteLength !== 32) throw new Error("EVIDENCE_ENCRYPTION_KEY must be a base64-encoded 32-byte key.");
   return crypto.subtle.importKey("raw", asArrayBuffer(raw), "AES-GCM", false, ["encrypt", "decrypt"]);
 }
@@ -35,15 +60,16 @@ async function importNamedAesKey(base64: string, name: string): Promise<CryptoKe
   return crypto.subtle.importKey("raw", asArrayBuffer(raw), "AES-GCM", false, ["encrypt", "decrypt"]);
 }
 
-export async function encryptEvidence(plain: Uint8Array, associatedData: string): Promise<{ ciphertext: Uint8Array; iv: string }> {
+export async function encryptEvidence(plain: Uint8Array, associatedData: string): Promise<{ ciphertext: Uint8Array; iv: string; keyId: string }> {
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const key = await importAesKey();
+  const keyId = evidenceKeyring().activeId;
+  const key = await importAesKey(keyId);
   const encrypted = await crypto.subtle.encrypt({ name: "AES-GCM", iv: asArrayBuffer(iv), additionalData: asArrayBuffer(encoder.encode(associatedData)), tagLength: 128 }, key, asArrayBuffer(plain));
-  return { ciphertext: new Uint8Array(encrypted), iv: bytesToBase64(iv) };
+  return { ciphertext: new Uint8Array(encrypted), iv: bytesToBase64(iv), keyId };
 }
 
-export async function decryptEvidence(ciphertext: Uint8Array, iv: string, associatedData: string): Promise<Uint8Array> {
-  const key = await importAesKey();
+export async function decryptEvidence(ciphertext: Uint8Array, iv: string, associatedData: string, keyId = "legacy-v1"): Promise<Uint8Array> {
+  const key = await importAesKey(keyId);
   const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv: asArrayBuffer(base64ToBytes(iv)), additionalData: asArrayBuffer(encoder.encode(associatedData)), tagLength: 128 }, key, asArrayBuffer(ciphertext));
   return new Uint8Array(decrypted);
 }
@@ -61,11 +87,18 @@ export async function decryptSecret(ciphertext: string, iv: string, keyBase64: s
   return new TextDecoder().decode(decrypted);
 }
 
-export async function hmac(value: string): Promise<string> {
-  const secret = requireEnv("AUDIT_HMAC_KEY");
+export function activeAuditKeyId(): string { return auditKeyring().activeId; }
+
+export async function hmac(value: string, keyId = activeAuditKeyId()): Promise<string> {
+  const secret = auditKeyring().values[keyId];
+  if (!secret) throw new Error(`Audit HMAC key ${keyId} is unavailable; retained history cannot be verified.`);
   const key = await crypto.subtle.importKey("raw", encoder.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(value));
   return bytesToBase64(new Uint8Array(signature));
+}
+
+export function rotatingSecretKeyring(json: string | undefined, legacy: string | undefined, activeId: string | undefined, label: string): { activeId: string; values: Record<string, string> } {
+  return parseKeyring(json, legacy, activeId, label);
 }
 
 export async function signPackage(value: string): Promise<{ signature: string; publicKey: string }> {

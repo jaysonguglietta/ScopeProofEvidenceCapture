@@ -65,3 +65,36 @@ test("assessor exports are assessment-scoped and never silently truncated", asyn
   assert.match(migration, /`coverage_status`/);
   assert.match(migration, /`selection_json`/);
 });
+
+test("encrypted and signed records retain versioned key identifiers", async () => {
+  const cryptoSource = await read("lib/server/crypto.ts");
+  const evidence = await read("lib/server/evidence.ts");
+  const jira = await read("lib/server/jira.ts");
+  const migration = await read("drizzle/0011_easy_vision.sql");
+  assert.match(cryptoSource, /active key .* is not present in the retained keyring/);
+  assert.match(evidence, /encryption_key_id/);
+  assert.match(jira, /token_key_id = excluded\.token_key_id/);
+  assert.match(jira, /hmac_key_id\) VALUES/);
+  assert.match(migration, /`encryption_key_id`/);
+  assert.match(migration, /`hmac_key_id`/);
+  assert.match(migration, /`token_key_id`/);
+});
+
+test("key rotation uses copy-switch-delete and refuses missing retained keys", async () => {
+  const operations = await read("lib/server/key-operations.ts");
+  assert.match(operations, /\.rekey-/);
+  assert.match(operations, /executeAuditedBatch\(actor, "key\.evidence_rotated"/);
+  assert.match(operations, /EVIDENCE_BUCKET\.delete\(row\.r2_key\)/);
+  assert.match(operations, /validateRetainedKeyReferences/);
+  assert.match(operations, /Jira OAuth token key .* is unavailable during rotation/);
+});
+
+test("audit checkpoints are independently signed, stored, and host allowlisted", async () => {
+  const checkpoints = await read("lib/server/checkpoints.ts");
+  const jobs = await read("lib/server/jobs.ts");
+  assert.match(checkpoints, /signPackage\(canonical\)/);
+  assert.match(checkpoints, /audit-checkpoints\/\$\{month\}/);
+  assert.match(checkpoints, /AUDIT_CHECKPOINT_ALLOWED_HOSTS/);
+  assert.match(checkpoints, /allowedOrigins: \[url\.origin\]/);
+  assert.match(jobs, /createAuditCheckpoint\(now\)/);
+});

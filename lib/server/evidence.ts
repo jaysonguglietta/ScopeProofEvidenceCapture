@@ -81,15 +81,15 @@ export async function storeEvidence(input: EvidenceInput): Promise<{ id: string;
   const associatedData = stableJson({ id, controlId: input.controlId, source: input.source, capturedAt });
   const encrypted = await encryptEvidence(bytes, associatedData);
   const r2Key = `evidence/${capturedAt.slice(0, 7)}/${id}.enc`;
-  await env.EVIDENCE_BUCKET.put(r2Key, encrypted.ciphertext, { customMetadata: { evidenceId: id, sha256: digest, encryptionVersion: "1" }, httpMetadata: { contentType: "application/octet-stream" } });
+  await env.EVIDENCE_BUCKET.put(r2Key, encrypted.ciphertext, { customMetadata: { evidenceId: id, sha256: digest, encryptionVersion: "2", encryptionKeyId: encrypted.keyId }, httpMetadata: { contentType: "application/octet-stream" } });
   try {
     const insert = env.DB.prepare(`INSERT INTO evidence_artifacts
-      (id, control_id, framework, catalog_version, title, description, type, source, system, environment, assessment_period, evidence_owner, tags_json, expected_evidence, mapped_controls_json, jira_issue_key, jira_issue_url, manual_redactions, collector_id, job_id, session_id, device_id, r2_key, content_type, byte_size, sha256, encryption_iv, captured_at, expires_at, redaction_count, redaction_summary_json, manifest_sha256, chain_previous_hash, chain_event_hash, timestamp_authority, timestamp_token, safety_scan_sha256, safety_scan_policy, safety_scan_completed_at, created_by, assessment_id, coverage_status, coverage_json)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(
+      (id, control_id, framework, catalog_version, title, description, type, source, system, environment, assessment_period, evidence_owner, tags_json, expected_evidence, mapped_controls_json, jira_issue_key, jira_issue_url, manual_redactions, collector_id, job_id, session_id, device_id, r2_key, content_type, byte_size, sha256, encryption_iv, encryption_version, encryption_key_id, captured_at, expires_at, redaction_count, redaction_summary_json, manifest_sha256, chain_previous_hash, chain_event_hash, timestamp_authority, timestamp_token, safety_scan_sha256, safety_scan_policy, safety_scan_completed_at, created_by, assessment_id, coverage_status, coverage_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(
       id, input.controlId, input.framework || "PCI DSS 4.0.1", input.catalogVersion || null, input.title, input.description, input.type, input.source, input.system,
       input.environment || null, input.assessmentPeriod || null, input.evidenceOwner || null, stableJson(input.tags || []), input.expectedEvidence || null,
       stableJson(input.mappedControls || []), input.jiraIssueKey || null, input.jiraIssueURL || null, Math.max(0, Math.min(input.manualRedactions || 0, 10_000)), input.collectorId || null, input.jobId || null,
-      input.sessionId || null, input.deviceId || null, r2Key, input.contentType, bytes.byteLength, digest, encrypted.iv, capturedAt, expiresAt, redactionCount, stableJson(findings),
+      input.sessionId || null, input.deviceId || null, r2Key, input.contentType, bytes.byteLength, digest, encrypted.iv, 2, encrypted.keyId, capturedAt, expiresAt, redactionCount, stableJson(findings),
       input.manifestSha256 || null, input.chainPreviousHash || null, input.chainEventHash || null, input.timestampAuthority || null, input.timestampToken || null,
       input.safetyScanSha256 || null, input.safetyScanPolicy || null, input.safetyScanCompletedAt || null, input.createdBy.id, input.assessmentId || null,
       input.coverageStatus || (input.collectorId ? "complete" : "not_applicable"), stableJson(input.coverage || {}),
@@ -119,7 +119,8 @@ export async function readEvidenceBytes(id: string): Promise<{ bytes: Uint8Array
   const object = await env.EVIDENCE_BUCKET.get(String(row.r2_key));
   if (!object) throw new Error("Encrypted evidence object is missing.");
   const associatedData = stableJson({ id: row.id, controlId: row.control_id, source: row.source, capturedAt: row.captured_at });
-  const bytes = await decryptEvidence(new Uint8Array(await object.arrayBuffer()), String(row.encryption_iv), associatedData);
+  const keyId = String(row.encryption_key_id || object.customMetadata?.encryptionKeyId || "legacy-v1");
+  const bytes = await decryptEvidence(new Uint8Array(await object.arrayBuffer()), String(row.encryption_iv), associatedData, keyId);
   if (await sha256(bytes) !== row.sha256) throw new Error("Evidence integrity verification failed.");
   return { bytes, row };
 }

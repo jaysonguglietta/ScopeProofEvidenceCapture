@@ -124,11 +124,11 @@ export async function buildAssessorPackage(actor: AuthenticatedUser, assessmentI
     const encrypted = await encryptEvidence(zip, associatedData);
     const r2Key = `exports/${id}.zip.enc`;
     pendingR2Key = r2Key;
-    await env.EVIDENCE_BUCKET.put(r2Key, encrypted.ciphertext, { customMetadata: { packageId: id, sha256: digest, encryptionIv: encrypted.iv, encryptionVersion: "1" } });
+    await env.EVIDENCE_BUCKET.put(r2Key, encrypted.ciphertext, { customMetadata: { packageId: id, sha256: digest, encryptionIv: encrypted.iv, encryptionVersion: "2", encryptionKeyId: encrypted.keyId } });
     const completedAt = new Date().toISOString();
     const expiresAt = new Date(Date.now() + 7 * 86_400_000).toISOString();
     await executeAuditedBatch(actor, "package.created", "export_package", id, { evidenceCount: rows.length, sha256: digest, byteSize: zip.byteLength, expiresAt }, [
-      env.DB.prepare("UPDATE export_packages SET status = 'ready', r2_key = ?, sha256 = ?, signature = ?, evidence_count = ?, excluded_count = ?, byte_size = ?, completed_at = ?, expires_at = ?, error_message = NULL WHERE id = ? AND status = 'building'").bind(r2Key, digest, signature, rows.length, excludedCount, zip.byteLength, completedAt, expiresAt, id),
+      env.DB.prepare("UPDATE export_packages SET status = 'ready', r2_key = ?, sha256 = ?, signature = ?, evidence_count = ?, excluded_count = ?, encryption_key_id = ?, byte_size = ?, completed_at = ?, expires_at = ?, error_message = NULL WHERE id = ? AND status = 'building'").bind(r2Key, digest, signature, rows.length, excludedCount, encrypted.keyId, zip.byteLength, completedAt, expiresAt, id),
     ], { sql: "EXISTS (SELECT 1 FROM export_packages WHERE id = ? AND status = 'ready' AND sha256 = ?)", bindings: [id, digest] });
     return { id, evidenceCount: rows.length, excludedCount, sha256: digest, signature };
   } catch (error) {
@@ -142,14 +142,14 @@ export async function buildAssessorPackage(actor: AuthenticatedUser, assessmentI
 
 export async function readAssessorPackage(id: string, actor: AuthenticatedUser): Promise<{ bytes: Uint8Array; sha256: string } | null> {
   const env = getEnv();
-  const row = await env.DB.prepare("SELECT r2_key, sha256, expires_at FROM export_packages WHERE id = ? AND status = 'ready' AND (requested_by = ? OR ? = 'admin')").bind(id, actor.id, actor.role).first<{ r2_key: string; sha256: string; expires_at: string }>();
+  const row = await env.DB.prepare("SELECT r2_key, sha256, expires_at, encryption_key_id FROM export_packages WHERE id = ? AND status = 'ready' AND (requested_by = ? OR ? = 'admin')").bind(id, actor.id, actor.role).first<{ r2_key: string; sha256: string; expires_at: string; encryption_key_id: string }>();
   if (!row) return null;
   if (new Date(row.expires_at).getTime() < Date.now()) throw new Error("This package download has expired.");
   const object = await env.EVIDENCE_BUCKET.get(row.r2_key);
   if (!object) throw new Error("Encrypted package object is missing.");
   const iv = object.customMetadata?.encryptionIv;
   if (!iv) throw new Error("Package encryption metadata is missing.");
-  const bytes = await decryptEvidence(new Uint8Array(await object.arrayBuffer()), iv, stableJson({ id, type: "assessor_package" }));
+  const bytes = await decryptEvidence(new Uint8Array(await object.arrayBuffer()), iv, stableJson({ id, type: "assessor_package" }), row.encryption_key_id || object.customMetadata?.encryptionKeyId || "legacy-v1");
   if (await sha256(bytes) !== row.sha256) throw new Error("Package integrity verification failed.");
   return { bytes, sha256: row.sha256 };
 }
