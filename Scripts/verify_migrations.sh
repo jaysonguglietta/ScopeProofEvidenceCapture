@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-database="$(mktemp -t scopeproof-migrations).sqlite"
+database="$(mktemp "${TMPDIR:-/tmp}/scopeproof-migrations.XXXXXX")"
 trap 'rm -f "$database"' EXIT HUP INT TERM
 
 for migration in \
