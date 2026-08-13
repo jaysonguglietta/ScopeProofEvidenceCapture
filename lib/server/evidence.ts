@@ -74,7 +74,7 @@ export async function storeEvidence(input: EvidenceInput): Promise<{ id: string;
   const digest = await sha256(bytes);
   if (input.safetyScanSha256 && input.safetyScanSha256 !== digest) throw new Response(JSON.stringify({ error: "Safety scan digest does not match the evidence artifact." }), { status: 422, headers: { "content-type": "application/json" } });
   if (input.type === "screenshot" && (!input.safetyScanSha256 || !input.safetyScanPolicy || !input.safetyScanCompletedAt)) throw new Response(JSON.stringify({ error: "Screenshot evidence requires a digest-bound exact-pixel safety scan." }), { status: 422, headers: { "content-type": "application/json" } });
-  const existing = await env.DB.prepare("SELECT id FROM evidence_artifacts WHERE sha256 = ? AND source = ? AND control_id = ?").bind(digest, input.source, input.controlId).first<{ id: string }>();
+  const existing = await env.DB.prepare("SELECT id FROM evidence_artifacts WHERE sha256 = ? AND source = ? AND control_id = ? AND assessment_id = ?").bind(digest, input.source, input.controlId, input.assessmentId || null).first<{ id: string }>();
   if (existing) return { id: existing.id, deduplicated: true, redactionCount };
   const capturedAt = input.capturedAt || new Date().toISOString();
   const expiresAt = new Date(new Date(capturedAt).getTime() + (input.validityDays || 90) * 86_400_000).toISOString();
