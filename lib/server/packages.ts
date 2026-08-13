@@ -47,17 +47,28 @@ function buildPdf(lines: string[]): Uint8Array {
   return strToU8(pdf);
 }
 
-export async function buildAssessorPackage(actor: AuthenticatedUser): Promise<{ id: string; evidenceCount: number; sha256: string; signature: string }> {
+export async function buildAssessorPackage(actor: AuthenticatedUser, assessmentId: string): Promise<{ id: string; evidenceCount: number; excludedCount: number; sha256: string; signature: string }> {
   const env = getEnv();
+  if (!/^asm_[a-f0-9]{32}$/.test(assessmentId)) throw new Response(JSON.stringify({ error: "A valid assessment is required." }), { status: 400, headers: { "content-type": "application/json" } });
+  const assessment = await env.DB.prepare("SELECT id, name, framework, period_start, period_end, systems_json, controls_json, status FROM assessments WHERE id = ?").bind(assessmentId).first<Record<string, unknown>>();
+  if (!assessment || assessment.status === "draft") throw new Response(JSON.stringify({ error: "Only active or closed assessments can be exported." }), { status: 409, headers: { "content-type": "application/json" } });
   const id = randomId("pkg");
   let pendingR2Key: string | null = null;
-  await executeAuditedBatch(actor, "package.requested", "export_package", id, {}, [
-    env.DB.prepare("INSERT INTO export_packages (id, requested_by) VALUES (?, ?)").bind(id, actor.id),
+  const selection = { assessmentId, name: assessment.name, framework: assessment.framework, periodStart: assessment.period_start, periodEnd: assessment.period_end, systems: JSON.parse(String(assessment.systems_json || "[]")), controls: JSON.parse(String(assessment.controls_json || "[]")), inclusion: "approved, unexpired, complete coverage" };
+  await executeAuditedBatch(actor, "package.requested", "export_package", id, selection, [
+    env.DB.prepare("INSERT INTO export_packages (id, requested_by, assessment_id, selection_json) VALUES (?, ?, ?, ?)").bind(id, actor.id, assessmentId, stableJson(selection)),
   ]);
   try {
     const generatedAt = new Date().toISOString();
-    const rows = (await env.DB.prepare(`SELECT id, control_id, framework, catalog_version, title, description, type, source, system, environment, assessment_period, evidence_owner, tags_json, expected_evidence, mapped_controls_json, jira_issue_key, jira_issue_url, content_type, byte_size, sha256, captured_at, expires_at, redaction_count, manual_redactions, safety_scan_sha256, safety_scan_policy, safety_scan_completed_at, approved_by, approved_at
-      FROM evidence_artifacts WHERE status = 'approved' AND expires_at > ? ORDER BY control_id, captured_at DESC LIMIT 100`).bind(generatedAt).all<Record<string, unknown>>()).results;
+    const counts = await env.DB.prepare("SELECT COUNT(*) AS total, SUM(CASE WHEN status = 'approved' AND expires_at > ? AND coverage_status != 'partial' THEN 1 ELSE 0 END) AS eligible, SUM(CASE WHEN coverage_status = 'partial' THEN 1 ELSE 0 END) AS partial FROM evidence_artifacts WHERE assessment_id = ?").bind(generatedAt, assessmentId).first<{ total: number; eligible: number; partial: number }>();
+    const eligibleCount = Number(counts?.eligible || 0);
+    const totalCount = Number(counts?.total || 0);
+    const excludedCount = totalCount - eligibleCount;
+    if (Number(counts?.partial || 0) > 0) throw new Error("Assessment contains partial-coverage evidence. Recollect it completely before export.");
+    if (eligibleCount > 100) throw new Error(`Assessment contains ${eligibleCount} eligible artifacts, exceeding the 100-artifact package limit. Split the assessment scope explicitly; Scopeproof will not truncate it.`);
+    const rows = (await env.DB.prepare(`SELECT id, control_id, framework, catalog_version, title, description, type, source, system, environment, assessment_period, evidence_owner, tags_json, expected_evidence, mapped_controls_json, jira_issue_key, jira_issue_url, content_type, byte_size, sha256, captured_at, expires_at, redaction_count, manual_redactions, safety_scan_sha256, safety_scan_policy, safety_scan_completed_at, approved_by, approved_at, coverage_status, coverage_json
+      FROM evidence_artifacts WHERE assessment_id = ? AND status = 'approved' AND expires_at > ? AND coverage_status != 'partial' ORDER BY control_id, captured_at DESC, id`).bind(assessmentId, generatedAt).all<Record<string, unknown>>()).results;
+    if (rows.length !== eligibleCount) throw new Error("Assessment evidence changed while the package was being selected. Retry the export.");
     if (!rows.length) throw new Error("No approved evidence is available for export.");
     const files: Record<string, Uint8Array> = {};
     let totalEvidenceBytes = 0;
@@ -85,15 +96,16 @@ export async function buildAssessorPackage(actor: AuthenticatedUser): Promise<{ 
     ];
     files["assessor-report.pdf"] = buildPdf(reportLines);
     const evidence = rows.map((row) => {
-      const { tags_json: tagsJson, mapped_controls_json: mappedControlsJson, ...signedFields } = row;
+      const { tags_json: tagsJson, mapped_controls_json: mappedControlsJson, coverage_json: coverageJson, ...signedFields } = row;
       return {
         ...signedFields,
         package_path: `evidence/${safeName(String(row.framework || "PCI DSS 4.0.1"))}/${safeName(String(row.control_id))}/${String(row.id)}-${safeName(String(row.title))}.${extension(String(row.content_type))}`,
         tags: JSON.parse(String(tagsJson || "[]")),
         mappedControls: JSON.parse(String(mappedControlsJson || "[]")),
+        coverage: JSON.parse(String(coverageJson || "{}")),
       };
     });
-    const manifest = { schemaVersion: 3, packageId: id, frameworks, assessmentPeriods: periods, generatedAt, generatedBy: actor.email, inclusionPolicy: { status: "approved", maximumArtifacts: 100 }, readme: { filename: "00-READ-ME.txt", sha256: await sha256(files["00-READ-ME.txt"]) }, report: { filename: "assessor-report.pdf", sha256: await sha256(files["assessor-report.pdf"]) }, index: { filename: "01-Evidence-Index.csv", sha256: await sha256(files["01-Evidence-Index.csv"]) }, jiraHandoff: { filename: "02-Jira-Handoff.txt", sha256: await sha256(files["02-Jira-Handoff.txt"]) }, evidence };
+    const manifest = { schemaVersion: 4, packageId: id, assessment: selection, frameworks, assessmentPeriods: periods, generatedAt, generatedBy: actor.email, selectionCounts: { total: totalCount, included: rows.length, excluded: excludedCount }, inclusionPolicy: { status: "approved", coverage: "complete_or_not_applicable", expiration: `after:${generatedAt}`, maximumArtifacts: 100, truncation: "forbidden" }, readme: { filename: "00-READ-ME.txt", sha256: await sha256(files["00-READ-ME.txt"]) }, report: { filename: "assessor-report.pdf", sha256: await sha256(files["assessor-report.pdf"]) }, index: { filename: "01-Evidence-Index.csv", sha256: await sha256(files["01-Evidence-Index.csv"]) }, jiraHandoff: { filename: "02-Jira-Handoff.txt", sha256: await sha256(files["02-Jira-Handoff.txt"]) }, evidence };
     const manifestCanonical = stableJson(manifest);
     const signed = await signPackage(manifestCanonical);
     const signature = signed.signature;
@@ -110,9 +122,9 @@ export async function buildAssessorPackage(actor: AuthenticatedUser): Promise<{ 
     const completedAt = new Date().toISOString();
     const expiresAt = new Date(Date.now() + 7 * 86_400_000).toISOString();
     await executeAuditedBatch(actor, "package.created", "export_package", id, { evidenceCount: rows.length, sha256: digest, byteSize: zip.byteLength, expiresAt }, [
-      env.DB.prepare("UPDATE export_packages SET status = 'ready', r2_key = ?, sha256 = ?, signature = ?, evidence_count = ?, byte_size = ?, completed_at = ?, expires_at = ?, error_message = NULL WHERE id = ? AND status = 'building'").bind(r2Key, digest, signature, rows.length, zip.byteLength, completedAt, expiresAt, id),
+      env.DB.prepare("UPDATE export_packages SET status = 'ready', r2_key = ?, sha256 = ?, signature = ?, evidence_count = ?, excluded_count = ?, byte_size = ?, completed_at = ?, expires_at = ?, error_message = NULL WHERE id = ? AND status = 'building'").bind(r2Key, digest, signature, rows.length, excludedCount, zip.byteLength, completedAt, expiresAt, id),
     ], { sql: "EXISTS (SELECT 1 FROM export_packages WHERE id = ? AND status = 'ready' AND sha256 = ?)", bindings: [id, digest] });
-    return { id, evidenceCount: rows.length, sha256: digest, signature };
+    return { id, evidenceCount: rows.length, excludedCount, sha256: digest, signature };
   } catch (error) {
     if (pendingR2Key) await env.EVIDENCE_BUCKET.delete(pendingR2Key);
     await executeAuditedBatch(actor, "package.failed", "export_package", id, { errorCode: "PACKAGE_GENERATION_FAILED" }, [

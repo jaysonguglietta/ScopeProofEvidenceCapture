@@ -16,6 +16,20 @@ export const securityInvariants = sqliteTable("security_invariants", {
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
 });
 
+export const assessments = sqliteTable("assessments", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull(),
+  framework: text("framework").notNull(),
+  periodStart: text("period_start").notNull(),
+  periodEnd: text("period_end").notNull(),
+  systemsJson: text("systems_json").notNull().default("[]"),
+  controlsJson: text("controls_json").notNull().default("[]"),
+  ownerId: text("owner_id").notNull(),
+  status: text("status", { enum: ["draft", "active", "closed"] }).notNull().default("draft"),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [index("idx_assessments_status_period").on(table.status, table.periodEnd), index("idx_assessments_owner").on(table.ownerId)]);
+
 export const captureDevices = sqliteTable("capture_devices", {
   id: text("id").primaryKey(),
   displayName: text("display_name").notNull(),
@@ -74,6 +88,9 @@ export const collectionJobs = sqliteTable("collection_jobs", {
   completedAt: text("completed_at"),
   leaseId: text("lease_id"),
   leaseExpiresAt: text("lease_expires_at"),
+  assessmentId: text("assessment_id"),
+  coverageStatus: text("coverage_status", { enum: ["complete", "partial", "unknown"] }).notNull().default("unknown"),
+  coverageJson: text("coverage_json").notNull().default("{}"),
 }, (table) => [index("idx_jobs_status_next_attempt").on(table.status, table.nextAttemptAt), index("idx_jobs_collector_created").on(table.collectorId, table.createdAt)]);
 
 export const evidenceArtifacts = sqliteTable("evidence_artifacts", {
@@ -125,6 +142,9 @@ export const evidenceArtifacts = sqliteTable("evidence_artifacts", {
   purgedAt: text("purged_at"),
   purgeAttempts: integer("purge_attempts").notNull().default(0),
   purgeError: text("purge_error"),
+  assessmentId: text("assessment_id"),
+  coverageStatus: text("coverage_status", { enum: ["complete", "partial", "not_applicable"] }).notNull().default("not_applicable"),
+  coverageJson: text("coverage_json").notNull().default("{}"),
 }, (table) => [
   uniqueIndex("idx_evidence_sha_source_control").on(table.sha256, table.source, table.controlId),
   index("idx_evidence_status_created").on(table.status, table.createdAt),
@@ -134,6 +154,7 @@ export const evidenceArtifacts = sqliteTable("evidence_artifacts", {
   index("idx_evidence_device_captured").on(table.deviceId, table.capturedAt),
   index("idx_evidence_session").on(table.sessionId),
   index("idx_evidence_jira_issue").on(table.jiraIssueKey),
+  index("idx_evidence_assessment_status").on(table.assessmentId, table.status),
 ]);
 
 export const retentionHolds = sqliteTable("retention_holds", {
@@ -194,7 +215,10 @@ export const exportPackages = sqliteTable("export_packages", {
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
   completedAt: text("completed_at"),
   expiresAt: text("expires_at"),
-}, (table) => [index("idx_exports_requested_created").on(table.requestedBy, table.createdAt)]);
+  assessmentId: text("assessment_id"),
+  selectionJson: text("selection_json").notNull().default("{}"),
+  excludedCount: integer("excluded_count").notNull().default(0),
+}, (table) => [index("idx_exports_requested_created").on(table.requestedBy, table.createdAt), index("idx_exports_assessment_created").on(table.assessmentId, table.createdAt)]);
 
 export const jiraConnections = sqliteTable("jira_connections", {
   id: text("id").primaryKey(),
