@@ -30,6 +30,7 @@ export interface Evidence {
   mappedControls?: Array<{ framework: string; controlID: string; relationship: string }>;
   jiraIssueKey?: string;
   jiraIssueURL?: string;
+  assessmentId?: string;
 }
 
 export interface Control {
@@ -53,6 +54,7 @@ export interface CollectionRun {
   controls: number;
   duration: string;
   note?: string;
+  assessmentId?: string;
 }
 
 export interface Finding {

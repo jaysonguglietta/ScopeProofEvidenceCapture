@@ -20,6 +20,8 @@ ALTER TABLE `collection_jobs` ADD `coverage_json` text DEFAULT '{}' NOT NULL;-->
 ALTER TABLE `evidence_artifacts` ADD `assessment_id` text;--> statement-breakpoint
 ALTER TABLE `evidence_artifacts` ADD `coverage_status` text DEFAULT 'not_applicable' NOT NULL;--> statement-breakpoint
 ALTER TABLE `evidence_artifacts` ADD `coverage_json` text DEFAULT '{}' NOT NULL;--> statement-breakpoint
+DROP INDEX `idx_evidence_sha_source_control`;--> statement-breakpoint
+CREATE UNIQUE INDEX `idx_evidence_sha_source_control_assessment` ON `evidence_artifacts` (`sha256`,`source`,`control_id`,`assessment_id`);--> statement-breakpoint
 CREATE INDEX `idx_evidence_assessment_status` ON `evidence_artifacts` (`assessment_id`,`status`);--> statement-breakpoint
 ALTER TABLE `export_packages` ADD `assessment_id` text;--> statement-breakpoint
 ALTER TABLE `export_packages` ADD `selection_json` text DEFAULT '{}' NOT NULL;--> statement-breakpoint

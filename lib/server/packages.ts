@@ -60,7 +60,13 @@ export async function buildAssessorPackage(actor: AuthenticatedUser, assessmentI
   ]);
   try {
     const generatedAt = new Date().toISOString();
-    const counts = await env.DB.prepare("SELECT COUNT(*) AS total, SUM(CASE WHEN status = 'approved' AND expires_at > ? AND coverage_status != 'partial' THEN 1 ELSE 0 END) AS eligible, SUM(CASE WHEN coverage_status = 'partial' THEN 1 ELSE 0 END) AS partial FROM evidence_artifacts WHERE assessment_id = ?").bind(generatedAt, assessmentId).first<{ total: number; eligible: number; partial: number }>();
+    const counts = await env.DB.prepare(`SELECT COUNT(*) AS total,
+      SUM(CASE WHEN e.status = 'approved' AND e.expires_at > ? AND e.coverage_status != 'partial' THEN 1 ELSE 0 END) AS eligible,
+      SUM(CASE WHEN e.coverage_status = 'partial' AND e.status IN ('needs_review','expiring') AND e.expires_at > ?
+        AND NOT EXISTS (SELECT 1 FROM evidence_artifacts newer WHERE newer.assessment_id = e.assessment_id AND newer.control_id = e.control_id
+          AND newer.source = e.source AND newer.system = e.system AND newer.coverage_status != 'partial' AND newer.captured_at > e.captured_at
+          AND newer.status NOT IN ('rejected','expired','purged') AND newer.expires_at > ?) THEN 1 ELSE 0 END) AS partial
+      FROM evidence_artifacts e WHERE e.assessment_id = ?`).bind(generatedAt, generatedAt, generatedAt, assessmentId).first<{ total: number; eligible: number; partial: number }>();
     const eligibleCount = Number(counts?.eligible || 0);
     const totalCount = Number(counts?.total || 0);
     const excludedCount = totalCount - eligibleCount;
