@@ -1,0 +1,9 @@
+# Production security and release surfaces require explicit owner review.
+/.github/ @jaysonguglietta
+/.openai/ @jaysonguglietta
+/app/api/ @jaysonguglietta
+/db/ @jaysonguglietta
+/drizzle/ @jaysonguglietta
+/lib/server/ @jaysonguglietta
+/macos/ @jaysonguglietta
+/Scripts/ @jaysonguglietta

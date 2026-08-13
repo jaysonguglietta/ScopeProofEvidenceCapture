@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased — production evidence correctness and operations
+
+- Replaced demo-derived compliance state with fail-closed, assessment-scoped authoritative records.
+- Added complete/partial collector coverage provenance and non-truncating assessment exports.
+- Added versioned evidence, export, audit, Jira-token, and Jira-receipt key references with bounded audited rotation.
+- Added signed audit-chain checkpoints, optional independent delivery, production readiness checks, and HMAC-authenticated monitoring health.
+- Added migration replay, native macOS CI, immutable GitHub Action references, SBOM/provenance artifacts, CODEOWNERS, and dependency automation.
+- Added key-management, backup/recovery, monitoring, incident-response, launch-authorization, and production macOS release procedures.
+
 All notable Scopeproof changes are recorded here. Dates use the repository’s release timezone.
 
 ## 1.4.0 — 2026-08-12

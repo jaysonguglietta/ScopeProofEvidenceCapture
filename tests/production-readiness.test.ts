@@ -98,3 +98,18 @@ test("audit checkpoints are independently signed, stored, and host allowlisted",
   assert.match(checkpoints, /allowedOrigins: \[url\.origin\]/);
   assert.match(jobs, /createAuditCheckpoint\(now\)/);
 });
+
+test("release and operations controls are executable and fail closed", async () => {
+  const workflow = await read(".github/workflows/security.yml");
+  const monitoring = await read("lib/server/monitoring.ts");
+  const operations = await read("docs/PRODUCTION_OPERATIONS.md");
+  assert.doesNotMatch(workflow, /uses: actions\/(checkout|setup-node|upload-artifact)@v\d/);
+  assert.match(workflow, /working-directory: macos\/ScopeproofCapture/);
+  assert.match(workflow, /verify_migrations\.sh/);
+  assert.match(workflow, /actions\/attest@[a-f0-9]{40}/);
+  assert.match(monitoring, /SECURITY_EVENT_ALLOWED_HOSTS/);
+  assert.match(monitoring, /x-scopeproof-signature/);
+  assert.match(operations, /Quarterly recovery drill/);
+  assert.match(operations, /single-tenant/);
+  assert.match(operations, /Launch authorization checklist/);
+});
