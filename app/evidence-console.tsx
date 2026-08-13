@@ -258,7 +258,12 @@ export function EvidenceConsole() {
       const response = await fetch("/api/packages", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ assessmentId: selectedAssessmentId }) });
       if (!response.ok) throw new Error(await apiError(response));
       const data = await response.json() as { package: { id: string; evidenceCount: number } };
-      window.location.assign(`/api/packages/${encodeURIComponent(data.package.id)}`);
+      const download = document.createElement("a");
+      download.href = `/api/packages/${encodeURIComponent(data.package.id)}`;
+      download.setAttribute("download", "");
+      document.body.appendChild(download);
+      download.click();
+      download.remove();
       setModal(null); setToast(`Signed package ready with ${data.package.evidenceCount} encrypted artifacts.`);
     } catch (error) { setToast(error instanceof Error ? error.message : "Package generation failed."); }
     finally { setBusy(false); }
