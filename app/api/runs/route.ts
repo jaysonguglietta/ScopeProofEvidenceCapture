@@ -20,12 +20,14 @@ export async function POST(request: Request) {
     await enforceRateLimit(request, user.id, "collection:queue", 20, 3_600);
     requireBoundedContentLength(request, 8 * 1024);
     await ensureDefaultCollectors(user);
-    const body = await request.json() as { collectorIds?: string[] };
+    const body = await request.json() as { collectorIds?: string[]; assessmentId?: string };
     const ids = [...new Set(body.collectorIds || [])].filter((id) => /^collector_(aws|github|okta|cloudflare|browser)$/.test(id)).slice(0, 5);
     if (!ids.length) return Response.json({ error: "Select at least one valid collector." }, { status: 400 });
+    const assessmentId = String(body.assessmentId || "");
+    if (!/^asm_[a-f0-9]{32}$/.test(assessmentId)) return Response.json({ error: "Select an active assessment before collecting evidence." }, { status: 400 });
     const results = [];
     for (const collectorId of ids) {
-      const jobId = await queueCollection(collectorId, user);
+      const jobId = await queueCollection(collectorId, user, "manual", assessmentId);
       results.push({ jobId, collectorId, ...(await processJob(jobId, user)) });
     }
     return Response.json({ results }, { status: results.some((result) => result.status === "failed") ? 207 : 200 });

@@ -19,6 +19,7 @@ export async function POST(request: Request) {
     const system = String(form.get("system") || "").trim().slice(0, 180);
     const description = String(form.get("description") || "").trim().slice(0, 2000);
     const type = String(form.get("type") || "code").toLowerCase() as ArtifactType;
+    const assessmentId = String(form.get("assessmentId") || "").trim();
     if (!title || !controlId || !system || !["code", "configuration", "report"].includes(type)) return Response.json({ error: "Title, control, system, and a scannable text evidence type are required. Screenshots must use a digest-bound capture workflow." }, { status: 400 });
     const attachment = form.get("attachment");
     let contentType = "text/plain";
@@ -29,7 +30,8 @@ export async function POST(request: Request) {
       contentType = attachment.type || "text/plain";
       bytes = new Uint8Array(await attachment.arrayBuffer());
     }
-    const result = await storeEvidence({ controlId, title, description, type, source: "Manual submission", system, contentType, bytes, createdBy: user });
+    if (!/^asm_[a-f0-9]{32}$/.test(assessmentId)) return Response.json({ error: "Select an open assessment for this evidence." }, { status: 400 });
+    const result = await storeEvidence({ controlId, title, description, type, source: "Manual submission", system, contentType, bytes, createdBy: user, assessmentId, framework: String(form.get("framework") || "PCI DSS 4.0.1").slice(0, 100), assessmentPeriod: String(form.get("assessmentPeriod") || "").slice(0, 100) });
     return Response.json(result, { status: result.deduplicated ? 200 : 201 });
   } catch (error) { return jsonError(error); }
 }

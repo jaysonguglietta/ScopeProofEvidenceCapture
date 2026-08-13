@@ -51,6 +51,11 @@ export async function POST(request: Request) {
     try { trustedTimestamp = await requestTrustedTimestamp(imageDigest); } catch (error) { trustedTimestampError = error instanceof Error ? error.message.slice(0, 300) : "Timestamp authority unavailable"; }
     const timestampAuthority = trustedTimestamp?.authority || "Scopeproof signed server time";
     const timestampToken = JSON.stringify({ ...attestationBody, signature: signed.signature, publicKeySpkiBase64: signed.publicKey, algorithm: "ECDSA-P256-SHA256", trustedTimestamp, trustedTimestampError });
+    const candidateAssessments = (await getEnv().DB.prepare("SELECT id, framework, systems_json, controls_json FROM assessments WHERE status = 'active' ORDER BY period_end DESC LIMIT 20").all<{ id: string; framework: string; systems_json: string; controls_json: string }>()).results.filter((assessment) => {
+      const systems = JSON.parse(assessment.systems_json || "[]") as string[]; const controls = JSON.parse(assessment.controls_json || "[]") as string[];
+      return assessment.framework === complianceArea && (!systems.length || systems.includes(system)) && (!controls.length || controls.includes(controlId));
+    });
+    if (candidateAssessments.length !== 1) return Response.json({ error: candidateAssessments.length ? "Capture matches multiple active assessments; close or narrow the overlapping scopes." : "Capture does not match an active assessment scope." }, { status: 409 });
     const result = await storeEvidence({
       controlId, framework: complianceArea, catalogVersion, title, description: manifest.description, type: "screenshot", source: `Scopeproof Capture / ${device.displayName} / ${complianceArea}`, system,
       environment, assessmentPeriod, evidenceOwner, tags, expectedEvidence, mappedControls, jiraIssueKey, jiraIssueURL, manualRedactions,
@@ -58,6 +63,7 @@ export async function POST(request: Request) {
       manifestSha256: attestationBody.manifestSha256, chainPreviousHash: attestationBody.chainPreviousHash, chainEventHash: attestationBody.chainEventHash,
       timestampAuthority, timestampToken,
       safetyScanSha256: manifest.safetyScanSha256, safetyScanPolicy: manifest.safetyScanPolicy, safetyScanCompletedAt: manifest.safetyScanCompletedAt,
+      assessmentId: candidateAssessments[0].id,
     });
     const hostedArtifact = await getEnv().DB.prepare("SELECT device_id, created_by, sha256, manifest_sha256, jira_issue_key FROM evidence_artifacts WHERE id = ?")
       .bind(result.id).first<{ device_id: string | null; created_by: string; sha256: string; manifest_sha256: string | null; jira_issue_key: string | null }>();

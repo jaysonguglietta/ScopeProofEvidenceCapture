@@ -23,13 +23,14 @@ export async function ensureDefaultCollectors(actor: AuthenticatedUser): Promise
   }
 }
 
-export async function queueCollection(collectorId: string, actor: AuthenticatedUser, triggerType: "manual" | "scheduled" | "retry" = "manual"): Promise<string> {
+export async function queueCollection(collectorId: string, actor: AuthenticatedUser, triggerType: "manual" | "scheduled" | "retry" = "manual", assessmentId?: string): Promise<string> {
   const env = getEnv();
   const collector = await env.DB.prepare("SELECT id FROM collectors WHERE id = ? AND enabled = 1").bind(collectorId).first();
   if (!collector) throw new Error("Collector is unavailable or disabled.");
+  if (assessmentId && !(await env.DB.prepare("SELECT 1 FROM assessments WHERE id = ? AND status = 'active'").bind(assessmentId).first())) throw new Response(JSON.stringify({ error: "Collections require an active assessment." }), { status: 409, headers: { "content-type": "application/json" } });
   const id = randomId("job");
   await executeAuditedBatch(actor, "collection.queued", "collection_job", id, { collectorId, triggerType }, [
-    env.DB.prepare("INSERT INTO collection_jobs (id, collector_id, requested_by, trigger_type) VALUES (?, ?, ?, ?)").bind(id, collectorId, actor.id, triggerType),
+    env.DB.prepare("INSERT INTO collection_jobs (id, collector_id, requested_by, trigger_type, assessment_id) VALUES (?, ?, ?, ?, ?)").bind(id, collectorId, actor.id, triggerType, assessmentId || null),
   ]);
   return id;
 }
@@ -52,20 +53,21 @@ export async function processJob(jobId: string, actor?: AuthenticatedUser): Prom
   ], { sql: "EXISTS (SELECT 1 FROM collection_jobs WHERE id = ? AND lease_id = ?)", bindings: [jobId, leaseId] });
   if (!claim.meta.changes) return { status: String(job.status), artifacts: Number(job.artifact_count || 0), error: "Collection job is already claimed." };
   try {
-    const artifacts = await runCollector(String(collector.provider) as CollectorProvider, { actor: runActor, config: JSON.parse(String(collector.config_json || "{}")) });
+    const collection = await runCollector(String(collector.provider) as CollectorProvider, { actor: runActor, config: JSON.parse(String(collector.config_json || "{}")) });
     let stored = 0;
-    for (const artifact of artifacts) {
+    for (const artifact of collection.artifacts) {
       const ownsLease = await env.DB.prepare("SELECT 1 FROM collection_jobs WHERE id = ? AND status = 'running' AND lease_id = ? AND lease_expires_at > ?").bind(jobId, leaseId, new Date().toISOString()).first();
       if (!ownsLease) throw new CollectorError("Collection lease expired before evidence persistence.", "LEASE_LOST", true);
-      const result = await storeEvidence({ ...artifact, createdBy: runActor, collectorId: String(collector.id), jobId });
+      const result = await storeEvidence({ ...artifact, createdBy: runActor, collectorId: String(collector.id), jobId, assessmentId: job.assessment_id ? String(job.assessment_id) : undefined, coverageStatus: collection.coverage.complete ? "complete" : "partial", coverage: collection.coverage });
       if (!result.deduplicated) stored += 1;
     }
     const completed = new Date().toISOString();
-    await executeAuditedBatch(runActor, "collection.completed", "collection_job", jobId, { collectorId: collector.id, artifactCount: stored, attempt }, [
-      env.DB.prepare("UPDATE collection_jobs SET status = 'completed', artifact_count = ?, completed_at = ?, lease_id = NULL, lease_expires_at = NULL WHERE id = ? AND status = 'running' AND lease_id = ?").bind(stored, completed, jobId, leaseId),
-      env.DB.prepare("UPDATE collectors SET status = 'healthy', last_run_at = ?, last_error = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND EXISTS (SELECT 1 FROM collection_jobs WHERE id = ? AND status = 'completed' AND completed_at = ?)").bind(completed, collector.id, jobId, completed),
-    ], { sql: "EXISTS (SELECT 1 FROM collection_jobs WHERE id = ? AND status = 'completed' AND completed_at = ?)", bindings: [jobId, completed] });
-    return { status: "completed", artifacts: stored };
+    const finalStatus = collection.coverage.complete ? "completed" : "partial";
+    await executeAuditedBatch(runActor, `collection.${finalStatus}`, "collection_job", jobId, { collectorId: collector.id, artifactCount: stored, attempt, coverage: collection.coverage }, [
+      env.DB.prepare("UPDATE collection_jobs SET status = ?, artifact_count = ?, completed_at = ?, coverage_status = ?, coverage_json = ?, lease_id = NULL, lease_expires_at = NULL WHERE id = ? AND status = 'running' AND lease_id = ?").bind(finalStatus, stored, completed, collection.coverage.complete ? "complete" : "partial", JSON.stringify(collection.coverage), jobId, leaseId),
+      env.DB.prepare("UPDATE collectors SET status = ?, last_run_at = ?, last_error = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND EXISTS (SELECT 1 FROM collection_jobs WHERE id = ? AND status = ? AND completed_at = ?)").bind(collection.coverage.complete ? "healthy" : "action_needed", completed, collection.coverage.complete ? null : collection.coverage.omissions.join(" ").slice(0, 1000), collector.id, jobId, finalStatus, completed),
+    ], { sql: "EXISTS (SELECT 1 FROM collection_jobs WHERE id = ? AND status = ? AND completed_at = ?)", bindings: [jobId, finalStatus, completed] });
+    return { status: finalStatus, artifacts: stored, error: collection.coverage.complete ? undefined : collection.coverage.omissions.join(" ") };
   } catch (error) {
     const collectorError = error instanceof CollectorError ? error : new CollectorError(error instanceof Error ? error.message : "Unknown collector failure", "INTERNAL_ERROR", true);
     const maxAttempts = Number(job.max_attempts || 3);
@@ -88,7 +90,9 @@ export async function processDueWork(now = new Date()): Promise<void> {
   const collectors = (await env.DB.prepare("SELECT id, schedule_cron, last_run_at FROM collectors WHERE enabled = 1 AND schedule_cron IS NOT NULL").all<{ id: string; schedule_cron: string; last_run_at: string | null }>()).results;
   for (const collector of collectors) {
     if (!isCronDue(collector.schedule_cron, now, collector.last_run_at ? new Date(collector.last_run_at) : null)) continue;
-    const jobId = await queueCollection(collector.id, systemActor, "scheduled");
+    const assessment = await env.DB.prepare("SELECT id FROM assessments WHERE status = 'active' ORDER BY period_end DESC LIMIT 1").first<{ id: string }>();
+    if (!assessment) { console.error("scopeproof_scheduled_collection_skipped", { collectorId: collector.id, reason: "no_active_assessment" }); continue; }
+    const jobId = await queueCollection(collector.id, systemActor, "scheduled", assessment.id);
     await processJob(jobId, systemActor);
   }
 }

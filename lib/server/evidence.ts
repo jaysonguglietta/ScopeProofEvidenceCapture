@@ -2,6 +2,7 @@ import type { AuthenticatedUser } from "./auth";
 import { executeAuditedBatch } from "./audit";
 import { decryptEvidence, encryptEvidence, randomId, sha256, stableJson } from "./crypto";
 import { getEnv } from "./env";
+import { getAssessment } from "./assessments";
 import { redactText, type RedactionFinding } from "./redaction";
 
 export type ArtifactType = "screenshot" | "code" | "configuration" | "report";
@@ -41,6 +42,9 @@ export interface EvidenceInput {
   safetyScanSha256?: string;
   safetyScanPolicy?: string;
   safetyScanCompletedAt?: string;
+  assessmentId?: string;
+  coverageStatus?: "complete" | "partial" | "not_applicable";
+  coverage?: Record<string, unknown>;
 }
 
 function isTextual(contentType: string): boolean {
@@ -49,6 +53,15 @@ function isTextual(contentType: string): boolean {
 
 export async function storeEvidence(input: EvidenceInput): Promise<{ id: string; deduplicated: boolean; redactionCount: number }> {
   const env = getEnv();
+  if (input.assessmentId) {
+    const assessment = await getAssessment(input.assessmentId);
+    if (!assessment || assessment.status === "closed") throw new Response(JSON.stringify({ error: "Evidence must target an open assessment." }), { status: 409, headers: { "content-type": "application/json" } });
+    const systems = assessment.systems as string[];
+    const controls = assessment.controls as string[];
+    if (String(assessment.framework) !== (input.framework || "PCI DSS 4.0.1") || (systems.length && !systems.includes(input.system)) || (controls.length && !controls.includes(input.controlId))) {
+      throw new Response(JSON.stringify({ error: "Evidence falls outside the selected assessment scope." }), { status: 422, headers: { "content-type": "application/json" } });
+    }
+  }
   const id = randomId("ev");
   let bytes = input.bytes;
   const findings = [...(input.preflightFindings || [])];
@@ -61,7 +74,7 @@ export async function storeEvidence(input: EvidenceInput): Promise<{ id: string;
   const digest = await sha256(bytes);
   if (input.safetyScanSha256 && input.safetyScanSha256 !== digest) throw new Response(JSON.stringify({ error: "Safety scan digest does not match the evidence artifact." }), { status: 422, headers: { "content-type": "application/json" } });
   if (input.type === "screenshot" && (!input.safetyScanSha256 || !input.safetyScanPolicy || !input.safetyScanCompletedAt)) throw new Response(JSON.stringify({ error: "Screenshot evidence requires a digest-bound exact-pixel safety scan." }), { status: 422, headers: { "content-type": "application/json" } });
-  const existing = await env.DB.prepare("SELECT id FROM evidence_artifacts WHERE sha256 = ? AND source = ? AND control_id = ?").bind(digest, input.source, input.controlId).first<{ id: string }>();
+  const existing = await env.DB.prepare("SELECT id FROM evidence_artifacts WHERE sha256 = ? AND source = ? AND control_id = ? AND assessment_id = ?").bind(digest, input.source, input.controlId, input.assessmentId || null).first<{ id: string }>();
   if (existing) return { id: existing.id, deduplicated: true, redactionCount };
   const capturedAt = input.capturedAt || new Date().toISOString();
   const expiresAt = new Date(new Date(capturedAt).getTime() + (input.validityDays || 90) * 86_400_000).toISOString();
@@ -71,14 +84,15 @@ export async function storeEvidence(input: EvidenceInput): Promise<{ id: string;
   await env.EVIDENCE_BUCKET.put(r2Key, encrypted.ciphertext, { customMetadata: { evidenceId: id, sha256: digest, encryptionVersion: "1" }, httpMetadata: { contentType: "application/octet-stream" } });
   try {
     const insert = env.DB.prepare(`INSERT INTO evidence_artifacts
-      (id, control_id, framework, catalog_version, title, description, type, source, system, environment, assessment_period, evidence_owner, tags_json, expected_evidence, mapped_controls_json, jira_issue_key, jira_issue_url, manual_redactions, collector_id, job_id, session_id, device_id, r2_key, content_type, byte_size, sha256, encryption_iv, captured_at, expires_at, redaction_count, redaction_summary_json, manifest_sha256, chain_previous_hash, chain_event_hash, timestamp_authority, timestamp_token, safety_scan_sha256, safety_scan_policy, safety_scan_completed_at, created_by)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(
+      (id, control_id, framework, catalog_version, title, description, type, source, system, environment, assessment_period, evidence_owner, tags_json, expected_evidence, mapped_controls_json, jira_issue_key, jira_issue_url, manual_redactions, collector_id, job_id, session_id, device_id, r2_key, content_type, byte_size, sha256, encryption_iv, captured_at, expires_at, redaction_count, redaction_summary_json, manifest_sha256, chain_previous_hash, chain_event_hash, timestamp_authority, timestamp_token, safety_scan_sha256, safety_scan_policy, safety_scan_completed_at, created_by, assessment_id, coverage_status, coverage_json)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`).bind(
       id, input.controlId, input.framework || "PCI DSS 4.0.1", input.catalogVersion || null, input.title, input.description, input.type, input.source, input.system,
       input.environment || null, input.assessmentPeriod || null, input.evidenceOwner || null, stableJson(input.tags || []), input.expectedEvidence || null,
       stableJson(input.mappedControls || []), input.jiraIssueKey || null, input.jiraIssueURL || null, Math.max(0, Math.min(input.manualRedactions || 0, 10_000)), input.collectorId || null, input.jobId || null,
       input.sessionId || null, input.deviceId || null, r2Key, input.contentType, bytes.byteLength, digest, encrypted.iv, capturedAt, expiresAt, redactionCount, stableJson(findings),
       input.manifestSha256 || null, input.chainPreviousHash || null, input.chainEventHash || null, input.timestampAuthority || null, input.timestampToken || null,
-      input.safetyScanSha256 || null, input.safetyScanPolicy || null, input.safetyScanCompletedAt || null, input.createdBy.id,
+      input.safetyScanSha256 || null, input.safetyScanPolicy || null, input.safetyScanCompletedAt || null, input.createdBy.id, input.assessmentId || null,
+      input.coverageStatus || (input.collectorId ? "complete" : "not_applicable"), stableJson(input.coverage || {}),
     );
     await executeAuditedBatch(input.createdBy, "evidence.created", "evidence", id, { controlId: input.controlId, source: input.source, jiraIssueKey: input.jiraIssueKey || null, sha256: digest, redactionCount, byteSize: bytes.byteLength }, [insert]);
   } catch (error) {
@@ -91,10 +105,10 @@ export async function storeEvidence(input: EvidenceInput): Promise<{ id: string;
 export async function listEvidence(limit = 100): Promise<Array<Record<string, unknown>>> {
   const rows = (await getEnv().DB.prepare(`SELECT id, control_id, framework, catalog_version, title, description, type, source, system, environment, assessment_period, evidence_owner, tags_json, expected_evidence, mapped_controls_json, jira_issue_key, jira_issue_url, manual_redactions, collector_id, job_id, session_id, device_id, content_type, byte_size, sha256, captured_at, expires_at,
       CASE WHEN status != 'purged' AND expires_at <= ? THEN 'expired' ELSE status END AS status,
-      redaction_count, redaction_summary_json, manifest_sha256, chain_previous_hash, chain_event_hash, timestamp_authority, safety_scan_sha256, safety_scan_policy, safety_scan_completed_at, created_by, created_at, approved_by, approved_at,
+      redaction_count, redaction_summary_json, manifest_sha256, chain_previous_hash, chain_event_hash, timestamp_authority, safety_scan_sha256, safety_scan_policy, safety_scan_completed_at, created_by, created_at, approved_by, approved_at, assessment_id, coverage_status, coverage_json,
       (SELECT expires_at FROM retention_holds WHERE evidence_id = evidence_artifacts.id AND expires_at > ?) AS retention_hold_expires_at
     FROM evidence_artifacts ORDER BY captured_at DESC LIMIT ?`).bind(new Date().toISOString(), new Date().toISOString(), Math.min(Math.max(limit, 1), 250)).all<Record<string, unknown>>()).results;
-  return rows.map((row: Record<string, unknown>) => ({ ...row, redaction_summary: JSON.parse(String(row.redaction_summary_json || "[]")), tags: JSON.parse(String(row.tags_json || "[]")), mapped_controls: JSON.parse(String(row.mapped_controls_json || "[]")), redaction_summary_json: undefined, tags_json: undefined, mapped_controls_json: undefined }));
+  return rows.map((row: Record<string, unknown>) => ({ ...row, redaction_summary: JSON.parse(String(row.redaction_summary_json || "[]")), tags: JSON.parse(String(row.tags_json || "[]")), mapped_controls: JSON.parse(String(row.mapped_controls_json || "[]")), coverage: JSON.parse(String(row.coverage_json || "{}")), redaction_summary_json: undefined, tags_json: undefined, mapped_controls_json: undefined, coverage_json: undefined }));
 }
 
 export async function readEvidenceBytes(id: string): Promise<{ bytes: Uint8Array; row: Record<string, unknown> } | null> {
@@ -114,11 +128,12 @@ export async function approveEvidence(id: string, actor: AuthenticatedUser, revi
   const expectedSha256 = review.expectedSha256.trim().toLowerCase();
   const rationale = review.rationale.trim();
   if (!/^[a-f0-9]{64}$/.test(expectedSha256) || rationale.length < 20 || rationale.length > 1_000) throw new Response(JSON.stringify({ error: "Approval requires the full artifact digest and a 20–1,000 character review rationale." }), { status: 400, headers: { "content-type": "application/json" } });
-  const artifact = await getEnv().DB.prepare("SELECT id, sha256, created_by, status, expires_at FROM evidence_artifacts WHERE id = ?").bind(id).first<{ id: string; sha256: string; created_by: string; status: string; expires_at: string }>();
+  const artifact = await getEnv().DB.prepare("SELECT id, sha256, created_by, status, expires_at, coverage_status FROM evidence_artifacts WHERE id = ?").bind(id).first<{ id: string; sha256: string; created_by: string; status: string; expires_at: string; coverage_status: string }>();
   if (!artifact) throw new Response(JSON.stringify({ error: "Evidence not found" }), { status: 404, headers: { "content-type": "application/json" } });
   if (new Date(artifact.expires_at).getTime() <= Date.now() || artifact.status === "purged") throw new Response(JSON.stringify({ error: "Expired evidence cannot be approved." }), { status: 410, headers: { "content-type": "application/json" } });
   if (artifact.created_by === actor.id) throw new Response(JSON.stringify({ error: "Collectors and uploaders cannot approve their own evidence." }), { status: 403, headers: { "content-type": "application/json" } });
   if (artifact.sha256 !== expectedSha256) throw new Response(JSON.stringify({ error: "The reviewed artifact digest changed. Reload and inspect the evidence again." }), { status: 409, headers: { "content-type": "application/json" } });
+  if (artifact.coverage_status === "partial") throw new Response(JSON.stringify({ error: "Partial collector evidence cannot be approved as complete. Resolve the coverage gap and recollect it." }), { status: 409, headers: { "content-type": "application/json" } });
   const approvedAt = new Date().toISOString();
   const [result] = await executeAuditedBatch(actor, "evidence.approved", "evidence", id, { artifactSha256: expectedSha256, rationale }, [
     getEnv().DB.prepare("UPDATE evidence_artifacts SET status = 'approved', approved_by = ?, approved_at = ? WHERE id = ? AND sha256 = ? AND created_by != ? AND status IN ('needs_review', 'expiring') AND expires_at > ?").bind(actor.id, approvedAt, id, expectedSha256, actor.id, approvedAt),

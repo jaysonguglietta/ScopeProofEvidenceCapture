@@ -2,11 +2,11 @@
 
 import { useEffect, useMemo, useState } from "react";
 import Image from "next/image";
-import { controls, evidence as seedEvidence, findings, requirementCoverage, runs as seedRuns } from "../lib/data";
+import { controls } from "../lib/data";
 import type { CollectionRun, Evidence, EvidenceStatus } from "../lib/types";
 
 type View = "Overview" | "Controls" | "Evidence" | "Collection runs" | "Findings" | "Connections" | "Settings" | "Help";
-type Modal = "run" | "add" | "export" | "device" | null;
+type Modal = "run" | "add" | "export" | "device" | "assessment" | null;
 
 const nav: { label: View; mark: string; section: "workspace" | "manage" }[] = [
   { label: "Overview", mark: "⌂", section: "workspace" },
@@ -31,6 +31,7 @@ type ApiCollector = { id: string; provider: string; display_name: string; enable
 type ApiUser = { id: string; email: string; displayName: string; role: string };
 type ApiDevice = { id: string; display_name: string; platform: string; status: string; app_version: string | null; last_seen_at: string | null; created_at: string; revoked_at: string | null };
 type ApiJiraConnection = { connected: boolean; configured: boolean; id?: string; siteUrl?: string; siteName?: string; allowedProjects?: string[]; status?: "active" | "reauthorization_required"; lastTestedAt?: string | null; updatedAt?: string };
+type ApiAssessment = { id: string; name: string; framework: string; period_start: string; period_end: string; systems: string[]; controls: string[]; owner_id: string; status: "draft" | "active" | "closed"; created_at: string; updated_at: string };
 
 function cls(...values: Array<string | false | null | undefined>) {
   return values.filter(Boolean).join(" ");
@@ -52,6 +53,7 @@ function mapApiEvidence(row: Record<string, unknown>): Evidence {
     owner: String(row.evidence_owner || "Unassigned"), environment: String(row.environment || "Unspecified"), assessmentPeriod: String(row.assessment_period || "Unspecified"),
     mappedControls: Array.isArray(row.mapped_controls) ? row.mapped_controls as Evidence["mappedControls"] : [],
     jiraIssueKey: row.jira_issue_key ? String(row.jira_issue_key) : undefined, jiraIssueURL: String(row.jira_issue_url || "").startsWith("https://") ? String(row.jira_issue_url) : undefined,
+    assessmentId: row.assessment_id ? String(row.assessment_id) : undefined,
     collector: String(row.collector_id || "Manual submission"), checksum: `sha256:${String(row.sha256)}`, sha256: String(row.sha256), createdBy: String(row.created_by || ""), approvedBy: row.approved_by ? String(row.approved_by) : undefined, description: String(row.description || ""),
     code: ["Code", "Configuration"].includes(type) ? "Encrypted artifact\nIntegrity verified on access\nOpen or export to inspect contents" : undefined,
     language: type === "Code" ? "Protected source" : type === "Configuration" ? "Protected config" : undefined,
@@ -64,7 +66,7 @@ function mapApiRun(row: Record<string, unknown>): CollectionRun {
   const started = row.started_at ? new Date(String(row.started_at)).getTime() : 0;
   const completed = row.completed_at ? new Date(String(row.completed_at)).getTime() : 0;
   const duration = started && completed ? `${Math.max(1, Math.round((completed - started) / 1000))}s` : row.status === "running" ? "In progress" : "—";
-  return { id: String(row.id), source: String(row.display_name || row.provider || row.collector_id), startedAt: formatDate(row.created_at), status: statusMap[String(row.status)] || "Failed", artifacts: Number(row.artifact_count || 0), controls: Number(row.artifact_count || 0), duration, note: row.error_message ? String(row.error_message) : row.status === "retrying" ? `Retry ${row.attempt}/${row.max_attempts}` : undefined };
+  return { id: String(row.id), source: String(row.display_name || row.provider || row.collector_id), startedAt: formatDate(row.created_at), status: statusMap[String(row.status)] || "Failed", artifacts: Number(row.artifact_count || 0), controls: Number(row.artifact_count || 0), duration, note: row.error_message ? String(row.error_message) : row.status === "retrying" ? `Retry ${row.attempt}/${row.max_attempts}` : undefined, assessmentId: row.assessment_id ? String(row.assessment_id) : undefined };
 }
 
 function StatusPill({ status }: { status: string }) {
@@ -114,8 +116,10 @@ export function EvidenceConsole() {
   const [typeFilter, setTypeFilter] = useState("All types");
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
-  const [evidenceItems, setEvidenceItems] = useState<Evidence[]>(seedEvidence);
-  const [runItems, setRunItems] = useState<CollectionRun[]>(seedRuns);
+  const [evidenceItems, setEvidenceItems] = useState<Evidence[]>([]);
+  const [runItems, setRunItems] = useState<CollectionRun[]>([]);
+  const [assessmentItems, setAssessmentItems] = useState<ApiAssessment[]>([]);
+  const [selectedAssessmentId, setSelectedAssessmentId] = useState("");
   const [collectorItems, setCollectorItems] = useState<ApiCollector[]>([]);
   const [deviceItems, setDeviceItems] = useState<ApiDevice[]>([]);
   const [deviceToken, setDeviceToken] = useState<string | null>(null);
@@ -131,14 +135,16 @@ export function EvidenceConsole() {
     let cancelled = false;
     const load = async () => {
       try {
-        const [meResponse, evidenceResponse, runsResponse, collectorsResponse, auditResponse] = await Promise.all([fetch("/api/me"), fetch("/api/evidence"), fetch("/api/runs"), fetch("/api/collectors"), fetch("/api/audit")]);
-        if (!meResponse.ok || !evidenceResponse.ok || !runsResponse.ok || !collectorsResponse.ok) throw new Error("Backend unavailable");
-        const [me, evidenceData, runData, collectorData, auditData] = await Promise.all([meResponse.json(), evidenceResponse.json(), runsResponse.json(), collectorsResponse.json(), auditResponse.ok ? auditResponse.json() : Promise.resolve(null)]) as [{ user: ApiUser }, { evidence: Array<Record<string, unknown>> }, { runs: Array<Record<string, unknown>> }, { collectors: ApiCollector[] }, { integrity: { valid: boolean; checked: number } } | null];
+        const [meResponse, evidenceResponse, runsResponse, collectorsResponse, auditResponse, assessmentsResponse] = await Promise.all([fetch("/api/me"), fetch("/api/evidence"), fetch("/api/runs"), fetch("/api/collectors"), fetch("/api/audit"), fetch("/api/assessments")]);
+        if (!meResponse.ok || !evidenceResponse.ok || !runsResponse.ok || !collectorsResponse.ok || !assessmentsResponse.ok) throw new Error("Backend unavailable");
+        const [me, evidenceData, runData, collectorData, auditData, assessmentData] = await Promise.all([meResponse.json(), evidenceResponse.json(), runsResponse.json(), collectorsResponse.json(), auditResponse.ok ? auditResponse.json() : Promise.resolve(null), assessmentsResponse.json()]) as [{ user: ApiUser }, { evidence: Array<Record<string, unknown>> }, { runs: Array<Record<string, unknown>> }, { collectors: ApiCollector[] }, { integrity: { valid: boolean; checked: number } } | null, { assessments: ApiAssessment[] }];
         if (cancelled) return;
         setCurrentUser(me.user);
         setEvidenceItems((evidenceData.evidence as Array<Record<string, unknown>>).map(mapApiEvidence));
         setRunItems((runData.runs as Array<Record<string, unknown>>).map(mapApiRun));
         setCollectorItems(collectorData.collectors);
+        setAssessmentItems(assessmentData.assessments);
+        setSelectedAssessmentId(assessmentData.assessments.find((item) => item.status === "active")?.id || "");
         setAuditIntegrity(auditData?.integrity || null);
         if (["compliance_lead", "admin"].includes(me.user.role)) {
           const deviceResponse = await fetch("/api/devices");
@@ -148,7 +154,7 @@ export function EvidenceConsole() {
         }
         setBackendState("live");
       } catch {
-        if (!cancelled) setBackendState("unavailable");
+        if (!cancelled) { setEvidenceItems([]); setRunItems([]); setCollectorItems([]); setAssessmentItems([]); setCurrentUser(null); setAuditIntegrity(null); setBackendState("unavailable"); }
       }
     };
     void load();
@@ -183,11 +189,13 @@ export function EvidenceConsole() {
     return () => window.removeEventListener("keydown", close);
   }, []);
 
-  const filteredEvidence = useMemo(() => evidenceItems.filter((item) => {
+  const scopedEvidence = useMemo(() => evidenceItems.filter((item) => item.assessmentId === selectedAssessmentId), [evidenceItems, selectedAssessmentId]);
+  const scopedRuns = useMemo(() => runItems.filter((item) => item.assessmentId === selectedAssessmentId), [runItems, selectedAssessmentId]);
+  const filteredEvidence = useMemo(() => scopedEvidence.filter((item) => {
     const q = search.trim().toLowerCase();
     const matchesQuery = !q || [item.title, item.control, item.source, item.system, item.jiraIssueKey || "", item.tags.join(" ")].join(" ").toLowerCase().includes(q);
     return matchesQuery && (statusFilter === "All statuses" || item.status === statusFilter) && (typeFilter === "All types" || item.type === typeFilter);
-  }), [evidenceItems, search, statusFilter, typeFilter]);
+  }), [scopedEvidence, search, statusFilter, typeFilter]);
 
   function navigate(next: View) {
     setView(next); setSidebarOpen(false); setSearch("");
@@ -210,10 +218,11 @@ export function EvidenceConsole() {
     const selected = form.getAll("source").map(String);
     if (!selected.length) { setToast("Select at least one evidence source."); return; }
     setBusy(true);
-    const newRun: CollectionRun = { id: `pending-${Date.now()}`, source: selected.length === 1 ? `${selected[0].replace("collector_", "")} on-demand collection` : `On-demand collection · ${selected.length} sources`, startedAt: "Just now", status: "Running", artifacts: 0, controls: 0, duration: "In progress" };
+    const newRun: CollectionRun = { id: `pending-${Date.now()}`, source: selected.length === 1 ? `${selected[0].replace("collector_", "")} on-demand collection` : `On-demand collection · ${selected.length} sources`, startedAt: "Just now", status: "Running", artifacts: 0, controls: 0, duration: "In progress", assessmentId: selectedAssessmentId };
     setRunItems((items) => [newRun, ...items]);
     try {
-      const response = await fetch("/api/runs", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ collectorIds: selected }) });
+      const assessmentId = String(form.get("assessmentId") || selectedAssessmentId);
+      const response = await fetch("/api/runs", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ collectorIds: selected, assessmentId }) });
       const data = await response.json() as { error?: string; results: Array<{ artifacts: number; status: string }> };
       if (!response.ok && response.status !== 207) throw new Error(data.error || "Collection failed.");
       const refreshed = await fetch("/api/runs").then((result) => result.json()) as { runs: Array<Record<string, unknown>> };
@@ -228,6 +237,9 @@ export function EvidenceConsole() {
   async function handleAdd(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
+    const assessment = assessmentItems.find((item) => item.id === String(form.get("assessmentId")));
+    if (!assessment) { setToast("Select an open assessment."); return; }
+    form.set("framework", assessment.framework); form.set("assessmentPeriod", `${assessment.period_start} – ${assessment.period_end}`);
     setBusy(true);
     try {
       const response = await fetch("/api/evidence", { method: "POST", body: form });
@@ -243,7 +255,7 @@ export function EvidenceConsole() {
   async function exportPackage() {
     setBusy(true);
     try {
-      const response = await fetch("/api/packages", { method: "POST" });
+      const response = await fetch("/api/packages", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ assessmentId: selectedAssessmentId }) });
       if (!response.ok) throw new Error(await apiError(response));
       const data = await response.json() as { package: { id: string; evidenceCount: number } };
       window.location.assign(`/api/packages/${encodeURIComponent(data.package.id)}`);
@@ -266,6 +278,29 @@ export function EvidenceConsole() {
       setDeviceItems(refreshed.devices);
       setToast(`${displayName} enrolled. Copy the token now; Scopeproof will not show it again.`);
     } catch (error) { setToast(error instanceof Error ? error.message : "Device enrollment failed."); }
+    finally { setBusy(false); }
+  }
+
+  async function createAssessment(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault(); const form = new FormData(event.currentTarget); setBusy(true);
+    try {
+      const response = await fetch("/api/assessments", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: form.get("name"), framework: form.get("framework"), periodStart: form.get("periodStart"), periodEnd: form.get("periodEnd"), systems: String(form.get("systems") || "").split(/[,\n]/).map((v) => v.trim()).filter(Boolean), controls: String(form.get("controls") || "").split(/[,\n]/).map((v) => v.trim()).filter(Boolean), status: "active" }) });
+      if (!response.ok) throw new Error(await apiError(response));
+      const data = await response.json() as { assessment: ApiAssessment }; setAssessmentItems((items) => [data.assessment, ...items]); setSelectedAssessmentId(data.assessment.id); setModal(null); setToast(`${data.assessment.name} is now the active evidence scope.`);
+    } catch (error) { setToast(error instanceof Error ? error.message : "Assessment could not be created."); }
+    finally { setBusy(false); }
+  }
+
+  async function closeAssessment() {
+    if (!activeAssessment || activeAssessment.status !== "active" || !window.confirm(`Close ${activeAssessment.name}? New evidence can no longer be collected into it.`)) return;
+    setBusy(true);
+    try {
+      const response = await fetch("/api/assessments", { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: activeAssessment.id, status: "closed" }) });
+      if (!response.ok) throw new Error(await apiError(response));
+      const data = await response.json() as { assessment: ApiAssessment };
+      setAssessmentItems((items) => items.map((item) => item.id === data.assessment.id ? data.assessment : item));
+      setToast(`${data.assessment.name} is closed and its scope is immutable.`);
+    } catch (error) { setToast(error instanceof Error ? error.message : "Assessment could not be closed."); }
     finally { setBusy(false); }
   }
 
@@ -316,8 +351,9 @@ export function EvidenceConsole() {
     finally { setBusy(false); }
   }
 
-  const canCollect = ["compliance_lead", "admin"].includes(currentUser?.role || "");
-  const canExport = ["reviewer", "compliance_lead", "admin"].includes(currentUser?.role || "");
+  const activeAssessment = assessmentItems.find((item) => item.id === selectedAssessmentId);
+  const canCollect = backendState === "live" && activeAssessment?.status === "active" && ["compliance_lead", "admin"].includes(currentUser?.role || "");
+  const canExport = backendState === "live" && Boolean(activeAssessment) && ["reviewer", "compliance_lead", "admin"].includes(currentUser?.role || "");
   const canManageOperations = ["compliance_lead", "admin"].includes(currentUser?.role || "");
 
   return (
@@ -325,14 +361,14 @@ export function EvidenceConsole() {
       <a className="skip-link" href="#main-content">Skip to content</a>
       <aside className={cls("sidebar", sidebarOpen && "open")}>
         <div className="brand"><div className="brand-mark">S</div><div><strong>Scopeproof</strong><span>PCI operations</span></div></div>
-        <div className="workspace-switch"><span>AC</span><div><strong>Acme Commerce</strong><small>PCI DSS 4.0.1</small></div><b>⌄</b></div>
+        <div className="workspace-switch"><span>AS</span><div><label className="sr-only" htmlFor="assessment-workspace">Assessment workspace</label><select id="assessment-workspace" value={selectedAssessmentId} onChange={(event) => setSelectedAssessmentId(event.target.value)}><option value="">No assessment selected</option>{assessmentItems.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.status}</option>)}</select><small>{activeAssessment?.framework || "Create a scope to begin"}</small></div>{activeAssessment?.status === "active" && canManageOperations ? <button disabled={busy} onClick={closeAssessment} title="Close this assessment">×</button> : <b>⌄</b>}</div>
         <nav aria-label="Primary navigation">
           <span className="nav-label">Workspace</span>
-          {nav.filter((item) => item.section === "workspace").map((item) => <button key={item.label} className={view === item.label ? "active" : ""} onClick={() => navigate(item.label)}><i>{item.mark}</i>{item.label}{item.label === "Findings" && <em>4</em>}</button>)}
+          {nav.filter((item) => item.section === "workspace").map((item) => <button key={item.label} className={view === item.label ? "active" : ""} onClick={() => navigate(item.label)}><i>{item.mark}</i>{item.label}{item.label === "Findings" && <em>{scopedEvidence.filter((entry) => entry.status !== "Approved").length + scopedRuns.filter((run) => ["Failed", "Partial"].includes(run.status)).length}</em>}</button>)}
           <span className="nav-label manage">Manage</span>
           {nav.filter((item) => item.section === "manage").map((item) => <button key={item.label} className={view === item.label ? "active" : ""} onClick={() => navigate(item.label)}><i>{item.mark}</i>{item.label}</button>)}
         </nav>
-        <div className="assessment-card"><div><span>Q3 assessment</span><strong>82%</strong></div><progress value="82" max="100" /><p>18 days until review</p></div>
+        <div className="assessment-card"><div><span>{activeAssessment?.status || "Not configured"}</span><strong>{scopedEvidence.filter((item) => item.status === "Approved").length}</strong></div><progress value={scopedEvidence.filter((item) => item.status === "Approved").length} max={Math.max(1, scopedEvidence.length)} /><p>{activeAssessment ? `${activeAssessment.period_start} – ${activeAssessment.period_end}` : "Create an assessment scope"}</p></div>
         <div className="profile"><span>{(currentUser?.displayName || "M C").split(/\s|@/).slice(0, 2).map((part) => part[0]?.toUpperCase()).join("")}</span><div><strong>{currentUser?.displayName || "Authenticated user"}</strong><small>{currentUser?.role?.replaceAll("_", " ") || "Loading access…"}</small></div><button aria-label="Open profile menu" onClick={() => setToast("Identity is provided by your private Sites access policy.")}>•••</button></div>
       </aside>
       {sidebarOpen && <button className="sidebar-scrim" aria-label="Close navigation" onClick={() => setSidebarOpen(false)} />}
@@ -340,7 +376,7 @@ export function EvidenceConsole() {
       <main id="main-content">
         <header className="topbar">
           <button className="mobile-menu" onClick={() => setSidebarOpen(true)} aria-label="Open navigation">☰</button>
-          <div className="breadcrumbs"><span>Acme Commerce</span><b>/</b><strong>{view}</strong></div>
+          <div className="breadcrumbs"><span>{activeAssessment?.name || "Scopeproof"}</span><b>/</b><strong>{view}</strong></div>
           <div className="top-actions">
             <button className="icon-button" aria-label="Notifications" onClick={() => setToast("You’re all caught up. No new notifications.")}>♢<i /></button>
             <button className="button secondary" disabled={!canExport} title={!canExport ? "Reviewer or evidence-operations access is required." : undefined} onClick={() => setModal("export")}>↓ <span>Export package</span></button>
@@ -349,20 +385,21 @@ export function EvidenceConsole() {
         </header>
 
         <section className="page-wrap">
-          <div className={cls("security-strip", backendState)}><span>{backendState === "live" ? "✓" : backendState === "loading" ? "↻" : "!"}</span><div><strong>{backendState === "live" ? "Protected evidence workspace" : backendState === "loading" ? "Connecting to protected storage…" : "Protected services unavailable"}</strong><p>{backendState === "live" ? `AES-256-GCM storage · ${currentUser?.role?.replaceAll("_", " ")} access · audit chain ${auditIntegrity?.valid ? `verified (${auditIntegrity.checked} events)` : "pending"}` : backendState === "unavailable" ? "The interface is showing non-authoritative sample data until authenticated storage reconnects." : "Authenticating and verifying storage bindings."}</p></div></div>
-          {view === "Overview" && <Overview evidenceItems={evidenceItems} runItems={runItems} canCollect={canCollect} onNavigate={navigate} onSelect={setSelectedEvidence} onRun={() => setModal("run")} />}
-          {view === "Controls" && <ControlsView onNavigate={navigate} />}
+          <div className={cls("security-strip", backendState)}><span>{backendState === "live" ? "✓" : backendState === "loading" ? "↻" : "!"}</span><div><strong>{backendState === "live" ? "Protected evidence workspace" : backendState === "loading" ? "Connecting to protected storage…" : "Protected services unavailable"}</strong><p>{backendState === "live" ? `AES-256-GCM storage · ${currentUser?.role?.replaceAll("_", " ")} access · audit chain ${auditIntegrity?.valid ? `verified (${auditIntegrity.checked} events)` : "pending"}` : backendState === "unavailable" ? "Authoritative data is hidden until authentication and protected storage recover." : "Authenticating and verifying storage bindings."}</p></div></div>
+          {backendState !== "live" ? <EmptyState message={backendState === "loading" ? "Authenticating and loading authoritative evidence…" : "Scopeproof could not verify the protected backend. Reload after restoring authentication or storage; no sample compliance data is displayed."} /> : <>
+          {view === "Overview" && <Overview evidenceItems={scopedEvidence} runItems={scopedRuns} collectors={collectorItems} assessment={activeAssessment} user={currentUser} canCollect={canCollect} onNavigate={navigate} onSelect={setSelectedEvidence} onRun={() => activeAssessment ? setModal("run") : setModal("assessment")} onCreateAssessment={() => setModal("assessment")} />}
+          {view === "Controls" && <ControlsView evidenceItems={scopedEvidence} onNavigate={navigate} />}
           {view === "Evidence" && <EvidenceView items={filteredEvidence} canCollect={canCollect} search={search} setSearch={setSearch} status={statusFilter} setStatus={setStatusFilter} type={typeFilter} setType={setTypeFilter} onSelect={setSelectedEvidence} onAdd={() => setModal("add")} />}
-          {view === "Collection runs" && <RunsView items={runItems} canCollect={canCollect} onRun={() => setModal("run")} onToast={setToast} />}
-          {view === "Findings" && <FindingsView />}
+          {view === "Collection runs" && <RunsView items={scopedRuns} canCollect={canCollect} onRun={() => setModal("run")} onToast={setToast} />}
+          {view === "Findings" && <FindingsView evidenceItems={scopedEvidence} runItems={scopedRuns} />}
           {view === "Connections" && <ConnectionsView collectors={collectorItems} devices={deviceItems} jira={jiraConnection} canManageJira={canManageOperations} busy={busy} onConnectJira={connectJira} onTestJira={testJira} onDisconnectJira={disconnectJiraConnection} onEnroll={() => { setDeviceToken(null); setModal("device"); }} onRevoke={revokeDevice} onToast={setToast} />}
           {view === "Settings" && <SettingsView redaction={redaction} setRedaction={setRedaction} notifications={notifications} setNotifications={setNotifications} auditIntegrity={auditIntegrity} role={currentUser?.role || "auditor"} onToast={setToast} />}
-          {view === "Help" && <HelpView onNavigate={navigate} />}
+          {view === "Help" && <HelpView onNavigate={navigate} />}</>}
         </section>
       </main>
 
       {selectedEvidence && <EvidenceDrawer key={selectedEvidence.id} item={selectedEvidence} currentUser={currentUser} onClose={() => setSelectedEvidence(null)} onApprove={approveEvidence} onToast={setToast} />}
-      {modal && <Modal type={modal} collectors={collectorItems} deviceToken={deviceToken} onClose={() => !busy && setModal(null)} onRun={handleRun} onAdd={handleAdd} onExport={exportPackage} onDevice={enrollDevice} busy={busy} />}
+      {modal && <Modal type={modal} collectors={collectorItems} assessments={assessmentItems} selectedAssessmentId={selectedAssessmentId} setSelectedAssessmentId={setSelectedAssessmentId} deviceToken={deviceToken} onClose={() => !busy && setModal(null)} onRun={handleRun} onAdd={handleAdd} onExport={exportPackage} onDevice={enrollDevice} onAssessment={createAssessment} busy={busy} />}
       {toast && <div className="toast" role="status"><span>✓</span>{toast}</div>}
     </div>
   );
@@ -372,20 +409,27 @@ function PageTitle({ eyebrow, title, description, actions }: { eyebrow?: string;
   return <div className="page-title"><div>{eyebrow && <span className="eyebrow">{eyebrow}</span>}<h1>{title}</h1><p>{description}</p></div>{actions && <div className="page-actions">{actions}</div>}</div>;
 }
 
-function Overview({ evidenceItems, runItems, canCollect, onNavigate, onSelect, onRun }: { evidenceItems: Evidence[]; runItems: CollectionRun[]; canCollect: boolean; onNavigate: (view: View) => void; onSelect: (item: Evidence) => void; onRun: () => void }) {
+function Overview({ evidenceItems, runItems, collectors, assessment, user, canCollect, onNavigate, onSelect, onRun, onCreateAssessment }: { evidenceItems: Evidence[]; runItems: CollectionRun[]; collectors: ApiCollector[]; assessment?: ApiAssessment; user: ApiUser | null; canCollect: boolean; onNavigate: (view: View) => void; onSelect: (item: Evidence) => void; onRun: () => void; onCreateAssessment: () => void }) {
   const queue = evidenceItems.filter((item) => item.status !== "Approved");
+  const approved = evidenceItems.filter((item) => item.status === "Approved").length;
+  const coveredControls = new Set(evidenceItems.filter((item) => item.status === "Approved").map((item) => item.control)).size;
+  const scopedControls = assessment?.controls.length || new Set(evidenceItems.map((item) => item.control)).size;
+  const readiness = scopedControls ? Math.round(coveredControls / scopedControls * 100) : 0;
+  const configuredCollectors = collectors.filter((item) => item.configuration.configured).length;
+  const collectorAttention = collectors.filter((item) => item.status === "action_needed" || !item.configuration.configured).length;
+  const firstName = (user?.displayName || user?.email || "Operator").split(/[ @]/)[0];
   return <>
-    <PageTitle eyebrow="Friday, August 7" title="Good morning, Maya" description="Your PCI evidence program is healthy. Here’s what needs attention before the next review." actions={<><button className="button secondary mobile-hide" onClick={() => onNavigate("Evidence")}>Review evidence</button><button className="button primary mobile-hide" disabled={!canCollect} title={!canCollect ? "Evidence-operations access is required." : undefined} onClick={onRun}>＋ Run collection</button></>} />
-    <div className="attention-banner"><span>!</span><div><strong>{queue.length + 5} items need attention</strong><p>4 evidence items are awaiting review, 2 controls have gaps, and 1 connection requires action.</p></div><button onClick={() => onNavigate("Evidence")}>Open review queue <b>→</b></button></div>
+    <PageTitle eyebrow={new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" })} title={`Welcome, ${firstName}`} description={assessment ? `Authoritative status for ${assessment.name}.` : "Create an assessment before collecting or exporting evidence."} actions={<>{!assessment && <button className="button primary mobile-hide" onClick={onCreateAssessment}>＋ Create assessment</button>}<button className="button secondary mobile-hide" onClick={() => onNavigate("Evidence")}>Review evidence</button><button className="button primary mobile-hide" disabled={!canCollect} title={!canCollect ? "An active assessment and evidence-operations access are required." : undefined} onClick={onRun}>＋ Run collection</button></>} />
+    <div className="attention-banner"><span>!</span><div><strong>{queue.length + collectorAttention} items need attention</strong><p>{queue.length} evidence item(s) await review and {collectorAttention} collector(s) are incomplete or unconfigured.</p></div><button onClick={() => onNavigate(queue.length ? "Evidence" : "Connections")}>Review details <b>→</b></button></div>
     <div className="metrics-grid">
-      <article className="metric-card featured"><Ring value={82} label="readiness" /><div><span>Assessment readiness</span><strong>On track for Q3</strong><p><b>↑ 6%</b> since last week</p></div></article>
-      <article className="metric-card"><div className="metric-icon blue">▱</div><span>Evidence coverage</span><strong>91 <small>/ 108</small></strong><p>84% of scoped controls</p></article>
-      <article className="metric-card"><div className="metric-icon violet">↻</div><span>Automated evidence</span><strong>76%</strong><p><b>82 collectors</b> running</p></article>
-      <article className="metric-card"><div className="metric-icon amber">◇</div><span>Open findings</span><strong>4</strong><p><em>1 high severity</em></p></article>
+      <article className="metric-card featured"><Ring value={readiness} label="coverage" /><div><span>Assessment evidence coverage</span><strong>{assessment ? `${coveredControls} of ${scopedControls} controls` : "No active scope"}</strong><p>Approved evidence only</p></div></article>
+      <article className="metric-card"><div className="metric-icon blue">▱</div><span>Approved evidence</span><strong>{approved} <small>/ {evidenceItems.length}</small></strong><p>{queue.length} awaiting action</p></article>
+      <article className="metric-card"><div className="metric-icon violet">↻</div><span>Configured collectors</span><strong>{configuredCollectors} <small>/ {collectors.length}</small></strong><p>{runItems.filter((item) => item.status === "Partial" || item.status === "Failed").length} run issue(s)</p></article>
+      <article className="metric-card"><div className="metric-icon amber">◇</div><span>Coverage gaps</span><strong>{Math.max(0, scopedControls - coveredControls)}</strong><p><em>Derived from active scope</em></p></article>
     </div>
     <div className="dashboard-grid">
       <section className="panel coverage-panel"><div className="panel-head"><div><h2>Control coverage</h2><p>PCI DSS 4.0.1 requirements in scope</p></div><button onClick={() => onNavigate("Controls")}>View controls →</button></div>
-        <div className="coverage-list">{requirementCoverage.map((item) => <div className="coverage-row" key={item.req}><span className="req-badge">{item.req}</span><div><strong>{item.name}</strong><div className="progress-line"><i style={{ width: `${item.value}%` }} /></div></div><b className={item.value < 70 ? "low" : ""}>{item.value}%</b></div>)}</div>
+        <div className="coverage-list">{(assessment?.controls || []).slice(0, 12).map((controlId) => { const count = evidenceItems.filter((item) => item.control === controlId && item.status === "Approved").length; const value = count ? 100 : 0; return <div className="coverage-row" key={controlId}><span className="req-badge">{controlId}</span><div><strong>{controls.find((item) => item.id === controlId)?.title || "Scoped control"}</strong><div className="progress-line"><i style={{ width: `${value}%` }} /></div></div><b className={!value ? "low" : ""}>{value}%</b></div>; })}{!assessment?.controls.length && <EmptyState message="No control list is defined for the active assessment." />}</div>
       </section>
       <section className="panel activity-panel"><div className="panel-head"><div><h2>Collection activity</h2><p>Latest automation runs</p></div><button onClick={() => onNavigate("Collection runs")}>View all →</button></div>
         <div className="activity-list">{runItems.slice(0, 4).map((run) => <div className="activity-item" key={run.id}><div className={cls("source-dot", run.status.toLowerCase())}>{run.source.slice(0, 2).toUpperCase()}</div><div><strong>{run.source}</strong><span>{run.artifacts ? `${run.artifacts} artifacts · ` : ""}{run.startedAt}</span></div><StatusPill status={run.status} /></div>)}</div>
@@ -398,12 +442,14 @@ function Overview({ evidenceItems, runItems, canCollect, onNavigate, onSelect, o
   </>;
 }
 
-function ControlsView({ onNavigate }: { onNavigate: (view: View) => void }) {
+function ControlsView({ evidenceItems, onNavigate }: { evidenceItems: Evidence[]; onNavigate: (view: View) => void }) {
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState("All");
-  const items = controls.filter((control) => (!query || `${control.id} ${control.title} ${control.owner}`.toLowerCase().includes(query.toLowerCase())) && (filter === "All" || control.status === filter));
+  const liveControls = controls.map((control) => { const related = evidenceItems.filter((item) => item.control === control.id); const approved = related.filter((item) => item.status === "Approved").length; return { ...control, evidenceCount: related.length, status: approved ? "Covered" : related.length ? "Partial" : "Gap", automation: related.length ? Math.round(related.filter((item) => item.collector !== "Manual submission").length / related.length * 100) : 0, nextDue: related.map((item) => item.expiresAt).sort()[0] || "No evidence" }; });
+  const items = liveControls.filter((control) => (!query || `${control.id} ${control.title} ${control.owner}`.toLowerCase().includes(query.toLowerCase())) && (filter === "All" || control.status === filter));
+  const covered = liveControls.filter((item) => item.status === "Covered").length; const partial = liveControls.filter((item) => item.status === "Partial").length; const gaps = liveControls.filter((item) => item.status === "Gap").length;
   return <><PageTitle eyebrow="PCI DSS 4.0.1" title="Control workspace" description="Track coverage, ownership, and collection automation for every control in scope." actions={<button className="button primary" onClick={() => onNavigate("Evidence")}>Review evidence</button>} />
-    <div className="summary-strip"><div><strong>108</strong><span>Controls in scope</span></div><div><strong>91</strong><span>Fully covered</span></div><div><strong>11</strong><span>Partially covered</span></div><div><strong>6</strong><span>Evidence gaps</span></div></div>
+    <div className="summary-strip"><div><strong>{liveControls.length}</strong><span>Catalog controls</span></div><div><strong>{covered}</strong><span>Fully covered</span></div><div><strong>{partial}</strong><span>Partially covered</span></div><div><strong>{gaps}</strong><span>Evidence gaps</span></div></div>
     <section className="panel table-panel"><div className="toolbar"><label className="search-box"><span>⌕</span><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search control, owner, or requirement…" /></label><div className="segmented">{["All", "Covered", "Partial", "Gap"].map((item) => <button className={filter === item ? "active" : ""} key={item} onClick={() => setFilter(item)}>{item}</button>)}</div></div>
       {items.length ? <div className="data-table controls-table"><div className="table-header"><span>Control</span><span>Owner</span><span>Coverage</span><span>Automation</span><span>Next due</span><span /></div>{items.map((control) => <div className="table-row" key={control.id}><div><span className="control-id">{control.id}</span><strong>{control.title}</strong><small>{control.systems.join(" · ")}</small></div><span>{control.owner}</span><div><StatusPill status={control.status} /><small>{control.evidenceCount} artifacts</small></div><div className="automation-cell"><strong>{control.automation}%</strong><div><i style={{ width: `${control.automation}%` }} /></div></div><span className={control.nextDue === "Overdue" ? "danger-text" : ""}>{control.nextDue}</span><button aria-label={`View control ${control.id}`} onClick={() => onNavigate("Evidence")}>→</button></div>)}</div> : <EmptyState message="Try a different control search or coverage filter." />}
     </section>
@@ -429,11 +475,15 @@ function RunsView({ items, canCollect, onRun, onToast }: { items: CollectionRun[
   </>;
 }
 
-function FindingsView() {
-  const [items, setItems] = useState(findings);
+function FindingsView({ evidenceItems, runItems }: { evidenceItems: Evidence[]; runItems: CollectionRun[] }) {
+  const items = [
+    ...evidenceItems.filter((item) => item.status !== "Approved").map((item) => ({ id: `evidence:${item.id}`, severity: item.status === "Failed" ? "High" : item.status === "Expiring" ? "Medium" : "Low", title: `${item.status}: ${item.title}`, control: item.control, owner: item.owner || "Unassigned", due: item.expiresAt, status: "Open" })),
+    ...runItems.filter((item) => item.status === "Failed" || item.status === "Partial").map((item) => ({ id: `run:${item.id}`, severity: item.status === "Failed" ? "High" : "Medium", title: `${item.status} collection: ${item.source}`, control: "Collector", owner: "Compliance operations", due: "Investigate now", status: "Open" })),
+  ];
+  const high = items.filter((item) => item.severity === "High").length; const medium = items.filter((item) => item.severity === "Medium").length; const low = items.filter((item) => item.severity === "Low").length;
   return <><PageTitle eyebrow="Remediation" title="Findings" description="Resolve evidence gaps and collection failures before they become assessment exceptions." />
-    <div className="finding-stats"><article><span className="severity-dot high" /><strong>1</strong><p>High severity</p></article><article><span className="severity-dot medium" /><strong>2</strong><p>Medium severity</p></article><article><span className="severity-dot low" /><strong>1</strong><p>Low severity</p></article><article><strong>11 days</strong><p>Average time to close</p></article></div>
-    <section className="panel finding-list"><div className="panel-head padded"><div><h2>Active findings</h2><p>Prioritized by severity and due date</p></div></div>{items.map((item) => <div className="finding-row" key={item.id}><span className={`severity-flag ${item.severity.toLowerCase()}`}>{item.severity}</span><div><strong>{item.title}</strong><p>{item.id} · Control {item.control}</p></div><div><small>Owner</small><span>{item.owner}</span></div><div><small>Due</small><span>{item.due}</span></div><select aria-label={`Update status for ${item.title}`} value={item.status} onChange={(e) => setItems((current) => current.map((finding) => finding.id === item.id ? { ...finding, status: e.target.value as typeof item.status } : finding))}><option>Open</option><option>In progress</option><option>Accepted</option><option>Resolved</option></select></div>)}</section>
+    <div className="finding-stats"><article><span className="severity-dot high" /><strong>{high}</strong><p>High severity</p></article><article><span className="severity-dot medium" /><strong>{medium}</strong><p>Medium severity</p></article><article><span className="severity-dot low" /><strong>{low}</strong><p>Low severity</p></article><article><strong>{items.length}</strong><p>Authoritative open items</p></article></div>
+    <section className="panel finding-list"><div className="panel-head padded"><div><h2>Active findings</h2><p>Derived from evidence and collection state</p></div></div>{items.length ? items.map((item) => <div className="finding-row" key={item.id}><span className={`severity-flag ${item.severity.toLowerCase()}`}>{item.severity}</span><div><strong>{item.title}</strong><p>{item.id} · Control {item.control}</p></div><div><small>Owner</small><span>{item.owner}</span></div><div><small>Due</small><span>{item.due}</span></div><StatusPill status={item.status} /></div>) : <EmptyState message="No evidence or collection exceptions are currently recorded." />}</section>
   </>;
 }
 
@@ -524,12 +574,13 @@ function EvidenceDrawer({ item, currentUser, onClose, onApprove, onToast }: { it
   </>;
 }
 
-function Modal({ type, collectors, deviceToken, onClose, onRun, onAdd, onExport, onDevice, busy }: { type: Exclude<Modal, null>; collectors: ApiCollector[]; deviceToken: string | null; onClose: () => void; onRun: (e: React.FormEvent<HTMLFormElement>) => void; onAdd: (e: React.FormEvent<HTMLFormElement>) => void; onExport: () => void; onDevice: (e: React.FormEvent<HTMLFormElement>) => void; busy: boolean }) {
-  const titles = { run: "Run evidence collection", add: "Add manual evidence", export: "Export evidence package", device: "Enroll Mac capture device" };
+function Modal({ type, collectors, assessments, selectedAssessmentId, setSelectedAssessmentId, deviceToken, onClose, onRun, onAdd, onExport, onDevice, onAssessment, busy }: { type: Exclude<Modal, null>; collectors: ApiCollector[]; assessments: ApiAssessment[]; selectedAssessmentId: string; setSelectedAssessmentId: (id: string) => void; deviceToken: string | null; onClose: () => void; onRun: (e: React.FormEvent<HTMLFormElement>) => void; onAdd: (e: React.FormEvent<HTMLFormElement>) => void; onExport: () => void; onDevice: (e: React.FormEvent<HTMLFormElement>) => void; onAssessment: (e: React.FormEvent<HTMLFormElement>) => void; busy: boolean }) {
+  const titles = { run: "Run evidence collection", add: "Add manual evidence", export: "Export evidence package", device: "Enroll Mac capture device", assessment: "Create assessment scope" };
   return <div className="modal-layer" role="dialog" aria-modal="true" aria-labelledby="modal-title"><button className="modal-scrim" onClick={onClose} aria-label="Close dialog" /><section className="modal"><div className="modal-head"><div><span className="eyebrow">Scopeproof</span><h2 id="modal-title">{titles[type]}</h2></div><button onClick={onClose} aria-label="Close dialog">×</button></div>
-    {type === "run" && <form onSubmit={onRun}><p className="modal-intro">Select configured sources to query now. Provider responses are scanned, encrypted, checksum de-duplicated, and written to the audit chain.</p><fieldset className="source-select"><legend>Live evidence sources</legend>{sources.map((source, index) => { const collector = collectors.find((item) => item.id === source.id); const configured = collector?.configuration.configured === true; return <label key={source.name} className={!configured ? "disabled" : ""}><input type="checkbox" name="source" value={source.id} defaultChecked={configured && index < 3} disabled={!configured} /><span>{source.mark}</span><div><strong>{source.name}</strong><small>{configured ? `${source.detail} · ${collector?.schedule_cron || "On demand"} UTC` : `Missing ${collector?.configuration.missing.join(", ") || "hosted credentials"}`}</small></div></label>; })}</fieldset><label className="checkbox-line"><input type="checkbox" checked readOnly /> Enforce PAN, secret, and token scanning before encryption</label><div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy}>{busy ? <><span className="button-spinner" /> Collecting live evidence…</> : "Start live collection"}</button></div></form>}
-    {type === "add" && <form onSubmit={onAdd} className="evidence-form"><div className="form-grid"><label className="field full"><span>Evidence title</span><input name="title" required placeholder="e.g. Production database encryption settings" /></label><label className="field"><span>PCI control</span><select name="control" required defaultValue=""><option value="" disabled>Select control</option>{controls.map((control) => <option key={control.id} value={control.id}>{control.id} — {control.title}</option>)}</select></label><label className="field"><span>Evidence type</span><select name="type"><option value="code">Code</option><option value="configuration">Configuration</option><option value="report">Text report</option></select></label><label className="field"><span>System or asset</span><input name="system" required placeholder="payments-production" /></label><label className="field"><span>Code language</span><select name="language"><option>Text</option><option>HCL</option><option>YAML</option><option>JSON</option><option>Shell</option><option>TypeScript</option></select></label><label className="field full"><span>Description</span><textarea name="description" rows={3} placeholder="What this evidence proves and where it came from" /></label><label className="field full"><span>Code or configuration excerpt</span><textarea name="code" className="mono-input" rows={5} required placeholder="# Paste the focused excerpt here; server-side redaction runs before encryption" /></label></div><div className="upload-zone"><span>↑</span><div><strong>Attach an optional text-based artifact</strong><p>TXT, JSON, XML, or YAML up to 10 MB · screenshots must use the preflight browser collector</p></div><label className="choose-file">Choose file<input name="attachment" type="file" accept="text/*,application/json,application/xml,application/yaml" /></label></div><div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy}>{busy ? "Encrypting…" : "Scan, encrypt & add"}</button></div></form>}
-    {type === "export" && <div><p className="modal-intro">Generate a signed, framework-aware assessor package containing every approved artifact, a CSV/PDF evidence index, SHA-256 manifest, and integrity attestation.</p><div className="export-summary"><div><span>▣</span><p><strong>Approved evidence across configured frameworks</strong><small>Organized by framework and control · encrypted while stored</small></p></div><StatusPill status="Ready" /></div><label className="checkbox-line"><input type="checkbox" checked readOnly /> Embed decrypted artifacts into the protected ZIP</label><label className="checkbox-line"><input type="checkbox" checked readOnly /> ECDSA-sign manifest and include public verification key</label><div className="privacy-note"><span>i</span><p>The package is generated server-side, integrity-checked after decryption, and expires after seven days. Downloads are recorded in the immutable audit chain.</p></div><div className="modal-actions"><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy} onClick={onExport}>{busy ? "Building signed package…" : "↓ Generate signed ZIP"}</button></div></div>}
+    {type === "run" && <form onSubmit={onRun}><p className="modal-intro">Select configured sources to query. Scope, pagination, omissions, and API versions are recorded with every artifact.</p><label className="field"><span>Assessment</span><select name="assessmentId" required value={selectedAssessmentId} onChange={(e) => setSelectedAssessmentId(e.target.value)}>{assessments.filter((item) => item.status === "active").map((item) => <option value={item.id} key={item.id}>{item.name} · {item.period_start}–{item.period_end}</option>)}</select></label><fieldset className="source-select"><legend>Live evidence sources</legend>{sources.map((source, index) => { const collector = collectors.find((item) => item.id === source.id); const configured = collector?.configuration.configured === true; return <label key={source.name} className={!configured ? "disabled" : ""}><input type="checkbox" name="source" value={source.id} defaultChecked={configured && index < 3} disabled={!configured} /><span>{source.mark}</span><div><strong>{source.name}</strong><small>{configured ? `${source.detail} · ${collector?.schedule_cron || "On demand"} UTC` : `Missing ${collector?.configuration.missing.join(", ") || "hosted credentials"}`}</small></div></label>; })}</fieldset><label className="checkbox-line"><input type="checkbox" checked readOnly /> Block approval and export when provider coverage is partial</label><div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy || !selectedAssessmentId}>{busy ? <><span className="button-spinner" /> Collecting live evidence…</> : "Start live collection"}</button></div></form>}
+    {type === "add" && <form onSubmit={onAdd} className="evidence-form"><div className="form-grid"><label className="field full"><span>Assessment</span><select name="assessmentId" required value={selectedAssessmentId} onChange={(e) => setSelectedAssessmentId(e.target.value)}>{assessments.filter((item) => item.status !== "closed").map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label><label className="field full"><span>Evidence title</span><input name="title" required placeholder="e.g. Production database encryption settings" /></label><label className="field"><span>Control</span><select name="control" required defaultValue=""><option value="" disabled>Select control</option>{controls.map((control) => <option key={control.id} value={control.id}>{control.id} — {control.title}</option>)}</select></label><label className="field"><span>Evidence type</span><select name="type"><option value="code">Code</option><option value="configuration">Configuration</option><option value="report">Text report</option></select></label><label className="field"><span>System or asset</span><input name="system" required placeholder="payments-production" /></label><label className="field"><span>Code language</span><select name="language"><option>Text</option><option>HCL</option><option>YAML</option><option>JSON</option><option>Shell</option><option>TypeScript</option></select></label><label className="field full"><span>Description</span><textarea name="description" rows={3} placeholder="What this evidence proves and where it came from" /></label><label className="field full"><span>Code or configuration excerpt</span><textarea name="code" className="mono-input" rows={5} required placeholder="# Paste the focused excerpt here; server-side redaction runs before encryption" /></label></div><div className="upload-zone"><span>↑</span><div><strong>Attach an optional text-based artifact</strong><p>TXT, JSON, XML, or YAML up to 10 MB</p></div><label className="choose-file">Choose file<input name="attachment" type="file" accept="text/*,application/json,application/xml,application/yaml" /></label></div><div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy || !selectedAssessmentId}>{busy ? "Encrypting…" : "Scan, encrypt & add"}</button></div></form>}
+    {type === "export" && <div><p className="modal-intro">Generate a signed package for one explicit assessment. Scope and inclusion counts are bound into the manifest; truncation is forbidden.</p><label className="field"><span>Assessment</span><select required value={selectedAssessmentId} onChange={(e) => setSelectedAssessmentId(e.target.value)}>{assessments.filter((item) => item.status !== "draft").map((item) => <option value={item.id} key={item.id}>{item.name} · {item.framework}</option>)}</select></label><div className="export-summary"><div><span>▣</span><p><strong>{assessments.find((item) => item.id === selectedAssessmentId)?.name || "Select an assessment"}</strong><small>Approved, unexpired evidence with complete coverage only</small></p></div><StatusPill status={selectedAssessmentId ? "Ready" : "Blocked"} /></div><label className="checkbox-line"><input type="checkbox" checked readOnly /> Refuse partial or silently truncated evidence sets</label><label className="checkbox-line"><input type="checkbox" checked readOnly /> ECDSA-sign manifest and include public verification key</label><div className="privacy-note"><span>i</span><p>The package expires after seven days and every download is audited.</p></div><div className="modal-actions"><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy || !selectedAssessmentId} onClick={onExport}>{busy ? "Building signed package…" : "↓ Generate signed ZIP"}</button></div></div>}
+    {type === "assessment" && <form onSubmit={onAssessment} className="evidence-form"><p className="modal-intro">Define the authoritative framework, period, systems, and controls before collecting evidence.</p><div className="form-grid"><label className="field full"><span>Assessment name</span><input name="name" required minLength={3} maxLength={180} placeholder="2026 PCI DSS annual assessment" /></label><label className="field"><span>Framework</span><select name="framework"><option>PCI DSS 4.0.1</option><option>HIPAA</option><option>FedRAMP</option><option>SOC 2</option><option>ISO 27001</option></select></label><label className="field"><span>Period start</span><input name="periodStart" type="date" required /></label><label className="field"><span>Period end</span><input name="periodEnd" type="date" required /></label><label className="field full"><span>Systems in scope</span><textarea name="systems" rows={3} required placeholder="payments-production, identity-production" /><small>Comma or line separated; collection outside this list is rejected.</small></label><label className="field full"><span>Control IDs</span><textarea name="controls" rows={3} required placeholder="1.2.5, 2.2.1, 6.3.2" /><small>Comma or line separated; evidence outside this list is rejected.</small></label></div><div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy}>{busy ? "Creating scope…" : "Create active assessment"}</button></div></form>}
     {type === "device" && (deviceToken ? <div><p className="modal-intro">This token is shown once. Copy it into the Mac app under <strong>Scopeproof shield → Capture & Jira Settings</strong>, then close this dialog.</p><div className="token-reveal"><code>{deviceToken}</code><button className="button secondary" onClick={() => void navigator.clipboard.writeText(deviceToken)}>Copy token</button></div><div className="privacy-note"><span>!</span><p>Treat this token like a password. It is stored hashed on the server and in the Mac login Keychain. Revoke the device immediately if the token is exposed.</p></div><div className="modal-actions"><button className="button primary" onClick={onClose}>I saved the token</button></div></div> : <form onSubmit={onDevice}><p className="modal-intro">Create a revocable identity for one Mac. Evidence uploaded by this device is attributed to your user and written to the immutable audit chain.</p><label className="field"><span>Device name</span><input name="displayName" required maxLength={100} defaultValue="Jayson’s Mac" placeholder="e.g. Compliance MacBook Pro" /></label><div className="privacy-note"><span>i</span><p>The token is displayed only once. The Mac stores it in Keychain and sends it only to your configured Scopeproof server.</p></div><div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy}>{busy ? "Creating secure token…" : "Create device token"}</button></div></form>)}
   </section></div>;
 }
