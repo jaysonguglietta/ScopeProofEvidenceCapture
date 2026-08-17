@@ -163,6 +163,7 @@ test("one-time SBOM credentials are exact-host, ephemeral, and non-retryable", a
   assert.match(nativeMenu, /Generate Repository SBOM…/);
   assert.match(nativeMenu, /NSSecureTextField/);
   assert.match(nativeMenu, /token\.stringValue = ""/);
+  assert.match(nativeMenu, /grid\.frame = NSRect\(x: 0, y: 0, width: 590, height: 210\)/);
   assert.match(nativeService, /URLSessionConfiguration\.ephemeral/);
   assert.match(nativeService, /urlCredentialStorage = nil/);
   assert.match(nativeService, /github-git-data-api-static/);
