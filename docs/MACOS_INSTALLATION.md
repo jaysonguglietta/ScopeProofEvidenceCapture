@@ -2,6 +2,8 @@
 
 This guide installs the local-first Scopeproof Capture menu-bar application for one macOS user. Local capture, evidence search, lifecycle review, and assessor-package export do not require a hosted Scopeproof account, server URL, or device token.
 
+Repository SBOM generation is intentionally separate: it runs only in the hosted web console because GitHub credentials must remain server-side. The Mac app neither stores the GitHub token nor downloads repository archives. See the [repository SBOM guide](SBOM_GUIDE.md) when that evidence is required.
+
 ## Requirements
 
 - macOS 14 or newer.

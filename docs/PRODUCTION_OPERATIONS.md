@@ -13,7 +13,7 @@ At least daily, capture or verify:
 1. A restorable D1 snapshot/export that includes its capture time and platform restore identifier.
 2. An inventory of every R2 object key, size, ETag/digest metadata, and capture time. Replicate ciphertext to an organization-controlled account or storage service with retention/immutability enabled when policy requires account-level disaster recovery.
 3. Every retained encryption/HMAC key version, the package-signing recovery key, public-key fingerprints, Jira client configuration, Sites configuration, and release public metadata. Key escrow must be encrypted under a separately controlled recovery key with dual-person access.
-4. The deployed Git commit, Sites version identifier, migrations applied, macOS release envelope, notarization log, and SBOM.
+4. The deployed Git commit, Sites version identifier, migrations applied, macOS release envelope, notarization log, release SBOM, and representative repository-SBOM job/evidence metadata. Keep release and repository SBOMs labeled separately.
 5. A JSON backup manifest listing each exported file as `{ "path": "relative/path", "sha256": "..." }`. Verify it with `node Scripts/verify_backup_manifest.mjs backup-manifest.json` before marking the backup successful.
 
 Never place plaintext evidence or production secrets in an ordinary workstation backup. Keep backup access separate from application-administrator access and alert on backup deletion, retention changes, restore activity, and failed daily verification.
@@ -34,6 +34,10 @@ Configure `SECURITY_EVENT_ENDPOINT`, its exact hostname allowlist, and a bearer 
 
 Also alert from platform logs on `scopeproof_api_error`, `scopeproof_audited_batch_failure`, `scopeproof_audit_checkpoint_delivery_failure`, `scopeproof_operational_health_delivery_failure`, `scopeproof_rekey_old_object_delete_failure`, and sustained rate limiting. Do not send evidence contents, OAuth tokens, user tokens, OCR text, or secrets to monitoring.
 
+For repository SBOM operations, review `sbom_jobs` for sustained `failed`, overdue `retrying`, or expired `running` leases; spikes in `GITHUB_AUTH_FAILED`, `REPOSITORY_OR_REF_NOT_FOUND`, `ARCHIVE_LIMIT_EXCEEDED`, `INVALID_ARCHIVE`, `INVALID_MANIFEST`, or `COMPONENT_LIMIT_EXCEEDED`; and repeated rate limiting. Authentication failures require token repair or rotation and are not automatic retries. Archive/manifest/component failures require repository-owner remediation or a reviewed limit/parser change—not a blanket limit increase. After credential rotation, generate a canary SBOM from a known repository and confirm a completed audit trail.
+
+Repository SBOM evidence follows the ordinary evidence expiration, legal-hold, encryption-key, approval, download, and assessor-package controls. Retain job metadata and the source/archive/artifact digests for the approved retention period. Do not retain downloaded GitHub ZIPs; Scopeproof processes them transiently and persists only the generated encrypted SBOM plus provenance metadata.
+
 ## Incident response
 
 Severity 1 includes suspected key compromise, audit-chain/checkpoint failure, unauthorized evidence access, cross-boundary exposure, malicious release/update, or loss of both primary and recovery data. Immediately stop collection/export/Jira transfer, preserve logs and external checkpoints, revoke affected device/OAuth/provider credentials, restrict administrator access, and open the security incident process. Do not rotate away or destroy a suspected key before preserving a controlled recovery copy needed to analyze historical records.
@@ -50,6 +54,7 @@ Close an incident only after root cause, evidence preservation, containment, era
 - At least two named administrators and separate collector/reviewer identities exist; roles and break-glass access are reviewed.
 - Jira OAuth uses an organization-owned Atlassian app and least-privilege projects; a test attachment and reconciliation exercise succeeded.
 - Every required collector has complete pagination coverage and an approved least-privilege service identity.
+- Repository SBOM generation is either explicitly disabled or uses a fixed organization and repository-restricted GitHub credential with Metadata/Contents read only; a known-commit canary, independent review, and assessor-package inclusion test succeeded.
 - Backup verification and an isolated recovery drill met approved RPO/RTO.
 - GitHub protected-branch checks, code-owner review, dependency updates, secret scanning, and release approvals are enabled.
 - The production Mac build is Developer ID signed, hardened, notarized, stapled, update-signed, hosted on an approved HTTPS origin, and verified on a clean Mac.

@@ -9,6 +9,7 @@ Scopeproof handles security and compliance evidence that may expose sensitive co
 - Evidence encryption, audit HMAC, and package-signing keys.
 - User identity, roles, review decisions, Jira associations, and audit history.
 - The integrity and availability of captures, manifests, receipts, and packages.
+- Repository source provenance, generated SBOM contents, SBOM job history, and the GitHub read token used to access private source archives.
 
 ## Implemented controls
 
@@ -35,11 +36,15 @@ Scopeproof handles security and compliance evidence that may expose sensitive co
 - Jira URLs require HTTPS, issue keys are format-restricted, and native Jira metadata must match the immutable manifest.
 - Jira API calls use fixed Atlassian hosts and server-selected cloud IDs. OAuth state is random, user-bound, stored only as a hash, single-use, and expires after ten minutes. Requested sites must end in `.atlassian.net`, match Atlassian’s accessible resources, and use configured project allowlists.
 - Jira uploads require explicit confirmation and revalidate the device, issue, project, PNG digest, redaction safety state, Approved lifecycle chain, and attachment limits. A durable idempotency reservation prevents concurrent duplicate attachment sets; ambiguous network/provider outcomes require reconciliation instead of automatic replay. OAuth refresh-token rotation is serialized with an expiring lease and optimistic token version. Signed upload receipts and audit events exclude token material.
+- Repository SBOM creation is restricted to compliance leads and administrators, while evidence approval remains independent. The server constructs the repository owner from fixed `GITHUB_ORG`, validates repository/ref syntax, requires an active assessment with PCI DSS 6.3.2 and matching system scope, and resolves the requested ref to an immutable commit before inventory generation.
+- GitHub access is read-only and destination-restricted to `api.github.com` and the exact `codeload.github.com` archive redirect. The credential is never returned to the browser or stored in D1. Generated JSON uses the same evidence encryption, digest, lifecycle, download-audit, retention, and package controls as other hosted evidence.
 
 ### Abuse resistance
 
 - Provider requests, pagination, browser targets, retries, due work, upload sizes, package counts, and decrypted package bytes are bounded.
 - Browser collection permits HTTPS targets only. It scans the single captured PNG through an HTTPS OCR endpoint on an exact host allowlist, verifies the OCR response names the same digest, and fails closed on scan errors or sensitive recognized pixels.
+- Repository archives are untrusted. Scopeproof validates the central directory before extraction, rejects malformed/oversized/over-compressed archives and non-UTF-8 or NUL-containing manifests, extracts only recognized lockfiles, caps parsed components, and never invokes source files, package managers, install hooks, build tools, containers, or subprocesses.
+- SBOM generation permits ten requests per authenticated user per hour, uses leased jobs with bounded retries only for transient provider failures, and caps scheduler work to prevent one repository from monopolizing execution.
 - Error responses use request IDs and avoid returning server exception details to clients.
 
 ## Secure operating requirements
@@ -54,6 +59,7 @@ Scopeproof handles security and compliance evidence that may expose sensitive co
 8. Review audit-chain health, device inventory, collector errors, failed jobs, expiring evidence, and package downloads routinely.
 9. Rotate or revoke a device/provider credential immediately after suspected exposure.
 10. Preserve old encryption-key material under controlled key-version procedures until all dependent evidence is expired or re-encrypted.
+11. Restrict `GITHUB_TOKEN` to the intended repositories with Metadata and Contents read access only. Rotate it, monitor GitHub access, remove repositories no longer in scope, and leave SBOM generation unconfigured rather than granting broad organization access.
 
 ## Residual risks and limitations
 
@@ -66,6 +72,8 @@ Scopeproof handles security and compliance evidence that may expose sensitive co
 - Spreadsheet CSV indexes are presentation-only and prefix formula-like cells (including after leading ASCII whitespace/control characters) with an apostrophe. Use the signed JSON manifest for machine verification.
 - Update trust depends on protecting the offline release private key and accurately provisioning its matching public key and validity window in the signed app bundle. An empty key list fails closed and intentionally disables updates.
 - Provider coverage is intentionally bounded and may require additional collection for large environments.
+- Repository SBOM coverage is limited to supported pinned lockfiles and the first 250 repositories returned for the configured organization. Static parsing cannot prove the deployed artifact, dynamically loaded dependencies, vendored code, generated lockfiles absent from the commit, transitive resolution performed outside a supported lockfile, vulnerability status, or license obligations.
+- A compromised GitHub organization administrator or source repository can supply deceptive lockfiles. Commit immutability and archive hashing establish what Scopeproof parsed, not that the source is trustworthy; require protected branches, change review, release provenance, and vulnerability analysis as separate controls.
 - Key rotation is not automatic; replacing an encryption key without a migration can make prior evidence undecryptable.
 - An ad-hoc local macOS build is not notarized and does not provide a Developer ID trust chain.
 

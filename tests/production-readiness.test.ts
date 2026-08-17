@@ -142,6 +142,12 @@ test("SBOM evidence is reviewable, downloadable, comparable, and documented for 
   const consoleSource = await read("app/evidence-console.tsx");
   const packageSource = await read("lib/server/packages.ts");
   const guide = await read("docs/SBOM_GUIDE.md");
+  const operatorGuide = await read("docs/OPERATOR_GUIDE.md");
+  const assessorGuide = await read("docs/ASSESSOR_GUIDE.md");
+  const architecture = await read("docs/ARCHITECTURE.md");
+  const securityGuide = await read("docs/SECURITY.md");
+  const deploymentGuide = await read("docs/DEPLOYMENT.md");
+  const operationsGuide = await read("docs/PRODUCTION_OPERATIONS.md");
   assert.match(consoleSource, /"SBOMs"/);
   assert.match(consoleSource, /CycloneDX 1\.6 JSON/);
   assert.match(consoleSource, /SPDX 2\.3 JSON/);
@@ -151,4 +157,10 @@ test("SBOM evidence is reviewable, downloadable, comparable, and documented for 
   assert.match(guide, /does not clone a repository or execute repository code/);
   assert.match(guide, /Metadata: read/);
   assert.match(guide, /Contents: read/);
+  assert.match(operatorGuide, /Generate a repository SBOM/);
+  assert.match(assessorGuide, /Repository SBOM review/);
+  assert.match(architecture, /Repository SBOM data flow/);
+  assert.match(securityGuide, /Repository archives are untrusted/);
+  assert.match(deploymentGuide, /GitHub and repository SBOM setup/);
+  assert.match(operationsGuide, /For repository SBOM operations/);
 });
