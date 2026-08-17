@@ -14,6 +14,19 @@
 
 All notable Scopeproof changes are recorded here. Dates use the repository’s release timezone.
 
+## 1.5.0 — 2026-08-17
+
+### Added
+
+- Added **Generate Repository SBOM…** directly to the macOS shield menu with exact GitHub URL, masked one-time token, branch/tag/commit, and CycloneDX 1.6 or SPDX 2.3 selection.
+- Added bounded, read-only GitHub commit/tree/blob collection that downloads only supported lockfiles and never clones, extracts archives, executes source, invokes package managers, or starts subprocesses.
+- Added direct JSON export with immutable commit and manifest-set provenance plus an adjacent SHA-256 checksum protected with current-user-only file permissions.
+
+### Security
+
+- Native GitHub access uses an ephemeral session with redirects, cookies, URL caching, and credential storage disabled. The token is cleared at submission, never persisted or logged, and never automatically retried.
+- Added strict GitHub host/repository/ref/token validation, response and tree limits, per-manifest and aggregate byte limits, UTF-8/NUL validation, component limits, one-run concurrency, and native parser regression tests.
+
 ## 1.4.0 — 2026-08-12
 
 ### Added

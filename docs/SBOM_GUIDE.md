@@ -1,10 +1,24 @@
 # Repository SBOM guide
 
-Scopeproof can generate an auditor-facing Software Bill of Materials from either an administrator-managed GitHub organization or one repository supplied for a one-time run. The result is encrypted as evidence, mapped to PCI DSS 6.3.2, independently reviewed through the normal evidence workflow, and included in an assessor package after approval.
+Scopeproof can generate an auditor-facing Software Bill of Materials from a GitHub repository in either the native Mac app or the hosted console.
 
-This is a hosted Scopeproof web-console capability, not a function of the local-only Mac app. The Mac app can continue to capture and package local screenshot evidence without GitHub configuration.
+The native Mac workflow is a direct one-time export: it creates CycloneDX or SPDX JSON plus a checksum at a location selected by the operator. The hosted workflow can use managed or one-time repository access and stores the result as encrypted, PCI DSS 6.3.2 assessment evidence with independent review, comparison, audited download, and assessor-package inclusion. A local export is not silently uploaded or treated as approved hosted evidence.
 
-## Choose repository access
+## Choose the workflow
+
+### Native Mac one-time export
+
+Choose **Generate Repository SBOM…** from the Scopeproof shield menu. Enter an exact URL in the form `https://github.com/owner/repository`, a short-lived token selected only for that repository with **Metadata: read** and **Contents: read**, the branch/tag/commit, and the output format. The Mac resolves the ref to an immutable commit, enumerates the bounded Git tree, downloads only recognized lockfile blobs, parses them locally, and asks where to save the JSON and adjacent `.sha256.txt` checksum.
+
+The native token field is masked and cleared at submission. The request uses an ephemeral URL session with no cookies, URL cache, credential storage, redirects, persistence, logging, or retry queue. The token is never written to preferences, Keychain, the Local Console index, evidence files, checksums, or audit records. Scopeproof cannot erase every transient copy from process memory or control endpoint malware, system network inspection, crash collection outside the app, or GitHub access logs. Use a dedicated short-expiry token and revoke it after the run.
+
+Native generation requires no assessment or hosted login. Consequently it does not enforce hosted RBAC or assessment scope, perform prior-run comparison, encrypt or retain the output, create a lifecycle record, request independent approval, or add the file to an assessor package. The operator must validate, classify, retain, approve, and transfer the direct export under organizational policy.
+
+### Hosted assessment evidence
+
+Use the hosted **SBOMs → Generate SBOM** flow when the inventory must be governed as Scopeproof assessment evidence. It supports either the managed organization or a one-time repository credential described below.
+
+## Choose hosted repository access
 
 ### Managed organization
 
@@ -17,7 +31,7 @@ Do not grant write, administration, workflow, issue, or secret permissions. Rota
 
 Apply `drizzle/0012_opposite_rachel_grey.sql` before enabling the feature. If a GitHub App installation token is used, Scopeproof does not mint or refresh it; an external secret-rotation process must replace the expiring token in Sites. The console labels managed access **Not configured** until both variables are present; one-time access remains available.
 
-### One-time repository
+### Hosted one-time repository
 
 Choose **One-time repository** in the generation dialog and enter:
 
@@ -57,9 +71,11 @@ Record the assessment ID, repository, requested ref, resolved commit, source-arc
 
 ## Security and operational limits
 
-Scopeproof does not clone a repository or execute repository code, build scripts, lifecycle hooks, package managers, container builds, or dependency installers. It downloads one ZIP from GitHub at the resolved commit and extracts only recognized lockfiles.
+Scopeproof does not clone a repository or execute repository code, build scripts, lifecycle hooks, package managers, container builds, or dependency installers. The hosted workflow downloads one ZIP from GitHub at the resolved commit and extracts only recognized lockfiles.
 
 The server enforces a 20 MB compressed archive limit, 5,000-entry limit, 100-manifest limit, 2 MB per manifest, 8 MB total selected manifest data, a 100:1 decompression ratio limit, valid UTF-8 text, and at most 5,000 unique components. Archive redirects are accepted only from GitHub's `codeload.github.com` host. Generation is rate-limited to ten requests per user per hour and uses leased, audited jobs. Managed jobs have bounded retry for transient provider failures; one-time jobs do not retry.
+
+The native Mac generator does not download or extract an archive. It uses only `api.github.com`, rejects redirects, caps the recursive tree response at 8 MB and 5,000 entries, selects at most 100 recognized lockfile blobs, limits each to 2 MB and their decoded total to 8 MB, requires valid UTF-8 without NUL bytes, and emits at most 5,000 unique components. Only one native run may execute at a time and no failed request retries automatically. GitHub's own API rate limits still apply.
 
 Supported inputs are `package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock`, `pnpm-lock.yaml`, `requirements.txt`, `Pipfile.lock`, `poetry.lock`, `Cargo.lock`, `go.sum`, `Gemfile.lock`, and `composer.lock`. A run fails explicitly when no supported lockfile or pinned component can be found. Unsupported ecosystems require a reviewed parser addition; Scopeproof does not infer a complete inventory from unpinned manifest files.
 

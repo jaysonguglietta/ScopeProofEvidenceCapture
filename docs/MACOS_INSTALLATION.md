@@ -2,7 +2,7 @@
 
 This guide installs the local-first Scopeproof Capture menu-bar application for one macOS user. Local capture, evidence search, lifecycle review, and assessor-package export do not require a hosted Scopeproof account, server URL, or device token.
 
-Repository SBOM generation is intentionally separate: it runs only in the hosted web console because GitHub credentials must remain server-side. The Mac app neither stores the GitHub token nor downloads repository archives. See the [repository SBOM guide](SBOM_GUIDE.md) when that evidence is required.
+The Mac app can generate a direct, one-time repository SBOM without a hosted account. Choose **Generate Repository SBOM…**, enter an exact GitHub URL and short-lived read-only token, and save CycloneDX or SPDX JSON plus its SHA-256 checksum. The credential is used only for the active request and is not stored. Use the hosted console instead when the SBOM must be assessment-scoped, independently approved, compared with prior evidence, or included automatically in an assessor package. See the [repository SBOM guide](SBOM_GUIDE.md).
 
 ## Requirements
 
@@ -10,6 +10,7 @@ Repository SBOM generation is intentionally separate: it runs only in the hosted
 - A local copy of this repository.
 - Apple's Swift toolchain. Install it with `xcode-select --install` if `swift --version` is unavailable.
 - Screen Recording permission for browser-window capture.
+- HTTPS access to `api.github.com` when using local repository SBOM generation.
 
 ## Install and launch
 
@@ -56,6 +57,7 @@ The script quits a running Scopeproof process before replacing the application. 
 - The shield is visible in the menu bar.
 - **Open Local Console** opens a browser page while Scopeproof is running.
 - **Open Evidence Folder** opens `~/Pictures/Scopeproof Evidence`.
+- **Generate Repository SBOM…** opens a masked one-time GitHub credential dialog and offers CycloneDX 1.6 or SPDX 2.3 JSON.
 - A test capture shows the selected framework/control and a date/time stamp in its visible banner.
 - The PNG, manifest, and lifecycle sidecar appear together under the expected framework/control folder.
 
@@ -69,6 +71,7 @@ The script quits a running Scopeproof process before replacing the application. 
 | Browser reports unauthorized | Do not reuse an old loopback URL; reopen the console from the shield menu to establish a fresh per-launch session. |
 | Capture permission repeats | Confirm the enabled entry is the copy at `~/Applications/Scopeproof Capture.app`, then quit and reopen it. |
 | Capture cannot find the intended window | Use **Choose Browser Window…** and select the exact browser/window title. |
+| Repository SBOM authentication fails | Create a fresh fine-grained token selected only for the repository with Metadata: read and Contents: read, then submit a new run. The app never retains or retries a one-time token. |
 
 ## Managed distribution
 

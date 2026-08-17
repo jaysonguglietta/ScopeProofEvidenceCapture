@@ -49,7 +49,9 @@ Scopeproof combines a private Cloudflare-hosted evidence console with a local ma
 5. The material action is appended to the HMAC-authenticated audit chain.
 6. A different authorized reviewer loads the actual decrypted bytes, confirms the server-verified digest, records a rationale, and may approve. Approved evidence can then be decrypted transiently for a bounded export, re-hashed, indexed, signed with ECDSA P-256, encrypted again for R2 storage, and made available through an expiring download.
 
-## Repository SBOM data flow
+## Repository SBOM data flows
+
+### Hosted assessment evidence
 
 1. A compliance lead or administrator selects an active assessment, repository source, ref, and output format. Managed mode uses a repository in `GITHUB_ORG`; one-time mode parses an exact GitHub URL and validates a short-lived token. Server-side authorization, same-origin checks, request-size validation, assessment/control scope, and a per-user hourly quota are enforced before a job is queued.
 2. The Worker resolves the ref to a 40-character commit SHA through GitHub's API, then requests exactly one archive for that commit. It does not clone, check out, build, install, or execute repository content.
@@ -59,6 +61,14 @@ Scopeproof combines a private Cloudflare-hosted evidence console with a local ma
 6. An independent reviewer inspects and approves the linked evidence. Only approved, unexpired evidence is eligible for an assessor package.
 
 One-time work has `max_attempts = 1`. If the request fails or its lease expires, the job fails closed and requires a new token; scheduled processing cannot reconstruct or reuse the credential.
+
+### Native Mac direct export
+
+1. An operator explicitly opens **Generate Repository SBOM…** and submits an exact GitHub HTTPS URL, a masked short-lived token, a ref, and a format. Input validation rejects other hosts, URL credentials, ports, query/fragment data, encoded path separators, unsafe refs, and malformed credentials.
+2. A dedicated ephemeral URL session with no cache, cookies, credential store, or redirects calls only `api.github.com`. It resolves the ref to a 40-character commit, reads the bounded recursive Git tree, and requests only recognized lockfile blobs by validated Git object ID.
+3. The Mac validates response, tree, manifest, UTF-8, aggregate-size, and component limits; parses the lockfiles in-process; and never invokes a subprocess, archive extractor, package manager, build tool, or repository source file.
+4. The generator emits CycloneDX 1.6 or SPDX 2.3 with repository, immutable commit, manifest-set SHA-256, manifest paths, generator, collection method, and component provenance. The operator selects the destination; the app writes JSON and an adjacent checksum with mode `0600`.
+5. The token field is cleared at submission and the token is released with the one request. No preferences, Keychain, local index, audit event, log, evidence record, cookie, cache, or retry queue contains it. The output remains a direct export and is not silently promoted into the hosted assessment lifecycle.
 
 ## Lifecycle and integrity model
 
@@ -71,7 +81,7 @@ One-time work has `max_attempts = 1`. If the request fails or its lease expires,
 ## Bounded operations
 
 - Provider inventories, zones, branch-protection checks, URLs, retries, and due jobs are capped.
-- Repository SBOMs cap the compressed ZIP at 20 MB, archive entries at 5,000, selected manifests at 100 and 8 MB total, each manifest at 2 MB and 100:1 decompression, unique components at 5,000, generation at ten requests per user per hour, and due-job processing at three jobs per scheduler pass.
+- Hosted repository SBOMs cap the compressed ZIP at 20 MB, archive entries at 5,000, selected manifests at 100 and 8 MB total, each manifest at 2 MB and 100:1 decompression, unique components at 5,000, generation at ten requests per user per hour, and due-job processing at three jobs per scheduler pass. Native generation caps the Git tree response at 8 MB/5,000 entries, selects at most 100 manifests at 2 MB each/8 MB total, emits at most 5,000 components, and permits one non-retrying run at a time.
 - Native screenshot and manifest request sizes are capped and only PNG evidence is accepted.
 - Hosted packages contain at most 100 approved artifacts and 25 MB of decrypted evidence and expire after seven days.
 - Retry orchestration uses at most three attempts with bounded exponential backoff; authentication and unsafe-content failures do not retry automatically.

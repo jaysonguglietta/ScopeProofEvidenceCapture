@@ -53,7 +53,7 @@ The native Local Console is served directly by Scopeproof Capture. It is not the
 
 - Preserve server-side authorization; hiding a control in React is not an access-control decision.
 - Treat provider content, capture metadata, filenames, Jira values, and package names as attacker-controlled.
-- Treat GitHub ZIP structures and every lockfile field as attacker-controlled. Do not add repository checkout, command execution, lifecycle scripts, package installation, or an unrestricted archive library path to SBOM generation.
+- Treat GitHub ZIP structures, Git tree/blob responses, and every lockfile field as attacker-controlled. Do not add repository checkout, command execution, lifecycle scripts, package installation, or an unrestricted archive library path to SBOM generation.
 - Use bound SQL parameters and strict size/type limits.
 - Never log secrets, decrypted evidence, device tokens, or recognized OCR text.
 - Keep original capture manifests immutable; record later decisions in lifecycle/audit records.
@@ -62,11 +62,11 @@ The native Local Console is served directly by Scopeproof Capture. It is not the
 
 ## Extending SBOM support
 
-Add a new ecosystem only when a deterministic lockfile contains pinned versions. Keep parsing in `lib/server/sbom.ts`; do not invoke the ecosystem's package manager or execute repository-supplied configuration. Preserve the pre-extraction ZIP validation, recognized-basename allowlist, UTF-8/NUL checks, manifest and aggregate byte limits, decompression-ratio limit, component ceiling, package-URL normalization, and immutable commit/archive provenance.
+Add a new ecosystem only when a deterministic lockfile contains pinned versions. Keep hosted and native parser behavior aligned in `lib/server/sbom.ts` and `macos/ScopeproofCapture/Sources/ScopeproofCapture/RepositorySBOMService.swift`; do not invoke the ecosystem's package manager or execute repository-supplied configuration. Preserve the hosted pre-extraction ZIP validation and the native Git tree/blob bounds, recognized-basename allowlists, UTF-8/NUL checks, manifest and aggregate byte limits, component ceilings, package-URL normalization, and immutable commit provenance.
 
 Tests for a parser must cover valid direct/transitive dependencies, duplicate normalization, malformed and oversized input, adversarial names/versions, empty or unpinned manifests, archive traversal-style names, decompression limits, stable CycloneDX/SPDX output, and confirmation that no subprocess or install path is introduced. Update the operator, assessor, security, architecture, deployment, dependency-security, SBOM, and changelog documentation in the same pull request.
 
-One-time credential changes must preserve exact `github.com` URL parsing, same-origin POST authorization, bounded request size, `Cache-Control: no-store`, masked non-controlled token input, immediate field clearing, absence of browser storage, absence of credential columns/bindings/audit details, one-attempt jobs, and scheduler failure rather than credentialless replay. Tests must use obvious synthetic strings and must never call GitHub with a developer token.
+Hosted one-time credential changes must preserve exact `github.com` URL parsing, same-origin POST authorization, bounded request size, `Cache-Control: no-store`, masked non-controlled token input, immediate field clearing, absence of browser storage, absence of credential columns/bindings/audit details, one-attempt jobs, and scheduler failure rather than credentialless replay. Native changes must additionally preserve an ephemeral cache/cookie/credential-free session, redirect rejection, API-host restriction, one-run concurrency, no Keychain/preferences/index/audit/log storage, secure file permissions, and no retry. Tests must use obvious synthetic strings and must never call GitHub with a developer token.
 
 ## Native release
 

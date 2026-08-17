@@ -40,6 +40,8 @@ One-time jobs intentionally have one attempt. `LEASE_EXPIRED` or transient GitHu
 
 Repository SBOM evidence follows the ordinary evidence expiration, legal-hold, encryption-key, approval, download, and assessor-package controls. Retain job metadata and the source/archive/artifact digests for the approved retention period. Do not retain downloaded GitHub ZIPs; Scopeproof processes them transiently and persists only the generated encrypted SBOM plus provenance metadata.
 
+Native Mac SBOM exports are deliberately outside hosted retention and approval controls. Require operators to retain the JSON and adjacent checksum in an approved encrypted evidence location, record the immutable commit and reviewer decision, transfer them through an approved channel, and dispose of them under the applicable schedule. The one-time token must be revoked after the run and must never be copied into a ticket, command history, evidence file, or troubleshooting log.
+
 ## Incident response
 
 Severity 1 includes suspected key compromise, audit-chain/checkpoint failure, unauthorized evidence access, cross-boundary exposure, malicious release/update, or loss of both primary and recovery data. Immediately stop collection/export/Jira transfer, preserve logs and external checkpoints, revoke affected device/OAuth/provider credentials, restrict administrator access, and open the security incident process. Do not rotate away or destroy a suspected key before preserving a controlled recovery copy needed to analyze historical records.
@@ -57,6 +59,7 @@ Close an incident only after root cause, evidence preservation, containment, era
 - Jira OAuth uses an organization-owned Atlassian app and least-privilege projects; a test attachment and reconciliation exercise succeeded.
 - Every required collector has complete pagination coverage and an approved least-privilege service identity.
 - Repository SBOM generation uses either a fixed organization with a repository-restricted managed credential or short-lived one-time tokens; both have Metadata/Contents read only. Request-body logging is disabled, and a known-commit canary, independent review, and assessor-package inclusion test succeeded.
+- Native Mac SBOM export was tested with a non-production repository; the URL/token dialog, immutable commit, bounded lockfile-only collection, CycloneDX/SPDX output, checksum, mode `0600`, token revocation, and documented manual review/retention path were verified.
 - Backup verification and an isolated recovery drill met approved RPO/RTO.
 - GitHub protected-branch checks, code-owner review, dependency updates, secret scanning, and release approvals are enabled.
 - The production Mac build is Developer ID signed, hardened, notarized, stapled, update-signed, hosted on an approved HTTPS origin, and verified on a clean Mac.

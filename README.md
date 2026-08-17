@@ -5,7 +5,7 @@ Scopeproof is a private, multi-framework compliance evidence-operations applicat
 The repository contains two coordinated products:
 
 - A private web console for collection orchestration, review, encrypted storage, audit history, and signed exports.
-- **Scopeproof Capture 1.4.0** for macOS, a local-first menu-bar application with a private evidence console, explicitly initiated timestamped/redacted screenshots, assessor packaging, optional hosted synchronization, and Jira handoff.
+- **Scopeproof Capture 1.5.0** for macOS, a local-first menu-bar application with a private evidence console, explicitly initiated timestamped/redacted screenshots, one-time repository SBOM export, assessor packaging, optional hosted synchronization, and Jira handoff.
 
 ## Documentation
 
@@ -81,7 +81,7 @@ Required platform secrets:
 
 Provider-specific values are documented in `.env.example`. Browser capture additionally requires `BROWSER_OCR_ENDPOINT`, `BROWSER_OCR_TOKEN`, and an exact `BROWSER_OCR_ALLOWED_HOSTS` allowlist; the OCR service must return the submitted PNG digest, recognized text, and a policy version. Use read-only, least-privilege credentials and limit browser targets to dedicated evidence URLs that do not expose cardholder data.
 
-Repository SBOM generation supports two hosted-console access modes. Administrators can configure `GITHUB_ORG` and `GITHUB_TOKEN` in Sites for a reusable managed repository list, or an operator can choose **One-time repository** under **SBOMs → Generate SBOM** and submit one exact GitHub URL plus a short-lived token. The one-time token is masked, cleared on submission, used only in request memory, and never written to D1, R2, audit details, logs, settings, browser storage, or the Mac Keychain. Use repository-scoped credentials with only **Metadata: read** and **Contents: read**. This capability is not part of the local-only Mac console. See the [repository SBOM guide](docs/SBOM_GUIDE.md) for assessment scope, supported lockfiles, approval, and auditor interpretation.
+Repository SBOM generation is available in two places. The hosted console supports managed organization access or an exact one-time GitHub URL and token, then creates assessment-scoped evidence with review, comparison, approval, and package inclusion. The Mac shield menu also provides **Generate Repository SBOM…** for a direct one-time CycloneDX or SPDX export plus checksum without a hosted account. In both one-time modes the masked token is cleared on submission and never persisted. Use a repository-scoped credential with only **Metadata: read** and **Contents: read**, then revoke it after the run. See the [repository SBOM guide](docs/SBOM_GUIDE.md) for workflow differences, supported lockfiles, safety limits, and auditor interpretation.
 
 Native updates use `MACOS_RELEASE_MANIFEST_JSON`, `MACOS_RELEASE_SIGNATURE_DER_BASE64`, and `MACOS_RELEASE_ALLOWED_HOSTS`. The signed manifest binds the version, monotonic sequence, URL, digest, size, validity window, release key, Developer ID team, and designated requirement. The Mac downloads without credentials or redirects and locally verifies the signature, digest, code identity, Gatekeeper acceptance, and stapled notarization before opening the local ZIP. RFC 3161 requires the TSA and pinned-verifier settings documented in `.env.example`; configuring only a TSA URL does not create trusted time. Device enrollment and revocation are managed in **Connections → Mac capture devices**.
 
