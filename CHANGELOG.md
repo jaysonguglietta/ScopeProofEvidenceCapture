@@ -14,6 +14,13 @@
 
 All notable Scopeproof changes are recorded here. Dates use the repository’s release timezone.
 
+## 1.5.1 — 2026-08-17
+
+### Fixed
+
+- Fixed the native repository SBOM dialog collapsing its input controls behind the action buttons by giving the AppKit accessory grid and each control explicit dimensions.
+- Added purpose-specific SBOM and warning icons so repository prompts and validation errors are easier to distinguish.
+
 ## 1.5.0 — 2026-08-17
 
 ### Added

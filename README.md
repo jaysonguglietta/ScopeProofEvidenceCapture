@@ -5,7 +5,7 @@ Scopeproof is a private, multi-framework compliance evidence-operations applicat
 The repository contains two coordinated products:
 
 - A private web console for collection orchestration, review, encrypted storage, audit history, and signed exports.
-- **Scopeproof Capture 1.5.0** for macOS, a local-first menu-bar application with a private evidence console, explicitly initiated timestamped/redacted screenshots, one-time repository SBOM export, assessor packaging, optional hosted synchronization, and Jira handoff.
+- **Scopeproof Capture 1.5.1** for macOS, a local-first menu-bar application with a private evidence console, explicitly initiated timestamped/redacted screenshots, one-time repository SBOM export, assessor packaging, optional hosted synchronization, and Jira handoff.
 
 ## Documentation
 

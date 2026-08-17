@@ -430,6 +430,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard repositorySBOMTask == nil else { return }
         NSApplication.shared.activate(ignoringOtherApps: true)
         let alert = NSAlert()
+        alert.icon = NSImage(systemSymbolName: "doc.text.magnifyingglass", accessibilityDescription: "Repository SBOM")
         alert.messageText = "Generate a one-time repository SBOM"
         alert.informativeText = "Scopeproof reads supported lockfiles at one immutable GitHub commit. Repository code is never cloned, built, installed, or executed."
         alert.addButton(withTitle: "Generate")
@@ -452,8 +453,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let safety = NSTextField(wrappingLabelWithString: "One-time credential: used only for this request, never written to settings, Keychain, evidence, logs, or a retry queue. Revoke it after the file is generated.")
         safety.textColor = .secondaryLabelColor
         safety.maximumNumberOfLines = 3
-        for field in [repositoryURL, token, ref] { field.frame.size.width = 430 }
-        safety.frame.size.width = 430
+        for field in [repositoryURL, token, ref] {
+            field.frame = NSRect(x: 0, y: 0, width: 430, height: 26)
+        }
+        format.frame = NSRect(x: 0, y: 0, width: 430, height: 28)
+        safety.frame = NSRect(x: 0, y: 0, width: 430, height: 54)
         let grid = NSGridView(views: [
             [label("GitHub repository *"), repositoryURL],
             [label("One-time token *"), token],
@@ -465,6 +469,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         grid.columnSpacing = 12
         grid.column(at: 0).xPlacement = .trailing
         grid.column(at: 1).xPlacement = .fill
+        // NSAlert does not establish constraints for an NSGridView accessory. Without
+        // an explicit frame AppKit can collapse the form to a few pixels above the
+        // buttons, leaving every input invisible.
+        grid.frame = NSRect(x: 0, y: 0, width: 590, height: 210)
         alert.accessoryView = grid
         alert.window.initialFirstResponder = repositoryURL
 
@@ -761,6 +769,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApplication.shared.activate(ignoringOtherApps: true)
         let alert = NSAlert()
         alert.alertStyle = .warning
+        alert.icon = NSImage(systemSymbolName: "exclamationmark.shield.fill", accessibilityDescription: "Scopeproof warning")
         alert.messageText = "Scopeproof could not complete the operation"
         alert.informativeText = error.localizedDescription
         alert.addButton(withTitle: "OK")
