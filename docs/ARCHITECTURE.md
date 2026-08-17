@@ -26,7 +26,7 @@ Scopeproof combines a private Cloudflare-hosted evidence console with a local ma
 6. **Mac → native upload endpoint:** a revocable bearer token identifies the device and HMAC-authenticates the exact manifest/image digest pair. The server derives metadata only from the versioned manifest and strictly validates PNG structure, decompression bounds, dimensions, digest, and capture-chain consistency before storage.
 7. **Scopeproof → assessor/Jira:** exports leave the system through an operator-controlled handoff. Hashes, signatures, visible stamps, and package instructions support independent verification, but destination authorization remains an organizational responsibility.
 8. **Scopeproof → Atlassian:** the hosted service exchanges OAuth codes, encrypts rotating tokens with a Jira-specific key, resolves the consented cloud ID, and calls only `api.atlassian.com`. A user/device may access only its own connection and configured project allowlist. The Mac sends approved evidence to Scopeproof, never Atlassian credentials.
-9. **Worker → GitHub repository archive:** the server accepts a repository only from the configured organization, resolves the requested ref through `api.github.com`, and follows an archive redirect only to `codeload.github.com`. The archive and every selected manifest are attacker-controlled. The Worker applies byte, entry, decompression-ratio, manifest, UTF-8, and component limits and parses recognized lockfiles without executing repository content.
+9. **Worker → GitHub repository archive:** managed mode accepts a repository only from the configured organization. One-time mode accepts only an exact HTTPS `github.com/owner/repository` URL and a request-scoped token. Both resolve the requested ref through `api.github.com` and follow an archive redirect only to `codeload.github.com`. The archive and every selected manifest are attacker-controlled. The Worker applies byte, entry, decompression-ratio, manifest, UTF-8, and component limits and parses recognized lockfiles without executing repository content. One-time tokens are never persisted or included in audit details.
 
 ## Native capture data flow
 
@@ -51,12 +51,14 @@ Scopeproof combines a private Cloudflare-hosted evidence console with a local ma
 
 ## Repository SBOM data flow
 
-1. A compliance lead or administrator selects an active assessment, repository in `GITHUB_ORG`, ref, and output format. Server-side authorization, same-origin checks, request-size validation, assessment/control scope, and a per-user hourly quota are enforced before a job is queued.
+1. A compliance lead or administrator selects an active assessment, repository source, ref, and output format. Managed mode uses a repository in `GITHUB_ORG`; one-time mode parses an exact GitHub URL and validates a short-lived token. Server-side authorization, same-origin checks, request-size validation, assessment/control scope, and a per-user hourly quota are enforced before a job is queued.
 2. The Worker resolves the ref to a 40-character commit SHA through GitHub's API, then requests exactly one archive for that commit. It does not clone, check out, build, install, or execute repository content.
 3. The Worker validates the ZIP directory before extraction and selects only recognized dependency lockfiles. Parsed components are normalized and de-duplicated by package URL with a hard component ceiling.
 4. Scopeproof emits CycloneDX 1.6 or SPDX 2.3 JSON containing repository, commit, source-archive SHA-256, manifest, generator, and component provenance.
-5. The result is stored through the ordinary encrypted evidence path and linked to an audited `sbom_jobs` record. A completed prior run for the same repository and assessment supplies a bounded added/removed/changed comparison.
+5. The result is stored through the ordinary encrypted evidence path and linked to an audited `sbom_jobs` record. A completed prior run for the same repository and assessment supplies a bounded added/removed/changed comparison. Repository identity and credential mode are retained; the credential is not.
 6. An independent reviewer inspects and approves the linked evidence. Only approved, unexpired evidence is eligible for an assessor package.
+
+One-time work has `max_attempts = 1`. If the request fails or its lease expires, the job fails closed and requires a new token; scheduled processing cannot reconstruct or reuse the credential.
 
 ## Lifecycle and integrity model
 

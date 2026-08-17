@@ -285,6 +285,10 @@ select { height: 35px; padding: 0 30px 0 10px; }
 .connection-alert strong { color: #853e3e; }
 .connection-alert p { color: #a56969; }
 .connection-alert button { min-height: 31px; padding: 0 11px; border: 1px solid #e8baba; border-radius: 6px; background: white; color: #a14242; }
+.connection-alert.optional { border-color: #d9e1ef; background: #f7f9fd; }
+.connection-alert.optional > span { background: #dfe8fb; color: #4062b7; }
+.connection-alert.optional strong { color: #40516a; }
+.connection-alert.optional p { color: #6d7b8f; }
 .connections-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
 .device-panel { margin-top: 18px; padding: 20px; }
 .device-list { display: grid; margin-top: 12px; }
@@ -401,6 +405,15 @@ select { height: 35px; padding: 0 30px 0 10px; }
 .source-select label strong, .source-select label small { display: block; }
 .source-select label strong { font-size: 9.5px; }
 .source-select label small { margin-top: 3px; color: #8b96a6; font-size: 8px; }
+.credential-choice { margin: 0 0 15px; padding: 0; border: 0; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.credential-choice legend { grid-column: 1 / -1; margin-bottom: 1px; color: #536177; font-size: 9.5px; font-weight: 650; }
+.credential-choice label { min-height: 62px; padding: 10px; display: flex; align-items: flex-start; gap: 8px; border: 1px solid #dfe4eb; border-radius: 8px; background: #fff; }
+.credential-choice label:has(input:checked) { border-color: #9fb0e7; background: #f4f7ff; box-shadow: inset 0 0 0 1px #dfe6fb; }
+.credential-choice label.disabled { opacity: .58; background: #f6f7f9; }
+.credential-choice input { margin-top: 2px; accent-color: var(--blue); }
+.credential-choice span { display: grid; gap: 4px; }
+.credential-choice strong { color: #35445b; font-size: 9.5px; }
+.credential-choice small { color: #8490a1; font-size: 8px; font-weight: 450; line-height: 1.35; }
 .checkbox-line { margin-top: 13px; display: flex; align-items: center; gap: 8px; color: #59687e; font-size: 9.5px; }
 .checkbox-line input { accent-color: var(--blue); }
 .modal-actions { margin: 18px -20px -20px; padding: 13px 20px; display: flex; justify-content: flex-end; gap: 8px; border-top: 1px solid var(--line); background: #fafbfd; }
@@ -556,6 +569,8 @@ select { height: 35px; padding: 0 30px 0 10px; }
   .form-grid { grid-template-columns: 1fr; }
   .field.full { grid-column: 1; }
   .source-select { grid-template-columns: 1fr; }
+  .credential-choice { grid-template-columns: 1fr; }
+  .credential-choice legend { grid-column: 1; }
   .upload-zone { align-items: flex-start; flex-wrap: wrap; }
   .upload-zone div { min-width: calc(100% - 45px); }
   .choose-file { margin-left: 40px; }

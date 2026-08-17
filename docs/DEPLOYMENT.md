@@ -50,6 +50,8 @@ Missing variables leave the corresponding collector in **Not configured**. Authe
 
 The GitHub API permissions are described in GitHub's [repository administration endpoints](https://docs.github.com/en/rest/repos/repos) and [repository contents endpoints](https://docs.github.com/en/rest/repos/contents). Review the [repository SBOM guide](SBOM_GUIDE.md) before enabling the feature for auditors.
 
+Managed GitHub configuration is optional for one-time repository access. When managed variables are absent, authorized operators may submit an exact GitHub URL and short-lived token in **SBOMs → Generate SBOM → One-time repository**. No additional hosted secret or migration is required. Confirm reverse proxies, request tracing, browser monitoring, and support tooling do not capture authorization request bodies; Scopeproof itself never logs or persists the submitted token.
+
 ## Database migrations
 
 Drizzle schema changes live in `db/schema.ts`. Generate a migration with:
@@ -71,7 +73,7 @@ Inspect generated SQL for destructive operations, unintended nullability changes
 
 Review role assignments regularly. Use separate named accounts; do not share administrator sessions.
 
-Apply migrations through `drizzle/0012_opposite_rachel_grey.sql`. Migration 0010 adds authoritative assessment scope and collector coverage; migration 0011 adds versioned encryption/HMAC key references and signed audit checkpoints; migration 0012 adds repository SBOM jobs. Production fails closed when `BOOTSTRAP_ADMIN_EMAILS` or `TRUSTED_APP_ORIGINS` is unsafe. Browser collection remains unavailable until its OCR endpoint, token, and exact host allowlist are all configured. Repository SBOM generation remains unavailable until both GitHub variables are configured.
+Apply migrations through `drizzle/0012_opposite_rachel_grey.sql`. Migration 0010 adds authoritative assessment scope and collector coverage; migration 0011 adds versioned encryption/HMAC key references and signed audit checkpoints; migration 0012 adds repository SBOM jobs. Production fails closed when `BOOTSTRAP_ADMIN_EMAILS` or `TRUSTED_APP_ORIGINS` is unsafe. Browser collection remains unavailable until its OCR endpoint, token, and exact host allowlist are all configured. Managed repository selection requires both GitHub variables; one-time repository generation does not.
 
 ## macOS device deployment
 

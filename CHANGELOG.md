@@ -2,6 +2,7 @@
 
 ## Unreleased — production evidence correctness and operations
 
+- Added one-time repository SBOM generation from an exact GitHub URL and short-lived read-only token entered in the SBOM menu. The token is masked, cleared on submission, used only for the active request, excluded from persistence/logs/audit details, and never available to automatic retries.
 - Added an auditor-facing repository SBOM workspace that generates CycloneDX 1.6 or SPDX 2.3 JSON from supported GitHub lockfiles at an immutable commit without cloning or executing repository code.
 - Added assessment-scoped PCI DSS 6.3.2 evidence, independent approval, assessor-package inclusion, prior-inventory comparison, audited downloads, bounded parsing, retryable jobs, and least-privilege GitHub configuration guidance.
 - Replaced demo-derived compliance state with fail-closed, assessment-scoped authoritative records.
