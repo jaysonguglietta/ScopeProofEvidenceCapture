@@ -9,6 +9,8 @@
 
 The logical hosted bindings are declared in `.openai/hosting.json`. Do not place physical resource identifiers or secret values in that file.
 
+Save Sites releases from the validated `dist/` archive produced by the official Sites packaging helper. This preserves the reviewed vendored dependency graph; source-only rebuilds intentionally reject local `file:` dependencies.
+
 ## Required hosted secrets
 
 | Variable | Requirement |
