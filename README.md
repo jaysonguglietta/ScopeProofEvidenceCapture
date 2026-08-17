@@ -15,6 +15,7 @@ The repository contains two coordinated products:
 | Evidence collectors and reviewers | [Operator guide](docs/OPERATOR_GUIDE.md) |
 | Jira/GRC coordinators | [Jira evidence handoff](docs/JIRA_HANDOFF.md) |
 | External assessors | [Assessor package and verification guide](docs/ASSESSOR_GUIDE.md) |
+| Software inventory operators | [Repository SBOM generation](docs/SBOM_GUIDE.md) |
 | Platform administrators | [Deployment and administration](docs/DEPLOYMENT.md) |
 | Security and risk teams | [Security model and operating controls](docs/SECURITY.md) |
 | Engineers and maintainers | [Architecture](docs/ARCHITECTURE.md) and [development guide](docs/DEVELOPMENT.md) |
@@ -48,7 +49,7 @@ The first time you capture, macOS may ask for Screen Recording access. Allow **S
 ## Provider evidence
 
 - AWS: Config recorder settings and EC2 security group inventory using SigV4.
-- GitHub: organization repository inventory and default-branch protection.
+- GitHub: organization repository inventory, default-branch protection, and non-executing CycloneDX 1.6 or SPDX 2.3 generation at an immutable commit.
 - Okta: global sign-on/MFA policies and access-review group inventory.
 - Cloudflare: WAF managed rulesets for scoped zones.
 - Browser capture: Cloudflare Browser Rendering produces one immutable full-page PNG, then an approved OCR service scans those exact digest-bound pixels. Captures fail closed if OCR is unavailable, the digest differs, or detected pixels contain PANs or secrets.

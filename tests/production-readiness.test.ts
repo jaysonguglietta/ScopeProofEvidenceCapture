@@ -113,3 +113,42 @@ test("release and operations controls are executable and fail closed", async () 
   assert.match(operations, /single-tenant/);
   assert.match(operations, /Launch authorization checklist/);
 });
+
+test("repository SBOM generation is immutable, non-executing, bounded, and assessment scoped", async () => {
+  const sbom = await read("lib/server/sbom.ts");
+  const route = await read("app/api/sboms/route.ts");
+  const jobs = await read("lib/server/jobs.ts");
+  const migration = await read("drizzle/0012_opposite_rachel_grey.sql");
+  assert.match(sbom, /commits\/\$\{encodeURIComponent\(String\(job\.requested_ref\)\)\}/);
+  assert.match(sbom, /zipball\/\$\{commit\}/);
+  assert.match(sbom, /\["api\.github\.com", "codeload\.github\.com"\]/);
+  assert.match(sbom, /MAX_ARCHIVE_BYTES = 20 \* 1024 \* 1024/);
+  assert.match(sbom, /MAX_ARCHIVE_ENTRIES = 5_000/);
+  assert.match(sbom, /MAX_COMPONENTS = 5_000/);
+  assert.match(sbom, /unzipSync\(bytes, \{ filter:/);
+  assert.match(sbom, /controlId: "6\.3\.2"/);
+  assert.match(sbom, /coverageStatus: "complete"/);
+  assert.doesNotMatch(sbom, /child_process|execSync|spawnSync|npm install|yarn install|pnpm install/);
+  assert.match(route, /requireApiPermission\(request, "generate_sbom"\)/);
+  assert.match(route, /enforceRateLimit\(request, user\.id, "sbom:generate", 10, 3_600\)/);
+  assert.match(jobs, /processDueSbomWork\(now\)/);
+  assert.match(migration, /CREATE TABLE `sbom_jobs`/);
+  assert.match(migration, /`resolved_commit_sha` text/);
+  assert.match(migration, /`source_archive_sha256` text/);
+  assert.match(migration, /`artifact_sha256` text/);
+});
+
+test("SBOM evidence is reviewable, downloadable, comparable, and documented for auditors", async () => {
+  const consoleSource = await read("app/evidence-console.tsx");
+  const packageSource = await read("lib/server/packages.ts");
+  const guide = await read("docs/SBOM_GUIDE.md");
+  assert.match(consoleSource, /"SBOMs"/);
+  assert.match(consoleSource, /CycloneDX 1\.6 JSON/);
+  assert.match(consoleSource, /SPDX 2\.3 JSON/);
+  assert.match(consoleSource, /Since prior/);
+  assert.match(consoleSource, /\/api\/evidence\/\$\{encodeURIComponent\(item\.evidence_id\)\}/);
+  assert.match(packageSource, /FROM evidence_artifacts WHERE assessment_id = \? AND status = 'approved'/);
+  assert.match(guide, /does not clone a repository or execute repository code/);
+  assert.match(guide, /Metadata: read/);
+  assert.match(guide, /Contents: read/);
+});

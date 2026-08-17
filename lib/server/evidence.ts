@@ -51,7 +51,7 @@ function isTextual(contentType: string): boolean {
   return contentType.startsWith("text/") || /json|xml|yaml|javascript|typescript|x-sh|hcl/i.test(contentType);
 }
 
-export async function storeEvidence(input: EvidenceInput): Promise<{ id: string; deduplicated: boolean; redactionCount: number }> {
+export async function storeEvidence(input: EvidenceInput): Promise<{ id: string; deduplicated: boolean; redactionCount: number; sha256: string }> {
   const env = getEnv();
   if (input.assessmentId) {
     const assessment = await getAssessment(input.assessmentId);
@@ -75,7 +75,7 @@ export async function storeEvidence(input: EvidenceInput): Promise<{ id: string;
   if (input.safetyScanSha256 && input.safetyScanSha256 !== digest) throw new Response(JSON.stringify({ error: "Safety scan digest does not match the evidence artifact." }), { status: 422, headers: { "content-type": "application/json" } });
   if (input.type === "screenshot" && (!input.safetyScanSha256 || !input.safetyScanPolicy || !input.safetyScanCompletedAt)) throw new Response(JSON.stringify({ error: "Screenshot evidence requires a digest-bound exact-pixel safety scan." }), { status: 422, headers: { "content-type": "application/json" } });
   const existing = await env.DB.prepare("SELECT id FROM evidence_artifacts WHERE sha256 = ? AND source = ? AND control_id = ? AND assessment_id = ?").bind(digest, input.source, input.controlId, input.assessmentId || null).first<{ id: string }>();
-  if (existing) return { id: existing.id, deduplicated: true, redactionCount };
+  if (existing) return { id: existing.id, deduplicated: true, redactionCount, sha256: digest };
   const capturedAt = input.capturedAt || new Date().toISOString();
   const expiresAt = new Date(new Date(capturedAt).getTime() + (input.validityDays || 90) * 86_400_000).toISOString();
   const associatedData = stableJson({ id, controlId: input.controlId, source: input.source, capturedAt });
@@ -99,7 +99,7 @@ export async function storeEvidence(input: EvidenceInput): Promise<{ id: string;
     await env.EVIDENCE_BUCKET.delete(r2Key);
     throw error;
   }
-  return { id, deduplicated: false, redactionCount };
+  return { id, deduplicated: false, redactionCount, sha256: digest };
 }
 
 export async function listEvidence(limit = 100): Promise<Array<Record<string, unknown>>> {

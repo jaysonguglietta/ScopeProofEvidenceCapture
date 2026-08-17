@@ -10,9 +10,11 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
     const artifact = await readEvidenceBytes(id);
     if (!artifact) return Response.json({ error: "Evidence not found" }, { status: 404 });
     const inline = new URL(request.url).searchParams.get("view") === "inline";
+    const contentType = String(artifact.row.content_type);
+    const extension = contentType.includes("json") ? ".json" : contentType.includes("png") ? ".png" : contentType.includes("pdf") ? ".pdf" : ".txt";
     return new Response(artifact.bytes.buffer.slice(artifact.bytes.byteOffset, artifact.bytes.byteOffset + artifact.bytes.byteLength) as ArrayBuffer, { headers: {
-      "content-type": String(artifact.row.content_type),
-      "content-disposition": `${inline ? "inline" : "attachment"}; filename="${id}"`,
+      "content-type": contentType,
+      "content-disposition": `${inline ? "inline" : "attachment"}; filename="${id}${extension}"`,
       "content-security-policy": "default-src 'none'; sandbox",
       "x-content-type-options": "nosniff",
       "x-scopeproof-sha256": String(artifact.row.sha256),

@@ -9,6 +9,7 @@ import { publishOperationalHealth } from "./monitoring";
 import { storeEvidence } from "./evidence";
 import { purgeRateLimitBuckets } from "./rate-limit";
 import { purgeExpiredEvidence } from "./retention";
+import { processDueSbomWork } from "./sbom";
 
 const systemActor: AuthenticatedUser = { id: "system:scheduler", email: "scheduler@scopeproof.internal", displayName: "Scopeproof Scheduler", role: "admin" };
 
@@ -90,6 +91,7 @@ export async function processDueWork(now = new Date()): Promise<void> {
   await purgeRateLimitBuckets(Math.floor(now.getTime() / 1_000));
   const dueRetries = (await env.DB.prepare("SELECT id FROM collection_jobs WHERE (status = 'retrying' AND next_attempt_at <= ?) OR (status = 'running' AND lease_expires_at < ?) ORDER BY next_attempt_at LIMIT 10").bind(now.toISOString(), now.toISOString()).all<{ id: string }>()).results;
   for (const job of dueRetries) await processJob(job.id);
+  await processDueSbomWork(now);
   const collectors = (await env.DB.prepare("SELECT id, schedule_cron, last_run_at FROM collectors WHERE enabled = 1 AND schedule_cron IS NOT NULL").all<{ id: string; schedule_cron: string; last_run_at: string | null }>()).results;
   for (const collector of collectors) {
     if (!isCronDue(collector.schedule_cron, now, collector.last_run_at ? new Date(collector.last_run_at) : null)) continue;

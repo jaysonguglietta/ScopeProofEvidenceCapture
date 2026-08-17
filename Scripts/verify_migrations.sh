@@ -16,12 +16,13 @@ for migration in \
   drizzle/0008_real_nebula.sql \
   drizzle/0009_chubby_martin_li.sql \
   drizzle/0010_tearful_goblin_queen.sql \
-  drizzle/0011_easy_vision.sql
+  drizzle/0011_easy_vision.sql \
+  drizzle/0012_opposite_rachel_grey.sql
 do
   test -f "$migration"
   sqlite3 "$database" ".read $migration"
 done
 
 test "$(sqlite3 "$database" 'PRAGMA integrity_check;')" = "ok"
-test "$(sqlite3 "$database" "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('assessments','audit_checkpoints','evidence_artifacts');")" = "3"
+test "$(sqlite3 "$database" "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('assessments','audit_checkpoints','evidence_artifacts','sbom_jobs');")" = "4"
 echo "Migration replay and integrity check passed."

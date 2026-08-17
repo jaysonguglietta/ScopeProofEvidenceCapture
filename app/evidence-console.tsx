@@ -5,13 +5,14 @@ import Image from "next/image";
 import { controls } from "../lib/data";
 import type { CollectionRun, Evidence, EvidenceStatus } from "../lib/types";
 
-type View = "Overview" | "Controls" | "Evidence" | "Collection runs" | "Findings" | "Connections" | "Settings" | "Help";
-type Modal = "run" | "add" | "export" | "device" | "assessment" | null;
+type View = "Overview" | "Controls" | "Evidence" | "SBOMs" | "Collection runs" | "Findings" | "Connections" | "Settings" | "Help";
+type Modal = "run" | "add" | "sbom" | "export" | "device" | "assessment" | null;
 
 const nav: { label: View; mark: string; section: "workspace" | "manage" }[] = [
   { label: "Overview", mark: "⌂", section: "workspace" },
   { label: "Controls", mark: "◎", section: "workspace" },
   { label: "Evidence", mark: "▱", section: "workspace" },
+  { label: "SBOMs", mark: "◫", section: "workspace" },
   { label: "Collection runs", mark: "↻", section: "workspace" },
   { label: "Findings", mark: "◇", section: "workspace" },
   { label: "Connections", mark: "⌘", section: "manage" },
@@ -32,6 +33,8 @@ type ApiUser = { id: string; email: string; displayName: string; role: string };
 type ApiDevice = { id: string; display_name: string; platform: string; status: string; app_version: string | null; last_seen_at: string | null; created_at: string; revoked_at: string | null };
 type ApiJiraConnection = { connected: boolean; configured: boolean; id?: string; siteUrl?: string; siteName?: string; allowedProjects?: string[]; status?: "active" | "reauthorization_required"; lastTestedAt?: string | null; updatedAt?: string };
 type ApiAssessment = { id: string; name: string; framework: string; period_start: string; period_end: string; systems: string[]; controls: string[]; owner_id: string; status: "draft" | "active" | "closed"; created_at: string; updated_at: string };
+type ApiRepository = { name: string; fullName: string; defaultBranch: string; private: boolean; archived: boolean };
+type ApiSbom = { id: string; assessment_id: string; repository_full_name: string; requested_ref: string; resolved_commit_sha: string | null; format: "cyclonedx_json" | "spdx_json"; status: "queued" | "running" | "completed" | "retrying" | "failed"; attempt: number; max_attempts: number; evidence_id: string | null; component_count: number; direct_dependency_count: number; manifest_count: number; source_archive_sha256: string | null; artifact_sha256: string | null; generator_name: string; generator_version: string; manifests: string[]; comparison: { baseline?: boolean; previousJobId?: string; added?: number; removed?: number; changed?: number; addedComponents?: string[]; removedComponents?: string[]; changedComponents?: string[] }; error_code: string | null; error_message: string | null; created_at: string; completed_at: string | null };
 
 function cls(...values: Array<string | false | null | undefined>) {
   return values.filter(Boolean).join(" ");
@@ -119,6 +122,9 @@ export function EvidenceConsole() {
   const [evidenceItems, setEvidenceItems] = useState<Evidence[]>([]);
   const [runItems, setRunItems] = useState<CollectionRun[]>([]);
   const [assessmentItems, setAssessmentItems] = useState<ApiAssessment[]>([]);
+  const [sbomItems, setSbomItems] = useState<ApiSbom[]>([]);
+  const [repositoryItems, setRepositoryItems] = useState<ApiRepository[]>([]);
+  const [sbomConfigured, setSbomConfigured] = useState(false);
   const [selectedAssessmentId, setSelectedAssessmentId] = useState("");
   const [collectorItems, setCollectorItems] = useState<ApiCollector[]>([]);
   const [deviceItems, setDeviceItems] = useState<ApiDevice[]>([]);
@@ -135,15 +141,18 @@ export function EvidenceConsole() {
     let cancelled = false;
     const load = async () => {
       try {
-        const [meResponse, evidenceResponse, runsResponse, collectorsResponse, auditResponse, assessmentsResponse] = await Promise.all([fetch("/api/me"), fetch("/api/evidence"), fetch("/api/runs"), fetch("/api/collectors"), fetch("/api/audit"), fetch("/api/assessments")]);
-        if (!meResponse.ok || !evidenceResponse.ok || !runsResponse.ok || !collectorsResponse.ok || !assessmentsResponse.ok) throw new Error("Backend unavailable");
-        const [me, evidenceData, runData, collectorData, auditData, assessmentData] = await Promise.all([meResponse.json(), evidenceResponse.json(), runsResponse.json(), collectorsResponse.json(), auditResponse.ok ? auditResponse.json() : Promise.resolve(null), assessmentsResponse.json()]) as [{ user: ApiUser }, { evidence: Array<Record<string, unknown>> }, { runs: Array<Record<string, unknown>> }, { collectors: ApiCollector[] }, { integrity: { valid: boolean; checked: number } } | null, { assessments: ApiAssessment[] }];
+        const [meResponse, evidenceResponse, runsResponse, collectorsResponse, auditResponse, assessmentsResponse, sbomsResponse] = await Promise.all([fetch("/api/me"), fetch("/api/evidence"), fetch("/api/runs"), fetch("/api/collectors"), fetch("/api/audit"), fetch("/api/assessments"), fetch("/api/sboms")]);
+        if (!meResponse.ok || !evidenceResponse.ok || !runsResponse.ok || !collectorsResponse.ok || !assessmentsResponse.ok || !sbomsResponse.ok) throw new Error("Backend unavailable");
+        const [me, evidenceData, runData, collectorData, auditData, assessmentData, sbomData] = await Promise.all([meResponse.json(), evidenceResponse.json(), runsResponse.json(), collectorsResponse.json(), auditResponse.ok ? auditResponse.json() : Promise.resolve(null), assessmentsResponse.json(), sbomsResponse.json()]) as [{ user: ApiUser }, { evidence: Array<Record<string, unknown>> }, { runs: Array<Record<string, unknown>> }, { collectors: ApiCollector[] }, { integrity: { valid: boolean; checked: number } } | null, { assessments: ApiAssessment[] }, { jobs: ApiSbom[]; repositories: ApiRepository[]; configured: boolean }];
         if (cancelled) return;
         setCurrentUser(me.user);
         setEvidenceItems((evidenceData.evidence as Array<Record<string, unknown>>).map(mapApiEvidence));
         setRunItems((runData.runs as Array<Record<string, unknown>>).map(mapApiRun));
         setCollectorItems(collectorData.collectors);
         setAssessmentItems(assessmentData.assessments);
+        setSbomItems(sbomData.jobs);
+        setRepositoryItems(sbomData.repositories);
+        setSbomConfigured(sbomData.configured);
         setSelectedAssessmentId(assessmentData.assessments.find((item) => item.status === "active")?.id || "");
         setAuditIntegrity(auditData?.integrity || null);
         if (["compliance_lead", "admin"].includes(me.user.role)) {
@@ -154,7 +163,7 @@ export function EvidenceConsole() {
         }
         setBackendState("live");
       } catch {
-        if (!cancelled) { setEvidenceItems([]); setRunItems([]); setCollectorItems([]); setAssessmentItems([]); setCurrentUser(null); setAuditIntegrity(null); setBackendState("unavailable"); }
+        if (!cancelled) { setEvidenceItems([]); setRunItems([]); setCollectorItems([]); setAssessmentItems([]); setSbomItems([]); setRepositoryItems([]); setCurrentUser(null); setAuditIntegrity(null); setBackendState("unavailable"); }
       }
     };
     void load();
@@ -191,6 +200,7 @@ export function EvidenceConsole() {
 
   const scopedEvidence = useMemo(() => evidenceItems.filter((item) => item.assessmentId === selectedAssessmentId), [evidenceItems, selectedAssessmentId]);
   const scopedRuns = useMemo(() => runItems.filter((item) => item.assessmentId === selectedAssessmentId), [runItems, selectedAssessmentId]);
+  const scopedSboms = useMemo(() => sbomItems.filter((item) => item.assessment_id === selectedAssessmentId), [sbomItems, selectedAssessmentId]);
   const filteredEvidence = useMemo(() => scopedEvidence.filter((item) => {
     const q = search.trim().toLowerCase();
     const matchesQuery = !q || [item.title, item.control, item.source, item.system, item.jiraIssueKey || "", item.tags.join(" ")].join(" ").toLowerCase().includes(q);
@@ -231,6 +241,21 @@ export function EvidenceConsole() {
       const failures = (data.results as Array<{ status: string }>).filter((result) => result.status !== "completed").length;
       setModal(null); setToast(failures ? `Collection finished with ${failures} source issue(s). Review run details.` : `Collection complete: ${captured} new artifacts captured.`); setView("Collection runs");
     } catch (error) { setRunItems((items) => items.filter((run) => run.id !== newRun.id)); setToast(error instanceof Error ? error.message : "Collection failed."); }
+    finally { setBusy(false); }
+  }
+
+  async function handleSbom(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    setBusy(true);
+    try {
+      const response = await fetch("/api/sboms", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ assessmentId: form.get("assessmentId"), repository: form.get("repository"), ref: form.get("ref"), format: form.get("format") }) });
+      const data = await response.json() as { job?: ApiSbom; error?: string };
+      if (!response.ok || !data.job || data.job.status !== "completed") throw new Error(data.job?.error_message || data.error || "SBOM generation failed.");
+      const [sboms, evidence] = await Promise.all([fetch("/api/sboms").then((result) => result.json()) as Promise<{ jobs: ApiSbom[] }>, fetch("/api/evidence").then((result) => result.json()) as Promise<{ evidence: Array<Record<string, unknown>> }>]);
+      setSbomItems(sboms.jobs); setEvidenceItems(evidence.evidence.map(mapApiEvidence)); setModal(null); setView("SBOMs");
+      setToast(`${data.job.repository_full_name} SBOM generated with ${data.job.component_count} components and added to evidence review.`);
+    } catch (error) { setToast(error instanceof Error ? error.message : "SBOM generation failed."); }
     finally { setBusy(false); }
   }
 
@@ -395,6 +420,7 @@ export function EvidenceConsole() {
           {view === "Overview" && <Overview evidenceItems={scopedEvidence} runItems={scopedRuns} collectors={collectorItems} assessment={activeAssessment} user={currentUser} canCollect={canCollect} onNavigate={navigate} onSelect={setSelectedEvidence} onRun={() => activeAssessment ? setModal("run") : setModal("assessment")} onCreateAssessment={() => setModal("assessment")} />}
           {view === "Controls" && <ControlsView evidenceItems={scopedEvidence} onNavigate={navigate} />}
           {view === "Evidence" && <EvidenceView items={filteredEvidence} canCollect={canCollect} search={search} setSearch={setSearch} status={statusFilter} setStatus={setStatusFilter} type={typeFilter} setType={setTypeFilter} onSelect={setSelectedEvidence} onAdd={() => setModal("add")} />}
+          {view === "SBOMs" && <SbomView items={scopedSboms} configured={sbomConfigured} canGenerate={canCollect} onGenerate={() => setModal("sbom")} onOpenEvidence={(id) => { const item = evidenceItems.find((entry) => entry.id === id); if (item) setSelectedEvidence(item); else setToast("The evidence record is unavailable. Reload and try again."); }} />}
           {view === "Collection runs" && <RunsView items={scopedRuns} canCollect={canCollect} onRun={() => setModal("run")} onToast={setToast} />}
           {view === "Findings" && <FindingsView evidenceItems={scopedEvidence} runItems={scopedRuns} />}
           {view === "Connections" && <ConnectionsView collectors={collectorItems} devices={deviceItems} jira={jiraConnection} canManageJira={canManageOperations} busy={busy} onConnectJira={connectJira} onTestJira={testJira} onDisconnectJira={disconnectJiraConnection} onEnroll={() => { setDeviceToken(null); setModal("device"); }} onRevoke={revokeDevice} onToast={setToast} />}
@@ -404,7 +430,7 @@ export function EvidenceConsole() {
       </main>
 
       {selectedEvidence && <EvidenceDrawer key={selectedEvidence.id} item={selectedEvidence} currentUser={currentUser} onClose={() => setSelectedEvidence(null)} onApprove={approveEvidence} onToast={setToast} />}
-      {modal && <Modal type={modal} collectors={collectorItems} assessments={assessmentItems} selectedAssessmentId={selectedAssessmentId} setSelectedAssessmentId={setSelectedAssessmentId} deviceToken={deviceToken} onClose={() => !busy && setModal(null)} onRun={handleRun} onAdd={handleAdd} onExport={exportPackage} onDevice={enrollDevice} onAssessment={createAssessment} busy={busy} />}
+      {modal && <Modal type={modal} collectors={collectorItems} repositories={repositoryItems} assessments={assessmentItems} selectedAssessmentId={selectedAssessmentId} setSelectedAssessmentId={setSelectedAssessmentId} deviceToken={deviceToken} onClose={() => !busy && setModal(null)} onRun={handleRun} onSbom={handleSbom} onAdd={handleAdd} onExport={exportPackage} onDevice={enrollDevice} onAssessment={createAssessment} busy={busy} />}
       {toast && <div className="toast" role="status"><span>✓</span>{toast}</div>}
     </div>
   );
@@ -466,6 +492,26 @@ function EvidenceView({ items, canCollect, search, setSearch, status, setStatus,
     <section className="panel evidence-library"><div className="toolbar"><label className="search-box wide"><span>⌕</span><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search evidence, control, system, or tag…" /></label><select aria-label="Filter by evidence type" value={type} onChange={(e) => setType(e.target.value)}><option>All types</option><option>Screenshot</option><option>Code</option><option>Configuration</option><option>Report</option></select><select aria-label="Filter by review status" value={status} onChange={(e) => setStatus(e.target.value)}><option>All statuses</option><option>Approved</option><option>Needs review</option><option>Expiring</option><option>Failed</option></select></div>
       <div className="library-subhead"><span>{items.length} artifacts</span><span>Sorted by <b>most recent</b></span></div>
       {items.length ? <div className="library-grid">{items.map((item) => <button className="library-card" key={item.id} onClick={() => onSelect(item)}><EvidenceVisual item={item} /><div className="library-body"><div><span className="type-label">{item.type}</span><StatusPill status={item.status} /></div><h3>{item.title}</h3><p>{item.description}</p><div className="artifact-meta"><span><b>{item.control}</b> · {item.requirement}</span><span>{item.source} / {item.system}</span><span>{item.capturedAt}</span></div></div></button>)}</div> : <EmptyState message="No evidence matches these filters." action="Clear filters" onAction={() => { setSearch(""); setStatus("All statuses"); setType("All types"); }} />}
+    </section>
+  </>;
+}
+
+function SbomView({ items, configured, canGenerate, onGenerate, onOpenEvidence }: { items: ApiSbom[]; configured: boolean; canGenerate: boolean; onGenerate: () => void; onOpenEvidence: (id: string) => void }) {
+  const complete = items.filter((item) => item.status === "completed");
+  const latest = complete[0];
+  return <>
+    <PageTitle eyebrow="Software supply chain" title="SBOM workspace" description="Generate auditor-ready software inventories from an immutable GitHub commit without executing repository code." actions={<button className="button primary" disabled={!canGenerate || !configured} title={!configured ? "Configure GITHUB_TOKEN and GITHUB_ORG first." : !canGenerate ? "An active assessment and SBOM permission are required." : undefined} onClick={onGenerate}>＋ Generate SBOM</button>} />
+    {!configured && <div className="connection-alert"><span>!</span><div><strong>GitHub SBOM connection is not configured</strong><p>Add a read-only GitHub token and organization to the hosted environment. The token needs repository Metadata and Contents read access.</p></div></div>}
+    <div className="summary-strip sbom-summary"><div><strong>{complete.length}</strong><span>Completed inventories</span></div><div><strong>{new Set(complete.map((item) => item.repository_full_name)).size}</strong><span>Repositories inventoried</span></div><div><strong>{latest?.component_count || 0}</strong><span>Components in latest</span></div><div><strong>{items.filter((item) => item.status === "failed" || item.status === "retrying").length}</strong><span>Jobs needing attention</span></div></div>
+    <div className="info-callout"><span>i</span><div><strong>Auditable by design</strong><p>Every run records the requested ref, resolved 40-character commit SHA, source archive hash, generator version, parsed manifests, artifact hash, and differences from the prior inventory.</p></div></div>
+    <section className="panel sbom-panel"><div className="panel-head"><div><h2>Generated inventories</h2><p>CycloneDX 1.6 and SPDX 2.3 evidence mapped to PCI DSS 6.3.2</p></div></div>
+      {items.length ? <div className="sbom-list">{items.map((item) => { const delta = item.comparison || {}; return <article className="sbom-row" key={item.id}>
+        <div className="sbom-icon">{item.format === "spdx_json" ? "SP" : "CX"}</div>
+        <div className="sbom-main"><div><strong>{item.repository_full_name}</strong><StatusPill status={titleCase(item.status)} /></div><p><code>{item.resolved_commit_sha ? item.resolved_commit_sha.slice(0, 12) : item.requested_ref}</code> · {item.format === "spdx_json" ? "SPDX 2.3 JSON" : "CycloneDX 1.6 JSON"} · {formatDate(item.created_at)}</p>{item.error_message && <small className="danger-text">{item.error_message}</small>}</div>
+        <dl><div><dt>Components</dt><dd>{item.component_count}</dd></div><div><dt>Direct</dt><dd>{item.direct_dependency_count}</dd></div><div><dt>Manifests</dt><dd>{item.manifest_count}</dd></div></dl>
+        <div className="sbom-delta"><span className={delta.baseline ? "neutral" : "added"}>+{delta.added || 0}</span><span className={delta.baseline ? "neutral" : "changed"}>~{delta.changed || 0}</span><span className={delta.baseline ? "neutral" : "removed"}>−{delta.removed || 0}</span><small>{delta.baseline ? "Baseline" : "Since prior"}</small></div>
+        <div className="sbom-actions">{item.evidence_id && <><button className="button secondary" onClick={() => onOpenEvidence(item.evidence_id!)}>Review</button><a className="button secondary" href={`/api/evidence/${encodeURIComponent(item.evidence_id)}`} download>↓ JSON</a></>}</div>
+      </article>; })}</div> : <EmptyState message={configured ? "No SBOM has been generated for this assessment. Create a baseline inventory from a configured GitHub repository." : "Configure the GitHub connection to generate the first SBOM."} action={configured && canGenerate ? "Generate baseline" : undefined} onAction={configured && canGenerate ? onGenerate : undefined} />}
     </section>
   </>;
 }
@@ -579,10 +625,13 @@ function EvidenceDrawer({ item, currentUser, onClose, onApprove, onToast }: { it
   </>;
 }
 
-function Modal({ type, collectors, assessments, selectedAssessmentId, setSelectedAssessmentId, deviceToken, onClose, onRun, onAdd, onExport, onDevice, onAssessment, busy }: { type: Exclude<Modal, null>; collectors: ApiCollector[]; assessments: ApiAssessment[]; selectedAssessmentId: string; setSelectedAssessmentId: (id: string) => void; deviceToken: string | null; onClose: () => void; onRun: (e: React.FormEvent<HTMLFormElement>) => void; onAdd: (e: React.FormEvent<HTMLFormElement>) => void; onExport: () => void; onDevice: (e: React.FormEvent<HTMLFormElement>) => void; onAssessment: (e: React.FormEvent<HTMLFormElement>) => void; busy: boolean }) {
-  const titles = { run: "Run evidence collection", add: "Add manual evidence", export: "Export evidence package", device: "Enroll Mac capture device", assessment: "Create assessment scope" };
+function Modal({ type, collectors, repositories, assessments, selectedAssessmentId, setSelectedAssessmentId, deviceToken, onClose, onRun, onSbom, onAdd, onExport, onDevice, onAssessment, busy }: { type: Exclude<Modal, null>; collectors: ApiCollector[]; repositories: ApiRepository[]; assessments: ApiAssessment[]; selectedAssessmentId: string; setSelectedAssessmentId: (id: string) => void; deviceToken: string | null; onClose: () => void; onRun: (e: React.FormEvent<HTMLFormElement>) => void; onSbom: (e: React.FormEvent<HTMLFormElement>) => void; onAdd: (e: React.FormEvent<HTMLFormElement>) => void; onExport: () => void; onDevice: (e: React.FormEvent<HTMLFormElement>) => void; onAssessment: (e: React.FormEvent<HTMLFormElement>) => void; busy: boolean }) {
+  const [sbomRepository, setSbomRepository] = useState(repositories.find((item) => !item.archived)?.name || "");
+  const [sbomRef, setSbomRef] = useState(repositories.find((item) => !item.archived)?.defaultBranch || "main");
+  const titles = { run: "Run evidence collection", sbom: "Generate repository SBOM", add: "Add manual evidence", export: "Export evidence package", device: "Enroll Mac capture device", assessment: "Create assessment scope" };
   return <div className="modal-layer" role="dialog" aria-modal="true" aria-labelledby="modal-title"><button className="modal-scrim" onClick={onClose} aria-label="Close dialog" /><section className="modal"><div className="modal-head"><div><span className="eyebrow">Scopeproof</span><h2 id="modal-title">{titles[type]}</h2></div><button onClick={onClose} aria-label="Close dialog">×</button></div>
     {type === "run" && <form onSubmit={onRun}><p className="modal-intro">Select configured sources to query. Scope, pagination, omissions, and API versions are recorded with every artifact.</p><label className="field"><span>Assessment</span><select name="assessmentId" required value={selectedAssessmentId} onChange={(e) => setSelectedAssessmentId(e.target.value)}>{assessments.filter((item) => item.status === "active").map((item) => <option value={item.id} key={item.id}>{item.name} · {item.period_start}–{item.period_end}</option>)}</select></label><fieldset className="source-select"><legend>Live evidence sources</legend>{sources.map((source, index) => { const collector = collectors.find((item) => item.id === source.id); const configured = collector?.configuration.configured === true; return <label key={source.name} className={!configured ? "disabled" : ""}><input type="checkbox" name="source" value={source.id} defaultChecked={configured && index < 3} disabled={!configured} /><span>{source.mark}</span><div><strong>{source.name}</strong><small>{configured ? `${source.detail} · ${collector?.schedule_cron || "On demand"} UTC` : `Missing ${collector?.configuration.missing.join(", ") || "hosted credentials"}`}</small></div></label>; })}</fieldset><label className="checkbox-line"><input type="checkbox" checked readOnly /> Block approval and export when provider coverage is partial</label><div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy || !selectedAssessmentId}>{busy ? <><span className="button-spinner" /> Collecting live evidence…</> : "Start live collection"}</button></div></form>}
+    {type === "sbom" && <form onSubmit={onSbom}><p className="modal-intro">Scopeproof resolves the selected ref to an immutable Git commit, downloads a bounded ZIP, and parses supported lockfiles. Build scripts, package managers, hooks, and repository code are never executed.</p><div className="form-grid"><label className="field full"><span>Assessment</span><select name="assessmentId" required value={selectedAssessmentId} onChange={(event) => setSelectedAssessmentId(event.target.value)}>{assessments.filter((item) => item.status === "active").map((item) => <option value={item.id} key={item.id}>{item.name} · {item.framework}</option>)}</select></label><label className="field full"><span>GitHub repository</span><select name="repository" required value={sbomRepository} onChange={(event) => { const repo = repositories.find((item) => item.name === event.target.value); setSbomRepository(event.target.value); if (repo) setSbomRef(repo.defaultBranch); }}><option value="" disabled>Select repository</option>{repositories.map((item) => <option value={item.name} key={item.fullName} disabled={item.archived}>{item.fullName}{item.private ? " · Private" : ""}{item.archived ? " · Archived" : ""}</option>)}</select></label><label className="field"><span>Branch, tag, or commit</span><input name="ref" required maxLength={200} value={sbomRef} onChange={(event) => setSbomRef(event.target.value)} autoCapitalize="none" autoCorrect="off" spellCheck={false} /></label><label className="field"><span>Output format</span><select name="format" defaultValue="cyclonedx_json"><option value="cyclonedx_json">CycloneDX 1.6 JSON</option><option value="spdx_json">SPDX 2.3 JSON</option></select></label></div><div className="privacy-note"><span>✓</span><p>The generated file is encrypted in the evidence store, mapped to PCI DSS 6.3.2, independently reviewable, and automatically eligible for the assessor package after approval.</p></div><div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy || !selectedAssessmentId || !sbomRepository}>{busy ? <><span className="button-spinner" /> Resolving and generating…</> : "Generate & add to evidence"}</button></div></form>}
     {type === "add" && <form onSubmit={onAdd} className="evidence-form"><div className="form-grid"><label className="field full"><span>Assessment</span><select name="assessmentId" required value={selectedAssessmentId} onChange={(e) => setSelectedAssessmentId(e.target.value)}>{assessments.filter((item) => item.status !== "closed").map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label><label className="field full"><span>Evidence title</span><input name="title" required placeholder="e.g. Production database encryption settings" /></label><label className="field"><span>Control</span><select name="control" required defaultValue=""><option value="" disabled>Select control</option>{controls.map((control) => <option key={control.id} value={control.id}>{control.id} — {control.title}</option>)}</select></label><label className="field"><span>Evidence type</span><select name="type"><option value="code">Code</option><option value="configuration">Configuration</option><option value="report">Text report</option></select></label><label className="field"><span>System or asset</span><input name="system" required placeholder="payments-production" /></label><label className="field"><span>Code language</span><select name="language"><option>Text</option><option>HCL</option><option>YAML</option><option>JSON</option><option>Shell</option><option>TypeScript</option></select></label><label className="field full"><span>Description</span><textarea name="description" rows={3} placeholder="What this evidence proves and where it came from" /></label><label className="field full"><span>Code or configuration excerpt</span><textarea name="code" className="mono-input" rows={5} required placeholder="# Paste the focused excerpt here; server-side redaction runs before encryption" /></label></div><div className="upload-zone"><span>↑</span><div><strong>Attach an optional text-based artifact</strong><p>TXT, JSON, XML, or YAML up to 10 MB</p></div><label className="choose-file">Choose file<input name="attachment" type="file" accept="text/*,application/json,application/xml,application/yaml" /></label></div><div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy || !selectedAssessmentId}>{busy ? "Encrypting…" : "Scan, encrypt & add"}</button></div></form>}
     {type === "export" && <div><p className="modal-intro">Generate a signed package for one explicit assessment. Scope and inclusion counts are bound into the manifest; truncation is forbidden.</p><label className="field"><span>Assessment</span><select required value={selectedAssessmentId} onChange={(e) => setSelectedAssessmentId(e.target.value)}>{assessments.filter((item) => item.status !== "draft").map((item) => <option value={item.id} key={item.id}>{item.name} · {item.framework}</option>)}</select></label><div className="export-summary"><div><span>▣</span><p><strong>{assessments.find((item) => item.id === selectedAssessmentId)?.name || "Select an assessment"}</strong><small>Approved, unexpired evidence with complete coverage only</small></p></div><StatusPill status={selectedAssessmentId ? "Ready" : "Blocked"} /></div><label className="checkbox-line"><input type="checkbox" checked readOnly /> Refuse partial or silently truncated evidence sets</label><label className="checkbox-line"><input type="checkbox" checked readOnly /> ECDSA-sign manifest and include public verification key</label><div className="privacy-note"><span>i</span><p>The package expires after seven days and every download is audited.</p></div><div className="modal-actions"><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy || !selectedAssessmentId} onClick={onExport}>{busy ? "Building signed package…" : "↓ Generate signed ZIP"}</button></div></div>}
     {type === "assessment" && <form onSubmit={onAssessment} className="evidence-form"><p className="modal-intro">Define the authoritative framework, period, systems, and controls before collecting evidence.</p><div className="form-grid"><label className="field full"><span>Assessment name</span><input name="name" required minLength={3} maxLength={180} placeholder="2026 PCI DSS annual assessment" /></label><label className="field"><span>Framework</span><select name="framework"><option>PCI DSS 4.0.1</option><option>HIPAA</option><option>FedRAMP</option><option>SOC 2</option><option>ISO 27001</option></select></label><label className="field"><span>Period start</span><input name="periodStart" type="date" required /></label><label className="field"><span>Period end</span><input name="periodEnd" type="date" required /></label><label className="field full"><span>Systems in scope</span><textarea name="systems" rows={3} required placeholder="payments-production, identity-production" /><small>Comma or line separated; collection outside this list is rejected.</small></label><label className="field full"><span>Control IDs</span><textarea name="controls" rows={3} required placeholder="1.2.5, 2.2.1, 6.3.2" /><small>Comma or line separated; evidence outside this list is rejected.</small></label></div><div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy}>{busy ? "Creating scope…" : "Create active assessment"}</button></div></form>}
