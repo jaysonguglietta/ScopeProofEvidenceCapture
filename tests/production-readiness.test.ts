@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { parseGitHubRepositoryUrl, validateOneTimeGitHubToken } from "../lib/server/sbom-input.ts";
 import { decodeXmlText } from "../lib/server/xml.ts";
 
 const read = (path: string) => readFile(new URL(`../${path}`, import.meta.url), "utf8");
@@ -136,6 +137,27 @@ test("repository SBOM generation is immutable, non-executing, bounded, and asses
   assert.match(migration, /`resolved_commit_sha` text/);
   assert.match(migration, /`source_archive_sha256` text/);
   assert.match(migration, /`artifact_sha256` text/);
+});
+
+test("one-time SBOM credentials are exact-host, ephemeral, and non-retryable", async () => {
+  assert.deepEqual(parseGitHubRepositoryUrl("https://github.com/openai/example.git"), { owner: "openai", repository: "example" });
+  for (const value of ["http://github.com/openai/example", "https://gitlab.com/openai/example", "https://github.com/openai/example/issues", "https://github.com/openai/example?token=secret", "https://user:secret@github.com/openai/example", "https://github.com/openai%2Fexample/repo"]) assert.throws(() => parseGitHubRepositoryUrl(value));
+  assert.equal(validateOneTimeGitHubToken("x".repeat(40)), "x".repeat(40));
+  for (const value of ["short", ` ${"x".repeat(40)}`, `${"x".repeat(20)}\n${"y".repeat(20)}`]) assert.throws(() => validateOneTimeGitHubToken(value));
+
+  const route = await read("app/api/sboms/route.ts");
+  const sbom = await read("lib/server/sbom.ts");
+  const schema = await read("db/schema.ts");
+  const consoleSource = await read("app/evidence-console.tsx");
+  assert.match(route, /sourceMode === "one_time"/);
+  assert.match(route, /no-store, max-age=0/);
+  assert.match(route, /One-time generation remains available|managedError/);
+  assert.match(sbom, /credentialMode === "one_time" \? 1 : 3/);
+  assert.match(sbom, /attempt < max_attempts/);
+  assert.doesNotMatch(schema, /githubToken|github_token/);
+  assert.match(consoleSource, /name="githubToken" type="password"/);
+  assert.match(consoleSource, /tokenInput\.value = ""/);
+  assert.doesNotMatch(consoleSource, /localStorage|sessionStorage/);
 });
 
 test("SBOM evidence is reviewable, downloadable, comparable, and documented for auditors", async () => {

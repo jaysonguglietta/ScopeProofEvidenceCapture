@@ -5,10 +5,14 @@ import { randomId, sha256, stableJson } from "./crypto";
 import { getAssessment } from "./assessments";
 import { getEnv } from "./env";
 import { storeEvidence } from "./evidence";
+import { isValidGitHubOwner, isValidGitRef, isValidRepositoryName, SbomError, validateOneTimeGitHubToken } from "./sbom-input";
+
+export { parseGitHubRepositoryUrl, SbomError, validateOneTimeGitHubToken } from "./sbom-input";
 
 export type SbomFormat = "cyclonedx_json" | "spdx_json";
 export type SbomComponent = { name: string; version: string; ecosystem: string; purl: string; direct: boolean; manifests: string[] };
 export type SbomComparison = { baseline: boolean; previousJobId?: string; added: number; removed: number; changed: number; addedComponents: string[]; removedComponents: string[]; changedComponents: string[] };
+export type SbomCredential = { mode: "managed" | "one_time"; owner: string; token?: string };
 
 const API_VERSION = "2022-11-28";
 const GENERATOR_NAME = "scopeproof-static-sbom";
@@ -21,20 +25,13 @@ const MAX_SELECTED_BYTES = 8 * 1024 * 1024;
 const MAX_COMPONENTS = 5_000;
 const manifestNames = new Set(["package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "requirements.txt", "pipfile.lock", "poetry.lock", "cargo.lock", "go.sum", "gemfile.lock", "composer.lock"]);
 
-export class SbomError extends Error {
-  readonly code: string;
-  readonly retryable: boolean;
-  readonly status: number;
-  constructor(message: string, code: string, retryable = false, status = 400) { super(message); this.code = code; this.retryable = retryable; this.status = status; }
-}
-
 function configured(value: string | undefined, name: string): string {
   if (!value) throw new SbomError(`${name} is not configured.`, "NOT_CONFIGURED", false, 503);
   return value;
 }
 
-function githubHeaders(): Record<string, string> {
-  return { authorization: `Bearer ${configured(getEnv().GITHUB_TOKEN, "GITHUB_TOKEN")}`, accept: "application/vnd.github+json", "x-github-api-version": API_VERSION, "user-agent": "Scopeproof-SBOM" };
+function githubHeaders(token?: string): Record<string, string> {
+  return { authorization: `Bearer ${token || configured(getEnv().GITHUB_TOKEN, "GITHUB_TOKEN")}`, accept: "application/vnd.github+json", "x-github-api-version": API_VERSION, "user-agent": "Scopeproof-SBOM" };
 }
 
 async function boundedFetch(url: string, init: RequestInit, label: string, maximumBytes: number, accepted: number[] = []): Promise<Response> {
@@ -64,8 +61,8 @@ async function boundedFetch(url: string, init: RequestInit, label: string, maxim
   throw new SbomError(`${label} returned ${bounded.status}.`, code, retryable, bounded.status);
 }
 
-async function githubJson<T>(path: string, label: string, maximumBytes = 2 * 1024 * 1024): Promise<T> {
-  const response = await boundedFetch(`https://api.github.com${path}`, { headers: githubHeaders() }, label, maximumBytes);
+async function githubJson<T>(path: string, label: string, maximumBytes = 2 * 1024 * 1024, token?: string): Promise<T> {
+  const response = await boundedFetch(`https://api.github.com${path}`, { headers: githubHeaders(token) }, label, maximumBytes);
   try { return await response.json() as T; }
   catch { throw new SbomError(`${label} returned invalid JSON.`, "GITHUB_INVALID_RESPONSE", false, 502); }
 }
@@ -81,9 +78,6 @@ export async function listSbomRepositories(): Promise<Array<{ name: string; full
   }
   return repos.map((repo) => ({ name: repo.name, fullName: repo.full_name, defaultBranch: repo.default_branch, private: repo.private, archived: repo.archived }));
 }
-
-function validRepository(value: string): boolean { return /^[A-Za-z0-9_.-]{1,100}$/.test(value) && value !== "." && value !== ".."; }
-function validRef(value: string): boolean { return value.length >= 1 && value.length <= 200 && !value.startsWith("-") && !value.includes("..") && !value.includes("@{") && ![...value].some((character) => character.charCodeAt(0) <= 32 || "~^:?*[\\".includes(character)); }
 
 function basename(path: string): string { return path.toLowerCase().split("/").pop() || ""; }
 function manifestPath(path: string): string { const parts = path.split("/"); return parts.length > 1 ? parts.slice(1).join("/") : path; }
@@ -240,8 +234,8 @@ function buildSpdx(repo: string, commit: string, generatedAt: string, archiveDig
   return { spdxVersion: "SPDX-2.3", dataLicense: "CC0-1.0", SPDXID: "SPDXRef-DOCUMENT", name: `${repo}-${commit.slice(0, 12)}-sbom`, documentNamespace: `https://scopeproof.local/sbom/${crypto.randomUUID()}`, creationInfo: { created: generatedAt, creators: [`Tool: ${GENERATOR_NAME}-${GENERATOR_VERSION}`], comment: `Repository https://github.com/${repo}; commit ${commit}; source archive SHA-256 ${archiveDigest}; manifests ${manifests.join(",")}` }, packages: [{ SPDXID: repoId, name: repo, versionInfo: commit, downloadLocation: `https://github.com/${repo}`, filesAnalyzed: false }, ...packages], relationships: [{ spdxElementId: "SPDXRef-DOCUMENT", relationshipType: "DESCRIBES", relatedSpdxElement: repoId }, ...packages.map((item) => ({ spdxElementId: repoId, relationshipType: "DEPENDS_ON", relatedSpdxElement: item.SPDXID }))] };
 }
 
-async function downloadArchive(owner: string, repository: string, commit: string): Promise<Uint8Array> {
-  const first = await boundedFetch(`https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/zipball/${commit}`, { headers: githubHeaders() }, "GitHub repository archive", 64 * 1024);
+async function downloadArchive(owner: string, repository: string, commit: string, token?: string): Promise<Uint8Array> {
+  const first = await boundedFetch(`https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/zipball/${commit}`, { headers: githubHeaders(token) }, "GitHub repository archive", 64 * 1024);
   if (first.status < 300 || first.status >= 400) return new Uint8Array(await first.arrayBuffer());
   const location = first.headers.get("location");
   if (!location) throw new SbomError("GitHub repository archive redirect is missing.", "GITHUB_INVALID_RESPONSE", false, 502);
@@ -249,12 +243,13 @@ async function downloadArchive(owner: string, repository: string, commit: string
   return new Uint8Array(await second.arrayBuffer());
 }
 
-export async function queueSbom(input: { assessmentId: string; repository: string; ref: string; format: SbomFormat }, actor: AuthenticatedUser): Promise<string> {
+export async function queueSbom(input: { assessmentId: string; owner?: string; repository: string; ref: string; format: SbomFormat; credentialMode?: "managed" | "one_time" }, actor: AuthenticatedUser): Promise<string> {
   const env = getEnv();
-  const owner = configured(env.GITHUB_ORG, "GITHUB_ORG");
+  const owner = (input.owner || configured(env.GITHUB_ORG, "GITHUB_ORG")).trim();
   const repository = input.repository.trim();
   const ref = input.ref.trim();
-  if (!/^asm_[a-f0-9]{32}$/.test(input.assessmentId) || !validRepository(repository) || !validRef(ref) || !["cyclonedx_json", "spdx_json"].includes(input.format)) throw new SbomError("Assessment, repository, ref, and SBOM format are required.", "INVALID_REQUEST");
+  const credentialMode = input.credentialMode === "one_time" ? "one_time" : "managed";
+  if (!/^asm_[a-f0-9]{32}$/.test(input.assessmentId) || !isValidGitHubOwner(owner) || !isValidRepositoryName(repository) || !isValidGitRef(ref) || !["cyclonedx_json", "spdx_json"].includes(input.format)) throw new SbomError("Assessment, repository, ref, and SBOM format are required.", "INVALID_REQUEST");
   const assessment = await getAssessment(input.assessmentId);
   if (!assessment || assessment.status !== "active") throw new SbomError("SBOM generation requires an active assessment.", "ASSESSMENT_NOT_ACTIVE", false, 409);
   const controls = assessment.controls as string[];
@@ -263,13 +258,13 @@ export async function queueSbom(input: { assessmentId: string; repository: strin
   const systems = assessment.systems as string[];
   if (systems.length && !systems.some((value) => [fullName, owner, "github"].includes(value.toLowerCase() === "github" ? "github" : value))) throw new SbomError(`Repository ${fullName} is outside the assessment system scope. Add ${fullName}, ${owner}, or GitHub to a new assessment scope.`, "OUT_OF_SCOPE", false, 422);
   const id = randomId("sbom");
-  await executeAuditedBatch(actor, "sbom.queued", "sbom_job", id, { assessmentId: input.assessmentId, repository: fullName, requestedRef: ref, format: input.format }, [
-    env.DB.prepare("INSERT INTO sbom_jobs (id, requested_by, assessment_id, repository_owner, repository_name, repository_full_name, requested_ref, format) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").bind(id, actor.id, input.assessmentId, owner, repository, fullName, ref, input.format),
+  await executeAuditedBatch(actor, "sbom.queued", "sbom_job", id, { assessmentId: input.assessmentId, repository: fullName, requestedRef: ref, format: input.format, credentialMode }, [
+    env.DB.prepare("INSERT INTO sbom_jobs (id, requested_by, assessment_id, repository_owner, repository_name, repository_full_name, requested_ref, format, max_attempts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(id, actor.id, input.assessmentId, owner, repository, fullName, ref, input.format, credentialMode === "one_time" ? 1 : 3),
   ]);
   return id;
 }
 
-export async function processSbom(jobId: string, actor: AuthenticatedUser): Promise<Record<string, unknown>> {
+export async function processSbom(jobId: string, actor: AuthenticatedUser, credential?: SbomCredential): Promise<Record<string, unknown>> {
   const env = getEnv();
   const job = await env.DB.prepare("SELECT * FROM sbom_jobs WHERE id = ?").bind(jobId).first<Record<string, unknown>>();
   if (!job) throw new SbomError("SBOM job not found.", "NOT_FOUND", false, 404);
@@ -281,9 +276,12 @@ export async function processSbom(jobId: string, actor: AuthenticatedUser): Prom
   if (!claim.meta.changes) return job;
   try {
     const owner = String(job.repository_owner); const repository = String(job.repository_name); const fullName = String(job.repository_full_name);
-    const commit = await githubJson<{ sha: string }>(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/commits/${encodeURIComponent(String(job.requested_ref))}`, "GitHub commit resolution");
+    const credentialMode = credential?.mode || "managed";
+    if (credential && credential.owner !== owner) throw new SbomError("The one-time credential does not match the queued repository owner.", "CREDENTIAL_SCOPE_MISMATCH", false, 422);
+    const token = credentialMode === "one_time" ? validateOneTimeGitHubToken(credential?.token || "") : undefined;
+    const commit = await githubJson<{ sha: string }>(`/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/commits/${encodeURIComponent(String(job.requested_ref))}`, "GitHub commit resolution", 2 * 1024 * 1024, token);
     if (!/^[a-f0-9]{40}$/.test(commit.sha)) throw new SbomError("GitHub returned an invalid commit identifier.", "GITHUB_INVALID_RESPONSE", false, 502);
-    const archive = await downloadArchive(owner, repository, commit.sha);
+    const archive = await downloadArchive(owner, repository, commit.sha, token);
     const archiveDigest = await sha256(archive);
     const manifests = extractDependencyManifests(archive);
     if (!manifests.length) throw new SbomError("No supported dependency lockfiles were found in this repository ref.", "NO_SUPPORTED_MANIFESTS", false, 422);
@@ -298,9 +296,9 @@ export async function processSbom(jobId: string, actor: AuthenticatedUser): Prom
     if (!assessment) throw new SbomError("Assessment no longer exists.", "ASSESSMENT_NOT_FOUND", false, 409);
     const systems = assessment.systems as string[];
     const system = systems.find((value) => value === fullName) || systems.find((value) => value === owner) || systems.find((value) => value.toLowerCase() === "github") || fullName;
-    const stored = await storeEvidence({ controlId: "6.3.2", framework: String(assessment.framework), title: `${String(job.format) === "spdx_json" ? "SPDX" : "CycloneDX"} SBOM — ${fullName}@${commit.sha.slice(0, 12)}`, description: `Static, non-executing dependency inventory generated from ${manifests.length} lockfile(s) at immutable Git commit ${commit.sha}.`, type: "report", source: "Scopeproof SBOM", system, environment: "source repository", assessmentPeriod: `${assessment.period_start} – ${assessment.period_end}`, evidenceOwner: actor.email, tags: ["SBOM", String(job.format) === "spdx_json" ? "SPDX 2.3" : "CycloneDX 1.6", `repository:${fullName}`, `commit:${commit.sha}`, `generator:${GENERATOR_NAME}@${GENERATOR_VERSION}`], expectedEvidence: "Software inventory with immutable source provenance for PCI DSS 6.3.2.", contentType: String(job.format) === "spdx_json" ? "application/spdx+json" : "application/vnd.cyclonedx+json", bytes, jobId, capturedAt: generatedAt, validityDays: 365, createdBy: actor, assessmentId: String(job.assessment_id), coverageStatus: "complete", coverage: { complete: true, repository: fullName, requestedRef: job.requested_ref, resolvedCommitSha: commit.sha, sourceArchiveSha256: archiveDigest, manifests: manifests.map((item) => item.path), componentCount: components.length, directDependencyCount: components.filter((item) => item.direct).length, generator: `${GENERATOR_NAME}@${GENERATOR_VERSION}`, comparison: delta } });
+    const stored = await storeEvidence({ controlId: "6.3.2", framework: String(assessment.framework), title: `${String(job.format) === "spdx_json" ? "SPDX" : "CycloneDX"} SBOM — ${fullName}@${commit.sha.slice(0, 12)}`, description: `Static, non-executing dependency inventory generated from ${manifests.length} lockfile(s) at immutable Git commit ${commit.sha}.`, type: "report", source: "Scopeproof SBOM", system, environment: "source repository", assessmentPeriod: `${assessment.period_start} – ${assessment.period_end}`, evidenceOwner: actor.email, tags: ["SBOM", String(job.format) === "spdx_json" ? "SPDX 2.3" : "CycloneDX 1.6", `repository:${fullName}`, `commit:${commit.sha}`, `credential:${credentialMode}`, `generator:${GENERATOR_NAME}@${GENERATOR_VERSION}`], expectedEvidence: "Software inventory with immutable source provenance for PCI DSS 6.3.2.", contentType: String(job.format) === "spdx_json" ? "application/spdx+json" : "application/vnd.cyclonedx+json", bytes, jobId, capturedAt: generatedAt, validityDays: 365, createdBy: actor, assessmentId: String(job.assessment_id), coverageStatus: "complete", coverage: { complete: true, repository: fullName, requestedRef: job.requested_ref, resolvedCommitSha: commit.sha, sourceArchiveSha256: archiveDigest, manifests: manifests.map((item) => item.path), componentCount: components.length, directDependencyCount: components.filter((item) => item.direct).length, credentialMode, generator: `${GENERATOR_NAME}@${GENERATOR_VERSION}`, comparison: delta } });
     const completedAt = new Date().toISOString();
-    await executeAuditedBatch(actor, "sbom.completed", "sbom_job", jobId, { repository: fullName, resolvedCommitSha: commit.sha, evidenceId: stored.id, artifactSha256: stored.sha256, componentCount: components.length, manifestCount: manifests.length, comparison: delta }, [env.DB.prepare("UPDATE sbom_jobs SET status = 'completed', resolved_commit_sha = ?, evidence_id = ?, previous_job_id = ?, component_count = ?, direct_dependency_count = ?, manifest_count = ?, source_archive_sha256 = ?, artifact_sha256 = ?, manifests_json = ?, components_json = ?, comparison_json = ?, completed_at = ?, lease_id = NULL, lease_expires_at = NULL WHERE id = ? AND status = 'running' AND lease_id = ?").bind(commit.sha, stored.id, previous?.id || null, components.length, components.filter((item) => item.direct).length, manifests.length, archiveDigest, stored.sha256, stableJson(manifests.map((item) => item.path)), stableJson(components), stableJson(delta), completedAt, jobId, leaseId)], { sql: "EXISTS (SELECT 1 FROM sbom_jobs WHERE id = ? AND status = 'completed' AND evidence_id = ?)", bindings: [jobId, stored.id] });
+    await executeAuditedBatch(actor, "sbom.completed", "sbom_job", jobId, { repository: fullName, resolvedCommitSha: commit.sha, evidenceId: stored.id, artifactSha256: stored.sha256, componentCount: components.length, manifestCount: manifests.length, credentialMode, comparison: delta }, [env.DB.prepare("UPDATE sbom_jobs SET status = 'completed', resolved_commit_sha = ?, evidence_id = ?, previous_job_id = ?, component_count = ?, direct_dependency_count = ?, manifest_count = ?, source_archive_sha256 = ?, artifact_sha256 = ?, manifests_json = ?, components_json = ?, comparison_json = ?, completed_at = ?, lease_id = NULL, lease_expires_at = NULL WHERE id = ? AND status = 'running' AND lease_id = ?").bind(commit.sha, stored.id, previous?.id || null, components.length, components.filter((item) => item.direct).length, manifests.length, archiveDigest, stored.sha256, stableJson(manifests.map((item) => item.path)), stableJson(components), stableJson(delta), completedAt, jobId, leaseId)], { sql: "EXISTS (SELECT 1 FROM sbom_jobs WHERE id = ? AND status = 'completed' AND evidence_id = ?)", bindings: [jobId, stored.id] });
     return (await getSbomJob(jobId)) || {};
   } catch (error) {
     const failure = error instanceof SbomError ? error : new SbomError(error instanceof Error ? error.message : "SBOM generation failed.", "INTERNAL_ERROR", true, 500);
@@ -325,7 +323,12 @@ export async function listSbomJobs(assessmentId?: string): Promise<Array<Record<
 
 export async function processDueSbomWork(now = new Date()): Promise<void> {
   const env = getEnv();
-  const jobs = (await env.DB.prepare("SELECT id, requested_by FROM sbom_jobs WHERE (status = 'retrying' AND next_attempt_at <= ?) OR (status = 'running' AND lease_expires_at < ?) ORDER BY next_attempt_at LIMIT 3").bind(now.toISOString(), now.toISOString()).all<{ id: string; requested_by: string }>()).results;
+  const exhausted = (await env.DB.prepare("SELECT id, requested_by FROM sbom_jobs WHERE status = 'running' AND lease_expires_at < ? AND attempt >= max_attempts ORDER BY lease_expires_at LIMIT 3").bind(now.toISOString()).all<{ id: string; requested_by: string }>()).results;
+  for (const job of exhausted) {
+    const user = await env.DB.prepare("SELECT id, email, display_name, role FROM users WHERE id = ?").bind(job.requested_by).first<{ id: string; email: string; display_name: string; role: AuthenticatedUser["role"] }>();
+    if (user) await executeAuditedBatch({ id: user.id, email: user.email, displayName: user.display_name, role: user.role }, "sbom.failed", "sbom_job", job.id, { code: "LEASE_EXPIRED", retryAt: null }, [env.DB.prepare("UPDATE sbom_jobs SET status = 'failed', error_code = 'LEASE_EXPIRED', error_message = 'The SBOM job ended before completion and no retry attempt remains. Start a new job.', completed_at = ?, lease_id = NULL, lease_expires_at = NULL WHERE id = ? AND status = 'running' AND lease_expires_at < ? AND attempt >= max_attempts").bind(now.toISOString(), job.id, now.toISOString())], { sql: "EXISTS (SELECT 1 FROM sbom_jobs WHERE id = ? AND status = 'failed' AND error_code = 'LEASE_EXPIRED')", bindings: [job.id] });
+  }
+  const jobs = (await env.DB.prepare("SELECT id, requested_by FROM sbom_jobs WHERE (status = 'retrying' AND next_attempt_at <= ? AND attempt < max_attempts) OR (status = 'running' AND lease_expires_at < ? AND attempt < max_attempts) ORDER BY next_attempt_at LIMIT 3").bind(now.toISOString(), now.toISOString()).all<{ id: string; requested_by: string }>()).results;
   for (const job of jobs) {
     const user = await env.DB.prepare("SELECT id, email, display_name, role FROM users WHERE id = ?").bind(job.requested_by).first<{ id: string; email: string; display_name: string; role: AuthenticatedUser["role"] }>();
     if (user) await processSbom(job.id, { id: user.id, email: user.email, displayName: user.display_name, role: user.role });

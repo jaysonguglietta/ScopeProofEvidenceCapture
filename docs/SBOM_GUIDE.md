@@ -1,10 +1,12 @@
 # Repository SBOM guide
 
-Scopeproof can generate an auditor-facing Software Bill of Materials for a repository in the configured GitHub organization. The result is encrypted as evidence, mapped to PCI DSS 6.3.2, independently reviewed through the normal evidence workflow, and included in an assessor package after approval.
+Scopeproof can generate an auditor-facing Software Bill of Materials from either an administrator-managed GitHub organization or one repository supplied for a one-time run. The result is encrypted as evidence, mapped to PCI DSS 6.3.2, independently reviewed through the normal evidence workflow, and included in an assessor package after approval.
 
 This is a hosted Scopeproof web-console capability, not a function of the local-only Mac app. The Mac app can continue to capture and package local screenshot evidence without GitHub configuration.
 
-## Configure GitHub
+## Choose repository access
+
+### Managed organization
 
 Set `GITHUB_ORG` to the one organization operators may inventory. Set `GITHUB_TOKEN` to a GitHub App installation token or fine-grained token limited to the intended repositories with:
 
@@ -13,9 +15,20 @@ Set `GITHUB_ORG` to the one organization operators may inventory. Set `GITHUB_TO
 
 Do not grant write, administration, workflow, issue, or secret permissions. Rotate the credential using the platform secret manager; never put it in the browser, Mac app, repository, or D1.
 
-Apply `drizzle/0012_opposite_rachel_grey.sql` before enabling the feature. If a GitHub App installation token is used, Scopeproof does not mint or refresh it; an external secret-rotation process must replace the expiring token in Sites. The console reports **Not configured** until both variables are present.
+Apply `drizzle/0012_opposite_rachel_grey.sql` before enabling the feature. If a GitHub App installation token is used, Scopeproof does not mint or refresh it; an external secret-rotation process must replace the expiring token in Sites. The console labels managed access **Not configured** until both variables are present; one-time access remains available.
 
-The active assessment must include control `6.3.2`. If its system scope is non-empty, it must include the exact `organization/repository`, the configured organization, or `GitHub`.
+### One-time repository
+
+Choose **One-time repository** in the generation dialog and enter:
+
+- an exact URL in the form `https://github.com/owner/repository` (an optional `.git` suffix is accepted); and
+- a short-lived token selected only for that repository with **Metadata: read** and **Contents: read**.
+
+Scopeproof rejects HTTP, other hosts, embedded URL credentials, query strings, fragments, encoded path separators, and extra path segments. The token field is masked and cleared immediately when submitted. The token travels only in the authenticated same-origin HTTPS request, is used in server memory for commit resolution and archive download, and is not written to D1, R2, job rows, evidence, audit details, application logs, settings, browser storage, or the Mac Keychain.
+
+The application cannot control browser extensions, password managers, endpoint malware, upstream network inspection configured by the organization, or GitHub's own access logs. Use a dedicated short-expiry token, decline browser credential saving, and revoke the token after the run. A one-time job receives one attempt and never retries automatically because no reusable credential exists.
+
+The active assessment must include control `6.3.2`. If its system scope is non-empty, it must include the exact `owner/repository`, the owner/organization, or `GitHub`.
 
 ## Access model
 
@@ -31,7 +44,7 @@ All authorization is enforced by the API. A disabled button is not the security 
 ## Generate and review
 
 1. Open **SBOMs** and select **Generate SBOM**.
-2. Choose the active assessment and a repository from the fixed organization.
+2. Choose **Managed organization** and select a repository, or choose **One-time repository** and provide the exact URL and short-lived token.
 3. Enter a branch, tag, or commit. Scopeproof resolves it to a 40-character commit SHA before downloading content.
 4. Choose CycloneDX 1.6 JSON or SPDX 2.3 JSON.
 5. Generate the inventory. Review its repository, commit, archive digest, manifests, generator version, component counts, and changes from the prior run.
@@ -46,11 +59,11 @@ Record the assessment ID, repository, requested ref, resolved commit, source-arc
 
 Scopeproof does not clone a repository or execute repository code, build scripts, lifecycle hooks, package managers, container builds, or dependency installers. It downloads one ZIP from GitHub at the resolved commit and extracts only recognized lockfiles.
 
-The server enforces a 20 MB compressed archive limit, 5,000-entry limit, 100-manifest limit, 2 MB per manifest, 8 MB total selected manifest data, a 100:1 decompression ratio limit, valid UTF-8 text, and at most 5,000 unique components. Archive redirects are accepted only from GitHub's `codeload.github.com` host. Generation is rate-limited to ten requests per user per hour and uses leased, audited jobs with bounded retry for transient provider failures.
+The server enforces a 20 MB compressed archive limit, 5,000-entry limit, 100-manifest limit, 2 MB per manifest, 8 MB total selected manifest data, a 100:1 decompression ratio limit, valid UTF-8 text, and at most 5,000 unique components. Archive redirects are accepted only from GitHub's `codeload.github.com` host. Generation is rate-limited to ten requests per user per hour and uses leased, audited jobs. Managed jobs have bounded retry for transient provider failures; one-time jobs do not retry.
 
 Supported inputs are `package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock`, `pnpm-lock.yaml`, `requirements.txt`, `Pipfile.lock`, `poetry.lock`, `Cargo.lock`, `go.sum`, `Gemfile.lock`, and `composer.lock`. A run fails explicitly when no supported lockfile or pinned component can be found. Unsupported ecosystems require a reviewed parser addition; Scopeproof does not infer a complete inventory from unpinned manifest files.
 
-Repository listing is intentionally capped at 250 repositories. If an intended repository is absent, narrow the token's selected repositories or use a dedicated Scopeproof GitHub organization/installation boundary rather than broadening access. Generated evidence is valid for 365 days by default but remains subject to the assessment period, ordinary evidence retention, legal hold, approval, supersession, and expiration controls.
+Managed repository listing is intentionally capped at 250 repositories. If an intended repository is absent, narrow the managed token's selected repositories, use a dedicated Scopeproof GitHub organization/installation boundary, or use one-time access rather than broadening a persistent credential. Generated evidence is valid for 365 days by default but remains subject to the assessment period, ordinary evidence retention, legal hold, approval, supersession, and expiration controls.
 
 ## Auditor interpretation
 
@@ -62,12 +75,15 @@ For repeat runs, Scopeproof records added, removed, and version-changed componen
 
 | Condition | Meaning and response |
 | --- | --- |
-| **GitHub SBOM connection is not configured** | One or both hosted variables are absent. Add them in Sites; never paste the token into the browser or commit it. |
-| `GITHUB_AUTH_FAILED` | The token is expired, revoked, not installed for the organization, or lacks access. Rotate/repair the secret and run a known-commit canary. |
+| **Managed GitHub connection is not configured** | One or both hosted variables are absent. Configure them in Sites for reusable access, or choose one-time repository access. |
+| `INVALID_REPOSITORY_URL` | Enter exactly `https://github.com/owner/repository`; remove query strings, fragments, extra paths, embedded credentials, or a non-GitHub host. |
+| `INVALID_GITHUB_TOKEN` | Re-enter a non-empty short-lived token. The submitted field was already cleared and no token was retained. |
+| `GITHUB_AUTH_FAILED` | The token is expired, revoked, not installed for the owner, lacks repository selection, or lacks read access. Repair managed access or create a fresh one-time token and run a known-commit canary. |
 | `REPOSITORY_OR_REF_NOT_FOUND` | The repository/ref does not exist or is hidden by token selection. Confirm organization, repository selection, spelling, and ref. |
 | `ASSESSMENT_NOT_ACTIVE` or scope error | Activate the intended assessment and include PCI DSS 6.3.2 plus the required system scope; do not bypass scope validation. |
 | `ARCHIVE_LIMIT_EXCEEDED` or `COMPONENT_LIMIT_EXCEEDED` | The repository exceeds a safety bound. Split the inventory boundary where appropriate or propose a reviewed code/configuration change with load tests; do not disable the limit. |
 | `INVALID_ARCHIVE` or `INVALID_MANIFEST` | GitHub returned malformed content or a recognized lockfile is not safe, valid, or parseable. Preserve job/audit metadata, inspect the commit outside Scopeproof in a quarantined engineering workflow, and correct the repository. |
-| Job is retrying | A transient provider failure was scheduled for bounded retry. If retries exhaust, repair the provider condition before starting a new job. |
+| Job is retrying | A managed-access provider failure was scheduled for bounded retry. If retries exhaust, repair the provider condition before starting a new job. One-time jobs require a new submission instead. |
+| `LEASE_EXPIRED` | A one-time or final-attempt job ended before completion. No credential is available to resume it; start a new job with a fresh token. |
 
 After token rotation or parser changes, generate both CycloneDX and SPDX canaries from a repository with known pinned dependencies, verify immutable commit/archive provenance and component counts, complete independent approval, and verify inclusion under 6.3.2 in a test assessor package.

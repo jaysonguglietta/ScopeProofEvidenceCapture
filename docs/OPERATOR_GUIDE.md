@@ -67,10 +67,10 @@ On the Mac, assign a Jira issue during capture, complete lifecycle review, and m
 
 ## Generate a repository SBOM
 
-Repository SBOM generation is a hosted-web workflow; it does not require or run inside the local Mac app. A platform administrator must first configure the fixed GitHub organization and a read-only token. The active assessment must include PCI DSS control **6.3.2** and, when system scope is populated, the selected repository, organization, or `GitHub`.
+Repository SBOM generation is a hosted-web workflow; it does not require or run inside the local Mac app. Use either a platform-managed GitHub organization or a one-time exact GitHub URL and short-lived read-only token. The active assessment must include PCI DSS control **6.3.2** and, when system scope is populated, the selected `owner/repository`, owner/organization, or `GitHub`.
 
 1. Open **SBOMs** in the hosted Scopeproof console and choose **Generate SBOM**.
-2. Select the active assessment and one repository from the configured organization.
+2. Choose **Managed organization** and select a repository, or choose **One-time repository** and enter `https://github.com/owner/repository` plus a repository-scoped token with Metadata and Contents read access.
 3. Enter the branch, tag, or commit to inventory and choose CycloneDX 1.6 JSON or SPDX 2.3 JSON.
 4. Generate the SBOM. Scopeproof resolves the ref to an immutable commit before reading supported lockfiles.
 5. Review the repository, resolved commit, source-archive digest, parsed manifests, component totals, generator version, and change summary.
@@ -78,6 +78,8 @@ Repository SBOM generation is a hosted-web workflow; it does not require or run 
 7. Export the assessment package. The approved SBOM appears under PCI DSS 6.3.2.
 
 The **JSON** action downloads the generated evidence before approval for authorized review; every download is authenticated and audited. A prior-run comparison is a review aid, not the authoritative inventory. See the [repository SBOM guide](SBOM_GUIDE.md) for supported inputs, safety limits, and interpretation.
+
+For one-time access, Scopeproof masks the token and clears the field at submission. It uses the token only during that request and does not write it to application storage, audit details, settings, logs, browser storage, or Keychain. Because the token is unavailable afterward, transient failures do not retry automatically; re-enter a fresh token for a new run. Prefer a short expiry and revoke the token after success or failure.
 
 ## Export for an assessor
 
@@ -103,7 +105,7 @@ Detailed validation steps are in the [assessor guide](ASSESSOR_GUIDE.md). Jira-s
 | Capture context dialog repeats | Complete every field marked `*`; if a Jira key is present it must look like `GRC-123`. |
 | No Jira key in filename/banner | Edit capture defaults, enter the issue key, then recapture; existing immutable evidence is not renamed. |
 | Upload remains pending | Verify the HTTPS server URL and active device token, then retry pending uploads. |
-| Generate SBOM is disabled | Ask a platform administrator to configure `GITHUB_ORG` and `GITHUB_TOKEN`; confirm your role can generate SBOMs and the assessment is active with PCI DSS 6.3.2 in scope. |
+| Generate SBOM is disabled | Confirm your role can generate SBOMs and the assessment is active with PCI DSS 6.3.2 in scope. Managed secrets are optional when using one-time repository access. |
 | Repository is missing | Confirm it belongs to the configured organization, is within the token's repository selection, and is among the bounded inventory results. |
 | SBOM reports no supported components | Commit a supported lockfile with pinned versions, or request a reviewed parser addition for that ecosystem. |
 | Package export is unavailable | Approve at least one artifact in the selected framework/period and resolve any integrity failure. |

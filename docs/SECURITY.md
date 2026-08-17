@@ -36,8 +36,8 @@ Scopeproof handles security and compliance evidence that may expose sensitive co
 - Jira URLs require HTTPS, issue keys are format-restricted, and native Jira metadata must match the immutable manifest.
 - Jira API calls use fixed Atlassian hosts and server-selected cloud IDs. OAuth state is random, user-bound, stored only as a hash, single-use, and expires after ten minutes. Requested sites must end in `.atlassian.net`, match Atlassian’s accessible resources, and use configured project allowlists.
 - Jira uploads require explicit confirmation and revalidate the device, issue, project, PNG digest, redaction safety state, Approved lifecycle chain, and attachment limits. A durable idempotency reservation prevents concurrent duplicate attachment sets; ambiguous network/provider outcomes require reconciliation instead of automatic replay. OAuth refresh-token rotation is serialized with an expiring lease and optimistic token version. Signed upload receipts and audit events exclude token material.
-- Repository SBOM creation is restricted to compliance leads and administrators, while evidence approval remains independent. The server constructs the repository owner from fixed `GITHUB_ORG`, validates repository/ref syntax, requires an active assessment with PCI DSS 6.3.2 and matching system scope, and resolves the requested ref to an immutable commit before inventory generation.
-- GitHub access is read-only and destination-restricted to `api.github.com` and the exact `codeload.github.com` archive redirect. The credential is never returned to the browser or stored in D1. Generated JSON uses the same evidence encryption, digest, lifecycle, download-audit, retention, and package controls as other hosted evidence.
+- Repository SBOM creation is restricted to compliance leads and administrators, while evidence approval remains independent. Managed mode constructs the repository owner from fixed `GITHUB_ORG`; one-time mode accepts only an exact HTTPS `github.com/owner/repository` URL. Both validate repository/ref syntax, require an active assessment with PCI DSS 6.3.2 and matching system scope, and resolve the requested ref to an immutable commit before inventory generation.
+- GitHub access is read-only and destination-restricted to `api.github.com` and the exact `codeload.github.com` archive redirect. Managed credentials remain server-side. A one-time token is masked, cleared from the form at submission, held only for the request, and excluded from D1, R2, jobs, evidence, audit details, logs, settings, browser storage, and Keychain. One-time jobs have one attempt and fail closed rather than retrying without a credential. Generated JSON uses the same evidence encryption, digest, lifecycle, download-audit, retention, and package controls as other hosted evidence.
 
 ### Abuse resistance
 
@@ -60,6 +60,7 @@ Scopeproof handles security and compliance evidence that may expose sensitive co
 9. Rotate or revoke a device/provider credential immediately after suspected exposure.
 10. Preserve old encryption-key material under controlled key-version procedures until all dependent evidence is expired or re-encrypted.
 11. Restrict `GITHUB_TOKEN` to the intended repositories with Metadata and Contents read access only. Rotate it, monitor GitHub access, remove repositories no longer in scope, and leave SBOM generation unconfigured rather than granting broad organization access.
+12. For one-time SBOM access, use a dedicated short-expiry repository-scoped token, prevent password-manager saving, revoke it after use, and treat the operator browser/endpoint as part of the credential trust boundary.
 
 ## Residual risks and limitations
 
@@ -74,6 +75,7 @@ Scopeproof handles security and compliance evidence that may expose sensitive co
 - Provider coverage is intentionally bounded and may require additional collection for large environments.
 - Repository SBOM coverage is limited to supported pinned lockfiles and the first 250 repositories returned for the configured organization. Static parsing cannot prove the deployed artifact, dynamically loaded dependencies, vendored code, generated lockfiles absent from the commit, transitive resolution performed outside a supported lockfile, vulnerability status, or license obligations.
 - A compromised GitHub organization administrator or source repository can supply deceptive lockfiles. Commit immutability and archive hashing establish what Scopeproof parsed, not that the source is trustworthy; require protected branches, change review, release provenance, and vulnerability analysis as separate controls.
+- One-time input avoids long-term application storage but cannot protect a token from a compromised browser, extension, endpoint, organization-managed TLS inspection, or GitHub access logging. Use managed endpoints and narrowly scoped, short-lived credentials; do not use a personal broad-scope token.
 - Key rotation is not automatic; replacing an encryption key without a migration can make prior evidence undecryptable.
 - An ad-hoc local macOS build is not notarized and does not provide a Developer ID trust chain.
 

@@ -36,6 +36,8 @@ Also alert from platform logs on `scopeproof_api_error`, `scopeproof_audited_bat
 
 For repository SBOM operations, review `sbom_jobs` for sustained `failed`, overdue `retrying`, or expired `running` leases; spikes in `GITHUB_AUTH_FAILED`, `REPOSITORY_OR_REF_NOT_FOUND`, `ARCHIVE_LIMIT_EXCEEDED`, `INVALID_ARCHIVE`, `INVALID_MANIFEST`, or `COMPONENT_LIMIT_EXCEEDED`; and repeated rate limiting. Authentication failures require token repair or rotation and are not automatic retries. Archive/manifest/component failures require repository-owner remediation or a reviewed limit/parser change—not a blanket limit increase. After credential rotation, generate a canary SBOM from a known repository and confirm a completed audit trail.
 
+One-time jobs intentionally have one attempt. `LEASE_EXPIRED` or transient GitHub failures require a fresh operator submission because Scopeproof retains no credential. Do not add the token to a ticket or log to make a job replayable. Review infrastructure/request logging configuration to ensure JSON request bodies are excluded, and investigate any suspected browser, extension, endpoint, or proxy capture as a credential incident.
+
 Repository SBOM evidence follows the ordinary evidence expiration, legal-hold, encryption-key, approval, download, and assessor-package controls. Retain job metadata and the source/archive/artifact digests for the approved retention period. Do not retain downloaded GitHub ZIPs; Scopeproof processes them transiently and persists only the generated encrypted SBOM plus provenance metadata.
 
 ## Incident response
@@ -54,7 +56,7 @@ Close an incident only after root cause, evidence preservation, containment, era
 - At least two named administrators and separate collector/reviewer identities exist; roles and break-glass access are reviewed.
 - Jira OAuth uses an organization-owned Atlassian app and least-privilege projects; a test attachment and reconciliation exercise succeeded.
 - Every required collector has complete pagination coverage and an approved least-privilege service identity.
-- Repository SBOM generation is either explicitly disabled or uses a fixed organization and repository-restricted GitHub credential with Metadata/Contents read only; a known-commit canary, independent review, and assessor-package inclusion test succeeded.
+- Repository SBOM generation uses either a fixed organization with a repository-restricted managed credential or short-lived one-time tokens; both have Metadata/Contents read only. Request-body logging is disabled, and a known-commit canary, independent review, and assessor-package inclusion test succeeded.
 - Backup verification and an isolated recovery drill met approved RPO/RTO.
 - GitHub protected-branch checks, code-owner review, dependency updates, secret scanning, and release approvals are enabled.
 - The production Mac build is Developer ID signed, hardened, notarized, stapled, update-signed, hosted on an approved HTTPS origin, and verified on a clean Mac.

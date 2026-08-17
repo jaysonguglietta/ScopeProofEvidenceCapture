@@ -66,6 +66,8 @@ Add a new ecosystem only when a deterministic lockfile contains pinned versions.
 
 Tests for a parser must cover valid direct/transitive dependencies, duplicate normalization, malformed and oversized input, adversarial names/versions, empty or unpinned manifests, archive traversal-style names, decompression limits, stable CycloneDX/SPDX output, and confirmation that no subprocess or install path is introduced. Update the operator, assessor, security, architecture, deployment, dependency-security, SBOM, and changelog documentation in the same pull request.
 
+One-time credential changes must preserve exact `github.com` URL parsing, same-origin POST authorization, bounded request size, `Cache-Control: no-store`, masked non-controlled token input, immediate field clearing, absence of browser storage, absence of credential columns/bindings/audit details, one-attempt jobs, and scheduler failure rather than credentialless replay. Tests must use obvious synthetic strings and must never call GitHub with a developer token.
+
 ## Native release
 
 Build from the repository root:
