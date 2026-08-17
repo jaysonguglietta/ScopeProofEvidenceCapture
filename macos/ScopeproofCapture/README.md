@@ -2,7 +2,7 @@
 
 Scopeproof Capture 1.4.0 is a local-first menu-bar application for producing, finding, reviewing, and packaging timestamped PCI DSS, HIPAA, FedRAMP, SOC 2, ISO 27001, and custom compliance evidence screenshots.
 
-Related guides: [installation and updates](../../docs/MACOS_INSTALLATION.md), [operator workflow](../../docs/OPERATOR_GUIDE.md), [Jira handoff](../../docs/JIRA_HANDOFF.md), [assessor verification](../../docs/ASSESSOR_GUIDE.md), and [security model](../../docs/SECURITY.md).
+Related guides: [installation and updates](../../docs/MACOS_INSTALLATION.md), [operator workflow](../../docs/OPERATOR_GUIDE.md), [Jira handoff](../../docs/JIRA_HANDOFF.md), [repository SBOM generation](../../docs/SBOM_GUIDE.md), [assessor verification](../../docs/ASSESSOR_GUIDE.md), and [security model](../../docs/SECURITY.md).
 
 ## Run locally
 
@@ -13,6 +13,8 @@ Requirements: macOS 14 or newer and Apple’s Swift toolchain. From the reposito
 ```
 
 This single command builds the app, installs it in `~/Applications`, and launches it without requiring an administrator password. Scopeproof opens a private Local Console in the browser automatically. No hosted login or enrollment token is required for local workflows. Look for the shield in the menu bar to capture evidence or reopen the console.
+
+Repository SBOM generation remains a hosted web-console workflow so GitHub credentials never enter the native app. Local capture, review, search, and package export continue to work without it.
 
 ## Local Console
 

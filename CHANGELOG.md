@@ -2,6 +2,8 @@
 
 ## Unreleased — production evidence correctness and operations
 
+- Added an auditor-facing repository SBOM workspace that generates CycloneDX 1.6 or SPDX 2.3 JSON from supported GitHub lockfiles at an immutable commit without cloning or executing repository code.
+- Added assessment-scoped PCI DSS 6.3.2 evidence, independent approval, assessor-package inclusion, prior-inventory comparison, audited downloads, bounded parsing, retryable jobs, and least-privilege GitHub configuration guidance.
 - Replaced demo-derived compliance state with fail-closed, assessment-scoped authoritative records.
 - Added complete/partial collector coverage provenance and non-truncating assessment exports.
 - Added versioned evidence, export, audit, Jira-token, and Jira-receipt key references with bounded audited rotation.

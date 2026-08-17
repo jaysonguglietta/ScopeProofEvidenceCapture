@@ -6,9 +6,9 @@ Scopeproof combines a private Cloudflare-hosted evidence console with a local ma
 
 | Component | Responsibility |
 | --- | --- |
-| React/vinext web console | Evidence review, collector operations, capture-device enrollment, role administration, audit status, and package export. |
-| Cloudflare Worker API | Authentication enforcement, RBAC, input validation, collection jobs, redaction, encryption, audit events, device uploads, and signed exports. |
-| D1 | Users, devices, sessions, collector/job state, evidence metadata, lifecycle status, package metadata, and append-only audit events. |
+| React/vinext web console | Evidence review, collector and SBOM operations, capture-device enrollment, role administration, audit status, and package export. |
+| Cloudflare Worker API | Authentication enforcement, RBAC, input validation, collection/SBOM jobs, bounded lockfile parsing, redaction, encryption, audit events, device uploads, and signed exports. |
+| D1 | Users, devices, sessions, collector and SBOM job state, evidence metadata, lifecycle status, package metadata, and append-only audit events. |
 | R2 | AES-256-GCM encrypted evidence objects and encrypted assessor packages. |
 | Provider collectors | Bounded read-only collection from AWS, GitHub, Okta, Cloudflare, and Cloudflare Browser Rendering. |
 | Scopeproof Capture | Explicit ScreenCaptureKit capture, local Vision OCR/redaction, visible stamping, manifests, lifecycle records, loopback Local Console, native search, Jira handoff, and local package export. |
@@ -26,6 +26,7 @@ Scopeproof combines a private Cloudflare-hosted evidence console with a local ma
 6. **Mac → native upload endpoint:** a revocable bearer token identifies the device and HMAC-authenticates the exact manifest/image digest pair. The server derives metadata only from the versioned manifest and strictly validates PNG structure, decompression bounds, dimensions, digest, and capture-chain consistency before storage.
 7. **Scopeproof → assessor/Jira:** exports leave the system through an operator-controlled handoff. Hashes, signatures, visible stamps, and package instructions support independent verification, but destination authorization remains an organizational responsibility.
 8. **Scopeproof → Atlassian:** the hosted service exchanges OAuth codes, encrypts rotating tokens with a Jira-specific key, resolves the consented cloud ID, and calls only `api.atlassian.com`. A user/device may access only its own connection and configured project allowlist. The Mac sends approved evidence to Scopeproof, never Atlassian credentials.
+9. **Worker → GitHub repository archive:** the server accepts a repository only from the configured organization, resolves the requested ref through `api.github.com`, and follows an archive redirect only to `codeload.github.com`. The archive and every selected manifest are attacker-controlled. The Worker applies byte, entry, decompression-ratio, manifest, UTF-8, and component limits and parses recognized lockfiles without executing repository content.
 
 ## Native capture data flow
 
@@ -48,6 +49,15 @@ Scopeproof combines a private Cloudflare-hosted evidence console with a local ma
 5. The material action is appended to the HMAC-authenticated audit chain.
 6. A different authorized reviewer loads the actual decrypted bytes, confirms the server-verified digest, records a rationale, and may approve. Approved evidence can then be decrypted transiently for a bounded export, re-hashed, indexed, signed with ECDSA P-256, encrypted again for R2 storage, and made available through an expiring download.
 
+## Repository SBOM data flow
+
+1. A compliance lead or administrator selects an active assessment, repository in `GITHUB_ORG`, ref, and output format. Server-side authorization, same-origin checks, request-size validation, assessment/control scope, and a per-user hourly quota are enforced before a job is queued.
+2. The Worker resolves the ref to a 40-character commit SHA through GitHub's API, then requests exactly one archive for that commit. It does not clone, check out, build, install, or execute repository content.
+3. The Worker validates the ZIP directory before extraction and selects only recognized dependency lockfiles. Parsed components are normalized and de-duplicated by package URL with a hard component ceiling.
+4. Scopeproof emits CycloneDX 1.6 or SPDX 2.3 JSON containing repository, commit, source-archive SHA-256, manifest, generator, and component provenance.
+5. The result is stored through the ordinary encrypted evidence path and linked to an audited `sbom_jobs` record. A completed prior run for the same repository and assessment supplies a bounded added/removed/changed comparison.
+6. An independent reviewer inspects and approves the linked evidence. Only approved, unexpired evidence is eligible for an assessor package.
+
 ## Lifecycle and integrity model
 
 - Capture manifests are immutable records of the final PNG and capture context.
@@ -59,6 +69,7 @@ Scopeproof combines a private Cloudflare-hosted evidence console with a local ma
 ## Bounded operations
 
 - Provider inventories, zones, branch-protection checks, URLs, retries, and due jobs are capped.
+- Repository SBOMs cap the compressed ZIP at 20 MB, archive entries at 5,000, selected manifests at 100 and 8 MB total, each manifest at 2 MB and 100:1 decompression, unique components at 5,000, generation at ten requests per user per hour, and due-job processing at three jobs per scheduler pass.
 - Native screenshot and manifest request sizes are capped and only PNG evidence is accepted.
 - Hosted packages contain at most 100 approved artifacts and 25 MB of decrypted evidence and expire after seven days.
 - Retry orchestration uses at most three attempts with bounded exponential backoff; authentication and unsafe-content failures do not retry automatically.

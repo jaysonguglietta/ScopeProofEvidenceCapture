@@ -26,7 +26,7 @@ Treat the package as sensitive. Store it only in an approved assessment workspac
 | `05-Jira-Handoff.txt` | Optional Jira handling policy and mapped issue keys. |
 | `Evidence/<framework>/<control>/` | Approved PNGs plus capture manifests, lifecycle records, and available upload receipts. |
 
-Hosted exports contain `00-READ-ME.txt`, `01-Evidence-Index.csv`, `02-Jira-Handoff.txt`, `assessor-report.pdf`, `manifest.json`, `VERIFY.txt`, and the approved artifacts organized under `evidence/<framework>/<control>/`. CSV files neutralize spreadsheet formula prefixes but remain presentation aids; the signed JSON manifest is the authoritative index.
+Hosted exports contain `00-READ-ME.txt`, `01-Evidence-Index.csv`, `02-Jira-Handoff.txt`, `assessor-report.pdf`, `manifest.json`, `VERIFY.txt`, and the approved artifacts organized under `evidence/<framework>/<control>/`. Approved repository SBOM JSON is stored under `evidence/<framework>/6.3.2/` and is indexed and hashed like other evidence. CSV files neutralize spreadsheet formula prefixes but remain presentation aids; the signed JSON manifest is the authoritative index.
 
 ## Verification sequence
 
@@ -52,6 +52,19 @@ After integrity validation, determine whether each artifact is sufficient and ap
 - Redactions do not conceal information necessary to evaluate the control.
 - The evidence is current, not duplicated, and not superseded.
 - Cross-framework mappings are independently validated rather than accepted as authoritative.
+
+## Repository SBOM review
+
+For CycloneDX 1.6 or SPDX 2.3 evidence mapped to PCI DSS 6.3.2, verify that:
+
+- the repository and 40-character resolved commit are in assessment scope;
+- the SBOM metadata records the source-archive SHA-256, parser/generator version, and lockfile paths;
+- the evidence-file SHA-256 matches the assessor-package manifest;
+- the component inventory is plausible for the repository and each material ecosystem has a supported lockfile;
+- repeat-run additions, removals, and version changes were reviewed, while treating the full current document as authoritative; and
+- deployment provenance separately demonstrates whether that commit and dependency set reached the assessed environment.
+
+The SBOM is a static inventory of supported pinned lockfiles. It does not prove deployment, runtime completeness, exploitability, patch status, license compliance, or absence of vulnerabilities. Request deployment attestations, vulnerability scan output, exception records, and change-management evidence where those assertions are required.
 
 ## Exceptions
 

@@ -5,7 +5,7 @@
 | Path | Purpose |
 | --- | --- |
 | `app/` | React/vinext console and API routes. |
-| `lib/server/` | Authentication, audit, crypto, collectors, jobs, evidence, devices, timestamps, and packages. |
+| `lib/server/` | Authentication, audit, crypto, collectors, repository SBOM generation, jobs, evidence, devices, timestamps, and packages. |
 | `db/schema.ts` | Drizzle/D1 schema. |
 | `drizzle/` | Ordered SQL migrations and snapshots. |
 | `macos/ScopeproofCapture/` | Swift Package for the macOS menu-bar app, embedded Local Console, SQLite index, and native tests. |
@@ -36,7 +36,7 @@ npm test
 git diff --check
 ```
 
-`npm test` builds the production Worker bundle, verifies the rendered application/API surface, and runs security regression tests for redaction, audit immutability, native upload validation, assessor packaging, Jira metadata, OAuth boundaries, and approved-evidence attachment controls.
+`npm test` builds the production Worker bundle, verifies the rendered application/API surface, and runs security regression tests for redaction, audit immutability, native upload validation, assessor packaging, Jira metadata, OAuth boundaries, approved-evidence attachment controls, and bounded non-executing repository SBOM generation.
 
 Native tests:
 
@@ -53,11 +53,18 @@ The native Local Console is served directly by Scopeproof Capture. It is not the
 
 - Preserve server-side authorization; hiding a control in React is not an access-control decision.
 - Treat provider content, capture metadata, filenames, Jira values, and package names as attacker-controlled.
+- Treat GitHub ZIP structures and every lockfile field as attacker-controlled. Do not add repository checkout, command execution, lifecycle scripts, package installation, or an unrestricted archive library path to SBOM generation.
 - Use bound SQL parameters and strict size/type limits.
 - Never log secrets, decrypted evidence, device tokens, or recognized OCR text.
 - Keep original capture manifests immutable; record later decisions in lifecycle/audit records.
 - Generate and inspect a forward migration for every D1 schema change.
 - Update root, operator, assessor, security, deployment, native, in-app Help, and changelog documentation when behavior or trust boundaries change.
+
+## Extending SBOM support
+
+Add a new ecosystem only when a deterministic lockfile contains pinned versions. Keep parsing in `lib/server/sbom.ts`; do not invoke the ecosystem's package manager or execute repository-supplied configuration. Preserve the pre-extraction ZIP validation, recognized-basename allowlist, UTF-8/NUL checks, manifest and aggregate byte limits, decompression-ratio limit, component ceiling, package-URL normalization, and immutable commit/archive provenance.
+
+Tests for a parser must cover valid direct/transitive dependencies, duplicate normalization, malformed and oversized input, adversarial names/versions, empty or unpinned manifests, archive traversal-style names, decompression limits, stable CycloneDX/SPDX output, and confirmation that no subprocess or install path is introduced. Update the operator, assessor, security, architecture, deployment, dependency-security, SBOM, and changelog documentation in the same pull request.
 
 ## Native release
 

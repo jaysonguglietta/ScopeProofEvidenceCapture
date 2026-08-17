@@ -65,6 +65,20 @@ First connect your Jira account under **Scopeproof web → Connections → Jira 
 
 On the Mac, assign a Jira issue during capture, complete lifecycle review, and mark the artifact **Approved** with a rationale. Upload that exact evidence set to Scopeproof and have an authenticated reviewer approve the hosted artifact. Then open **Search Evidence…**, select the artifact, and choose **Upload to Jira Cloud…**. Confirm the live issue summary and status before uploading. Scopeproof validates both approval records and the evidence hashes, then records a signed `.jira.json` receipt. Use **Copy Jira Comment** and manual attachment when OAuth is unavailable or policy requires manual transfer.
 
+## Generate a repository SBOM
+
+Repository SBOM generation is a hosted-web workflow; it does not require or run inside the local Mac app. A platform administrator must first configure the fixed GitHub organization and a read-only token. The active assessment must include PCI DSS control **6.3.2** and, when system scope is populated, the selected repository, organization, or `GitHub`.
+
+1. Open **SBOMs** in the hosted Scopeproof console and choose **Generate SBOM**.
+2. Select the active assessment and one repository from the configured organization.
+3. Enter the branch, tag, or commit to inventory and choose CycloneDX 1.6 JSON or SPDX 2.3 JSON.
+4. Generate the SBOM. Scopeproof resolves the ref to an immutable commit before reading supported lockfiles.
+5. Review the repository, resolved commit, source-archive digest, parsed manifests, component totals, generator version, and change summary.
+6. Open the linked evidence and inspect the actual JSON. A reviewer or administrator other than the generator must approve it before package inclusion.
+7. Export the assessment package. The approved SBOM appears under PCI DSS 6.3.2.
+
+The **JSON** action downloads the generated evidence before approval for authorized review; every download is authenticated and audited. A prior-run comparison is a review aid, not the authoritative inventory. See the [repository SBOM guide](SBOM_GUIDE.md) for supported inputs, safety limits, and interpretation.
+
 ## Export for an assessor
 
 1. Complete lifecycle review first; only **Approved** evidence is eligible.
@@ -89,5 +103,8 @@ Detailed validation steps are in the [assessor guide](ASSESSOR_GUIDE.md). Jira-s
 | Capture context dialog repeats | Complete every field marked `*`; if a Jira key is present it must look like `GRC-123`. |
 | No Jira key in filename/banner | Edit capture defaults, enter the issue key, then recapture; existing immutable evidence is not renamed. |
 | Upload remains pending | Verify the HTTPS server URL and active device token, then retry pending uploads. |
+| Generate SBOM is disabled | Ask a platform administrator to configure `GITHUB_ORG` and `GITHUB_TOKEN`; confirm your role can generate SBOMs and the assessment is active with PCI DSS 6.3.2 in scope. |
+| Repository is missing | Confirm it belongs to the configured organization, is within the token's repository selection, and is among the bounded inventory results. |
+| SBOM reports no supported components | Commit a supported lockfile with pinned versions, or request a reviewed parser addition for that ecosystem. |
 | Package export is unavailable | Approve at least one artifact in the selected framework/period and resolve any integrity failure. |
 | Evidence cannot be found | Search all frameworks and periods, or use **Open Evidence Folder**. |

@@ -39,6 +39,17 @@ Never reuse one value for multiple purposes. Record key ownership, creation date
 
 Missing variables leave the corresponding collector in **Not configured**. Authentication and unsafe-content failures require operator action; transient rate-limit/server failures can retry up to three times.
 
+### GitHub and repository SBOM setup
+
+1. Create a GitHub App installation token or fine-grained personal access token selected only for repositories in this Scopeproof tenant. Grant repository **Metadata: read** and **Contents: read**; grant no write, administration, workflow, issue, pull-request, environment, or secret permissions.
+2. Set `GITHUB_ORG` to the exact GitHub organization login and store `GITHUB_TOKEN` only as a hosted Sites secret. Scopeproof does not mint or refresh GitHub App installation tokens, so the external secret-rotation process must replace expiring installation tokens before use.
+3. Apply migration `drizzle/0012_opposite_rachel_grey.sql`, which creates `sbom_jobs` and its scheduler/query indexes, before deploying code that exposes `/api/sboms`.
+4. Create or select an active PCI DSS assessment containing control 6.3.2. If its system scope is not empty, include the exact `organization/repository`, the organization, or `GitHub`.
+5. Sign in as a compliance lead or administrator, open **SBOMs**, confirm only intended repositories are listed, and generate a non-production baseline from a known commit. Verify its commit SHA, archive digest, manifests, component count, encrypted evidence record, audit events, independent approval, and assessor-package inclusion.
+6. Confirm an auditor/reviewer cannot generate an SBOM, the generator cannot approve its own evidence, an out-of-organization repository/ref is rejected, and removing either hosted variable returns the feature to **Not configured**.
+
+The GitHub API permissions are described in GitHub's [repository administration endpoints](https://docs.github.com/en/rest/repos/repos) and [repository contents endpoints](https://docs.github.com/en/rest/repos/contents). Review the [repository SBOM guide](SBOM_GUIDE.md) before enabling the feature for auditors.
+
 ## Database migrations
 
 Drizzle schema changes live in `db/schema.ts`. Generate a migration with:
@@ -53,14 +64,14 @@ Inspect generated SQL for destructive operations, unintended nullability changes
 
 | Role | Typical capabilities |
 | --- | --- |
-| `auditor` | Read evidence/package metadata and audit-chain status; download authorized packages. |
+| `auditor` | Read evidence/package/SBOM metadata and audit-chain status; download authorized evidence and packages. Cannot generate or approve SBOM evidence. |
 | `reviewer` | Auditor access plus independent evidence inspection/approval and package generation. Cannot collect, enroll devices, or operate Jira. |
-| `compliance_lead` | Evidence collection, collector schedules, device enrollment, Jira operations, and package generation. Cannot approve evidence. |
-| `admin` | All operational permissions plus role administration; still cannot approve evidence the same identity created or uploaded. |
+| `compliance_lead` | Evidence collection, repository SBOM generation, collector schedules, device enrollment, Jira operations, and package generation. Cannot approve evidence. |
+| `admin` | All operational permissions, including SBOM generation, plus role administration; still cannot approve evidence the same identity created or uploaded. |
 
 Review role assignments regularly. Use separate named accounts; do not share administrator sessions.
 
-Apply migrations through `drizzle/0011_easy_vision.sql`. Migration 0010 adds authoritative assessment scope and collector coverage; migration 0011 adds versioned encryption/HMAC key references and signed audit checkpoints. Production fails closed when `BOOTSTRAP_ADMIN_EMAILS` or `TRUSTED_APP_ORIGINS` is unsafe. Browser collection remains unavailable until its OCR endpoint, token, and exact host allowlist are all configured.
+Apply migrations through `drizzle/0012_opposite_rachel_grey.sql`. Migration 0010 adds authoritative assessment scope and collector coverage; migration 0011 adds versioned encryption/HMAC key references and signed audit checkpoints; migration 0012 adds repository SBOM jobs. Production fails closed when `BOOTSTRAP_ADMIN_EMAILS` or `TRUSTED_APP_ORIGINS` is unsafe. Browser collection remains unavailable until its OCR endpoint, token, and exact host allowlist are all configured. Repository SBOM generation remains unavailable until both GitHub variables are configured.
 
 ## macOS device deployment
 
