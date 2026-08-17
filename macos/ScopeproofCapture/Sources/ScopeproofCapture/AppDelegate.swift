@@ -12,10 +12,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private lazy var captureService = CaptureService(preferences: preferences)
     private let uploadService = UploadService()
     private let updateService = UpdateService()
+    private let repositorySBOMService = RepositorySBOMService()
     private let helpController = HelpController()
     private let evidenceSearchController = EvidenceSearchController()
     private let logger = Logger(subsystem: "com.scopeproof.capture", category: "application")
     private var statusMenuItem = NSMenuItem(title: "Ready to capture", action: nil, keyEquivalent: "")
+    private var repositorySBOMTask: Task<Void, Never>?
     private lazy var localConsole = LocalConsoleServer(evidenceRoot: captureService.outputDirectory, preferences: preferences) { [weak self] in
         self?.chooseBrowserWindow()
     }
@@ -30,7 +32,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuWillOpen(_ menu: NSMenu) { rebuildMenu() }
 
-    func applicationWillTerminate(_ notification: Notification) { localConsole.stop() }
+    func applicationWillTerminate(_ notification: Notification) {
+        repositorySBOMTask?.cancel()
+        localConsole.stop()
+    }
 
     private func configureStatusItem() {
         if let button = statusItem.button {
@@ -137,6 +142,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         addItem("Open Local Console", action: #selector(openLocalConsole), key: "l", modifiers: [.command, .shift])
         addItem("Search Evidence…", action: #selector(searchEvidence), key: "f", modifiers: [.command, .shift])
         addItem("Export Assessor Package…", action: #selector(exportAssessorPackage), key: "x", modifiers: [.command, .shift])
+        let repositorySBOM = NSMenuItem(title: repositorySBOMTask == nil ? "Generate Repository SBOM…" : "Generating Repository SBOM…", action: #selector(generateRepositorySBOM), keyEquivalent: "b")
+        repositorySBOM.keyEquivalentModifierMask = [.command, .shift]
+        repositorySBOM.target = self
+        repositorySBOM.isEnabled = repositorySBOMTask == nil
+        menu.addItem(repositorySBOM)
         let historyItem = NSMenuItem(title: "Recent Captures", action: nil, keyEquivalent: "")
         let historyMenu = NSMenu()
         let entries = Array(CaptureHistory.entries(in: captureService.outputDirectory).prefix(10))
@@ -413,6 +423,126 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Task {
             do { try await localConsole.open(); setReady("Local console ready") }
             catch { setReady("Local console unavailable"); showError(error) }
+        }
+    }
+
+    @objc private func generateRepositorySBOM() {
+        guard repositorySBOMTask == nil else { return }
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Generate a one-time repository SBOM"
+        alert.informativeText = "Scopeproof reads supported lockfiles at one immutable GitHub commit. Repository code is never cloned, built, installed, or executed."
+        alert.addButton(withTitle: "Generate")
+        alert.addButton(withTitle: "Cancel")
+
+        let repositoryURL = NSTextField(string: "")
+        repositoryURL.placeholderString = "https://github.com/owner/repository"
+        repositoryURL.toolTip = "Exact GitHub HTTPS repository URL. Embedded credentials, query strings, fragments, ports, and other hosts are rejected."
+        repositoryURL.setAccessibilityLabel("GitHub repository URL")
+        let token = NSSecureTextField(string: "")
+        token.placeholderString = "Short-lived, repository-scoped token"
+        token.toolTip = "Use Metadata: read and Contents: read only. The token is cleared after submission and is not saved."
+        token.setAccessibilityLabel("One-time GitHub token")
+        let ref = NSTextField(string: "main")
+        ref.placeholderString = "Branch, tag, or commit"
+        ref.setAccessibilityLabel("Git branch, tag, or commit")
+        let format = NSPopUpButton()
+        format.addItems(withTitles: RepositorySBOMFormat.allCases.map(\.displayName))
+        format.setAccessibilityLabel("SBOM format")
+        let safety = NSTextField(wrappingLabelWithString: "One-time credential: used only for this request, never written to settings, Keychain, evidence, logs, or a retry queue. Revoke it after the file is generated.")
+        safety.textColor = .secondaryLabelColor
+        safety.maximumNumberOfLines = 3
+        for field in [repositoryURL, token, ref] { field.frame.size.width = 430 }
+        safety.frame.size.width = 430
+        let grid = NSGridView(views: [
+            [label("GitHub repository *"), repositoryURL],
+            [label("One-time token *"), token],
+            [label("Branch, tag, or commit *"), ref],
+            [label("Format *"), format],
+            [NSTextField(labelWithString: ""), safety],
+        ])
+        grid.rowSpacing = 11
+        grid.columnSpacing = 12
+        grid.column(at: 0).xPlacement = .trailing
+        grid.column(at: 1).xPlacement = .fill
+        alert.accessoryView = grid
+        alert.window.initialFirstResponder = repositoryURL
+
+        let response = alert.runModal()
+        let tokenValue = token.stringValue
+        token.stringValue = ""
+        guard response == .alertFirstButtonReturn else { return }
+        var request = RepositorySBOMRequest(
+            repositoryURL: repositoryURL.stringValue,
+            token: tokenValue,
+            ref: ref.stringValue,
+            format: RepositorySBOMFormat.allCases[max(0, format.indexOfSelectedItem)]
+        )
+        do {
+            _ = try RepositorySBOMService.parseRepositoryURL(request.repositoryURL)
+            try RepositorySBOMService.validateToken(request.token)
+            _ = try RepositorySBOMService.validateRef(request.ref)
+        } catch {
+            showError(error)
+            return
+        }
+
+        setBusy("Generating repository SBOM…")
+        repositorySBOMTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let result = try await repositorySBOMService.generate(request)
+                request.token.removeAll(keepingCapacity: false)
+                guard !Task.isCancelled else { return }
+                repositorySBOMTask = nil
+                setReady("SBOM ready · \(result.componentCount) components")
+                saveRepositorySBOM(result)
+            } catch is CancellationError {
+                request.token.removeAll(keepingCapacity: false)
+                repositorySBOMTask = nil
+                setReady("SBOM generation cancelled")
+            } catch {
+                request.token.removeAll(keepingCapacity: false)
+                repositorySBOMTask = nil
+                setReady("SBOM generation failed")
+                showError(error)
+            }
+            rebuildMenu()
+        }
+        rebuildMenu()
+    }
+
+    private func saveRepositorySBOM(_ result: RepositorySBOMResult) {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        let panel = NSSavePanel()
+        panel.title = "Save Repository SBOM"
+        panel.message = "Save the auditor-facing JSON and its SHA-256 checksum."
+        panel.allowedContentTypes = [.json]
+        panel.canCreateDirectories = true
+        panel.nameFieldStringValue = result.suggestedFilename
+        guard panel.runModal() == .OK, let destination = panel.url else {
+            setReady("SBOM generated but not saved")
+            return
+        }
+        let checksumURL = destination.appendingPathExtension("sha256.txt")
+        do {
+            try result.data.write(to: destination, options: .atomic)
+            let checksum = "\(result.artifactSHA256)  \(destination.lastPathComponent)\n"
+            try Data(checksum.utf8).write(to: checksumURL, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: checksumURL.path)
+            let completion = NSAlert()
+            completion.messageText = "Repository SBOM saved"
+            completion.informativeText = "\(result.repository) at \(result.resolvedCommit.prefix(12))\n\(result.componentCount) components from \(result.manifestPaths.count) lockfile(s)\nSHA-256: \(result.artifactSHA256)"
+            completion.addButton(withTitle: "Reveal in Finder")
+            completion.addButton(withTitle: "Done")
+            if completion.runModal() == .alertFirstButtonReturn { NSWorkspace.shared.activateFileViewerSelecting([destination, checksumURL]) }
+            setReady("Saved SBOM · \(result.componentCount) components")
+            notify(title: "Repository SBOM ready", body: "\(result.repository) at \(result.resolvedCommit.prefix(12)) was saved with a checksum.")
+        } catch {
+            try? FileManager.default.trashItem(at: destination, resultingItemURL: nil)
+            try? FileManager.default.trashItem(at: checksumURL, resultingItemURL: nil)
+            showError(error)
         }
     }
 

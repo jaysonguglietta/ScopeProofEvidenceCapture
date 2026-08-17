@@ -125,7 +125,7 @@ npx tsc --noEmit
 npm test
 ```
 
-Run the native tests with the Xcode Swift toolchain, build the `.app`, confirm its bundle version/signature, and smoke-test the menu, settings, capture classification, redaction review, search, Jira comment, and package export on a non-production evidence page.
+Run the native tests with the Xcode Swift toolchain, build the `.app`, confirm its bundle version/signature, and smoke-test the menu, one-time repository SBOM dialog/export/checksum, settings, capture classification, redaction review, search, Jira comment, and package export on non-production sources.
 
 ## Backup, retention, and recovery
 

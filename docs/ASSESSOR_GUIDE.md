@@ -64,6 +64,8 @@ For CycloneDX 1.6 or SPDX 2.3 evidence mapped to PCI DSS 6.3.2, verify that:
 - repeat-run additions, removals, and version changes were reviewed, while treating the full current document as authoritative; and
 - deployment provenance separately demonstrates whether that commit and dependency set reached the assessed environment.
 
+A direct Mac export is not automatically mapped, approved, encrypted, or packaged by the hosted evidence workflow. For that form, verify the adjacent `.sha256.txt` against the JSON, confirm the repository and 40-character commit in the document, inspect the manifest-set SHA-256 and lockfile paths, obtain the organization's separate reviewer/retention record, and confirm the file was transferred from an approved encrypted location. Hosted documents use source-archive provenance; native documents use manifest-set provenance because the Mac reads bounded Git blobs and never downloads an archive.
+
 The SBOM is a static inventory of supported pinned lockfiles. It does not prove deployment, runtime completeness, exploitability, patch status, license compliance, or absence of vulnerabilities. Request deployment attestations, vulnerability scan output, exception records, and change-management evidence where those assertions are required.
 
 ## Exceptions

@@ -106,7 +106,7 @@ enum ReleaseVerifier {
 
 actor UpdateService {
     private let approvedDownloadOrigins: Set<String> = ["https://scopeproof-pci.jayson-guglietta.chatgpt.site", "https://github.com"]
-    private var appVersion: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.3.2" }
+    private var appVersion: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.5.0" }
 
     func check(serverURL: URL?) async throws -> ReleaseManifest? {
         guard let server = BackendTrust.normalizedOrigin(serverURL) else { throw UploadFailure.invalidServer }

@@ -67,7 +67,24 @@ On the Mac, assign a Jira issue during capture, complete lifecycle review, and m
 
 ## Generate a repository SBOM
 
-Repository SBOM generation is a hosted-web workflow; it does not require or run inside the local Mac app. Use either a platform-managed GitHub organization or a one-time exact GitHub URL and short-lived read-only token. The active assessment must include PCI DSS control **6.3.2** and, when system scope is populated, the selected `owner/repository`, owner/organization, or `GitHub`.
+Choose the workflow that matches the evidence requirement:
+
+- Use the **Mac shield menu** for a direct one-time auditor export. It requires no hosted account and produces JSON plus a checksum, but it is not automatically attached to an assessment, reviewed, compared, or included in a Scopeproof package.
+- Use the **hosted console** when the SBOM must become assessment-scoped PCI DSS 6.3.2 evidence with RBAC, encrypted retention, prior-run comparison, independent approval, audited download, and package inclusion.
+
+### Direct one-time export on the Mac
+
+1. Choose **Generate Repository SBOM…** from the Scopeproof shield menu.
+2. Enter exactly `https://github.com/owner/repository`, a fresh token selected only for that repository with **Metadata: read** and **Contents: read**, and a branch, tag, or commit.
+3. Choose CycloneDX 1.6 JSON or SPDX 2.3 JSON and select **Generate**. The masked token is cleared immediately.
+4. Choose a save location. Scopeproof writes the JSON and an adjacent `.sha256.txt` checksum with current-user-only file permissions.
+5. Record the immutable commit and verify the checksum before transfer. Revoke the GitHub token after success or failure.
+
+The Mac reads only recognized lockfile blobs through GitHub's commit/tree/blob APIs. It does not clone, check out, build, install, execute, or unpack repository content. It uses an ephemeral URL session without cookies, URL cache, credential storage, redirects, persistence, or automatic retry. A direct export remains outside the Local Console screenshot lifecycle and must be reviewed and transferred under your organization's evidence-handling process.
+
+### Hosted assessment evidence
+
+Use either a platform-managed GitHub organization or a one-time exact GitHub URL and short-lived read-only token. The active assessment must include PCI DSS control **6.3.2** and, when system scope is populated, the selected `owner/repository`, owner/organization, or `GitHub`.
 
 1. Open **SBOMs** in the hosted Scopeproof console and choose **Generate SBOM**.
 2. Choose **Managed organization** and select a repository, or choose **One-time repository** and enter `https://github.com/owner/repository` plus a repository-scoped token with Metadata and Contents read access.
@@ -79,7 +96,7 @@ Repository SBOM generation is a hosted-web workflow; it does not require or run 
 
 The **JSON** action downloads the generated evidence before approval for authorized review; every download is authenticated and audited. A prior-run comparison is a review aid, not the authoritative inventory. See the [repository SBOM guide](SBOM_GUIDE.md) for supported inputs, safety limits, and interpretation.
 
-For one-time access, Scopeproof masks the token and clears the field at submission. It uses the token only during that request and does not write it to application storage, audit details, settings, logs, browser storage, or Keychain. Because the token is unavailable afterward, transient failures do not retry automatically; re-enter a fresh token for a new run. Prefer a short expiry and revoke the token after success or failure.
+For one-time hosted access, Scopeproof masks the token and clears the field at submission. It uses the token only during that request and does not write it to application storage, audit details, settings, logs, browser storage, or Keychain. Because the token is unavailable afterward, transient failures do not retry automatically; re-enter a fresh token for a new run. Prefer a short expiry and revoke the token after success or failure.
 
 ## Export for an assessor
 
@@ -106,6 +123,7 @@ Detailed validation steps are in the [assessor guide](ASSESSOR_GUIDE.md). Jira-s
 | No Jira key in filename/banner | Edit capture defaults, enter the issue key, then recapture; existing immutable evidence is not renamed. |
 | Upload remains pending | Verify the HTTPS server URL and active device token, then retry pending uploads. |
 | Generate SBOM is disabled | Confirm your role can generate SBOMs and the assessment is active with PCI DSS 6.3.2 in scope. Managed secrets are optional when using one-time repository access. |
+| Native SBOM menu says generation is already running | Wait for the current one-time request to finish; the Mac intentionally allows only one repository scan at a time. |
 | Repository is missing | Confirm it belongs to the configured organization, is within the token's repository selection, and is among the bounded inventory results. |
 | SBOM reports no supported components | Commit a supported lockfile with pinned versions, or request a reviewed parser addition for that ecosystem. |
 | Package export is unavailable | Approve at least one artifact in the selected framework/period and resolve any integrity failure. |

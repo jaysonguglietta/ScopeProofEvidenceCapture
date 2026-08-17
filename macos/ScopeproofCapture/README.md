@@ -1,6 +1,6 @@
 # Scopeproof Capture for macOS
 
-Scopeproof Capture 1.4.0 is a local-first menu-bar application for producing, finding, reviewing, and packaging timestamped PCI DSS, HIPAA, FedRAMP, SOC 2, ISO 27001, and custom compliance evidence screenshots.
+Scopeproof Capture 1.5.0 is a local-first menu-bar application for producing, finding, reviewing, and packaging timestamped PCI DSS, HIPAA, FedRAMP, SOC 2, ISO 27001, and custom compliance evidence screenshots, plus one-time repository SBOM exports.
 
 Related guides: [installation and updates](../../docs/MACOS_INSTALLATION.md), [operator workflow](../../docs/OPERATOR_GUIDE.md), [Jira handoff](../../docs/JIRA_HANDOFF.md), [repository SBOM generation](../../docs/SBOM_GUIDE.md), [assessor verification](../../docs/ASSESSOR_GUIDE.md), and [security model](../../docs/SECURITY.md).
 
@@ -14,7 +14,7 @@ Requirements: macOS 14 or newer and Apple’s Swift toolchain. From the reposito
 
 This single command builds the app, installs it in `~/Applications`, and launches it without requiring an administrator password. Scopeproof opens a private Local Console in the browser automatically. No hosted login or enrollment token is required for local workflows. Look for the shield in the menu bar to capture evidence or reopen the console.
 
-Repository SBOM generation remains a hosted web-console workflow so GitHub credentials never enter the native app. Local capture, review, search, and package export continue to work without it.
+Choose **Generate Repository SBOM…** from the shield menu for a direct one-time CycloneDX 1.6 or SPDX 2.3 export. The native app accepts an exact GitHub URL, a short-lived repository-scoped token, and a branch/tag/commit; reads only recognized lockfile blobs through GitHub's API; saves JSON plus a SHA-256 checksum; and does not persist or retry the credential. Use the hosted workflow instead when the SBOM must be assessment-scoped, independently approved, compared with a prior run, or included automatically in a Scopeproof assessor package.
 
 ## Local Console
 

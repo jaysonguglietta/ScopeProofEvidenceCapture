@@ -149,6 +149,8 @@ test("one-time SBOM credentials are exact-host, ephemeral, and non-retryable", a
   const sbom = await read("lib/server/sbom.ts");
   const schema = await read("db/schema.ts");
   const consoleSource = await read("app/evidence-console.tsx");
+  const nativeService = await read("macos/ScopeproofCapture/Sources/ScopeproofCapture/RepositorySBOMService.swift");
+  const nativeMenu = await read("macos/ScopeproofCapture/Sources/ScopeproofCapture/AppDelegate.swift");
   assert.match(route, /sourceMode === "one_time"/);
   assert.match(route, /no-store, max-age=0/);
   assert.match(route, /One-time generation remains available|managedError/);
@@ -158,6 +160,13 @@ test("one-time SBOM credentials are exact-host, ephemeral, and non-retryable", a
   assert.match(consoleSource, /name="githubToken" type="password"/);
   assert.match(consoleSource, /tokenInput\.value = ""/);
   assert.doesNotMatch(consoleSource, /localStorage|sessionStorage/);
+  assert.match(nativeMenu, /Generate Repository SBOM…/);
+  assert.match(nativeMenu, /NSSecureTextField/);
+  assert.match(nativeMenu, /token\.stringValue = ""/);
+  assert.match(nativeService, /URLSessionConfiguration\.ephemeral/);
+  assert.match(nativeService, /urlCredentialStorage = nil/);
+  assert.match(nativeService, /github-git-data-api-static/);
+  assert.doesNotMatch(nativeService, /Keychain|UserDefaults|Process|NSTask|\/usr\/bin/);
 });
 
 test("SBOM evidence is reviewable, downloadable, comparable, and documented for auditors", async () => {
