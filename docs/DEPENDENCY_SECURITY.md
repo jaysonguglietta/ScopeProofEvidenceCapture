@@ -2,6 +2,8 @@
 
 Scopeproof treats the deployed Worker bundle and its production dependency graph as the release boundary. Pull requests and weekly CI runs block High and Critical advisories in both the full development graph and the production graph, and retain a CycloneDX SBOM for 30 days.
 
+This release SBOM is distinct from the operator-facing repository SBOM workspace. The workspace generates CycloneDX 1.6 or SPDX 2.3 evidence for repositories supplied by the configured GitHub organization; see [Repository SBOM guide](SBOM_GUIDE.md).
+
 ## Temporary advisory exceptions
 
 These exceptions apply only to local development/build tooling. They are not present in `npm audit --omit=dev`, are not imported by the deployed Worker, and do not permit externally reachable development servers.

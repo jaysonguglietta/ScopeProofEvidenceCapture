@@ -29,7 +29,7 @@ Never reuse one value for multiple purposes. Record key ownership, creation date
 | Collector | Variables | Recommended scope |
 | --- | --- | --- |
 | AWS | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`, `AWS_REGION` | Read-only Config recorder and EC2 security-group inventory. Prefer temporary credentials. |
-| GitHub | `GITHUB_TOKEN`, `GITHUB_ORG` | Organization repository metadata and default-branch protection read access. |
+| GitHub | `GITHUB_TOKEN`, `GITHUB_ORG` | Limit the token to intended repositories with Metadata: read and Contents: read. This supports inventory, branch-protection collection, immutable commit resolution, and bounded SBOM archive download; no write scopes are required. |
 | Okta | `OKTA_BASE_URL`, `OKTA_API_TOKEN` | Read-only policy and group inventory. |
 | Cloudflare | `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, optional `CLOUDFLARE_ZONE_IDS` | Zone and managed-ruleset read access. |
 | Browser Rendering | Cloudflare variables, `BROWSER_CAPTURE_URLS`, `BROWSER_OCR_ENDPOINT`, `BROWSER_OCR_TOKEN`, `BROWSER_OCR_ALLOWED_HOSTS` | Dedicated HTTPS evidence URLs and a contractually approved OCR processor. The OCR response must echo the exact PNG SHA-256 and a policy version. |

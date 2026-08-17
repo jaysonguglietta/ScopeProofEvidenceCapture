@@ -2,15 +2,15 @@ import { activeAuditKeyId, hmac, randomId, sha256, stableJson } from "./crypto";
 import { getEnv } from "./env";
 
 export type Role = "admin" | "compliance_lead" | "reviewer" | "auditor";
-export type Permission = "approve_evidence" | "collect_evidence" | "manage_collectors" | "manage_devices" | "manage_jira" | "export_packages" | "manage_users" | "manage_retention";
+export type Permission = "approve_evidence" | "collect_evidence" | "generate_sbom" | "manage_collectors" | "manage_devices" | "manage_jira" | "export_packages" | "manage_users" | "manage_retention";
 export type AuthenticatedUser = { id: string; email: string; displayName: string; role: Role };
 
 const roleRank: Record<Role, number> = { auditor: 0, reviewer: 1, compliance_lead: 2, admin: 3 };
 const rolePermissions: Record<Role, ReadonlySet<Permission>> = {
   auditor: new Set(),
   reviewer: new Set(["approve_evidence", "export_packages"]),
-  compliance_lead: new Set(["collect_evidence", "manage_collectors", "manage_devices", "manage_jira", "export_packages"]),
-  admin: new Set(["approve_evidence", "collect_evidence", "manage_collectors", "manage_devices", "manage_jira", "export_packages", "manage_users", "manage_retention"]),
+  compliance_lead: new Set(["collect_evidence", "generate_sbom", "manage_collectors", "manage_devices", "manage_jira", "export_packages"]),
+  admin: new Set(["approve_evidence", "collect_evidence", "generate_sbom", "manage_collectors", "manage_devices", "manage_jira", "export_packages", "manage_users", "manage_retention"]),
 };
 
 function responseError(status: number, error: string): Response {
