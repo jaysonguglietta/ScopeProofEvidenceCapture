@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 struct ComplianceControl: Codable, Hashable, Sendable {
@@ -175,7 +176,11 @@ enum ComplianceCatalog {
     }
 
     static func importCatalog(from url: URL) throws -> ComplianceFramework {
-        let data = try Data(contentsOf: url)
+        let resource = try url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
+        guard resource.isRegularFile == true, let fileSize = resource.fileSize, fileSize > 0, fileSize <= 5 * 1024 * 1024 else { throw CocoaError(.fileReadTooLarge) }
+        let data = try Data(contentsOf: url, options: [.mappedIfSafe])
+        guard data.count == fileSize else { throw CocoaError(.fileReadCorruptFile) }
+        let digest = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
         let framework: ComplianceFramework
         if url.pathExtension.lowercased() == "csv" {
             let lines = String(decoding: data, as: UTF8.self).split(whereSeparator: \.isNewline)
@@ -205,12 +210,16 @@ enum ComplianceCatalog {
         }
         let cleanName = String(framework.name.trimmingCharacters(in: .whitespacesAndNewlines).prefix(160))
         guard !cleanName.isEmpty, !framework.controls.isEmpty, framework.controls.count <= 5_000 else { throw CocoaError(.fileReadCorruptFile) }
+        let controls = framework.controls.map { ComplianceControl(id: String($0.id.trimmingCharacters(in: .whitespacesAndNewlines).prefix(80)), title: String($0.title.trimmingCharacters(in: .whitespacesAndNewlines).prefix(240))) }.filter { !$0.id.isEmpty }
+        let normalizedIDs = controls.map { $0.id.lowercased() }
+        guard Set(normalizedIDs).count == normalizedIDs.count else { throw CocoaError(.fileReadCorruptFile) }
+        let source = framework.source.map { String($0.prefix(140)) } ?? url.lastPathComponent
         let normalized = ComplianceFramework(
             name: cleanName,
             fileCode: String(safeFileBase(framework.fileCode).uppercased().prefix(24)),
             folderName: safePathComponent(framework.folderName, fallback: "Imported", maximumLength: 100),
-            controls: framework.controls.map { ComplianceControl(id: String($0.id.trimmingCharacters(in: .whitespacesAndNewlines).prefix(80)), title: String($0.title.trimmingCharacters(in: .whitespacesAndNewlines).prefix(240))) }.filter { !$0.id.isEmpty },
-            version: framework.version.map { String($0.prefix(80)) }, source: framework.source.map { String($0.prefix(240)) } ?? url.lastPathComponent
+            controls: controls,
+            version: framework.version.map { String($0.prefix(80)) }, source: "\(source) · SHA-256 \(digest)"
         )
         guard !normalized.controls.isEmpty else { throw CocoaError(.fileReadCorruptFile) }
         var imported = frameworks.filter { $0.source != nil && $0.name != normalized.name }

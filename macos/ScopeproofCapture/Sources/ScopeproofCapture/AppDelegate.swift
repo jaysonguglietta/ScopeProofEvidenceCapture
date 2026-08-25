@@ -89,7 +89,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let managePresets = NSMenuItem(title: "Remove a Preset…", action: #selector(removePreset), keyEquivalent: ""); managePresets.target = self; managePresets.isEnabled = !preferences.presets.isEmpty; presetsMenu.addItem(managePresets)
         presetsItem.submenu = presetsMenu
         menu.addItem(presetsItem)
-        addItem("Import Control Catalog…", action: #selector(importControlCatalog))
+        addItem("Update / Import Control Catalog…", action: #selector(importControlCatalog))
         let removeCatalog = NSMenuItem(title: "Remove Imported Catalog…", action: #selector(removeImportedCatalog), keyEquivalent: ""); removeCatalog.target = self; removeCatalog.isEnabled = !ComplianceCatalog.importedFrameworks.isEmpty; menu.addItem(removeCatalog)
         menu.addItem(.separator())
 
@@ -295,13 +295,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             mappings.textColor = .secondaryLabelColor
             mappings.font = .systemFont(ofSize: 10)
             mappings.maximumNumberOfLines = 2
+            let catalogStatus = NSTextField(wrappingLabelWithString: "")
+            catalogStatus.textColor = .secondaryLabelColor
+            catalogStatus.font = .systemFont(ofSize: 10)
+            catalogStatus.maximumNumberOfLines = 2
+            catalogStatus.setAccessibilityLabel("Selected control catalog version and source")
+            let updateControls = NSButton(title: "Update Controls…", target: nil, action: nil)
+            updateControls.bezelStyle = .rounded
+            updateControls.toolTip = "Import a current Scopeproof JSON, OSCAL JSON, or CSV control catalog from an approved source."
             for field in [fileName, sessionName, title, system, period, description, owner, tags, expected, jiraIssue, sourceURL] { field.frame.size.width = 400 }
             control.frame.size.width = 400
             framework.frame.size.width = 400
             preview.frame.size.width = 400
             mappings.frame.size.width = 400
+            catalogStatus.frame.size.width = 280
+            let catalogRow = NSStackView(views: [catalogStatus, updateControls])
+            catalogRow.orientation = .horizontal
+            catalogRow.alignment = .centerY
+            catalogRow.spacing = 8
+            catalogRow.frame.size.width = 400
             let grid = NSGridView(views: [
-                [label("Compliance area *"), framework], [label("Control *"), control], [label("File name *"), fileName], [label("Saved as"), preview],
+                [label("Compliance area *"), framework], [label("Catalog"), catalogRow], [label("Control *"), control], [label("File name *"), fileName], [label("Saved as"), preview],
                 [label("Evidence title *"), title], [label("System or asset *"), system], [label("Environment *"), environment],
                 [label(detectedSourceURL == nil ? "Page URL" : "Page URL (detected)"), sourceURL],
                 [label("Assessment period *"), period], [label("Session name *"), sessionName], [label("Evidence owner"), owner],
@@ -311,11 +325,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             grid.column(at: 1).xPlacement = .fill
             grid.rowSpacing = 10
             grid.columnSpacing = 12
-            grid.frame = NSRect(x: 0, y: 0, width: 560, height: 575)
+            grid.frame = NSRect(x: 0, y: 0, width: 560, height: 610)
             alert.accessoryView = grid
             let coordinator = CaptureMetadataCoordinator(
                 frameworkPopup: framework, controlCombo: control, filenameField: fileName, periodField: period, jiraIssueField: jiraIssue,
-                previewLabel: preview, preferredControlID: controlValue, mappingLabel: mappings
+                previewLabel: preview, preferredControlID: controlValue, mappingLabel: mappings, catalogStatusLabel: catalogStatus,
+                updateControlsButton: updateControls, onUpdateControls: { [weak self] in self?.chooseAndImportControlCatalog()?.name }
             )
             alert.window.initialFirstResponder = missingFields.contains("control") ? control : (missingFields.contains("file name") ? fileName : (missingFields.contains("evidence title") ? title : control))
 
@@ -711,10 +726,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func importControlCatalog() {
-        let panel = NSOpenPanel(); panel.title = "Import Control Catalog"; panel.message = "Choose Scopeproof JSON, OSCAL catalog JSON, or CSV with control ID and title columns."; panel.allowedContentTypes = [.json, .commaSeparatedText]; panel.allowsMultipleSelection = false
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        do { let catalog = try ComplianceCatalog.importCatalog(from: url); setReady("Imported \(catalog.name) · \(catalog.controls.count) controls"); rebuildMenu() }
-        catch { showError(NSError(domain: "Scopeproof", code: 14, userInfo: [NSLocalizedDescriptionKey: "The catalog could not be imported. Use a Scopeproof framework JSON object, OSCAL catalog JSON, or CSV with a header followed by control ID,title rows."])) }
+        _ = chooseAndImportControlCatalog()
+    }
+
+    private func chooseAndImportControlCatalog() -> ComplianceFramework? {
+        let panel = NSOpenPanel()
+        panel.title = "Update Compliance Controls"
+        panel.message = "Built-in catalog: \(ComplianceCatalog.catalogVersion). Choose a current Scopeproof JSON, OSCAL catalog JSON, or CSV exported by the framework publisher or your approved GRC source."
+        panel.prompt = "Validate & Import"
+        panel.allowedContentTypes = [.json, .commaSeparatedText]
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return nil }
+        do {
+            let catalog = try ComplianceCatalog.importCatalog(from: url)
+            setReady("Updated \(catalog.name) · \(catalog.controls.count) controls · \(catalog.version ?? "version not supplied")")
+            rebuildMenu()
+            let alert = NSAlert()
+            alert.messageText = "Control catalog updated"
+            alert.informativeText = "\(catalog.name) now contains \(catalog.controls.count) controls. Version: \(catalog.version ?? "not supplied"). Source and SHA-256 are recorded with the imported catalog. Existing evidence was not changed."
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return catalog
+        } catch {
+            showError(NSError(domain: "Scopeproof", code: 14, userInfo: [NSLocalizedDescriptionKey: "The catalog was not imported because it failed validation. Use a regular file no larger than 5 MB containing a Scopeproof framework object, OSCAL catalog, or CSV with unique control IDs and an ID,title header."]))
+            return nil
+        }
     }
 
     @objc private func removeImportedCatalog() {

@@ -146,6 +146,33 @@ struct SensitiveDataScannerTests {
         #expect(JiraHandoffSettings(baseURL: "https://example.atlassian.net", projectKey: "GRC", attachmentMode: .evidenceSet, includeGuideInPackages: true, customInstructions: "").issueURL(for: "GRC-42")?.absoluteString == "https://example.atlassian.net/browse/GRC-42")
     }
 
+    @Test("Imports bounded catalogs with provenance and rejects duplicate control IDs")
+    func validatesImportedCatalogs() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("scopeproof-catalog-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let validURL = root.appendingPathComponent("approved-controls.json")
+        let valid = ComplianceFramework(
+            name: "Test Framework \(UUID().uuidString)", fileCode: "TEST", folderName: "Test",
+            controls: [.init(id: "T-1", title: "Test control")], version: "2026.1", source: "Approved GRC export"
+        )
+        try JSONEncoder().encode(valid).write(to: validURL)
+        let imported = try ComplianceCatalog.importCatalog(from: validURL)
+        defer { ComplianceCatalog.removeImportedCatalog(named: imported.name) }
+        #expect(imported.version == "2026.1")
+        #expect(imported.source?.contains("SHA-256") == true)
+        #expect(imported.source?.contains("approved-controls.json") == false)
+
+        let duplicateURL = root.appendingPathComponent("duplicate-controls.json")
+        let duplicate = ComplianceFramework(
+            name: "Duplicate Framework", fileCode: "DUP", folderName: "Duplicate",
+            controls: [.init(id: "AC-1", title: "First"), .init(id: "ac-1", title: "Duplicate")]
+        )
+        try JSONEncoder().encode(duplicate).write(to: duplicateURL)
+        #expect(throws: CocoaError.self) { try ComplianceCatalog.importCatalog(from: duplicateURL) }
+    }
+
     @Test("Finds legacy and current evidence recursively")
     func findsEvidenceRecursivelyAndDecodesLegacyManifest() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("scopeproof-history-\(UUID().uuidString)", isDirectory: true)

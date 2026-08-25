@@ -141,6 +141,21 @@ test("screenshot pipelines scan the exact persisted pixels and fail closed", asy
   for (const column of ["safety_scan_sha256", "safety_scan_policy", "safety_scan_completed_at"]) assert.ok(migration.includes(column));
 });
 
+test("native control catalog updates are visible, bounded, normalized, and provenance-recorded", async () => {
+  const [app, coordinator, catalog] = await Promise.all([
+    readFile(new URL("../macos/ScopeproofCapture/Sources/ScopeproofCapture/AppDelegate.swift", import.meta.url), "utf8"),
+    readFile(new URL("../macos/ScopeproofCapture/Sources/ScopeproofCapture/CaptureMetadataCoordinator.swift", import.meta.url), "utf8"),
+    readFile(new URL("../macos/ScopeproofCapture/Sources/ScopeproofCapture/ComplianceCatalog.swift", import.meta.url), "utf8"),
+  ]);
+  assert.match(app, /Update Controls…/);
+  assert.match(app, /catalogStatusLabel:/);
+  assert.match(coordinator, /Version .* controls/);
+  assert.match(catalog, /fileSize <= 5 \* 1024 \* 1024/);
+  assert.match(catalog, /Set\(normalizedIDs\)\.count == normalizedIDs\.count/);
+  assert.match(catalog, /SHA256\.hash\(data: data\)/);
+  assert.match(catalog, /SHA-256/);
+});
+
 test("assessor metadata migration and package preserve framework organization", async () => {
   const [migration, packageSource] = await Promise.all([
     readFile(new URL("../drizzle/0003_fine_wonder_man.sql", import.meta.url), "utf8"),

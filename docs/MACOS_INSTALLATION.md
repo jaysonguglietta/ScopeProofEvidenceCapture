@@ -85,6 +85,7 @@ The script quits a running Scopeproof process before replacing the application. 
 - **Generate Repository SBOM…** opens a masked one-time GitHub credential dialog and offers CycloneDX 1.6 or SPDX 2.3 JSON.
 - **AWS S3 Storage…** opens the security-profile, KMS/Object Lock, lifecycle/replication, FIPS, and Keychain credential configuration. Use **Save & Verify** for an existing bucket or **Create & Harden Bucket** after reviewing the irreversible retention warning.
 - **Browse S3 Evidence…** searches and sorts immutable versions under the verified prefix and downloads one selected PNG/JSON version to an explicit quarantined local destination.
+- The capture form shows the selected catalog version, source, and control count; **Update Controls…** validates and imports an approved JSON, OSCAL JSON, or CSV catalog without changing existing evidence.
 - A browser-window test capture shows a real right-side Mac menu-bar pixel strip across the top, followed by the selected framework/control, canonical capture timestamp, local clock/timezone reading, and full URL in its visible banner.
 - The PNG, manifest, and lifecycle sidecar appear together under the expected framework/control folder.
 
