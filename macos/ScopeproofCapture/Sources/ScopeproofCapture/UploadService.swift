@@ -18,7 +18,7 @@ enum UploadFailure: LocalizedError {
 }
 
 actor UploadService {
-    private var appVersion: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.8.0" }
+    private var appVersion: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.8.1" }
 
     func upload(_ capture: CaptureResult, serverURL: URL?) async throws -> URL {
         guard let serverURL = BackendTrust.normalizedOrigin(serverURL) else { throw UploadFailure.invalidServer }

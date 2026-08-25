@@ -91,7 +91,7 @@ The DMG workflow is intentionally separate from the trusted production updater:
 1. Start from the exact reviewed commit and confirm the worktree contains no uncommitted source or generated evidence.
 2. Run the complete validation set, including native tests, then run `./Scripts/build_development_dmg.sh` on macOS. Use `--skip-build` only when `DerivedData/Scopeproof Capture.app` was built from the same validated commit in the current job.
 3. Confirm the script reports both `DerivedData/Scopeproof-Capture-<version>-development-preview.dmg` and its `.sha256` file. The script requires an ad-hoc signature, creates an `/Applications` shortcut, mounts the image read-only, verifies the bundle signature and disk image, and writes a portable filename-only checksum.
-4. Confirm the packaged executable architecture with `file`. A release must state every supported architecture; the 1.8.0 development preview is Apple Silicon (`arm64`) only.
+4. Confirm the packaged executable architecture with `file`. A release must state every supported architecture; the 1.8.1 development preview is Apple Silicon (`arm64`) only.
 5. Publish both files together as a GitHub **prerelease** tied to the exact reviewed commit. Release notes must state the macOS minimum, architecture, digest-verification command, ad-hoc signature, lack of notarization, Gatekeeper implications, and prohibition on disabling Gatekeeper globally.
 6. Download both published assets into a clean temporary folder and run `shasum -a 256 -c <checksum-file>`. Compare GitHub's asset digest and size with the locally validated artifact.
 

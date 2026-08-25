@@ -5,7 +5,7 @@ Scopeproof is a private, multi-framework compliance evidence-operations applicat
 The repository contains two coordinated products:
 
 - A private web console for collection orchestration, review, encrypted storage, audit history, and signed exports.
-- **Scopeproof Capture 1.8.0** for macOS, a local-first menu-bar application with a private evidence console, explicitly initiated timestamped/redacted screenshots, one-time repository SBOM export, KMS/Object-Lock S3 evidence storage, version-aware verified downloads, assessor packaging, optional hosted synchronization, and Jira handoff.
+- **Scopeproof Capture 1.8.1** for macOS, a local-first menu-bar application with a private evidence console, explicitly initiated timestamped/redacted screenshots, one-time repository SBOM export, KMS/Object-Lock S3 evidence storage, version-aware verified downloads, assessor packaging, optional hosted synchronization, and Jira handoff.
 
 ## Documentation
 
@@ -26,7 +26,9 @@ The native-specific build and usage reference remains in [macos/ScopeproofCaptur
 
 ## Download the Mac app
 
-The current [Scopeproof Capture 1.8.0 development preview](https://github.com/jaysonguglietta/ScopeProofEvidenceCapture/releases/tag/v1.8.0-development-preview.1) includes a drag-to-Applications DMG and a separate SHA-256 checksum. It supports Apple Silicon (`arm64`) Macs running macOS 14 or newer. Download both release assets, verify the checksum as described in the [macOS installation guide](docs/MACOS_INSTALLATION.md), open the DMG, and drag **Scopeproof Capture** into **Applications**.
+[**Download the latest Scopeproof Capture DMG**](https://github.com/jaysonguglietta/ScopeProofEvidenceCapture/releases/download/v1.8.1-development-preview.1/Scopeproof-Capture-1.8.1-development-preview.dmg) · [SHA-256 checksum](https://github.com/jaysonguglietta/ScopeProofEvidenceCapture/releases/download/v1.8.1-development-preview.1/Scopeproof-Capture-1.8.1-development-preview.dmg.sha256) · [All releases](https://github.com/jaysonguglietta/ScopeProofEvidenceCapture/releases)
+
+The current [Scopeproof Capture 1.8.1 development preview](https://github.com/jaysonguglietta/ScopeProofEvidenceCapture/releases/tag/v1.8.1-development-preview.1) includes a drag-to-Applications DMG and a separate SHA-256 checksum. It supports Apple Silicon (`arm64`) Macs running macOS 14 or newer. Download both release assets, verify the checksum as described in the [macOS installation guide](docs/MACOS_INSTALLATION.md), open the DMG, and drag **Scopeproof Capture** into **Applications**.
 
 This preview is ad-hoc signed and is not Apple-notarized. macOS may therefore require an explicit **Open Anyway** decision after verification. It is for evaluation and named testers, not managed production deployment. A public production release still requires Developer ID signing, hardened runtime, notarization, and stapling.
 

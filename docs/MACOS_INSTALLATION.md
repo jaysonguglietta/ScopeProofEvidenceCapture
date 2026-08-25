@@ -7,7 +7,7 @@ The Mac app can generate a direct, one-time repository SBOM without a hosted acc
 ## Requirements
 
 - macOS 14 or newer.
-- An Apple Silicon (`arm64`) Mac for the current 1.8.0 development-preview DMG.
+- An Apple Silicon (`arm64`) Mac for the current 1.8.1 development-preview DMG.
 - Screen Recording permission for browser-window capture.
 - HTTPS access to `api.github.com` when using local repository SBOM generation.
 - HTTPS access to the configured region-specific AWS S3 and STS endpoints (or their FIPS variants) when using optional S3 storage.
@@ -16,18 +16,18 @@ The downloadable DMG does not require a repository checkout, Xcode, or Swift. Bu
 
 ## Install the development-preview DMG
 
-Open the [Scopeproof Capture 1.8.0 development-preview release](https://github.com/jaysonguglietta/ScopeProofEvidenceCapture/releases/tag/v1.8.0-development-preview.1) and download both:
+Open the [Scopeproof Capture 1.8.1 development-preview release](https://github.com/jaysonguglietta/ScopeProofEvidenceCapture/releases/tag/v1.8.1-development-preview.1) and download both:
 
-- `Scopeproof-Capture-1.8.0-development-preview.dmg`
-- `Scopeproof-Capture-1.8.0-development-preview.dmg.sha256`
+- `Scopeproof-Capture-1.8.1-development-preview.dmg`
+- `Scopeproof-Capture-1.8.1-development-preview.dmg.sha256`
 
 From the folder containing both downloads, verify the disk image before opening it:
 
 ```bash
-shasum -a 256 -c Scopeproof-Capture-1.8.0-development-preview.dmg.sha256
+shasum -a 256 -c Scopeproof-Capture-1.8.1-development-preview.dmg.sha256
 ```
 
-The expected DMG digest is `f3347f1ddeb4891e62e79861fed9535f4cdcdb56081941116e4b9ab6875999da`. The command must report `OK`. If it does not, delete both downloads and do not open the image.
+The expected DMG SHA-256 is `2ec6accbf88339b9de1087dd98c87aabfc118e191323866679f1bda365e83227`, which is also recorded in the adjacent `.sha256` release asset. The command must report `OK`. If it does not, delete both downloads and do not open the image.
 
 Open the DMG and drag **Scopeproof Capture** to the **Applications** shortcut. The installed path is `/Applications/Scopeproof Capture.app`. Eject the disk image before launching the installed copy.
 

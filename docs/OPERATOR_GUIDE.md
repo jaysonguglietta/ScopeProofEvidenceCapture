@@ -4,7 +4,7 @@ This guide is for evidence collectors, control owners, and reviewers. It describ
 
 ## Install and open the local Mac app
 
-For the simplest test installation on an Apple Silicon Mac, download the [Scopeproof Capture 1.8.0 development preview](https://github.com/jaysonguglietta/ScopeProofEvidenceCapture/releases/tag/v1.8.0-development-preview.1), verify its adjacent SHA-256 file, open the DMG, and drag **Scopeproof Capture** to **Applications**. This build is ad-hoc signed and not Apple-notarized; it is not a managed production release.
+For the simplest test installation on an Apple Silicon Mac, download the [Scopeproof Capture 1.8.1 development preview](https://github.com/jaysonguglietta/ScopeProofEvidenceCapture/releases/tag/v1.8.1-development-preview.1), verify its adjacent SHA-256 file, open the DMG, and drag **Scopeproof Capture** to **Applications**. This build is ad-hoc signed and not Apple-notarized; it is not a managed production release.
 
 Developers can instead build from the repository root:
 

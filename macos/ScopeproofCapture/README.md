@@ -1,12 +1,12 @@
 # Scopeproof Capture for macOS
 
-Scopeproof Capture 1.8.0 is a local-first menu-bar application for producing, finding, reviewing, storing, browsing, downloading, and packaging timestamped PCI DSS, HIPAA, FedRAMP, SOC 2, ISO 27001, and custom compliance evidence screenshots, plus one-time repository SBOM exports.
+Scopeproof Capture 1.8.1 is a local-first menu-bar application for producing, finding, reviewing, storing, browsing, downloading, and packaging timestamped PCI DSS, HIPAA, FedRAMP, SOC 2, ISO 27001, and custom compliance evidence screenshots, plus one-time repository SBOM exports.
 
 Related guides: [installation and updates](../../docs/MACOS_INSTALLATION.md), [operator workflow](../../docs/OPERATOR_GUIDE.md), [AWS S3 evidence storage](../../docs/S3_STORAGE.md), [Jira handoff](../../docs/JIRA_HANDOFF.md), [repository SBOM generation](../../docs/SBOM_GUIDE.md), [assessor verification](../../docs/ASSESSOR_GUIDE.md), and [security model](../../docs/SECURITY.md).
 
 ## Download the development preview
 
-Apple Silicon testers can download the [Scopeproof Capture 1.8.0 development-preview DMG and checksum](https://github.com/jaysonguglietta/ScopeProofEvidenceCapture/releases/tag/v1.8.0-development-preview.1). Verify the checksum before opening the DMG, then drag **Scopeproof Capture** to **Applications**. The preview is ad-hoc signed and not Apple-notarized, so it is not a production distribution. See the [installation guide](../../docs/MACOS_INSTALLATION.md) for exact verification and Gatekeeper instructions.
+Apple Silicon testers can download the [Scopeproof Capture 1.8.1 development-preview DMG and checksum](https://github.com/jaysonguglietta/ScopeProofEvidenceCapture/releases/tag/v1.8.1-development-preview.1). Verify the checksum before opening the DMG, then drag **Scopeproof Capture** to **Applications**. The preview is ad-hoc signed and not Apple-notarized, so it is not a production distribution. See the [installation guide](../../docs/MACOS_INSTALLATION.md) for exact verification and Gatekeeper instructions.
 
 ## Build and run locally
 

@@ -2,14 +2,26 @@
 
 ## Unreleased
 
-- Add a verified development-preview DMG with a drag-to-Applications layout, checksum, CI artifact retention, and explicit ad-hoc/notarization warnings.
-- Publish the Apple Silicon 1.8.0 development-preview DMG and checksum as a GitHub prerelease, and align installation, operator, native, architecture, security, development, and deployment documentation with the downloadable workflow.
-- Make the evidence-review phase explicit in the menu and present its modal workspace above browser windows on the active desktop; closing the review now safely discards instead of risking a hidden modal wait.
-- Add a live right-side macOS menu-bar pixel strip to browser, selected-window, URL-delayed, and scrolling evidence, with the same OCR/redaction/review/final-scan pipeline and explicit guidance that endpoint clock pixels are corroborating rather than independent time proof.
-- Add an **Update Controls…** action and visible catalog version/source/control count to the capture form; imported JSON, OSCAL, and CSV catalogs are limited to 5 MB, normalized, duplicate-checked, and recorded with a SHA-256 provenance digest.
-- Replace the clipped Capture & Jira Settings alert with compact **Capture & Local** and **Jira** tabs so every field and checkbox remains visible on smaller displays.
-- Make local-only mode explicit: replace the misleading hosted update-token error with **Open GitHub Releases…** and disable hosted upload retry until a valid server-bound device token exists.
-- Add the Mac menu-bar date, time, and timezone as a dedicated line in every screenshot evidence banner.
+No unreleased changes.
+
+## 1.8.1 — 2026-08-25
+
+### Added
+
+- Added a verified Apple Silicon development-preview DMG with a drag-to-Applications layout, adjacent SHA-256 checksum, CI artifact retention, and explicit ad-hoc-signing/notarization warnings.
+- Added a prominent direct DMG, checksum, and release-history shortcut to the repository README and aligned installation, operator, native, architecture, security, development, and deployment documentation with the downloadable workflow.
+- Added a live right-side macOS menu-bar pixel strip to browser, selected-window, URL-delayed, and scrolling evidence, with the same OCR, redaction, review, and final-scan pipeline.
+- Added **Update Controls…** plus visible catalog version, source, and control count. Imported JSON, OSCAL, and CSV catalogs are limited to 5 MB, normalized, duplicate-checked, and recorded with a SHA-256 provenance digest.
+- Added the Mac menu-bar date, time, and timezone as a dedicated line in every screenshot evidence banner.
+
+### Changed
+
+- Made the evidence-review phase explicit in the menu and present its modal workspace above browser windows on the active desktop; closing the review safely discards it.
+- Made local-only mode explicit by replacing the misleading hosted update-token error with **Open GitHub Releases…** and disabling hosted-upload retry until a valid server-bound device token exists.
+
+### Fixed
+
+- Replaced the clipped Capture & Jira Settings alert with compact **Capture & Local** and **Jira** tabs so every field and checkbox remains visible on smaller displays.
 
 ## Unreleased — production evidence correctness and operations
 

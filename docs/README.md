@@ -2,7 +2,7 @@
 
 Scopeproof documentation is organized by the person performing the work.
 
-The current downloadable Mac build is the [Scopeproof Capture 1.8.0 development preview](https://github.com/jaysonguglietta/ScopeProofEvidenceCapture/releases/tag/v1.8.0-development-preview.1). It is an Apple Silicon-only, ad-hoc-signed testing release; verify its checksum and read the [macOS installation guide](MACOS_INSTALLATION.md) before opening it.
+The current downloadable Mac build is the [Scopeproof Capture 1.8.1 development preview](https://github.com/jaysonguglietta/ScopeProofEvidenceCapture/releases/tag/v1.8.1-development-preview.1). It is an Apple Silicon-only, ad-hoc-signed testing release; verify its checksum and read the [macOS installation guide](MACOS_INSTALLATION.md) before opening it.
 
 | Guide | Primary audience | Purpose |
 | --- | --- | --- |
