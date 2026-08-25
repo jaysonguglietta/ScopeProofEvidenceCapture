@@ -179,7 +179,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         historyItem.submenu = historyMenu
         menu.addItem(historyItem)
-        addItem("Retry Pending Uploads", action: #selector(retryPendingUploads))
+        let retryHosted = NSMenuItem(title: hostedConnectionAvailable ? "Retry Pending Hosted Uploads" : "Hosted Uploads: Not connected", action: #selector(retryPendingUploads), keyEquivalent: "")
+        retryHosted.target = self
+        retryHosted.isEnabled = hostedConnectionAvailable
+        menu.addItem(retryHosted)
         let browseS3 = NSMenuItem(title: "Browse S3 Evidence…", action: #selector(openS3Browser), keyEquivalent: "")
         browseS3.target = self
         browseS3.isEnabled = preferences.s3Storage.canUpload && preferences.s3Storage.downloadsAllowed &&
@@ -204,7 +207,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         s3Settings.isEnabled = s3ConfigurationTask == nil
         menu.addItem(s3Settings)
         addItem("Capture & Jira Settings…", action: #selector(openSettings), key: ",", modifiers: [.command])
-        addItem("Check for Updates…", action: #selector(checkForUpdatesAction))
+        addItem(hostedConnectionAvailable ? "Check for Updates…" : "Open GitHub Releases…", action: #selector(checkForUpdatesAction))
         addItem("Help & How to Use…", action: #selector(showHelp), key: "?", modifiers: [.command, .shift])
         addItem("Screen Recording Settings…", action: #selector(openPermissionSettings))
         menu.addItem(.separator())
@@ -1122,6 +1125,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func checkForUpdatesAction() { checkForUpdates(silent: false) }
     private func checkForUpdates(silent: Bool) {
+        guard hostedConnectionAvailable else {
+            guard !silent else { return }
+            let alert = NSAlert()
+            alert.messageText = "Scopeproof is running in local-only mode"
+            alert.informativeText = "Automatic signed update checks require a connected Scopeproof service. You can download development-preview DMGs and checksums from the official GitHub Releases page. A locally compiled build may be newer than the latest published DMG."
+            alert.addButton(withTitle: "Open GitHub Releases")
+            alert.addButton(withTitle: "Cancel")
+            if alert.runModal() == .alertFirstButtonReturn,
+               let releases = URL(string: "https://github.com/jaysonguglietta/ScopeProofEvidenceCapture/releases") {
+                NSWorkspace.shared.open(releases)
+            }
+            return
+        }
         Task {
             do {
                 guard let release = try await updateService.check(serverURL: preferences.serverURL) else {
@@ -1150,8 +1166,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func quitApp() { NSApplication.shared.terminate(nil) }
 
     private func uploadStatusTitle() -> String {
-        guard let server = BackendTrust.normalizedOrigin(preferences.serverURL), KeychainStore.readToken(for: server) != nil else { return "Web upload: Not connected" }
+        guard hostedConnectionAvailable else { return "Web upload: Not connected" }
         return preferences.autoUpload ? "Web upload: Automatic" : "Web upload: Manual retry"
+    }
+
+    private var hostedConnectionAvailable: Bool {
+        guard let server = BackendTrust.normalizedOrigin(preferences.serverURL) else { return false }
+        return KeychainStore.readToken(for: server)?.isEmpty == false
     }
 
     private func s3StorageStatusTitle() -> String {

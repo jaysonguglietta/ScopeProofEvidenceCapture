@@ -163,6 +163,9 @@ test("native settings remain usable in a bounded tabbed dialog", async () => {
   assert.match(app, /jiraTab\.label = "Jira"/);
   assert.match(app, /Open Local Console when Scopeproof launches/);
   assert.match(app, /preferences\.openLocalConsoleAtLaunch = openLocal\.state == \.on/);
+  assert.match(app, /hostedConnectionAvailable \? "Check for Updates…" : "Open GitHub Releases…"/);
+  assert.match(app, /retryHosted\.isEnabled = hostedConnectionAvailable/);
+  assert.match(app, /Scopeproof is running in local-only mode/);
 });
 
 test("assessor metadata migration and package preserve framework organization", async () => {

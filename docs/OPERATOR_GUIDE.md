@@ -20,6 +20,8 @@ Scopeproof opens its **Local Console** in your browser at launch. This console r
 
 The Local Console is optional. To prevent it from starting automatically, open **Capture & Jira Settings…**, use the **Capture & Local** tab, clear **Open Local Console when Scopeproof launches**, save, then quit and reopen Scopeproof. The current random loopback port closes when the app quits; screenshot capture and the native evidence tools continue to work.
 
+In local-only mode, the menu shows **Open GitHub Releases…** for development-preview DMGs and checksums and disables **Hosted Uploads: Not connected**. Automatic signed update checks and hosted evidence/Jira transfer require a server-specific device token, but local capture, review, search, S3 storage, and package export do not.
+
 ## Before collecting evidence
 
 1. Confirm the system, environment, assessment period, framework, and control are in scope.
