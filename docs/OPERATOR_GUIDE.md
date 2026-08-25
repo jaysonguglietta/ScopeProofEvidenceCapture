@@ -34,8 +34,10 @@ Scopeproof opens its **Local Console** in your browser at launch. This console r
 4. Confirm the **Page URL**. **Capture Frontmost Browser Window** attempts to prefill the active Safari, Chrome, Edge, or Arc tab after macOS grants browser Automation access; **Open URL & Capture** supplies its opened address. Paste the complete HTTP or HTTPS address when detection is unavailable or when using Firefox. Scopeproof never reuses a prior URL when frontmost detection fails. It displays the complete sanitized URL in the header and manifest while removing embedded credentials and redacting sensitive query or fragment values.
 5. Optionally enter a Jira issue key such as `GRC-123`, tags, expected-evidence guidance, and a concise explanation of what the artifact proves.
 6. Inspect the **Saved as** preview. The final path is organized as `<Compliance area>/<Control>/<Assessment period>`.
-7. Inspect the review workspace. Confirm the correct window, full URL, scope, timestamp context, and automatic redactions. Drag over any additional sensitive value to apply an irreversible manual mask.
+7. Inspect the review workspace. Confirm the live Mac menu-bar strip across the top shows the expected date/time context, then confirm the correct window, full URL, scope, evidence header, and automatic redactions. Status icons and menu-bar text are evidence pixels too; drag over anything that should not be disclosed to the assessor.
 8. Save the reviewed capture. Scopeproof never saves the temporary unredacted capture.
+
+When scanning finishes, the menu status changes to **Waiting for evidence review…** and Scopeproof brings the modal review workspace above the browser on the active desktop. Choose **Save Evidence**, **Discard**, press Escape, or close the review window; closing is treated as a discard and cannot leave the app trapped in a hidden modal state.
 
 Each saved item can contain:
 
@@ -45,6 +47,8 @@ Each saved item can contain:
 - `.receipt.json`: server evidence identity and signed timestamp receipt, when uploaded.
 
 Files are stored under `~/Pictures/Scopeproof Evidence` and are private to the current macOS account.
+
+The visible menu-bar clock is useful corroborating context, but it is controlled by the endpoint and does not independently prove time. For scrolling evidence, Scopeproof captures the menu-bar strip when you choose **Finish & review**, rather than when the first viewport was taken. For stronger evidence, use the signed Scopeproof server-time receipt and, when configured and verified, the RFC 3161 timestamp attestation included with the artifact.
 
 ### Capture a page that needs multiple screenshots
 

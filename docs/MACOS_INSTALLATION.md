@@ -85,7 +85,7 @@ The script quits a running Scopeproof process before replacing the application. 
 - **Generate Repository SBOM…** opens a masked one-time GitHub credential dialog and offers CycloneDX 1.6 or SPDX 2.3 JSON.
 - **AWS S3 Storage…** opens the security-profile, KMS/Object Lock, lifecycle/replication, FIPS, and Keychain credential configuration. Use **Save & Verify** for an existing bucket or **Create & Harden Bucket** after reviewing the irreversible retention warning.
 - **Browse S3 Evidence…** searches and sorts immutable versions under the verified prefix and downloads one selected PNG/JSON version to an explicit quarantined local destination.
-- A test capture shows the selected framework/control, canonical capture timestamp, and dedicated Mac menu-bar date/time and timezone line in its visible banner.
+- A browser-window test capture shows a real right-side Mac menu-bar pixel strip across the top, followed by the selected framework/control, canonical capture timestamp, local clock/timezone reading, and full URL in its visible banner.
 - The PNG, manifest, and lifecycle sidecar appear together under the expected framework/control folder.
 
 ## Troubleshooting
@@ -97,6 +97,7 @@ The script quits a running Scopeproof process before replacing the application. 
 | Local Console does not open | Choose **Open Local Console**. If the session expired, quit and reopen Scopeproof. |
 | Browser reports unauthorized | Do not reuse an old loopback URL; reopen the console from the shield menu to establish a fresh per-launch session. |
 | Capture permission repeats | Confirm the enabled entry matches the installed copy you launch, remove obsolete copies, then fully quit and reopen Scopeproof. |
+| Menu says `Waiting for evidence review…` | Close the menu and use the review workspace Scopeproof placed above the browser. Save or discard it before starting another operation. |
 | Capture cannot find the intended window | Use **Choose Browser Window…** and select the exact browser/window title. |
 | Repository SBOM authentication fails | Create a fresh fine-grained token selected only for the repository with Metadata: read and Contents: read, then submit a new run. The app never retains or retries a one-time token. |
 | The app says SSE-S3 does not use a KMS key | Select SSE-KMS or DSSE-KMS when the bucket uses your customer-managed key, or clear the KMS ARN for an intentional SSE-S3 bucket. |

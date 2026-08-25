@@ -71,6 +71,12 @@ struct BrowserWindow: Sendable {
     var displayTitle: String { "\(owner) — \(title.isEmpty ? "Untitled window" : title)" }
 }
 
+private struct BrowserWindowPixels {
+    let image: CGImage
+    let menuBar: CGImage?
+    let capturedAt: Date
+}
+
 enum CaptureFailure: LocalizedError {
     case permissionRequired
     case invalidURL
@@ -107,6 +113,7 @@ final class CaptureService {
     private let scrollingMaximumPixelWidth = 2_560
     private let fileManager = FileManager.default
     private let preferences: CapturePreferences
+    private let onReviewPresented: @MainActor () -> Void
     private let reviewController = CaptureReviewController()
     private let localFormatter: DateFormatter = {
         let formatter = DateFormatter()
@@ -131,7 +138,10 @@ final class CaptureService {
         return formatter
     }()
 
-    init(preferences: CapturePreferences) { self.preferences = preferences }
+    init(preferences: CapturePreferences, onReviewPresented: @escaping @MainActor () -> Void = {}) {
+        self.preferences = preferences
+        self.onReviewPresented = onReviewPresented
+    }
 
     var outputDirectory: URL {
         let pictures = fileManager.urls(for: .picturesDirectory, in: .userDomainMask).first ?? fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Pictures")
@@ -184,7 +194,8 @@ final class CaptureService {
         Task { @MainActor in
             do {
                 try prepareOutputDirectory()
-                var viewports = [try await browserWindowImage(window, maximumPixelWidth: scrollingMaximumPixelWidth)]
+                let firstCapture = try await browserWindowPixels(window, maximumPixelWidth: scrollingMaximumPixelWidth, includeMenuBar: false)
+                var viewports = [firstCapture.image]
                 var viewportDigests = [sha256(try pngData(viewports[0]))]
                 let maximumViewports = maximumScrollingViewports(for: viewports[0])
                 guard maximumViewports >= 2 else {
@@ -194,7 +205,7 @@ final class CaptureService {
                 while true {
                     switch scrollingCaptureChoice(capturedCount: viewports.count, maximumCount: maximumViewports, window: window) {
                     case .captureNext:
-                        let next = try await browserWindowImage(window, maximumPixelWidth: scrollingMaximumPixelWidth)
+                        let next = try await browserWindowPixels(window, maximumPixelWidth: scrollingMaximumPixelWidth, includeMenuBar: false).image
                         guard next.width == viewports[0].width, next.height == viewports[0].height else {
                             throw CaptureFailure.scrollingCaptureFailed("The browser window size or display scale changed between sections. Keep the window size and zoom unchanged, then start again.")
                         }
@@ -210,8 +221,10 @@ final class CaptureService {
                             throw CaptureFailure.scrollingCaptureFailed("Capture at least two sections before finishing.")
                         }
                         let composite = try scrollingComposite(viewports: viewports)
+                        let liveMenuBar = try await liveMenuBarPixels(window: window, targetPixelWidth: composite.width)
+                        let captureDate = Date()
                         let method = "ScreenCaptureKit operator-guided scrolling composite (\(viewports.count) viewports; intermediate frames memory-only)"
-                        completion(.success(try finalizeCapture(original: composite, sourceURL: nil, browser: window.owner, windowTitle: window.title, method: method, context: context)))
+                        completion(.success(try finalizeCapture(original: composite, menuBar: liveMenuBar, sourceURL: nil, browser: window.owner, windowTitle: window.title, method: "\(method) + live macOS menu-bar strip", context: context, captureDate: captureDate)))
                         return
                     case .cancel:
                         throw CaptureFailure.cancelled
@@ -234,7 +247,7 @@ final class CaptureService {
                 if #available(macOS 14.2, *) { filter.includeMenuBar = true }
                 let configuration = captureConfiguration(width: CGFloat(display.width), height: CGFloat(display.height), scale: CGFloat(filter.pointPixelScale))
                 let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
-                completion(.success(try finalizeCapture(original: image, sourceURL: nil, browser: "Entire Display", windowTitle: "Full display with menu bar", method: "ScreenCaptureKit full-display", context: context)))
+                completion(.success(try finalizeCapture(original: image, menuBar: nil, sourceURL: nil, browser: "Entire Display", windowTitle: "Full display with menu bar", method: "ScreenCaptureKit full-display with live macOS menu bar", context: context, captureDate: Date(), liveMenuBarCaptured: true)))
             } catch { completion(.failure(error as? CaptureFailure ?? .screenshotFailed(error.localizedDescription))) }
         }
     }
@@ -266,13 +279,13 @@ final class CaptureService {
         Task { @MainActor in
             do {
                 try prepareOutputDirectory()
-                let image = try await browserWindowImage(window)
-                completion(.success(try finalizeCapture(original: image, sourceURL: sourceURL, browser: window.owner, windowTitle: window.title, method: "ScreenCaptureKit desktop-independent-window", context: context)))
+                let pixels = try await browserWindowPixels(window, includeMenuBar: true)
+                completion(.success(try finalizeCapture(original: pixels.image, menuBar: pixels.menuBar, sourceURL: sourceURL, browser: window.owner, windowTitle: window.title, method: "ScreenCaptureKit desktop-independent-window + live macOS menu-bar strip", context: context, captureDate: pixels.capturedAt)))
             } catch { completion(.failure(error as? CaptureFailure ?? .screenshotFailed(error.localizedDescription))) }
         }
     }
 
-    private func browserWindowImage(_ window: BrowserWindow, maximumPixelWidth: Int? = nil) async throws -> CGImage {
+    private func browserWindowPixels(_ window: BrowserWindow, maximumPixelWidth: Int? = nil, includeMenuBar: Bool) async throws -> BrowserWindowPixels {
         let content = try await SCShareableContent.current
         guard let shareableWindow = content.windows.first(where: { $0.windowID == window.id }) else { throw CaptureFailure.noBrowserWindow }
         let filter = SCContentFilter(desktopIndependentWindow: shareableWindow)
@@ -282,7 +295,49 @@ final class CaptureService {
             scale: CGFloat(filter.pointPixelScale),
             maximumPixelWidth: maximumPixelWidth
         )
-        return try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
+        let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
+        let menuBar = includeMenuBar ? try await liveMenuBarImage(content: content, above: shareableWindow, targetPixelWidth: image.width) : nil
+        return BrowserWindowPixels(image: image, menuBar: menuBar, capturedAt: Date())
+    }
+
+    private func liveMenuBarPixels(window: BrowserWindow, targetPixelWidth: Int) async throws -> CGImage {
+        let content = try await SCShareableContent.current
+        guard let shareableWindow = content.windows.first(where: { $0.windowID == window.id }) else { throw CaptureFailure.noBrowserWindow }
+        return try await liveMenuBarImage(content: content, above: shareableWindow, targetPixelWidth: targetPixelWidth)
+    }
+
+    private func liveMenuBarImage(content: SCShareableContent, above window: SCWindow, targetPixelWidth: Int) async throws -> CGImage {
+        let windowCenter = CGPoint(x: window.frame.midX, y: window.frame.midY)
+        let display = content.displays.first(where: { CGDisplayBounds($0.displayID).contains(windowCenter) })
+            ?? content.displays.first(where: { $0.displayID == CGMainDisplayID() })
+            ?? content.displays.first
+        guard let display else { throw CaptureFailure.screenshotFailed("The display containing the live Mac menu bar is not available.") }
+
+        let displayBounds = CGDisplayBounds(display.displayID)
+        let sourceWidth = min(displayBounds.width, max(1, window.frame.width))
+        let menuBarHeight = liveMenuBarHeight(displayID: display.displayID)
+        let sourceRect = CGRect(
+            x: max(0, displayBounds.width - sourceWidth),
+            y: 0,
+            width: sourceWidth,
+            height: min(displayBounds.height, menuBarHeight)
+        )
+        let filter = SCContentFilter(display: display, excludingWindows: [])
+        if #available(macOS 14.2, *) { filter.includeMenuBar = true }
+        let configuration = SCStreamConfiguration()
+        configuration.sourceRect = sourceRect
+        configuration.width = max(1, targetPixelWidth)
+        configuration.height = max(1, Int(ceil(sourceRect.height * CGFloat(targetPixelWidth) / sourceRect.width)))
+        configuration.showsCursor = false
+        let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
+        guard image.width > 0, image.height > 0 else { throw CaptureFailure.screenshotFailed("The live Mac menu bar returned an empty image.") }
+        return image
+    }
+
+    private func liveMenuBarHeight(displayID: CGDirectDisplayID) -> CGFloat {
+        let screen = NSScreen.screens.first { ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == displayID }
+        let visibleInset = screen.map { max(0, $0.frame.maxY - $0.visibleFrame.maxY) } ?? 0
+        return max(24, NSStatusBar.system.thickness, visibleInset)
     }
 
     private func prepareOutputDirectory() throws {
@@ -402,9 +457,11 @@ final class CaptureService {
         return data as Data
     }
 
-    private func finalizeCapture(original: CGImage, sourceURL: URL?, browser: String, windowTitle: String, method: String, context: CaptureContext) throws -> CaptureResult {
+    private func finalizeCapture(original: CGImage, menuBar: CGImage?, sourceURL: URL?, browser: String, windowTitle: String, method: String, context: CaptureContext, captureDate: Date, liveMenuBarCaptured: Bool = false) throws -> CaptureResult {
         let initialScan = try requiredSafetyScan(original)
-        let now = Date()
+        let menuBarScan = try menuBar.map { try requiredSafetyScan($0) }
+        let includesLiveMenuBar = liveMenuBarCaptured || menuBarScan != nil
+        let now = captureDate
         let capturedAt = ISO8601DateFormatter().string(from: now)
         let evidenceID = "EV-\(UUID().uuidString.replacingOccurrences(of: "-", with: "").prefix(10).uppercased())"
         let framework = ComplianceCatalog.framework(named: context.resolvedComplianceArea)
@@ -433,11 +490,16 @@ final class CaptureService {
         let controlLabel = context.resolvedControlTitle.isEmpty ? context.controlID : "\(context.controlID) — \(context.resolvedControlTitle)"
         let ownerLabel = context.resolvedEvidenceOwner.isEmpty ? "UNASSIGNED" : context.resolvedEvidenceOwner
         let jiraLabel = jiraIssueKey.isEmpty ? "" : "  •  JIRA \(jiraIssueKey)"
-        let stamp = "SCOPEPROOF EVIDENCE  •  CAPTURED \(localTimestamp)  •  \(evidenceID)\nMAC MENU BAR DATE & TIME  \(menuBarTimestamp)  •  \(menuBarTimeZone)\n\(framework.name.uppercased())  •  CONTROL \(controlLabel)\(jiraLabel)\nEVIDENCE \(context.title)  •  OWNER \(ownerLabel)\n\(context.system) / \(context.environment)  •  \(context.assessmentPeriod)  •  SOURCE \(browser) — \(safeWindowTitle)\nFULL URL  \(sourceLabel)"
+        let liveMenuBarLabel = includesLiveMenuBar
+            ? "LIVE MAC MENU BAR PIXELS INCLUDED \(menuBarScan == nil ? "IN CAPTURE" : "ABOVE")  •  CLOCK READING \(menuBarTimestamp)  •  \(menuBarTimeZone)"
+            : "MAC CLOCK READING  \(menuBarTimestamp)  •  \(menuBarTimeZone)"
+        let stamp = "SCOPEPROOF EVIDENCE  •  CAPTURED \(localTimestamp)  •  \(evidenceID)\n\(liveMenuBarLabel)\n\(framework.name.uppercased())  •  CONTROL \(controlLabel)\(jiraLabel)\nEVIDENCE \(context.title)  •  OWNER \(ownerLabel)\n\(context.system) / \(context.environment)  •  \(context.assessmentPeriod)  •  SOURCE \(browser) — \(safeWindowTitle)\nFULL URL  \(sourceLabel)"
         let stamped = try stampedImage(source: initialScan.image, stamp: stamp)
-        let stampedScan = try requiredSafetyScan(stamped)
-        let automaticFindings = mergedFindings(initialScan.findings + stampedScan.findings)
-        let automaticRedactions = initialScan.redactedRegions + stampedScan.redactedRegions
+        let evidencePixels = try menuBarScan.map { try evidenceImageWithMenuBar(menuBar: $0.image, evidence: stamped) } ?? stamped
+        let stampedScan = try requiredSafetyScan(evidencePixels)
+        let automaticFindings = mergedFindings(initialScan.findings + (menuBarScan?.findings ?? []) + stampedScan.findings)
+        let automaticRedactions = initialScan.redactedRegions + (menuBarScan?.redactedRegions ?? 0) + stampedScan.redactedRegions
+        onReviewPresented()
         guard let review = reviewController.review(image: stampedScan.image, findings: automaticFindings, automaticRedactions: automaticRedactions, context: context) else { throw CaptureFailure.cancelled }
         let imageData = try pngData(review.image)
         guard let exactSource = CGImageSourceCreateWithData(imageData as CFData, nil), let exactImage = CGImageSourceCreateImageAtIndex(exactSource, 0, nil) else { throw CaptureFailure.imageProcessingFailed }
@@ -455,7 +517,9 @@ final class CaptureService {
             schemaVersion: 6, evidenceID: evidenceID, capturedAt: capturedAt, localTimestamp: localTimestamp, timezone: TimeZone.current.identifier,
             sourceURL: recordedSourceURL?.absoluteString, sourceHost: recordedSourceURL?.host, browser: browser, windowTitle: windowTitle, screenshotFilename: imageURL.lastPathComponent,
             sha256: digest, pixelWidth: dimensions.width, pixelHeight: dimensions.height, captureMethod: method,
-            timestampAuthority: "Local macOS system clock displayed with the menu-bar date, time, and timezone; signed Scopeproof server attestation is stored in the upload receipt",
+            timestampAuthority: includesLiveMenuBar
+                ? "Live macOS menu-bar pixels and a local clock reading were captured in the operator-initiated workflow as corroborating context; a signed Scopeproof server attestation is stored in the upload receipt"
+                : "Local macOS system clock displayed with date, time, and timezone; a signed Scopeproof server attestation is stored in the upload receipt",
             safetyStatus: safetyStatus, redactionFindings: automaticFindings, redactedRegions: automaticRedactions,
             safetyScanSha256: digest, safetyScanPolicy: SensitiveDataScanner.policyVersion, safetyScanCompletedAt: capturedAt,
             sessionID: context.sessionID, sessionName: context.sessionName, controlID: context.controlID, title: context.title, system: context.system,
@@ -523,6 +587,20 @@ final class CaptureService {
         NSGraphicsContext.restoreGraphicsState()
         guard let stamped = context.makeImage() else { throw CaptureFailure.imageProcessingFailed }
         return stamped
+    }
+
+    func evidenceImageWithMenuBar(menuBar: CGImage, evidence: CGImage) throws -> CGImage {
+        guard menuBar.width > 0, menuBar.height > 0, evidence.width > 0, evidence.height > 0 else { throw CaptureFailure.imageProcessingFailed }
+        let menuBarHeight = max(1, Int(ceil(CGFloat(menuBar.height) * CGFloat(evidence.width) / CGFloat(menuBar.width))))
+        let outputHeight = evidence.height + menuBarHeight
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+              let context = CGContext(data: nil, width: evidence.width, height: outputHeight, bitsPerComponent: 8, bytesPerRow: 0, space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+            throw CaptureFailure.imageProcessingFailed
+        }
+        context.draw(evidence, in: CGRect(x: 0, y: 0, width: evidence.width, height: evidence.height))
+        context.draw(menuBar, in: CGRect(x: 0, y: evidence.height, width: evidence.width, height: menuBarHeight))
+        guard let combined = context.makeImage() else { throw CaptureFailure.imageProcessingFailed }
+        return combined
     }
 
     private func mergedFindings(_ findings: [SensitiveFinding]) -> [SensitiveFinding] {

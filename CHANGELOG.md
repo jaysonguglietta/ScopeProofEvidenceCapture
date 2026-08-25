@@ -4,6 +4,8 @@
 
 - Add a verified development-preview DMG with a drag-to-Applications layout, checksum, CI artifact retention, and explicit ad-hoc/notarization warnings.
 - Publish the Apple Silicon 1.8.0 development-preview DMG and checksum as a GitHub prerelease, and align installation, operator, native, architecture, security, development, and deployment documentation with the downloadable workflow.
+- Make the evidence-review phase explicit in the menu and present its modal workspace above browser windows on the active desktop; closing the review now safely discards instead of risking a hidden modal wait.
+- Add a live right-side macOS menu-bar pixel strip to browser, selected-window, URL-delayed, and scrolling evidence, with the same OCR/redaction/review/final-scan pipeline and explicit guidance that endpoint clock pixels are corroborating rather than independent time proof.
 - Add the Mac menu-bar date, time, and timezone as a dedicated line in every screenshot evidence banner.
 
 ## Unreleased — production evidence correctness and operations

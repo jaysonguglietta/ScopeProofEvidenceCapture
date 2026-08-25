@@ -16,6 +16,8 @@ Treat the package as sensitive. Store it only in an approved assessment workspac
 
 ## Local macOS package contents
 
+Browser-window evidence places a live right-side macOS menu-bar pixel strip across the top of the reviewed PNG so the system-displayed date/time and status context remain visible. Full-display evidence includes the real menu bar in the captured display. Treat these pixels and the adjacent local clock reading as corroborating endpoint context, not an independent trusted timestamp: an endpoint administrator can change the clock or displayed content. Use the immutable manifest capture time, signed Scopeproof server receipt, and a verified RFC 3161 attestation when independent time assurance is required.
+
 | Path | Purpose |
 | --- | --- |
 | `00-READ-ME.txt` | Package identity, scope, policy, and starting instructions. |

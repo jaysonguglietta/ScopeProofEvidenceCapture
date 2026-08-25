@@ -118,8 +118,15 @@ test("screenshot pipelines scan the exact persisted pixels and fail closed", asy
   assert.match(capture, /let exactScan = try requiredSafetyScan\(exactImage\)/);
   assert.ok(capture.indexOf("let exactScan") < capture.indexOf("imageData.write(to: imageURL"));
   assert.match(capture, /safetyScanSha256: digest/);
-  assert.match(capture, /MAC MENU BAR DATE & TIME/);
+  assert.match(capture, /LIVE MAC MENU BAR PIXELS INCLUDED/);
   assert.match(capture, /menuBarFormatter\.string\(from: now\)/);
+  assert.match(capture, /liveMenuBarImage/);
+  assert.match(capture, /configuration\.sourceRect = sourceRect/);
+  assert.match(capture, /displayBounds\.width - sourceWidth/);
+  assert.match(capture, /evidenceImageWithMenuBar/);
+  assert.match(capture, /captureDate: pixels\.capturedAt/);
+  assert.match(capture, /let liveMenuBar = try await liveMenuBarPixels/);
+  assert.ok(capture.indexOf("let composite = try scrollingComposite") < capture.indexOf("let liveMenuBar = try await liveMenuBarPixels"));
   assert.match(capture, /FULL URL/);
   assert.match(sourceUrl, /components\.user = nil/);
   assert.match(sourceUrl, /components\.password = nil/);

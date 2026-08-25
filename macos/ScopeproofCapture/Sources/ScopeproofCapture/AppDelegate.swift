@@ -9,7 +9,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
     private let menu = NSMenu()
     private let preferences = CapturePreferences()
-    private lazy var captureService = CaptureService(preferences: preferences)
+    private lazy var captureService = CaptureService(preferences: preferences) { [weak self] in
+        self?.setBusy(CaptureReviewPresentation.waitingStatus)
+        self?.rebuildMenu()
+    }
     private let uploadService = UploadService()
     private let s3StorageService = S3StorageService()
     private let updateService = UpdateService()
