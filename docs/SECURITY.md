@@ -83,6 +83,7 @@ Scopeproof handles security and compliance evidence that may expose sensitive co
 - S3 availability, IAM/Identity Center administration, destination replication policy, legal holds, KMS recovery, retention approval, CloudTrail cost/retention, and downstream readers remain AWS/customer responsibilities. The app does not perform an IAM Identity Center browser login; operators paste the resulting short-lived session and expiration. A compromised unlocked Mac can use that session within its IAM permissions, so keep it prefix-scoped and short-lived. Deep Archive restore time/cost and deletion lifecycle remain explicit customer decisions.
 - Key rotation is not automatic; replacing an encryption key without a migration can make prior evidence undecryptable.
 - An ad-hoc local macOS build is not notarized and does not provide a Developer ID trust chain.
+- The development-preview DMG checksum detects accidental or malicious byte changes only when obtained from a separately trusted release page. It does not authenticate the publisher, replace Developer ID signing/notarization, or make the preview appropriate for managed production deployment.
 
 ## Incident response
 

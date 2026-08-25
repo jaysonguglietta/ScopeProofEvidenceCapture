@@ -84,6 +84,19 @@ The app is produced at `DerivedData/Scopeproof Capture.app`. Update `macos/Scope
 
 For a clearly labeled ad-hoc testing image, run `./Scripts/build_development_dmg.sh`. It produces a verified drag-to-Applications DMG and SHA-256 file under `DerivedData/`. Never rename or promote that development-preview artifact as a production release.
 
+### Development-preview DMG release
+
+The DMG workflow is intentionally separate from the trusted production updater:
+
+1. Start from the exact reviewed commit and confirm the worktree contains no uncommitted source or generated evidence.
+2. Run the complete validation set, including native tests, then run `./Scripts/build_development_dmg.sh` on macOS. Use `--skip-build` only when `DerivedData/Scopeproof Capture.app` was built from the same validated commit in the current job.
+3. Confirm the script reports both `DerivedData/Scopeproof-Capture-<version>-development-preview.dmg` and its `.sha256` file. The script requires an ad-hoc signature, creates an `/Applications` shortcut, mounts the image read-only, verifies the bundle signature and disk image, and writes a portable filename-only checksum.
+4. Confirm the packaged executable architecture with `file`. A release must state every supported architecture; the 1.8.0 development preview is Apple Silicon (`arm64`) only.
+5. Publish both files together as a GitHub **prerelease** tied to the exact reviewed commit. Release notes must state the macOS minimum, architecture, digest-verification command, ad-hoc signature, lack of notarization, Gatekeeper implications, and prohibition on disabling Gatekeeper globally.
+6. Download both published assets into a clean temporary folder and run `shasum -a 256 -c <checksum-file>`. Compare GitHub's asset digest and size with the locally validated artifact.
+
+The `scopeproof-macos-development` GitHub Actions artifact is retained for 14 days for CI diagnostics. It is not a durable public release and must not be linked as the user download. The release asset on the GitHub Releases page is the durable tester handoff. Production packaging continues to use `Scripts/publish_release.sh` and must fail closed unless Developer ID identity, hardened runtime, notarization, stapling, update signature, and final-host verification all succeed.
+
 ## Publishing checklist
 
 1. Review the complete diff and confirm no evidence or secrets are present.
@@ -93,3 +106,4 @@ For a clearly labeled ad-hoc testing image, run `./Scripts/build_development_dmg
 5. Push to the intended GitHub repository.
 6. For hosted-service changes, deploy the same commit to the private Sites project and verify the deployment. Native-only changes do not require a Sites deployment.
 7. For native changes, install the exact release build, verify the menu-bar process and Local Console, and record the release outcome.
+8. For a development-preview DMG, perform a release-asset round-trip checksum verification and retain the release URL, target commit, asset digest, architecture, CI run, and approver in the release record.

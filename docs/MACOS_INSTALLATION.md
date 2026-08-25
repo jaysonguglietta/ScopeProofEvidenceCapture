@@ -7,13 +7,33 @@ The Mac app can generate a direct, one-time repository SBOM without a hosted acc
 ## Requirements
 
 - macOS 14 or newer.
-- A local copy of this repository.
-- Apple's Swift toolchain. Install it with `xcode-select --install` if `swift --version` is unavailable.
+- An Apple Silicon (`arm64`) Mac for the current 1.8.0 development-preview DMG.
 - Screen Recording permission for browser-window capture.
 - HTTPS access to `api.github.com` when using local repository SBOM generation.
 - HTTPS access to the configured region-specific AWS S3 and STS endpoints (or their FIPS variants) when using optional S3 storage.
 
-## Install and launch
+The downloadable DMG does not require a repository checkout, Xcode, or Swift. Building from source additionally requires a local copy of this repository and Apple's Swift toolchain. Install the toolchain with `xcode-select --install` if `swift --version` is unavailable.
+
+## Install the development-preview DMG
+
+Open the [Scopeproof Capture 1.8.0 development-preview release](https://github.com/jaysonguglietta/ScopeProofEvidenceCapture/releases/tag/v1.8.0-development-preview.1) and download both:
+
+- `Scopeproof-Capture-1.8.0-development-preview.dmg`
+- `Scopeproof-Capture-1.8.0-development-preview.dmg.sha256`
+
+From the folder containing both downloads, verify the disk image before opening it:
+
+```bash
+shasum -a 256 -c Scopeproof-Capture-1.8.0-development-preview.dmg.sha256
+```
+
+The expected DMG digest is `f3347f1ddeb4891e62e79861fed9535f4cdcdb56081941116e4b9ab6875999da`. The command must report `OK`. If it does not, delete both downloads and do not open the image.
+
+Open the DMG and drag **Scopeproof Capture** to the **Applications** shortcut. The installed path is `/Applications/Scopeproof Capture.app`. Eject the disk image before launching the installed copy.
+
+This DMG is ad-hoc signed and is not Apple-notarized. It is intended for evaluation and named testers who understand the Gatekeeper warning; it is not a trusted public production release. If macOS blocks it, do not disable Gatekeeper globally. Confirm the checksum and GitHub release source first, then use **System Settings → Privacy & Security → Open Anyway** only when your organization permits development-preview software.
+
+## Build and install from source
 
 From Terminal, change to the repository root and run:
 
@@ -21,19 +41,7 @@ From Terminal, change to the repository root and run:
 ./Scripts/run_macos_capture.sh
 ```
 
-The script builds a release executable, creates `DerivedData/Scopeproof Capture.app`, installs it at `~/Applications/Scopeproof Capture.app`, replaces an older per-user installation when present, and launches it. Administrator access is not required.
-
-### Development-preview DMG
-
-GitHub prereleases may include `Scopeproof-Capture-<version>-development-preview.dmg` and its adjacent `.sha256` file. This DMG provides the familiar drag-to-Applications layout, but the application inside is ad-hoc signed and is not Apple-notarized. It is intended only for named testers who understand the Gatekeeper warning; it is not a trusted public production release.
-
-After downloading both files, verify the checksum from Terminal:
-
-```bash
-shasum -a 256 -c Scopeproof-Capture-*-development-preview.dmg.sha256
-```
-
-Open the DMG and drag **Scopeproof Capture** to **Applications**. If macOS blocks the preview, do not disable Gatekeeper globally. Confirm the checksum and release source first, then use **System Settings → Privacy & Security → Open Anyway** only when your organization permits development-preview software.
+The script builds a release executable, creates `DerivedData/Scopeproof Capture.app`, installs it at `~/Applications/Scopeproof Capture.app`, replaces an older per-user installation when present, and launches it. Administrator access is not required. Do not keep both the DMG-installed and source-installed copies running; quit Scopeproof and consistently open one installed path so macOS permissions remain associated with the intended bundle.
 
 Scopeproof appears as a shield in the menu bar and opens its Local Console in the default browser. The console is served by the running Mac app on a random `127.0.0.1` port and is not published to the LAN or internet. If the tab is closed, choose **Open Local Console** from the shield menu or press `Command-Shift-L`.
 
@@ -44,9 +52,9 @@ On the first capture:
 1. Open **System Settings → Privacy & Security → Screen & System Audio Recording**.
 2. Enable **Scopeproof Capture**.
 3. Fully quit Scopeproof from its shield menu.
-4. Reopen `~/Applications/Scopeproof Capture.app`.
+4. Reopen `/Applications/Scopeproof Capture.app` for a DMG installation or `~/Applications/Scopeproof Capture.app` for a source installation.
 
-If Scopeproof is not listed, attempt one capture first so macOS can register the permission request. The permission belongs to the installed application; consistently launch the copy in `~/Applications` rather than an older build elsewhere.
+If Scopeproof is not listed, attempt one capture first so macOS can register the permission request. The permission belongs to the installed application; consistently launch the same `/Applications` or `~/Applications` copy rather than an older build or the copy still mounted inside the DMG.
 
 ## Confirm local-only settings
 
@@ -54,7 +62,11 @@ Open **Capture & Jira Settings…** from the shield menu. Leave **Server URL** b
 
 Evidence is stored under `~/Pictures/Scopeproof Evidence/<framework>/<control>/`. The Local Console's SQLite search index lives in the current user's Application Support folder and can be rebuilt from the immutable evidence manifests and lifecycle sidecars.
 
-## Update or rebuild
+## Update the DMG installation
+
+Download the newer release DMG and checksum, verify them, quit Scopeproof, and replace the existing app in `/Applications`. Evidence under `~/Pictures/Scopeproof Evidence`, Keychain items, and user preferences are not removed. Do not overwrite a production-notarized installation with a development preview unless your organization has approved that downgrade in release trust.
+
+## Update or rebuild from source
 
 Pull or copy the updated repository source, then run the installation command again:
 
@@ -66,7 +78,7 @@ The script quits a running Scopeproof process before replacing the application. 
 
 ## Verify the installation
 
-- `~/Applications/Scopeproof Capture.app` exists.
+- `/Applications/Scopeproof Capture.app` exists for a DMG installation, or `~/Applications/Scopeproof Capture.app` exists for a source installation.
 - The shield is visible in the menu bar.
 - **Open Local Console** opens a browser page while Scopeproof is running.
 - **Open Evidence Folder** opens `~/Pictures/Scopeproof Evidence`.
@@ -81,10 +93,10 @@ The script quits a running Scopeproof process before replacing the application. 
 | Symptom | Resolution |
 | --- | --- |
 | `swift` is not found | Run `xcode-select --install`, finish Apple's installer, and retry. |
-| Scopeproof is not in `/Applications` | The development installer intentionally uses the current user's `~/Applications` folder. |
+| Scopeproof is not in `/Applications` | The source installer intentionally uses the current user's `~/Applications` folder; the DMG installs into `/Applications`. |
 | Local Console does not open | Choose **Open Local Console**. If the session expired, quit and reopen Scopeproof. |
 | Browser reports unauthorized | Do not reuse an old loopback URL; reopen the console from the shield menu to establish a fresh per-launch session. |
-| Capture permission repeats | Confirm the enabled entry is the copy at `~/Applications/Scopeproof Capture.app`, then quit and reopen it. |
+| Capture permission repeats | Confirm the enabled entry matches the installed copy you launch, remove obsolete copies, then fully quit and reopen Scopeproof. |
 | Capture cannot find the intended window | Use **Choose Browser Window…** and select the exact browser/window title. |
 | Repository SBOM authentication fails | Create a fresh fine-grained token selected only for the repository with Metadata: read and Contents: read, then submit a new run. The app never retains or retries a one-time token. |
 | The app says SSE-S3 does not use a KMS key | Select SSE-KMS or DSSE-KMS when the bucket uses your customer-managed key, or clear the KMS ARN for an intentional SSE-S3 bucket. |

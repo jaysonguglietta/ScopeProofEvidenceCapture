@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Add a verified development-preview DMG with a drag-to-Applications layout, checksum, CI artifact retention, and explicit ad-hoc/notarization warnings.
+- Publish the Apple Silicon 1.8.0 development-preview DMG and checksum as a GitHub prerelease, and align installation, operator, native, architecture, security, development, and deployment documentation with the downloadable workflow.
 - Add the Mac menu-bar date, time, and timezone as a dedicated line in every screenshot evidence banner.
 
 ## Unreleased — production evidence correctness and operations

@@ -2,6 +2,8 @@
 
 Scopeproof documentation is organized by the person performing the work.
 
+The current downloadable Mac build is the [Scopeproof Capture 1.8.0 development preview](https://github.com/jaysonguglietta/ScopeProofEvidenceCapture/releases/tag/v1.8.0-development-preview.1). It is an Apple Silicon-only, ad-hoc-signed testing release; verify its checksum and read the [macOS installation guide](MACOS_INSTALLATION.md) before opening it.
+
 | Guide | Primary audience | Purpose |
 | --- | --- | --- |
 | [macOS installation](MACOS_INSTALLATION.md) | Mac users and endpoint administrators | Install, launch, update, verify, and troubleshoot the local-first menu-bar application. |
@@ -16,5 +18,6 @@ Scopeproof documentation is organized by the person performing the work.
 | [Production operations](PRODUCTION_OPERATIONS.md) | Service owners and incident responders | Operate backups, recovery drills, monitoring, incident response, single-tenant isolation, and launch authorization. |
 | [Architecture](ARCHITECTURE.md) | Engineers and technical assessors | Understand components, data flows, persistence, and integrity design. |
 | [Development guide](DEVELOPMENT.md) | Contributors and release managers | Build, test, migrate, package, and release the web and macOS applications. |
+| [Release history](https://github.com/jaysonguglietta/ScopeProofEvidenceCapture/releases) | Mac testers and release managers | Download published artifacts and review version-specific integrity and signing limitations. |
 
 Versioned product changes are recorded in the repository [changelog](../CHANGELOG.md). Native application details are also available in the [macOS README](../macos/ScopeproofCapture/README.md) and inside the app under **Help & How to Use…**.

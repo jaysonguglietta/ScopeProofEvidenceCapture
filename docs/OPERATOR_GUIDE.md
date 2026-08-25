@@ -4,13 +4,15 @@ This guide is for evidence collectors, control owners, and reviewers. It describ
 
 ## Install and open the local Mac app
 
-From the repository root, run:
+For the simplest test installation on an Apple Silicon Mac, download the [Scopeproof Capture 1.8.0 development preview](https://github.com/jaysonguglietta/ScopeProofEvidenceCapture/releases/tag/v1.8.0-development-preview.1), verify its adjacent SHA-256 file, open the DMG, and drag **Scopeproof Capture** to **Applications**. This build is ad-hoc signed and not Apple-notarized; it is not a managed production release.
+
+Developers can instead build from the repository root:
 
 ```bash
 ./Scripts/run_macos_capture.sh
 ```
 
-The command builds Scopeproof Capture, installs it for the current user in `~/Applications`, and launches it. No administrator password is required. If Swift is missing, run `xcode-select --install`, complete the installation, and try again. See the [macOS installation guide](MACOS_INSTALLATION.md) for permission, update, verification, and troubleshooting details.
+The command builds Scopeproof Capture, installs it for the current user in `~/Applications`, and launches it. No administrator password is required. If Swift is missing, run `xcode-select --install`, complete the installation, and try again. The DMG installs into `/Applications`; consistently launch one installed copy so Screen Recording permission remains associated with the intended application. See the [macOS installation guide](MACOS_INSTALLATION.md) for checksum, permission, update, verification, and troubleshooting details.
 
 Look for the Scopeproof shield in the menu bar. On the first capture, allow **Scopeproof Capture** under **System Settings → Privacy & Security → Screen & System Audio Recording**, then quit and reopen the app once.
 

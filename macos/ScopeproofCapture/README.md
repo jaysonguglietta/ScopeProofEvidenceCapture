@@ -4,7 +4,11 @@ Scopeproof Capture 1.8.0 is a local-first menu-bar application for producing, fi
 
 Related guides: [installation and updates](../../docs/MACOS_INSTALLATION.md), [operator workflow](../../docs/OPERATOR_GUIDE.md), [AWS S3 evidence storage](../../docs/S3_STORAGE.md), [Jira handoff](../../docs/JIRA_HANDOFF.md), [repository SBOM generation](../../docs/SBOM_GUIDE.md), [assessor verification](../../docs/ASSESSOR_GUIDE.md), and [security model](../../docs/SECURITY.md).
 
-## Run locally
+## Download the development preview
+
+Apple Silicon testers can download the [Scopeproof Capture 1.8.0 development-preview DMG and checksum](https://github.com/jaysonguglietta/ScopeProofEvidenceCapture/releases/tag/v1.8.0-development-preview.1). Verify the checksum before opening the DMG, then drag **Scopeproof Capture** to **Applications**. The preview is ad-hoc signed and not Apple-notarized, so it is not a production distribution. See the [installation guide](../../docs/MACOS_INSTALLATION.md) for exact verification and Gatekeeper instructions.
+
+## Build and run locally
 
 Requirements: macOS 14 or newer and Apple’s Swift toolchain. From the repository root, run:
 
@@ -12,7 +16,7 @@ Requirements: macOS 14 or newer and Apple’s Swift toolchain. From the reposito
 ./Scripts/run_macos_capture.sh
 ```
 
-This single command builds the app, installs it in `~/Applications`, and launches it without requiring an administrator password. Scopeproof opens a private Local Console in the browser automatically. No hosted login or enrollment token is required for local workflows. Look for the shield in the menu bar to capture evidence or reopen the console.
+This single command builds the app, installs it in `~/Applications`, and launches it without requiring an administrator password. This path requires the repository and Swift toolchain; the downloadable DMG does not. Scopeproof opens a private Local Console in the browser automatically. No hosted login or enrollment token is required for local workflows. Look for the shield in the menu bar to capture evidence or reopen the console.
 
 Choose **Generate Repository SBOM…** from the shield menu for a direct one-time CycloneDX 1.6 or SPDX 2.3 export. The native app accepts an exact GitHub URL, a short-lived repository-scoped token, and a branch/tag/commit; reads only recognized lockfile blobs through GitHub's API; saves JSON plus a SHA-256 checksum; and does not persist or retry the credential. Use the hosted workflow instead when the SBOM must be assessment-scoped, independently approved, compared with a prior run, or included automatically in a Scopeproof assessor package.
 

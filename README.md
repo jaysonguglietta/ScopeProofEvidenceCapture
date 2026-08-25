@@ -24,7 +24,13 @@ The repository contains two coordinated products:
 
 The native-specific build and usage reference remains in [macos/ScopeproofCapture/README.md](macos/ScopeproofCapture/README.md). The macOS application also includes **Help & How to Use…** in its shield menu.
 
-## Run the local Mac app
+## Download the Mac app
+
+The current [Scopeproof Capture 1.8.0 development preview](https://github.com/jaysonguglietta/ScopeProofEvidenceCapture/releases/tag/v1.8.0-development-preview.1) includes a drag-to-Applications DMG and a separate SHA-256 checksum. It supports Apple Silicon (`arm64`) Macs running macOS 14 or newer. Download both release assets, verify the checksum as described in the [macOS installation guide](docs/MACOS_INSTALLATION.md), open the DMG, and drag **Scopeproof Capture** into **Applications**.
+
+This preview is ad-hoc signed and is not Apple-notarized. macOS may therefore require an explicit **Open Anyway** decision after verification. It is for evaluation and named testers, not managed production deployment. A public production release still requires Developer ID signing, hardened runtime, notarization, and stapling.
+
+## Build the local Mac app from source
 
 On macOS 14 or newer, run this from the repository root:
 
@@ -32,7 +38,7 @@ On macOS 14 or newer, run this from the repository root:
 ./Scripts/run_macos_capture.sh
 ```
 
-The command builds Scopeproof Capture, installs it in your personal `~/Applications` folder, and launches it. It does not require an administrator password. The app starts a loopback-only Local Console and opens it in your browser; no hosted login or device token is required for local capture, search, lifecycle review, or assessor export. Look for the shield in the menu bar to reopen the console or capture evidence.
+The command builds Scopeproof Capture, installs it in your personal `~/Applications` folder, and launches it. This source-build path requires Apple's Swift toolchain but does not require an administrator password. The DMG path above installs into `/Applications` and does not require a repository checkout or Swift. In either case, the app starts a loopback-only Local Console and opens it in your browser; no hosted login or device token is required for local capture, search, lifecycle review, or assessor export. Look for the shield in the menu bar to reopen the console or capture evidence.
 
 The first time you capture, macOS may ask for Screen Recording access. Allow **Scopeproof Capture** under **System Settings → Privacy & Security → Screen & System Audio Recording**, then quit and reopen the app. If the command reports that Swift is missing, run `xcode-select --install`, complete Apple’s installer, and run the command again.
 

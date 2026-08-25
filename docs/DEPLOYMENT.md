@@ -79,6 +79,8 @@ Apply migrations through `drizzle/0012_opposite_rachel_grey.sql`. Migration 0010
 
 For a single-user local installation built from source, follow the [macOS installation guide](MACOS_INSTALLATION.md). It installs into `~/Applications`, opens the loopback Local Console, and requires no hosted enrollment.
 
+The GitHub Releases page may also contain an explicitly labeled development-preview DMG for named testers. That image installs into `/Applications` but is ad-hoc signed and not notarized. Verify its adjacent checksum, architecture, target commit, and release notes before use. Do not deploy it through MDM, present it as a production-trusted build, or use it to replace the Developer ID/notarization workflow below.
+
 For managed distribution:
 
 1. Build with `./Scripts/build_macos_capture.sh`.
@@ -90,7 +92,7 @@ For managed distribution:
 6. Publish the exact ZIP to its final HTTPS origin. Store only the envelope's `manifest` as `MACOS_RELEASE_MANIFEST_JSON`, its `signatureDERBase64` as `MACOS_RELEASE_SIGNATURE_DER_BASE64`, and configure the exact hostname in `MACOS_RELEASE_ALLOWED_HOSTS`.
 7. If hosted synchronization is enabled, enroll each Mac separately from **Connections**. Revoke devices when reassigned, lost, or retired. Leave the native Server URL blank when policy requires local-only operation.
 
-The development build is ad-hoc signed with a stable designated requirement for `com.scopeproof.capture`; it is not a notarized production release. The Local Console is embedded in the native process, binds to a random loopback-only port, and stops when the app quits. It does not require or deploy the hosted Sites application.
+The development build and development-preview DMG are ad-hoc signed with a stable designated requirement for `com.scopeproof.capture`; neither is a notarized production release. A checksum detects changed bytes but does not establish an Apple-trusted publisher identity. The Local Console is embedded in the native process, binds to a random loopback-only port, and stops when the app quits. It does not require or deploy the hosted Sites application.
 
 When native S3 evidence storage is enabled, complete the production profile in **AWS S3 Storage…**, use expiring IAM Identity Center/AssumeRole credentials, and deploy the monitoring template in `infra/aws/scopeproof-s3-observability.yaml`. The setup role, daily verifier/upload role, and optional browser role must be separate and prefix-scoped as documented in [AWS S3 evidence storage](S3_STORAGE.md). CloudTrail log-bucket names, KMS keys, replication roles/destinations, retention approval, and SNS subscriptions are environment-specific and are not deployed automatically with the Mac app.
 
