@@ -824,7 +824,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func openSettings() {
         let alert = NSAlert()
         alert.messageText = "Scopeproof Capture & Jira Settings"
-        alert.informativeText = "Local mode works without a server or device token. Hosted sync and Jira Cloud are optional; when enabled, device tokens remain protected in your login Keychain and Atlassian credentials stay on the hosted service."
+        alert.informativeText = "Local capture works without hosted services. Configure the optional local console, synchronization, retention, and Jira handoff defaults below."
         alert.addButton(withTitle: "Save")
         alert.addButton(withTitle: "Cancel")
         let server = NSTextField(string: preferences.serverURL?.absoluteString ?? "")
@@ -846,14 +846,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let instructions = NSTextField(string: jira.customInstructions)
         instructions.placeholderString = "Optional: project, issue type, reviewers, retention, or internal handling steps"
         for field in [server, token, jiraSite, jiraProject, instructions] { field.frame.size.width = 430 }
-        let section = NSTextField(labelWithString: "Jira handoff defaults (OAuth: web Connections)"); section.font = .systemFont(ofSize: 12, weight: .semibold); section.textColor = .secondaryLabelColor
-        let grid = NSGridView(views: [
-            [NSTextField(labelWithString: ""), openLocal], [label("Server URL"), server], [label("Device token"), token], [label("Local retention"), retention], [NSTextField(labelWithString: ""), auto],
-            [NSTextField(labelWithString: ""), section], [label("Jira site URL"), jiraSite], [label("Default project"), jiraProject],
-            [label("Attachment set"), attachmentMode], [NSTextField(labelWithString: ""), includeGuide], [label("Organization instructions"), instructions],
+        let captureGrid = NSGridView(views: [
+            [NSTextField(labelWithString: ""), openLocal], [label("Server URL"), server], [label("Device token"), token],
+            [label("Local retention"), retention], [NSTextField(labelWithString: ""), auto],
         ])
-        grid.rowSpacing = 10; grid.columnSpacing = 12; grid.column(at: 0).xPlacement = .trailing; grid.column(at: 1).xPlacement = .fill
-        alert.accessoryView = grid
+        captureGrid.rowSpacing = 12
+        captureGrid.columnSpacing = 12
+        captureGrid.column(at: 0).xPlacement = .trailing
+        captureGrid.column(at: 1).xPlacement = .fill
+        captureGrid.setAccessibilityLabel("Capture and local console settings")
+
+        let jiraGrid = NSGridView(views: [
+            [label("Jira site URL"), jiraSite], [label("Default project"), jiraProject], [label("Attachment set"), attachmentMode],
+            [NSTextField(labelWithString: ""), includeGuide], [label("Organization instructions"), instructions],
+        ])
+        jiraGrid.rowSpacing = 12
+        jiraGrid.columnSpacing = 12
+        jiraGrid.column(at: 0).xPlacement = .trailing
+        jiraGrid.column(at: 1).xPlacement = .fill
+        jiraGrid.setAccessibilityLabel("Jira handoff settings")
+
+        let tabs = NSTabView(frame: NSRect(x: 0, y: 0, width: 580, height: 245))
+        let captureTab = NSTabViewItem(identifier: "capture-local")
+        captureTab.label = "Capture & Local"
+        captureTab.view = captureGrid
+        let jiraTab = NSTabViewItem(identifier: "jira")
+        jiraTab.label = "Jira"
+        jiraTab.view = jiraGrid
+        tabs.addTabViewItem(captureTab)
+        tabs.addTabViewItem(jiraTab)
+        tabs.selectTabViewItem(captureTab)
+        tabs.setAccessibilityLabel("Scopeproof settings categories")
+        alert.accessoryView = tabs
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         let serverValue = server.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         let url = serverValue.isEmpty ? nil : URL(string: serverValue).flatMap(BackendTrust.normalizedOrigin)

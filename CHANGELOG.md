@@ -7,6 +7,7 @@
 - Make the evidence-review phase explicit in the menu and present its modal workspace above browser windows on the active desktop; closing the review now safely discards instead of risking a hidden modal wait.
 - Add a live right-side macOS menu-bar pixel strip to browser, selected-window, URL-delayed, and scrolling evidence, with the same OCR/redaction/review/final-scan pipeline and explicit guidance that endpoint clock pixels are corroborating rather than independent time proof.
 - Add an **Update Controls…** action and visible catalog version/source/control count to the capture form; imported JSON, OSCAL, and CSV catalogs are limited to 5 MB, normalized, duplicate-checked, and recorded with a SHA-256 provenance digest.
+- Replace the clipped Capture & Jira Settings alert with compact **Capture & Local** and **Jira** tabs so every field and checkbox remains visible on smaller displays.
 - Add the Mac menu-bar date, time, and timezone as a dedicated line in every screenshot evidence banner.
 
 ## Unreleased — production evidence correctness and operations

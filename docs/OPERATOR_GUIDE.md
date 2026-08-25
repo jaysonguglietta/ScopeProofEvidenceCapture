@@ -18,6 +18,8 @@ Look for the Scopeproof shield in the menu bar. On the first capture, allow **Sc
 
 Scopeproof opens its **Local Console** in your browser at launch. This console runs only while the menu-bar app is running, listens only on the Mac loopback interface, and does not require a hosted account or device token. Use it to search, preview, filter, and review local evidence. Choose **Open Local Console** from the shield menu if you close the browser tab.
 
+The Local Console is optional. To prevent it from starting automatically, open **Capture & Jira Settings…**, use the **Capture & Local** tab, clear **Open Local Console when Scopeproof launches**, save, then quit and reopen Scopeproof. The current random loopback port closes when the app quits; screenshot capture and the native evidence tools continue to work.
+
 ## Before collecting evidence
 
 1. Confirm the system, environment, assessment period, framework, and control are in scope.

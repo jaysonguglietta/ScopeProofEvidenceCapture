@@ -96,6 +96,7 @@ The script quits a running Scopeproof process before replacing the application. 
 | `swift` is not found | Run `xcode-select --install`, finish Apple's installer, and retry. |
 | Scopeproof is not in `/Applications` | The source installer intentionally uses the current user's `~/Applications` folder; the DMG installs into `/Applications`. |
 | Local Console does not open | Choose **Open Local Console**. If the session expired, quit and reopen Scopeproof. |
+| Settings fields or checkbox labels are clipped | Install build 20 or newer. **Capture & Jira Settings…** separates the bounded form into **Capture & Local** and **Jira** tabs. |
 | Browser reports unauthorized | Do not reuse an old loopback URL; reopen the console from the shield menu to establish a fresh per-launch session. |
 | Capture permission repeats | Confirm the enabled entry matches the installed copy you launch, remove obsolete copies, then fully quit and reopen Scopeproof. |
 | Menu says `Waiting for evidence review…` | Close the menu and use the review workspace Scopeproof placed above the browser. Save or discard it before starting another operation. |

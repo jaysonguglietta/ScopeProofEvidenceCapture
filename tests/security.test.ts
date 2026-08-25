@@ -156,6 +156,15 @@ test("native control catalog updates are visible, bounded, normalized, and prove
   assert.match(catalog, /SHA-256/);
 });
 
+test("native settings remain usable in a bounded tabbed dialog", async () => {
+  const app = await readFile(new URL("../macos/ScopeproofCapture/Sources/ScopeproofCapture/AppDelegate.swift", import.meta.url), "utf8");
+  assert.match(app, /NSTabView\(frame: NSRect\(x: 0, y: 0, width: 580, height: 245\)\)/);
+  assert.match(app, /captureTab\.label = "Capture & Local"/);
+  assert.match(app, /jiraTab\.label = "Jira"/);
+  assert.match(app, /Open Local Console when Scopeproof launches/);
+  assert.match(app, /preferences\.openLocalConsoleAtLaunch = openLocal\.state == \.on/);
+});
+
 test("assessor metadata migration and package preserve framework organization", async () => {
   const [migration, packageSource] = await Promise.all([
     readFile(new URL("../drizzle/0003_fine_wonder_man.sql", import.meta.url), "utf8"),
