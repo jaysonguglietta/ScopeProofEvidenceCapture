@@ -5,7 +5,7 @@ Scopeproof is a private, multi-framework compliance evidence-operations applicat
 The repository contains two coordinated products:
 
 - A private web console for collection orchestration, review, encrypted storage, audit history, and signed exports.
-- **Scopeproof Capture 1.5.1** for macOS, a local-first menu-bar application with a private evidence console, explicitly initiated timestamped/redacted screenshots, one-time repository SBOM export, assessor packaging, optional hosted synchronization, and Jira handoff.
+- **Scopeproof Capture 1.8.0** for macOS, a local-first menu-bar application with a private evidence console, explicitly initiated timestamped/redacted screenshots, one-time repository SBOM export, KMS/Object-Lock S3 evidence storage, version-aware verified downloads, assessor packaging, optional hosted synchronization, and Jira handoff.
 
 ## Documentation
 
@@ -16,6 +16,7 @@ The repository contains two coordinated products:
 | Jira/GRC coordinators | [Jira evidence handoff](docs/JIRA_HANDOFF.md) |
 | External assessors | [Assessor package and verification guide](docs/ASSESSOR_GUIDE.md) |
 | Software inventory operators | [Repository SBOM generation](docs/SBOM_GUIDE.md) |
+| AWS storage administrators | [AWS S3 evidence storage](docs/S3_STORAGE.md) |
 | Platform administrators | [Deployment and administration](docs/DEPLOYMENT.md) |
 | Security and risk teams | [Security model and operating controls](docs/SECURITY.md) |
 | Engineers and maintainers | [Architecture](docs/ARCHITECTURE.md) and [development guide](docs/DEVELOPMENT.md) |
@@ -45,6 +46,7 @@ The first time you capture, macOS may ask for Screen Recording access. Allow **S
 - Mutating routes enforce same-origin requests. Worker responses add CSP, HSTS, no-sniff, referrer, and permissions headers.
 - Revocable Mac device tokens are stored as SHA-256 hashes server-side. Native uploads use a device-token HMAC over the exact manifest and PNG digests; the server derives metadata from the signed manifest and strictly decodes the PNG before storage.
 - The native Local Console binds only to `127.0.0.1`, requires an ephemeral HttpOnly SameSite session, rejects cross-origin mutations and path input, verifies artifact hashes, and maintains a disposable SQLite index plus an immutable Keychain-HMAC-authenticated local audit chain.
+- Optional native S3 storage offers a production profile requiring expiring STS credentials, a Keychain-bound AWS account/destination, Block Public Access, versioning, BucketOwnerEnforced ownership, customer-managed KMS encryption, Object Lock, TLS/KMS bucket-policy enforcement, SHA-256 response verification, and exact-version downloads. The app supports FIPS endpoints, optional Deep Archive/replication, and a deployable CloudTrail alerting template. A documented Compatible S3 migration exception uses a dedicated no-console IAM identity restricted to one bucket/prefix and an S3-only KMS encryption context; production still requires temporary credentials.
 
 ## Provider evidence
 
@@ -58,7 +60,7 @@ Collectors run on demand and from a 15-minute scheduler. Transient failures retr
 
 ## Native screenshot evidence
 
-The menu-bar app in `macos/ScopeproofCapture` captures a user-selected browser window or display through ScreenCaptureKit. Raw pixels remain in memory. Scopeproof runs local Vision OCR, masks detected PANs and credentials, adds the full evidence header, scans the composited image again, presents those pixels for irreversible manual redaction, then re-scans the exact encoded PNG before atomically writing it. Scan failure prevents saving or upload. Capture presets, evidence owner/tags, expected-evidence guidance, catalog versions, and curated cross-framework mappings reduce classification drift.
+The menu-bar app in `macos/ScopeproofCapture` captures a user-selected browser window or display through ScreenCaptureKit. **Capture Frontmost Browser Window** can read the active Safari, Chrome, Edge, or Arc tab address after an explicit macOS Automation grant, sanitize it, and prefill it for operator confirmation; unsupported or denied detection falls back to an empty manual field. **Capture Scrolling Evidence…** combines two or more operator-positioned viewports into one artifact with numbered continuation dividers; every intermediate frame remains memory-only. Scopeproof runs local Vision OCR, masks detected PANs and credentials, adds the full evidence header—including a canonical capture timestamp, a dedicated Mac menu-bar date/time and timezone line, and a wrapping full-page-URL line—scans the composited image again, presents those pixels for irreversible manual redaction, then re-scans the exact encoded PNG before atomically writing it. URL credentials and sensitive query/fragment values are redacted before the URL reaches the image or manifest. Scan failure prevents saving or upload. Capture presets, evidence owner/tags, expected-evidence guidance, catalog versions, and curated cross-framework mappings reduce classification drift.
 
 The PNG is paired with an immutable JSON manifest containing its SHA-256 digest and local chain-of-custody hashes. Review state is derived only from schema-2 lifecycle events that bind the artifact digest, reviewer, time, rationale, and policy; inconsistent or legacy-unbound histories cannot be exported. Package signing requires local user presence. An optional Jira issue key is carried into the filename, visible banner, manifest, search, hosted metadata, and package index. Enrolled devices authenticate the exact manifest/image pair, and the server rejects alternate metadata, malformed/polyglot PNGs, dimension mismatches, broken chains, and unknown schemas. RFC 3161 responses are called trusted only when a pinned, allowlisted verifier validates the nonce, imprint, CMS signature, TSA certificate/EKU/path, configured trust anchor, validity, and revocation policy.
 

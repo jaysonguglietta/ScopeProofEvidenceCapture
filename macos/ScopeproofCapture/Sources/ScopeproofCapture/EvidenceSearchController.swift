@@ -227,7 +227,7 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
             guard selectedSystem == nil || selectedSystem == manifest.system else { return false }
             if let cutoff, let captured = ISO8601DateFormatter().date(from: manifest.capturedAt), captured < cutoff { return false }
             guard !query.isEmpty else { return true }
-            return [entry.imageURL.lastPathComponent, manifest.evidenceID, manifest.title, manifest.system, manifest.sessionName, manifest.description, manifest.controlID, manifest.customFileName ?? "", manifest.controlTitle ?? "", manifest.jiraIssueKey ?? "", manifest.jiraIssueURL ?? "", lifecycle.owner, lifecycle.reviewer, lifecycle.reviewNotes, lifecycle.tags.joined(separator: " ")]
+            return [entry.imageURL.lastPathComponent, manifest.evidenceID, manifest.title, manifest.system, manifest.sessionName, manifest.description, manifest.controlID, manifest.customFileName ?? "", manifest.controlTitle ?? "", manifest.sourceURL ?? "", manifest.sourceHost ?? "", manifest.jiraIssueKey ?? "", manifest.jiraIssueURL ?? "", lifecycle.owner, lifecycle.reviewer, lifecycle.reviewNotes, lifecycle.tags.joined(separator: " ")]
                 .joined(separator: " ").lowercased().contains(query)
         }
         tableView.reloadData()

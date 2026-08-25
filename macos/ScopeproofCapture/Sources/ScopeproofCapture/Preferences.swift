@@ -30,6 +30,7 @@ struct CaptureContext: Codable, Sendable {
     var tags: [String]? = nil
     var expectedEvidence: String? = nil
     var jiraIssueKey: String? = nil
+    var sourceURL: String? = nil
 
     var isValid: Bool {
         !sessionID.isEmpty && !sessionName.isEmpty && !resolvedComplianceArea.isEmpty && !controlID.isEmpty && !resolvedCustomFileName.isEmpty && !title.isEmpty && !system.isEmpty && !environment.isEmpty && !assessmentPeriod.isEmpty
@@ -61,7 +62,8 @@ struct CaptureContext: Codable, Sendable {
             evidenceOwner: NSFullUserName(),
             tags: [],
             expectedEvidence: "",
-            jiraIssueKey: ""
+            jiraIssueKey: "",
+            sourceURL: ""
         )
     }
 }
@@ -93,6 +95,7 @@ final class CapturePreferences {
         static let presets = "capture.presets"
         static let jiraHandoff = "capture.jiraHandoff"
         static let openLocalConsoleAtLaunch = "capture.openLocalConsoleAtLaunch"
+        static let s3Storage = "capture.s3Storage"
     }
 
     var browser: BrowserChoice {
@@ -177,6 +180,14 @@ final class CapturePreferences {
             return value
         }
         set { defaults.set(try? JSONEncoder().encode(newValue), forKey: Key.jiraHandoff) }
+    }
+
+    var s3Storage: S3StorageSettings {
+        get {
+            guard let data = defaults.data(forKey: Key.s3Storage), let value = try? JSONDecoder().decode(S3StorageSettings.self, from: data) else { return .defaults }
+            return value
+        }
+        set { defaults.set(try? JSONEncoder().encode(newValue), forKey: Key.s3Storage) }
     }
 
     func savePreset(name: String, context: CaptureContext) {

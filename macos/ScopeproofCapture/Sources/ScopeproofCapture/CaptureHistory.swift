@@ -6,7 +6,9 @@ struct CaptureHistoryEntry: Sendable {
     let imageURL: URL
     let receiptURL: URL
     var jiraReceiptURL: URL { manifestURL.deletingPathExtension().appendingPathExtension("jira.json") }
+    var s3ReceiptURL: URL { manifestURL.deletingPathExtension().appendingPathExtension("s3.json") }
     var isUploaded: Bool { FileManager.default.fileExists(atPath: receiptURL.path) }
+    var isStoredInS3: Bool { FileManager.default.fileExists(atPath: s3ReceiptURL.path) }
     var lifecycle: EvidenceLifecycleRecord { EvidenceLifecycleStore.load(for: self) }
 }
 
@@ -18,7 +20,7 @@ enum CaptureHistory {
             options: [.skipsHiddenFiles, .skipsPackageDescendants]
         ) else { return [] }
         let urls = enumerator.compactMap { $0 as? URL }
-        return urls.filter { $0.pathExtension == "json" && !$0.lastPathComponent.hasSuffix(".receipt.json") && !$0.lastPathComponent.hasSuffix(".review.json") }.compactMap { url in
+        return urls.filter { $0.pathExtension == "json" && !$0.lastPathComponent.hasSuffix(".receipt.json") && !$0.lastPathComponent.hasSuffix(".review.json") && !$0.lastPathComponent.hasSuffix(".s3.json") }.compactMap { url in
             guard let data = try? Data(contentsOf: url), let manifest = try? JSONDecoder().decode(CaptureManifest.self, from: data) else { return nil }
             let image = url.deletingLastPathComponent().appendingPathComponent(URL(fileURLWithPath: manifest.screenshotFilename).lastPathComponent)
             let receipt = url.deletingPathExtension().appendingPathExtension("receipt.json")
@@ -33,7 +35,7 @@ enum CaptureHistory {
         for entry in entries(in: directory) {
             guard let date = ISO8601DateFormatter().date(from: entry.manifest.capturedAt), date < cutoff else { continue }
             let lifecycleURL = EvidenceLifecycleStore.url(for: entry.manifestURL)
-            for url in [entry.imageURL, entry.manifestURL, entry.receiptURL, entry.jiraReceiptURL, lifecycleURL] where FileManager.default.fileExists(atPath: url.path) {
+            for url in [entry.imageURL, entry.manifestURL, entry.receiptURL, entry.jiraReceiptURL, entry.s3ReceiptURL, lifecycleURL] where FileManager.default.fileExists(atPath: url.path) {
                 try FileManager.default.trashItem(at: url, resultingItemURL: nil)
             }
             removed += 1

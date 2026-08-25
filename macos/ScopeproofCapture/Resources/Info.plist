@@ -11,11 +11,12 @@
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>Scopeproof Capture</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.5.1</string>
-  <key>CFBundleVersion</key><string>12</string>
+  <key>CFBundleShortVersionString</key><string>1.8.0</string>
+  <key>CFBundleVersion</key><string>16</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><true/>
   <key>NSScreenCaptureUsageDescription</key><string>Scopeproof Capture needs Screen Recording access to create explicit compliance evidence screenshots requested from the menu bar.</string>
+  <key>NSAppleEventsUsageDescription</key><string>Scopeproof Capture reads the active browser tab URL only when you request a capture so the verified address can be included in compliance evidence.</string>
   <key>NSUserNotificationAlertStyle</key><string>alert</string>
 </dict>
 </plist>

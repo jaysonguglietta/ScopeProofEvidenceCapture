@@ -13,6 +13,8 @@ enum KeychainStore {
     private static let packageSigningAccount = "assessor-package-signing-key-v2-user-presence"
     private static let updateSequenceAccount = "verified-update-highest-sequence-v1"
     private static let localAuditAccount = "local-console-audit-hmac-v1"
+    private static let s3CredentialsAccount = "aws-s3-evidence-credentials-v1"
+    private static let s3DestinationAccount = "aws-s3-verified-destination-v1"
 
     private static func readCredential() -> DeviceCredential? {
         let query: [String: Any] = [
@@ -52,6 +54,97 @@ enum KeychainStore {
     }
 
     static func deleteToken() { SecItemDelete([kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account] as CFDictionary) }
+
+    static func readS3Credentials() -> S3Credentials? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: s3CredentialsAccount,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+              let data = item as? Data,
+              let credentials = try? JSONDecoder().decode(S3Credentials.self, from: data) else { return nil }
+        if credentials.isExpired {
+            deleteS3Credentials()
+            return nil
+        }
+        return credentials
+    }
+
+    static func saveS3Credentials(_ credentials: S3Credentials) throws {
+        let validated = try S3Credentials.validated(
+            accessKeyID: credentials.accessKeyID, secretAccessKey: credentials.secretAccessKey,
+            sessionToken: credentials.sessionToken, expiresAt: credentials.expiresAt
+        )
+        let data = try JSONEncoder().encode(validated)
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: s3CredentialsAccount]
+        let attributes: [String: Any] = [kSecValueData as String: data, kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly]
+        let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        if status == errSecItemNotFound {
+            var create = query
+            attributes.forEach { create[$0.key] = $0.value }
+            let createStatus = SecItemAdd(create as CFDictionary, nil)
+            guard createStatus == errSecSuccess else { throw NSError(domain: NSOSStatusErrorDomain, code: Int(createStatus)) }
+        } else if status != errSecSuccess {
+            throw NSError(domain: NSOSStatusErrorDomain, code: Int(status))
+        }
+        deleteS3VerifiedDestination()
+    }
+
+    static func deleteS3Credentials() {
+        SecItemDelete([kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: s3CredentialsAccount] as CFDictionary)
+        deleteS3VerifiedDestination()
+    }
+
+    static func readS3VerifiedDestination() -> S3VerifiedDestination? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: s3DestinationAccount,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+              let data = item as? Data,
+              let destination = try? JSONDecoder().decode(S3VerifiedDestination.self, from: data),
+              destination.schemaVersion == 1 else { return nil }
+        return destination
+    }
+
+    static func saveS3VerifiedDestination(_ destination: S3VerifiedDestination) throws {
+        guard destination.schemaVersion == 1 else { throw S3StorageFailure.invalidResponse }
+        let data = try JSONEncoder().encode(destination)
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: s3DestinationAccount,
+        ]
+        let attributes: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+        ]
+        let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        if status == errSecItemNotFound {
+            var create = query
+            attributes.forEach { create[$0.key] = $0.value }
+            let createStatus = SecItemAdd(create as CFDictionary, nil)
+            guard createStatus == errSecSuccess else { throw NSError(domain: NSOSStatusErrorDomain, code: Int(createStatus)) }
+        } else if status != errSecSuccess {
+            throw NSError(domain: NSOSStatusErrorDomain, code: Int(status))
+        }
+    }
+
+    static func deleteS3VerifiedDestination() {
+        SecItemDelete([
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: s3DestinationAccount,
+        ] as CFDictionary)
+    }
 
     static func localAuditKey() throws -> Data {
         let query: [String: Any] = [

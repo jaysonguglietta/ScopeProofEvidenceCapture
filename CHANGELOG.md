@@ -1,7 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Add a verified development-preview DMG with a drag-to-Applications layout, checksum, CI artifact retention, and explicit ad-hoc/notarization warnings.
+- Add the Mac menu-bar date, time, and timezone as a dedicated line in every screenshot evidence banner.
+
 ## Unreleased — production evidence correctness and operations
 
+- Added active-tab URL detection to **Capture Frontmost Browser Window** for Safari, Chrome, Edge, and Arc. The sanitized address is prefilled for operator confirmation; unsupported browsers or denied macOS Automation access fail safely to an empty manual field instead of reusing a prior capture URL.
+- Added operator-guided **Capture Scrolling Evidence…** for browser evidence that spans two or more viewports. Scopeproof keeps every section in memory, inserts numbered continuation dividers, applies one evidence/URL banner, and runs the complete OCR, redaction, review, exact-PNG scan, manifest, indexing, and upload workflow on the combined artifact.
+- Added an editable full Page URL to capture classification. The complete sanitized URL is printed on its own line in the screenshot header, recorded in the immutable manifest, and included in local search; embedded credentials and sensitive query/fragment values are redacted before rendering or persistence.
 - Added one-time repository SBOM generation from an exact GitHub URL and short-lived read-only token entered in the SBOM menu. The token is masked, cleared on submission, used only for the active request, excluded from persistence/logs/audit details, and never available to automatic retries.
 - Added an auditor-facing repository SBOM workspace that generates CycloneDX 1.6 or SPDX 2.3 JSON from supported GitHub lockfiles at an immutable commit without cloning or executing repository code.
 - Added assessment-scoped PCI DSS 6.3.2 evidence, independent approval, assessor-package inclusion, prior-inventory comparison, audited downloads, bounded parsing, retryable jobs, and least-privilege GitHub configuration guidance.
@@ -13,6 +21,65 @@
 - Added key-management, backup/recovery, monitoring, incident-response, launch-authorization, and production macOS release procedures.
 
 All notable Scopeproof changes are recorded here. Dates use the repository’s release timezone.
+
+## 1.8.0 — 2026-08-20
+
+### Added
+
+- Added **Production compliance** S3 configuration with caller-identity verification, same-account expected-owner binding, expiring STS credentials, customer-managed SSE-KMS/DSSE-KMS, Object Lock retention, BucketOwnerEnforced ownership, TLS/KMS bucket policy, optional FIPS endpoints, Deep Archive transition, and replication.
+- Added complete bucket-posture verification for existing and newly created destinations. Security-sensitive routing and the verified AWS account/principal/posture are digest-bound in a separate device-only Keychain item; preference or credential changes disable uploads until re-verification.
+- Added S3 SHA-256 request/response verification, exact version IDs, KMS/retention metadata, and S3 request IDs to schema-2 upload receipts.
+- Replaced current-object browsing with bounded `ListObjectVersions` browsing and exact-version downloads. PNG/JSON downloads now validate version, ETag, size, optional returned checksum, and file structure before atomic save, then receive macOS quarantine metadata.
+- Added a deployable CloudFormation template for prefix-scoped CloudTrail data events, immutable audit-log storage, and SNS alerts on evidence deletion, S3 security-control changes, and KMS disable/deletion/policy changes.
+
+### Security
+
+- Production mode rejects long-lived access keys, empty prefixes, SSE-S3, missing KMS keys, expired sessions, incomplete bucket controls, mismatched owners, and unbound destinations.
+- Bucket creation displays an explicit irreversible Object Lock confirmation and never overwrites lifecycle or replication settings on a pre-existing bucket.
+- Upload-only and optional browser permissions are separated; unknown or executable S3 objects cannot be downloaded through Scopeproof.
+- Added least-privilege Compatible S3 IAM-user and KMS key-policy templates constrained to the exact bucket, prefix, account, regional S3 service, and encryption context. Real deployment identifiers are intentionally excluded from repository documentation.
+
+### Fixed
+
+- Replaced the misleading same-region KMS error shown when SSE-S3 was selected with a direct instruction to select SSE-KMS/DSSE-KMS or clear the KMS ARN.
+
+## 1.7.0 — 2026-08-20
+
+### Added
+
+- Added **Browse S3 Evidence…**, a native searchable and sortable workspace for files beneath the configured evidence prefix, with control folder, filename, assessment/evidence path, size, and modified time.
+- Added explicit single-file downloads through the macOS save panel and a **Reveal Download** action.
+- Added paginated S3 `ListObjectsV2` support capped at 5,000 objects and documented prefix-scoped `s3:GetObject` permissions.
+
+### Security
+
+- S3 downloads are limited to 250 MB, bound to the listed ETag with a signed `If-Match` request, streamed to a mode-`0600` temporary file, checked against the listed size, and moved into place only after completion.
+- Listing and download requests stay on the configured AWS bucket and prefix, reuse the redirect-rejecting ephemeral session, reject unsafe XML/object metadata, and never cache credentials or downloaded content in the browser workspace.
+
+## 1.6.1 — 2026-08-19
+
+### Added
+
+- Added **Create & Secure Bucket** to the native S3 configuration flow. It creates the bucket in the selected region, enables all four S3 Block Public Access controls, enables versioning, and verifies access before allowing automatic evidence upload.
+- Added fail-closed handling for partially completed bucket setup plus separate one-time creation and long-lived evidence-writer IAM examples.
+
+### Security
+
+- Automatic upload remains disabled until bucket creation, hardening, and connection verification all succeed. Scopeproof never attempts to delete a partially created bucket.
+- Bucket-management permissions are documented as temporary setup permissions that should be removed after the bucket is ready.
+
+## 1.6.0 — 2026-08-19
+
+### Added
+
+- Added native AWS S3 evidence storage with bucket, region, prefix, automatic/manual upload, connection testing, retry, disconnect, and Keychain-protected access key, secret key, and optional session token.
+- Added control-oriented object paths containing the verified PNG and immutable manifest together, plus a local credential-free S3 receipt after both uploads succeed.
+- Added direct AWS Signature Version 4 HTTPS requests, AES-256 S3 server-side encryption, fixed AWS endpoints, redirect rejection, local integrity validation, bounded transfers, native tests, least-privilege IAM guidance, and bucket-hardening documentation.
+
+### Security
+
+- AWS credentials use a `WhenUnlockedThisDeviceOnly` Keychain item and are excluded from preferences, evidence, receipts, logs, documentation examples, and Git. Non-secret bucket routing remains in preferences.
+- S3 upload permissions can be restricted to `s3:ListBucket` for connection testing and `s3:PutObject` for one bucket prefix; Scopeproof never lists object content, reads, deletes, changes ACLs, or makes objects public.
 
 ## 1.5.1 — 2026-08-17
 

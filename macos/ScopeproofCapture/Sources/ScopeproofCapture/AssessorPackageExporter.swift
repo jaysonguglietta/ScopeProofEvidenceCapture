@@ -46,7 +46,7 @@ enum AssessorPackageExporter {
                 .appendingPathComponent(framework.folderName, isDirectory: true)
                 .appendingPathComponent(ComplianceCatalog.safePathComponent(entry.manifest.controlID), isDirectory: true)
             try fileManager.createDirectory(at: evidenceFolder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-            let files = [entry.imageURL, entry.manifestURL, EvidenceLifecycleStore.url(for: entry.manifestURL), entry.receiptURL, entry.jiraReceiptURL]
+            let files = [entry.imageURL, entry.manifestURL, EvidenceLifecycleStore.url(for: entry.manifestURL), entry.receiptURL, entry.jiraReceiptURL, entry.s3ReceiptURL]
                 .filter { fileManager.fileExists(atPath: $0.path) }
             var packagedFiles: [[String: String]] = []
             for source in files {
@@ -104,7 +104,7 @@ enum AssessorPackageExporter {
         1. Open 01-Control-Coverage.csv to identify covered controls and visible evidence gaps.
         2. Open 02-Evidence-Index.csv to browse approved evidence by framework and control.
         3. Open Evidence/<framework>/<control>/ to review the PNG and adjacent metadata.
-        4. Each PNG has an immutable capture manifest (.json), review lifecycle (.review.json), and—when uploaded—a signed server receipt (.receipt.json).
+        4. Each PNG has an immutable capture manifest (.json), review lifecycle (.review.json), and—when available—a hosted receipt (.receipt.json), Jira receipt (.jira.json), or credential-free S3 receipt (.s3.json).
         5. Follow 04-Verification.txt to validate file hashes and the package signature.
         6. When present, follow 05-Jira-Handoff.txt before attaching files to a Jira issue.
 

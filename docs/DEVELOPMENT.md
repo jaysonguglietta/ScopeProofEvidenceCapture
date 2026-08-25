@@ -41,13 +41,17 @@ git diff --check
 Native tests:
 
 ```bash
-cd macos/ScopeproofCapture
-swift test
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  CLANG_MODULE_CACHE_PATH=/private/tmp/scopeproof-clang-cache \
+  SWIFTPM_MODULECACHE_OVERRIDE=/private/tmp/scopeproof-swiftpm-cache \
+  swift test --package-path macos/ScopeproofCapture
 ```
 
 On machines with multiple developer toolchains, select the full Xcode toolchain through `DEVELOPER_DIR`.
 
 The native Local Console is served directly by Scopeproof Capture. It is not the React development server and should remain usable with no hosted environment variables. When changing the console, verify its focused tests, release build, loopback-only listener, per-launch authentication, and unauthorized-request behavior.
+
+Native S3 changes must preserve generated regional AWS-only endpoints, redirect rejection, temporary-production credentials, expected-owner and destination binding, bounded XML/JSON parsing, KMS/Object Lock/posture checks, returned SHA-256 and version-ID enforcement, exact-version downloads, private temporary files, quarantine metadata, and the 5,000-version/250-MB bounds. Use only synthetic credentials and local request-construction/parser fixtures in tests; never contact S3 with a developer credential.
 
 ## Change discipline
 
@@ -77,6 +81,8 @@ Build from the repository root:
 ```
 
 The app is produced at `DerivedData/Scopeproof Capture.app`. Update `macos/ScopeproofCapture/Resources/Info.plist`, `.env.example`, the changelog, and operator documentation together for a new version. Production releases require Developer ID signing, hardened runtime, notarization, stapling, an HTTPS download, and a separately verified digest.
+
+For a clearly labeled ad-hoc testing image, run `./Scripts/build_development_dmg.sh`. It produces a verified drag-to-Applications DMG and SHA-256 file under `DerivedData/`. Never rename or promote that development-preview artifact as a production release.
 
 ## Publishing checklist
 

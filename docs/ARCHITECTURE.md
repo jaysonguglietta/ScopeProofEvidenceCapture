@@ -11,9 +11,9 @@ Scopeproof combines a private Cloudflare-hosted evidence console with a local ma
 | D1 | Users, devices, sessions, collector and SBOM job state, evidence metadata, lifecycle status, package metadata, and append-only audit events. |
 | R2 | AES-256-GCM encrypted evidence objects and encrypted assessor packages. |
 | Provider collectors | Bounded read-only collection from AWS, GitHub, Okta, Cloudflare, and Cloudflare Browser Rendering. |
-| Scopeproof Capture | Explicit ScreenCaptureKit capture, local Vision OCR/redaction, visible stamping, manifests, lifecycle records, loopback Local Console, native search, Jira handoff, and local package export. |
+| Scopeproof Capture | Explicit ScreenCaptureKit capture, local Vision OCR/redaction, visible stamping, manifests, lifecycle records, loopback Local Console, native search, direct S3 storage, Jira handoff, and local package export. |
 | Local Console / SQLite | A `127.0.0.1`-only authenticated browser UI and rebuildable metadata index for local overview, search, preview, filtering, review, and HMAC-authenticated audit events. |
-| macOS Keychain | Native device token, local-console audit key, and device-bound local package signing key. |
+| macOS Keychain | Native device token, expiring S3 credentials, verified S3 account/destination binding, local-console audit key, and device-bound local package signing key. |
 | Jira Cloud OAuth | User-consented issue lookup and explicit evidence attachment through Atlassian’s fixed API gateway. |
 
 ## Trust boundaries
@@ -27,18 +27,21 @@ Scopeproof combines a private Cloudflare-hosted evidence console with a local ma
 7. **Scopeproof → assessor/Jira:** exports leave the system through an operator-controlled handoff. Hashes, signatures, visible stamps, and package instructions support independent verification, but destination authorization remains an organizational responsibility.
 8. **Scopeproof → Atlassian:** the hosted service exchanges OAuth codes, encrypts rotating tokens with a Jira-specific key, resolves the consented cloud ID, and calls only `api.atlassian.com`. A user/device may access only its own connection and configured project allowlist. The Mac sends approved evidence to Scopeproof, never Atlassian credentials.
 9. **Worker → GitHub repository archive:** managed mode accepts a repository only from the configured organization. One-time mode accepts only an exact HTTPS `github.com/owner/repository` URL and a request-scoped token. Both resolve the requested ref through `api.github.com` and follow an archive redirect only to `codeload.github.com`. The archive and every selected manifest are attacker-controlled. The Worker applies byte, entry, decompression-ratio, manifest, UTF-8, and component limits and parses recognized lockfiles without executing repository content. One-time tokens are never persisted or included in audit details.
+10. **Mac → AWS STS/S3:** production configuration resolves the caller account through STS, verifies same-account bucket posture, and binds that exact configuration in Keychain. The app generates only regional S3/STS or FIPS endpoints, rejects redirects, and signs expected-owner requests with SigV4. New buckets can receive Block Public Access, ownership enforcement, KMS/DSSE, Object Lock, TLS/KMS policy, Deep Archive, and replication configuration. PUTs require returned SHA-256, encryption, KMS key, and version IDs. Browsing uses `ListObjectVersions`; explicit PNG/JSON downloads bind the version and ETag, validate content/checksum/size, receive quarantine metadata, and commit atomically from a private temporary file. Compatible S3 accepts a long-lived key only as an explicit migration mode; the documented exception constrains a dedicated principal to one bucket/prefix and S3-mediated KMS context.
 
 ## Native capture data flow
 
-1. The operator selects a window, URL, or display and supplies control context.
-2. ScreenCaptureKit captures pixels into process memory; unreviewed pixels are never written to a temporary file.
+1. The operator selects a window, scrolling evidence sequence, URL, or display and supplies control context, including an optional full page URL. **Capture Frontmost Browser Window** asks a fixed allowlist of browser bundle IDs for the active tab address only after an explicit action, sanitizes it immediately, and prefills it for confirmation. Failure clears the per-capture URL instead of falling back to stale context. **Open URL & Capture** makes its opened URL authoritative; other capture modes use the operator-confirmed Page URL.
+2. ScreenCaptureKit captures pixels into process memory; unreviewed pixels are never written to a temporary file. For scrolling evidence, the operator advances the selected browser window and Scopeproof composes 2–8 equal-sized viewports with explicit numbered dividers. It never performs heuristic overlap deletion, and cancellation or failure discards every intermediate frame.
 3. Vision OCR detects supported PAN/credential patterns and masks detected rectangles in memory.
-4. Scopeproof adds a header above the redacted pixels. Source URLs are stripped of credentials, query parameters, and fragments before rendering or recording.
+4. Scopeproof adds a header above the redacted pixels with the complete sanitized source URL on a dedicated wrapping line. URL credentials are removed, known-sensitive query values are replaced with `REDACTED`, and a sensitive fragment is replaced before rendering or recording; ordinary path, query, and fragment context is preserved.
 5. The composited image is scanned again, then the review workspace permits additional irreversible manual masks.
 6. Scopeproof encodes the reviewed PNG in memory, decodes and scans those exact bytes, and fails closed if the scan cannot complete or detects remaining sensitive content.
 7. The same verified bytes are atomically written and hashed. The manifest records that digest as both the artifact and safety-scan digest with the policy/version and completion time.
 8. Review decisions are recorded in a separate hash-chained lifecycle sidecar.
 9. Optional upload returns a signed server receipt. Only Approved evidence is eligible for local assessor export.
+
+Optional S3 storage follows the same saved artifact boundary. The Mac re-decodes the immutable manifest and confirms the screenshot digest, evidence ID, control ID, and filename before uploading the PNG and manifest to `<prefix>/<control>/<assessment-period>/<evidence-id>/`. A schema-2 local receipt binds the verified AWS identity, exact S3 versions/checksums, KMS/retention posture, and request IDs. S3 storage and Object Lock do not alter Scopeproof lifecycle state or make an artifact approved.
 
 ## Hosted evidence data flow
 

@@ -19,6 +19,7 @@ struct LocalEvidenceRecord: Codable, Sendable {
     let reviewNotes: String
     let tags: [String]
     let jiraIssueKey: String?
+    let sourceURL: String?
     let safetyStatus: String
     let sha256: String
     let uploaded: Bool
@@ -100,9 +101,9 @@ final class LocalEvidenceIndex: @unchecked Sendable {
                     INSERT INTO evidence_index (
                       evidence_id, captured_at, local_timestamp, compliance_area, control_id, control_title,
                       title, system_name, environment, assessment_period, owner, reviewer, review_status,
-                      review_notes, tags_json, jira_issue_key, safety_status, sha256, uploaded,
+                      review_notes, tags_json, jira_issue_key, source_url, safety_status, sha256, uploaded,
                       lifecycle_valid, manifest_path, image_path, indexed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """
                 for entry in entries {
                     let lifecycle = entry.lifecycle
@@ -118,6 +119,7 @@ final class LocalEvidenceIndex: @unchecked Sendable {
                             .text(lifecycle.owner.isEmpty ? (entry.manifest.evidenceOwner ?? "") : lifecycle.owner),
                             .text(lifecycle.reviewer), .text(lifecycle.status.rawValue), .text(lifecycle.reviewNotes),
                             .text(tagsJSON), entry.manifest.jiraIssueKey.map(SQLiteValue.text) ?? .null,
+                            entry.manifest.sourceURL.map(SQLiteValue.text) ?? .null,
                             .text(entry.manifest.safetyStatus), .text(entry.manifest.sha256), .integer(entry.isUploaded ? 1 : 0),
                             .integer(valid ? 1 : 0), .text(entry.manifestURL.path), .text(entry.imageURL.path),
                             .text(ISO8601DateFormatter().string(from: Date())),
@@ -142,9 +144,9 @@ final class LocalEvidenceIndex: @unchecked Sendable {
             let sql = """
                 SELECT evidence_id, captured_at, local_timestamp, compliance_area, control_id, control_title,
                        title, system_name, environment, assessment_period, owner, reviewer, review_status,
-                       review_notes, tags_json, jira_issue_key, safety_status, sha256, uploaded, lifecycle_valid
+                       review_notes, tags_json, jira_issue_key, source_url, safety_status, sha256, uploaded, lifecycle_valid
                 FROM evidence_index
-                WHERE (? = '' OR lower(title || ' ' || system_name || ' ' || owner || ' ' || tags_json || ' ' || evidence_id || ' ' || coalesce(jira_issue_key, '')) LIKE ?)
+                WHERE (? = '' OR lower(title || ' ' || system_name || ' ' || owner || ' ' || tags_json || ' ' || evidence_id || ' ' || coalesce(jira_issue_key, '') || ' ' || coalesce(source_url, '')) LIKE ?)
                   AND (? = '' OR compliance_area = ?)
                   AND (? = '' OR control_id = ?)
                   AND (? = '' OR review_status = ?)
@@ -168,8 +170,9 @@ final class LocalEvidenceIndex: @unchecked Sendable {
                         assessmentPeriod: columnText(statement, 9), owner: columnText(statement, 10), reviewer: columnText(statement, 11),
                         reviewStatus: columnText(statement, 12), reviewNotes: columnText(statement, 13), tags: tags,
                         jiraIssueKey: sqlite3_column_type(statement, 15) == SQLITE_NULL ? nil : columnText(statement, 15),
-                        safetyStatus: columnText(statement, 16), sha256: columnText(statement, 17),
-                        uploaded: sqlite3_column_int(statement, 18) == 1, lifecycleValid: sqlite3_column_int(statement, 19) == 1
+                        sourceURL: sqlite3_column_type(statement, 16) == SQLITE_NULL ? nil : columnText(statement, 16),
+                        safetyStatus: columnText(statement, 17), sha256: columnText(statement, 18),
+                        uploaded: sqlite3_column_int(statement, 19) == 1, lifecycleValid: sqlite3_column_int(statement, 20) == 1
                     ))
                 }
                 return records
@@ -244,6 +247,7 @@ final class LocalEvidenceIndex: @unchecked Sendable {
               review_notes TEXT NOT NULL,
               tags_json TEXT NOT NULL,
               jira_issue_key TEXT,
+              source_url TEXT,
               safety_status TEXT NOT NULL,
               sha256 TEXT NOT NULL,
               uploaded INTEGER NOT NULL CHECK (uploaded IN (0, 1)),
@@ -253,6 +257,7 @@ final class LocalEvidenceIndex: @unchecked Sendable {
               indexed_at TEXT NOT NULL
             )
             """)
+        try? execute("ALTER TABLE evidence_index ADD COLUMN source_url TEXT")
         try execute("CREATE INDEX IF NOT EXISTS idx_evidence_framework_control ON evidence_index(compliance_area, control_id, captured_at DESC)")
         try execute("CREATE INDEX IF NOT EXISTS idx_evidence_review_status ON evidence_index(review_status, captured_at DESC)")
         try execute("""

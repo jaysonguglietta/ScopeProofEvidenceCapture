@@ -17,6 +17,8 @@ export type NativeCaptureManifest = {
   schemaVersion: 6;
   evidenceID: string;
   capturedAt: string;
+  sourceURL: string;
+  sourceHost: string;
   screenshotFilename: string;
   sha256: string;
   pixelWidth: number;
@@ -126,6 +128,20 @@ function cleanJiraUrl(value: string, issueKey: string): boolean {
   } catch { return false; }
 }
 
+function cleanSourceUrl(value: string, sourceHost: string): boolean {
+  if (!value) return !sourceHost;
+  try {
+    const url = new URL(value);
+    if (!["http:", "https:"].includes(url.protocol) || !url.hostname || url.username || url.password || url.href.length > 2_048) return false;
+    if (url.hostname.toLowerCase() !== sourceHost.toLowerCase()) return false;
+    const sensitiveName = /(?:access[_-]?token|api[_-]?(?:key|token)|assertion|auth(?:orization)?|client[_-]?secret|code|credential|id[_-]?token|jwt|key|password|passwd|pwd|relaystate|samlresponse|secret|session(?:id)?|sid|sig(?:nature)?|token)$/i;
+    for (const [name, queryValue] of url.searchParams) {
+      if (sensitiveName.test(name) && queryValue !== "REDACTED") return false;
+    }
+    return true;
+  } catch { return false; }
+}
+
 export function parseNativeManifest(bytes: Uint8Array): NativeCaptureManifest {
   let parsed: unknown;
   try { parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); } catch { throw new NativeManifestError("Manifest must be valid UTF-8 JSON."); }
@@ -152,6 +168,9 @@ export function parseNativeManifest(bytes: Uint8Array): NativeCaptureManifest {
   if (jiraIssueKey && !jiraIssuePattern.test(jiraIssueKey)) throw new NativeManifestError("Manifest Jira issue key is invalid.");
   const jiraIssueURL = text(source, "jiraIssueURL", 500);
   if (!cleanJiraUrl(jiraIssueURL, jiraIssueKey)) throw new NativeManifestError("Manifest Jira URL does not match its issue key.");
+  const sourceURL = text(source, "sourceURL", 2_048);
+  const sourceHost = text(source, "sourceHost", 253);
+  if (!cleanSourceUrl(sourceURL, sourceHost)) throw new NativeManifestError("Manifest source URL is invalid or does not match its source host.");
   const chainPreviousHash = text(source, "chainPreviousHash", 128, true);
   const chainEventHash = text(source, "chainEventHash", 128, true);
   if ((chainPreviousHash !== "GENESIS" && !digestPattern.test(chainPreviousHash)) || !digestPattern.test(chainEventHash)) throw new NativeManifestError("Manifest capture-chain hashes are invalid.");
@@ -159,6 +178,8 @@ export function parseNativeManifest(bytes: Uint8Array): NativeCaptureManifest {
     schemaVersion: 6,
     evidenceID,
     capturedAt,
+    sourceURL,
+    sourceHost,
     screenshotFilename: text(source, "screenshotFilename", 240, true),
     sha256,
     pixelWidth: integer(source, "pixelWidth", 1, 16_384),

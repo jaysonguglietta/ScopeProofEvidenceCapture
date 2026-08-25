@@ -9,6 +9,8 @@ function manifest(overrides: Record<string, unknown> = {}): Uint8Array {
     capturedAt: new Date().toISOString(),
     localTimestamp: "2026-08-11 16:00:00 EDT",
     timezone: "America/New_York",
+    sourceURL: "https://admin.example.com/security/settings?view=policy&token=REDACTED#access",
+    sourceHost: "admin.example.com",
     browser: "Safari",
     windowTitle: "Evidence",
     screenshotFilename: "capture.png",
@@ -48,10 +50,13 @@ test("native manifest parser accepts the versioned schema and rejects ambiguity"
   const parsed = parseNativeManifest(manifest());
   assert.equal(parsed.schemaVersion, 6);
   assert.equal(parsed.controlID, "8.3.1");
+  assert.equal(parsed.sourceURL, "https://admin.example.com/security/settings?view=policy&token=REDACTED#access");
   assert.throws(() => parseNativeManifest(manifest({ unsupported: true })), NativeManifestError);
   assert.throws(() => parseNativeManifest(manifest({ safetyStatus: "passed", pixelWidth: 20_000 })), NativeManifestError);
   assert.throws(() => parseNativeManifest(manifest({ safetyScanSha256: "c".repeat(64) })), /not bound/);
   assert.throws(() => parseNativeManifest(manifest({ jiraIssueKey: "PCI-12", jiraIssueURL: "https://evil.example/browse/PCI-12" })), NativeManifestError);
+  assert.throws(() => parseNativeManifest(manifest({ sourceURL: "https://admin.example.com/settings", sourceHost: "evil.example" })), NativeManifestError);
+  assert.throws(() => parseNativeManifest(manifest({ sourceURL: "https://admin.example.com/settings?token=secret-value", sourceHost: "admin.example.com" })), NativeManifestError);
 });
 
 test("PNG validator decodes image data and rejects CRC/trailing-data tampering", async () => {

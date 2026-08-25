@@ -27,12 +27,13 @@ Scopeproof opens its **Local Console** in your browser at launch. This console r
 ## Capture a screenshot on macOS
 
 1. Open **Scopeproof Capture** from your Applications folder, then select its shield in the menu bar.
-2. Choose **Capture Frontmost Browser Window**, **Choose Browser Window…**, **Open URL & Capture…**, or **Capture Entire Display**.
+2. Choose **Capture Frontmost Browser Window**, **Choose Browser Window…**, **Capture Scrolling Evidence…**, **Open URL & Capture…**, or **Capture Entire Display**.
 3. In the classification dialog, select the compliance area and control. Enter a meaningful evidence filename, title, system/asset, environment, assessment period, and evidence owner.
-4. Optionally enter a Jira issue key such as `GRC-123`, tags, expected-evidence guidance, and a concise explanation of what the artifact proves.
-5. Inspect the **Saved as** preview. The final path is organized as `<Compliance area>/<Control>/<Assessment period>`.
-6. Inspect the review workspace. Confirm the correct window, scope, timestamp context, and automatic redactions. Drag over any additional sensitive value to apply an irreversible manual mask.
-7. Save the reviewed capture. Scopeproof never saves the temporary unredacted capture.
+4. Confirm the **Page URL**. **Capture Frontmost Browser Window** attempts to prefill the active Safari, Chrome, Edge, or Arc tab after macOS grants browser Automation access; **Open URL & Capture** supplies its opened address. Paste the complete HTTP or HTTPS address when detection is unavailable or when using Firefox. Scopeproof never reuses a prior URL when frontmost detection fails. It displays the complete sanitized URL in the header and manifest while removing embedded credentials and redacting sensitive query or fragment values.
+5. Optionally enter a Jira issue key such as `GRC-123`, tags, expected-evidence guidance, and a concise explanation of what the artifact proves.
+6. Inspect the **Saved as** preview. The final path is organized as `<Compliance area>/<Control>/<Assessment period>`.
+7. Inspect the review workspace. Confirm the correct window, full URL, scope, timestamp context, and automatic redactions. Drag over any additional sensitive value to apply an irreversible manual mask.
+8. Save the reviewed capture. Scopeproof never saves the temporary unredacted capture.
 
 Each saved item can contain:
 
@@ -42,6 +43,17 @@ Each saved item can contain:
 - `.receipt.json`: server evidence identity and signed timestamp receipt, when uploaded.
 
 Files are stored under `~/Pictures/Scopeproof Evidence` and are private to the current macOS account.
+
+### Capture a page that needs multiple screenshots
+
+1. Position the browser at the first evidence section and choose **Capture Scrolling Evidence…**.
+2. Complete the ordinary classification dialog, including the full Page URL, then select the exact browser window.
+3. After Scopeproof captures the first viewport, switch to the browser, scroll down with a small visible overlap, and return to Scopeproof. Do not resize the window or change browser zoom.
+4. Choose **Capture Next Section**. Repeat as needed; after at least two sections, choose **Finish & Review**.
+5. Inspect the single combined image. Numbered **CONTINUED** dividers distinguish the captured viewports, while the ordinary evidence banner appears once above the full artifact.
+6. Complete redaction review and save normally.
+
+Scopeproof bounds section count and final image size. If the maximum is reached, finish the current composite or cancel it. All intermediate viewports are memory-only and every section is discarded if you cancel, the browser window changes size, safety scanning fails, or review is not completed.
 
 ## Review and approve
 
@@ -58,6 +70,16 @@ Approval, rejection, and supersession require a note. Lifecycle changes are writ
 Local operation requires no enrollment. To add optional hosted synchronization, enroll the Mac from **Connections → Mac capture devices**, then paste the one-time device token into **Capture & Jira Settings…**. The token is stored in the macOS Keychain. Leave Server URL blank for local-only mode.
 
 If an upload fails, local evidence remains available. Correct the network, server URL, or revoked-token issue and choose **Retry Pending Uploads**. Never send a device token in email, Jira, chat, or an evidence package.
+
+### Store evidence in AWS S3
+
+Choose **AWS S3 Storage…** separately from hosted synchronization. For production, enter a same-account bucket, nonempty prefix, customer-managed KMS key, Object Lock mode/retention, and an expiring IAM Identity Center or AssumeRole credential set. Use **Save & Verify** for an existing bucket or **Create & Harden Bucket** after reviewing the irreversible Object Lock warning. The app binds the verified account, principal, destination, and posture in Keychain; any routing change disables uploads until verification. Remove all setup permissions afterward.
+
+The encryption selection must match the bucket: select **SSE-KMS** or **DSSE-KMS** when entering a KMS ARN; **SSE-S3** does not use that ARN. When temporary credentials are not yet available, Compatible S3 can use a dedicated no-console IAM user restricted to the exact bucket, prefix, regional S3 service, and KMS encryption context. Do not use a personal or administrator key, and migrate to the production temporary-credential workflow as soon as possible. The complete identity and key-policy templates are in [AWS S3 evidence storage](S3_STORAGE.md).
+
+Enable browsing only for operators who need it. **Browse S3 Evidence…** loads up to 5,000 object versions under the configured prefix. Select a PNG/JSON version and choose **Download Selected…**. Scopeproof signs the exact version ID and ETag, validates size/checksum/content, applies private permissions and macOS quarantine, and never auto-opens it. Add `s3:ListBucketVersions`, `s3:GetObjectVersion`, and KMS decrypt only to this browser role.
+
+Enable automatic S3 upload to copy each newly saved, safety-scanned PNG and immutable manifest, or leave it off and choose **Upload Pending Evidence to S3** manually. A successful pair creates a local `.s3.json` receipt with exact versions, S3 checksums/request IDs, caller identity, encryption, and retention. Deploy and test the documented CloudTrail alerting template before production use.
 
 ## Send approved evidence to Jira Cloud
 
@@ -119,6 +141,8 @@ Detailed validation steps are in the [assessor guide](ASSESSOR_GUIDE.md). Jira-s
 | Screen capture permission error | Enable Scopeproof Capture in Screen & System Audio Recording, fully quit the app, and reopen it. |
 | Local Console does not open | Choose **Open Local Console** from the shield menu. If the session expired, fully quit and reopen Scopeproof Capture. |
 | Wrong browser window | Use **Choose Browser Window…** and select the exact titled window. |
+| Frontmost Page URL is blank | Paste the URL manually. For Safari, Chrome, Edge, or Arc, optionally enable the browser under **System Settings → Privacy & Security → Automation → Scopeproof Capture**. Firefox requires manual URL entry. |
+| Scrolling sections do not align | Start again, keep the selected window size and zoom unchanged, and leave a small visible overlap when scrolling. Scopeproof separates viewports instead of guessing or deleting overlapping pixels. |
 | Capture context dialog repeats | Complete every field marked `*`; if a Jira key is present it must look like `GRC-123`. |
 | No Jira key in filename/banner | Edit capture defaults, enter the issue key, then recapture; existing immutable evidence is not renamed. |
 | Upload remains pending | Verify the HTTPS server URL and active device token, then retry pending uploads. |

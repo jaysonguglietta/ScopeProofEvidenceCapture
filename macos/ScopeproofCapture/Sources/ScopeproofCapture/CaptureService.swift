@@ -77,6 +77,7 @@ enum CaptureFailure: LocalizedError {
     case browserUnavailable(String)
     case noBrowserWindow
     case screenshotFailed(String)
+    case scrollingCaptureFailed(String)
     case safetyScanFailed(String)
     case imageProcessingFailed
     case cancelled
@@ -88,6 +89,7 @@ enum CaptureFailure: LocalizedError {
         case .browserUnavailable(let name): return "\(name) is not installed on this Mac."
         case .noBrowserWindow: return "No visible browser window was found. Bring the evidence page to the front and try again."
         case .screenshotFailed(let detail): return "macOS could not capture the browser window. \(detail)"
+        case .scrollingCaptureFailed(let detail): return "The scrolling evidence capture could not be completed. No evidence was saved. \(detail)"
         case .safetyScanFailed(let detail): return "The required final-image safety scan did not complete. No evidence was saved. \(detail)"
         case .imageProcessingFailed: return "The screenshot was captured but the protected evidence files could not be created."
         case .cancelled: return "The capture was discarded during review."
@@ -99,6 +101,10 @@ typealias CaptureCompletion = @MainActor @Sendable (Result<CaptureResult, Captur
 
 @MainActor
 final class CaptureService {
+    private let scrollingViewportLimit = 8
+    private let scrollingPixelBudget = 14_000_000
+    private let scrollingHeightBudget = 15_000
+    private let scrollingMaximumPixelWidth = 2_560
     private let fileManager = FileManager.default
     private let preferences: CapturePreferences
     private let reviewController = CaptureReviewController()
@@ -106,6 +112,14 @@ final class CaptureService {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd HH:mm:ss zzz"
         formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .current
+        return formatter
+    }()
+    private let menuBarFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .full
+        formatter.timeStyle = .medium
+        formatter.locale = .current
         formatter.timeZone = .current
         return formatter
     }()
@@ -133,7 +147,7 @@ final class CaptureService {
     }
 
     func openAndCapture(urlString: String, browser: BrowserChoice, delay: Int, context: CaptureContext, completion: @escaping CaptureCompletion) {
-        guard let url = URL(string: urlString), ["http", "https"].contains(url.scheme?.lowercased() ?? ""), url.host != nil else {
+        guard let url = EvidenceSourceURL.sanitized(urlString) else {
             completion(.failure(.invalidURL)); return
         }
         guard requestScreenRecordingPermissionIfNeeded() else { completion(.failure(.permissionRequired)); return }
@@ -163,6 +177,50 @@ final class CaptureService {
     func captureWindow(_ window: BrowserWindow, context: CaptureContext, completion: @escaping CaptureCompletion) {
         guard requestScreenRecordingPermissionIfNeeded() else { completion(.failure(.permissionRequired)); return }
         capture(window: window, sourceURL: nil, context: context, completion: completion)
+    }
+
+    func captureScrollingWindow(_ window: BrowserWindow, context: CaptureContext, completion: @escaping CaptureCompletion) {
+        guard requestScreenRecordingPermissionIfNeeded() else { completion(.failure(.permissionRequired)); return }
+        Task { @MainActor in
+            do {
+                try prepareOutputDirectory()
+                var viewports = [try await browserWindowImage(window, maximumPixelWidth: scrollingMaximumPixelWidth)]
+                var viewportDigests = [sha256(try pngData(viewports[0]))]
+                let maximumViewports = maximumScrollingViewports(for: viewports[0])
+                guard maximumViewports >= 2 else {
+                    throw CaptureFailure.scrollingCaptureFailed("This window is too large for a multi-section assessor artifact. Make the browser window smaller and try again.")
+                }
+
+                while true {
+                    switch scrollingCaptureChoice(capturedCount: viewports.count, maximumCount: maximumViewports, window: window) {
+                    case .captureNext:
+                        let next = try await browserWindowImage(window, maximumPixelWidth: scrollingMaximumPixelWidth)
+                        guard next.width == viewports[0].width, next.height == viewports[0].height else {
+                            throw CaptureFailure.scrollingCaptureFailed("The browser window size or display scale changed between sections. Keep the window size and zoom unchanged, then start again.")
+                        }
+                        let nextDigest = sha256(try pngData(next))
+                        if viewportDigests.contains(nextDigest) {
+                            showDuplicateViewportWarning(window: window)
+                            continue
+                        }
+                        viewports.append(next)
+                        viewportDigests.append(nextDigest)
+                    case .finish:
+                        guard viewports.count >= 2 else {
+                            throw CaptureFailure.scrollingCaptureFailed("Capture at least two sections before finishing.")
+                        }
+                        let composite = try scrollingComposite(viewports: viewports)
+                        let method = "ScreenCaptureKit operator-guided scrolling composite (\(viewports.count) viewports; intermediate frames memory-only)"
+                        completion(.success(try finalizeCapture(original: composite, sourceURL: nil, browser: window.owner, windowTitle: window.title, method: method, context: context)))
+                        return
+                    case .cancel:
+                        throw CaptureFailure.cancelled
+                    }
+                }
+            } catch {
+                completion(.failure(error as? CaptureFailure ?? .screenshotFailed(error.localizedDescription)))
+            }
+        }
     }
 
     func captureEntireDisplay(context: CaptureContext, completion: @escaping CaptureCompletion) {
@@ -208,26 +266,132 @@ final class CaptureService {
         Task { @MainActor in
             do {
                 try prepareOutputDirectory()
-                let content = try await SCShareableContent.current
-                guard let shareableWindow = content.windows.first(where: { $0.windowID == window.id }) else { throw CaptureFailure.noBrowserWindow }
-                let filter = SCContentFilter(desktopIndependentWindow: shareableWindow)
-                let configuration = captureConfiguration(width: shareableWindow.frame.width, height: shareableWindow.frame.height, scale: CGFloat(filter.pointPixelScale))
-                let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
+                let image = try await browserWindowImage(window)
                 completion(.success(try finalizeCapture(original: image, sourceURL: sourceURL, browser: window.owner, windowTitle: window.title, method: "ScreenCaptureKit desktop-independent-window", context: context)))
             } catch { completion(.failure(error as? CaptureFailure ?? .screenshotFailed(error.localizedDescription))) }
         }
+    }
+
+    private func browserWindowImage(_ window: BrowserWindow, maximumPixelWidth: Int? = nil) async throws -> CGImage {
+        let content = try await SCShareableContent.current
+        guard let shareableWindow = content.windows.first(where: { $0.windowID == window.id }) else { throw CaptureFailure.noBrowserWindow }
+        let filter = SCContentFilter(desktopIndependentWindow: shareableWindow)
+        let configuration = captureConfiguration(
+            width: shareableWindow.frame.width,
+            height: shareableWindow.frame.height,
+            scale: CGFloat(filter.pointPixelScale),
+            maximumPixelWidth: maximumPixelWidth
+        )
+        return try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: configuration)
     }
 
     private func prepareOutputDirectory() throws {
         try fileManager.createDirectory(at: outputDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
     }
 
-    private func captureConfiguration(width: CGFloat, height: CGFloat, scale: CGFloat) -> SCStreamConfiguration {
+    private func captureConfiguration(width: CGFloat, height: CGFloat, scale: CGFloat, maximumPixelWidth: Int? = nil) -> SCStreamConfiguration {
         let configuration = SCStreamConfiguration()
-        configuration.width = max(1, Int(width * max(scale, 1)))
-        configuration.height = max(1, Int(height * max(scale, 1)))
+        let nativeWidth = max(1, Int(width * max(scale, 1)))
+        let nativeHeight = max(1, Int(height * max(scale, 1)))
+        let reduction = maximumPixelWidth.map { min(1, CGFloat($0) / CGFloat(nativeWidth)) } ?? 1
+        configuration.width = max(1, Int(CGFloat(nativeWidth) * reduction))
+        configuration.height = max(1, Int(CGFloat(nativeHeight) * reduction))
         configuration.showsCursor = false
         return configuration
+    }
+
+    private enum ScrollingCaptureChoice { case captureNext, finish, cancel }
+
+    private func scrollingCaptureChoice(capturedCount: Int, maximumCount: Int, window: BrowserWindow) -> ScrollingCaptureChoice {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        let atLimit = capturedCount >= maximumCount
+        let alert = NSAlert()
+        alert.messageText = atLimit ? "Maximum sections captured" : "Section \(capturedCount) captured"
+        alert.informativeText = atLimit
+            ? "Scopeproof has captured the maximum safe size for one evidence image. Finish and review the combined artifact, or cancel to discard every section."
+            : "Switch to \(window.owner), scroll to the next evidence section with a small visible overlap, then return here and choose Capture Next Section. Keep the browser window size and zoom unchanged. Nothing is saved until you finish the review."
+
+        if atLimit {
+            alert.addButton(withTitle: "Finish & Review")
+            alert.addButton(withTitle: "Cancel")
+            return alert.runModal() == .alertFirstButtonReturn ? .finish : .cancel
+        }
+
+        alert.addButton(withTitle: "Capture Next Section")
+        if capturedCount >= 2 { alert.addButton(withTitle: "Finish & Review") }
+        alert.addButton(withTitle: "Cancel")
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn { return .captureNext }
+        if capturedCount >= 2, response == .alertSecondButtonReturn { return .finish }
+        return .cancel
+    }
+
+    private func scrollingDividerHeight(for width: Int) -> Int { max(44, min(72, width / 32)) }
+
+    private func showDuplicateViewportWarning(window: BrowserWindow) {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "No new section detected"
+        alert.informativeText = "The captured \(window.owner) viewport matches an earlier section exactly. Scroll to new evidence content, then try again."
+        alert.addButton(withTitle: "Continue")
+        alert.runModal()
+    }
+
+    private func maximumScrollingViewports(for image: CGImage) -> Int {
+        let divider = scrollingDividerHeight(for: image.width)
+        let heightLimited = (scrollingHeightBudget + divider) / (image.height + divider)
+        let pixelsPerSection = image.width * (image.height + divider)
+        let pixelLimited = (scrollingPixelBudget + image.width * divider) / max(1, pixelsPerSection)
+        return max(0, min(scrollingViewportLimit, heightLimited, pixelLimited))
+    }
+
+    func scrollingComposite(viewports: [CGImage]) throws -> CGImage {
+        guard viewports.count >= 2, viewports.count <= scrollingViewportLimit, let first = viewports.first else {
+            throw CaptureFailure.scrollingCaptureFailed("A scrolling artifact requires between 2 and \(scrollingViewportLimit) sections.")
+        }
+        guard viewports.allSatisfy({ $0.width == first.width && $0.height == first.height }) else {
+            throw CaptureFailure.scrollingCaptureFailed("Every section must have identical dimensions.")
+        }
+        guard viewports.count <= maximumScrollingViewports(for: first) else {
+            throw CaptureFailure.scrollingCaptureFailed("The combined artifact would exceed the safe image-size limit. Finish with fewer sections or use a smaller browser window.")
+        }
+
+        let dividerHeight = scrollingDividerHeight(for: first.width)
+        let totalHeight = first.height * viewports.count + dividerHeight * (viewports.count - 1)
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+              let context = CGContext(data: nil, width: first.width, height: totalHeight, bitsPerComponent: 8, bytesPerRow: 0, space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else {
+            throw CaptureFailure.imageProcessingFailed
+        }
+
+        let fontSize = max(13, min(20, CGFloat(first.width) * 0.009))
+        let labelAttributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedSystemFont(ofSize: fontSize, weight: .semibold),
+            .foregroundColor: NSColor.white,
+        ]
+        var cursor = totalHeight
+        for (index, viewport) in viewports.enumerated() {
+            cursor -= viewport.height
+            context.draw(viewport, in: CGRect(x: 0, y: cursor, width: first.width, height: first.height))
+            guard index < viewports.count - 1 else { continue }
+
+            cursor -= dividerHeight
+            context.setFillColor(CGColor(red: 0.035, green: 0.065, blue: 0.12, alpha: 1))
+            context.fill(CGRect(x: 0, y: cursor, width: first.width, height: dividerHeight))
+            context.setFillColor(CGColor(red: 0.29, green: 0.45, blue: 0.95, alpha: 1))
+            context.fill(CGRect(x: 0, y: cursor + dividerHeight - 4, width: first.width, height: 4))
+            let label = NSAttributedString(string: "CONTINUED  •  VIEWPORT \(index + 2) OF \(viewports.count)", attributes: labelAttributes)
+            let graphics = NSGraphicsContext(cgContext: context, flipped: false)
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = graphics
+            label.draw(at: NSPoint(
+                x: CGFloat(max(16, first.width / 100)),
+                y: CGFloat(cursor + max(10, (dividerHeight - Int(fontSize)) / 2))
+            ))
+            NSGraphicsContext.restoreGraphicsState()
+        }
+        guard let composite = context.makeImage() else { throw CaptureFailure.imageProcessingFailed }
+        return composite
     }
 
     private func pngData(_ image: CGImage) throws -> Data {
@@ -259,13 +423,17 @@ final class CaptureService {
         let imageURL = evidenceDirectory.appendingPathComponent(baseName).appendingPathExtension("png")
         let manifestURL = evidenceDirectory.appendingPathComponent(baseName).appendingPathExtension("json")
         let localTimestamp = localFormatter.string(from: now)
-        let recordedSourceURL = sanitizedSourceURL(sourceURL)
-        let rawSourceLabel = recordedSourceURL?.absoluteString ?? windowTitle
-        let sourceLabel = rawSourceLabel.count > 220 ? "\(rawSourceLabel.prefix(219))…" : rawSourceLabel
+        let menuBarTimestamp = menuBarFormatter.string(from: now)
+        let menuBarTimeZone = TimeZone.current.abbreviation().map {
+            $0 == TimeZone.current.identifier ? $0 : "\($0) / \(TimeZone.current.identifier)"
+        } ?? TimeZone.current.identifier
+        let recordedSourceURL = EvidenceSourceURL.sanitized(sourceURL?.absoluteString ?? context.sourceURL)
+        let sourceLabel = recordedSourceURL?.absoluteString ?? "NOT PROVIDED"
+        let safeWindowTitle = windowTitle.count > 220 ? "\(windowTitle.prefix(219))…" : windowTitle
         let controlLabel = context.resolvedControlTitle.isEmpty ? context.controlID : "\(context.controlID) — \(context.resolvedControlTitle)"
         let ownerLabel = context.resolvedEvidenceOwner.isEmpty ? "UNASSIGNED" : context.resolvedEvidenceOwner
         let jiraLabel = jiraIssueKey.isEmpty ? "" : "  •  JIRA \(jiraIssueKey)"
-        let stamp = "SCOPEPROOF EVIDENCE  •  CAPTURED \(localTimestamp)  •  \(evidenceID)\n\(framework.name.uppercased())  •  CONTROL \(controlLabel)\(jiraLabel)\nEVIDENCE \(context.title)  •  OWNER \(ownerLabel)\n\(context.system) / \(context.environment)  •  \(context.assessmentPeriod)  •  SOURCE \(browser) — \(sourceLabel)"
+        let stamp = "SCOPEPROOF EVIDENCE  •  CAPTURED \(localTimestamp)  •  \(evidenceID)\nMAC MENU BAR DATE & TIME  \(menuBarTimestamp)  •  \(menuBarTimeZone)\n\(framework.name.uppercased())  •  CONTROL \(controlLabel)\(jiraLabel)\nEVIDENCE \(context.title)  •  OWNER \(ownerLabel)\n\(context.system) / \(context.environment)  •  \(context.assessmentPeriod)  •  SOURCE \(browser) — \(safeWindowTitle)\nFULL URL  \(sourceLabel)"
         let stamped = try stampedImage(source: initialScan.image, stamp: stamp)
         let stampedScan = try requiredSafetyScan(stamped)
         let automaticFindings = mergedFindings(initialScan.findings + stampedScan.findings)
@@ -287,7 +455,7 @@ final class CaptureService {
             schemaVersion: 6, evidenceID: evidenceID, capturedAt: capturedAt, localTimestamp: localTimestamp, timezone: TimeZone.current.identifier,
             sourceURL: recordedSourceURL?.absoluteString, sourceHost: recordedSourceURL?.host, browser: browser, windowTitle: windowTitle, screenshotFilename: imageURL.lastPathComponent,
             sha256: digest, pixelWidth: dimensions.width, pixelHeight: dimensions.height, captureMethod: method,
-            timestampAuthority: "Local macOS clock; signed Scopeproof server attestation is stored in the upload receipt",
+            timestampAuthority: "Local macOS system clock displayed with the menu-bar date, time, and timezone; signed Scopeproof server attestation is stored in the upload receipt",
             safetyStatus: safetyStatus, redactionFindings: automaticFindings, redactedRegions: automaticRedactions,
             safetyScanSha256: digest, safetyScanPolicy: SensitiveDataScanner.policyVersion, safetyScanCompletedAt: capturedAt,
             sessionID: context.sessionID, sessionName: context.sessionName, controlID: context.controlID, title: context.title, system: context.system,
@@ -325,7 +493,7 @@ final class CaptureService {
         let fontSize: CGFloat = max(14, min(24, CGFloat(source.width) * 0.012))
         let paragraph = NSMutableParagraphStyle()
         paragraph.lineSpacing = 3
-        paragraph.lineBreakMode = .byWordWrapping
+        paragraph.lineBreakMode = .byCharWrapping
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedSystemFont(ofSize: fontSize, weight: .semibold),
             .foregroundColor: NSColor.white,
@@ -366,15 +534,6 @@ final class CaptureService {
         do { return try SensitiveDataScanner.scanAndRedact(image) }
         catch let failure as CaptureFailure { throw failure }
         catch { throw CaptureFailure.safetyScanFailed(error.localizedDescription) }
-    }
-
-    private func sanitizedSourceURL(_ sourceURL: URL?) -> URL? {
-        guard let sourceURL, var components = URLComponents(url: sourceURL, resolvingAgainstBaseURL: false) else { return sourceURL }
-        components.user = nil
-        components.password = nil
-        components.query = nil
-        components.fragment = nil
-        return components.url
     }
 
     private func sha256(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }

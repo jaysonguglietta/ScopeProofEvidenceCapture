@@ -1,8 +1,8 @@
 # Scopeproof Capture for macOS
 
-Scopeproof Capture 1.5.1 is a local-first menu-bar application for producing, finding, reviewing, and packaging timestamped PCI DSS, HIPAA, FedRAMP, SOC 2, ISO 27001, and custom compliance evidence screenshots, plus one-time repository SBOM exports.
+Scopeproof Capture 1.8.0 is a local-first menu-bar application for producing, finding, reviewing, storing, browsing, downloading, and packaging timestamped PCI DSS, HIPAA, FedRAMP, SOC 2, ISO 27001, and custom compliance evidence screenshots, plus one-time repository SBOM exports.
 
-Related guides: [installation and updates](../../docs/MACOS_INSTALLATION.md), [operator workflow](../../docs/OPERATOR_GUIDE.md), [Jira handoff](../../docs/JIRA_HANDOFF.md), [repository SBOM generation](../../docs/SBOM_GUIDE.md), [assessor verification](../../docs/ASSESSOR_GUIDE.md), and [security model](../../docs/SECURITY.md).
+Related guides: [installation and updates](../../docs/MACOS_INSTALLATION.md), [operator workflow](../../docs/OPERATOR_GUIDE.md), [AWS S3 evidence storage](../../docs/S3_STORAGE.md), [Jira handoff](../../docs/JIRA_HANDOFF.md), [repository SBOM generation](../../docs/SBOM_GUIDE.md), [assessor verification](../../docs/ASSESSOR_GUIDE.md), and [security model](../../docs/SECURITY.md).
 
 ## Run locally
 
@@ -27,12 +27,27 @@ When you make the first capture, allow **Scopeproof Capture** under **System Set
 ## Capture workflow
 
 1. Launch the app and select the shield icon in the macOS menu bar.
-2. Choose an exact browser window, capture the frontmost browser, open a URL after a delay, or capture a full display.
+2. Choose an exact browser window, capture the frontmost browser, combine a scrolling evidence page, open a URL after a delay, or capture a full display.
 3. In the pre-capture dialog, select a compliance framework and corresponding control, customize the filename, and confirm the owner, optional Jira issue, tags, expected evidence, and prefilled context. Use **Capture Presets** for recurring collections or import a Scopeproof JSON, OSCAL JSON, or CSV control catalog.
+   **Capture Frontmost Browser Window** prefills the complete active-tab URL for Safari, Chrome, Edge, and Arc when macOS browser Automation access is allowed. Confirm it before capture. Detection failure leaves the URL empty for safe manual entry; Firefox always uses manual entry.
 4. Scopeproof runs local OCR and masks detected PANs and credentials. In the review workspace, drag over any additional sensitive value before saving. The unredacted capture is never retained.
 5. Find the stamped PNG, immutable capture manifest, and hash-chained review record under `~/Pictures/Scopeproof Evidence/<Compliance area>/<Control>/<Assessment period>`, or enable upload in **Capture & Jira Settings**.
 
-Every screenshot receives a full-width, high-contrast header above the captured pixels containing local date, time, timezone, compliance framework, control number/title, optional Jira issue, system, source, and a unique evidence ID. The dedicated header never covers the evidence itself. Filenames include the framework, control, optional Jira issue, custom evidence name, capture time, and evidence ID. The adjacent JSON manifest contains UTC time, classification metadata, Jira reference, source metadata, final pixel dimensions, redaction counts, the PNG SHA-256 digest, and the previous/current chain hashes. A successful upload adds a local receipt containing the server-signed time attestation and optional RFC 3161 timestamp token.
+### Scrolling evidence
+
+Choose **Capture Scrolling Evidence…** when one browser viewport cannot show all evidence for a control. Select the browser window and Scopeproof captures its current view. Switch back to the browser, scroll down with a small visible overlap, return to Scopeproof, and choose **Capture Next Section**. After two or more sections, choose **Finish & Review**. Keep the window size and browser zoom unchanged throughout the sequence.
+
+Scopeproof creates one vertically combined PNG with a numbered divider before each continuation viewport and one evidence banner containing the timestamp, control, and complete sanitized Page URL. It caps the number and dimensions of sections so the final PNG remains acceptable to the local and hosted validation pipeline. Intermediate viewports remain in memory and are discarded on cancel or failure; only the reviewed, redacted, exact-scanned composite is saved.
+
+## AWS S3 storage
+
+Choose **AWS S3 Storage…** and use **Production compliance** for an expiring STS session, nonempty prefix, customer-managed KMS key, Object Lock retention, optional Deep Archive/replication, and FIPS endpoints. **Save & Verify** checks the caller account and complete bucket posture; **Create & Harden Bucket** configures and re-verifies it after an irreversible-retention confirmation. Credentials and the verified destination binding stay in device-only Keychain items. **Browse S3 Evidence…** lists up to 5,000 immutable versions and downloads only a selected PNG/JSON version after ETag, size, checksum, and content validation. **Upload Pending Evidence to S3** retries any capture without a local S3 receipt.
+
+Select SSE-KMS or DSSE-KMS when entering a customer-managed key; SSE-S3 does not use a KMS ARN. Compatible S3 may use a dedicated bucket/prefix-scoped no-console IAM user as a temporary migration exception. Production compliance requires an expiring STS session. The S3 guide includes both the IAM identity policy and the S3-service/encryption-context-restricted KMS key-policy statement.
+
+Remote objects are organized as `<prefix>/<control-id>-<control-title>/<assessment-period>/<evidence-id>/` and contain the exact verified PNG plus its immutable JSON manifest. Each SigV4 PUT includes SHA-256, expected-owner, and selected KMS headers; the local receipt records exact S3 version IDs, returned checksums, encryption, retention, account/principal, and request IDs. See the [S3 storage guide](../../docs/S3_STORAGE.md) for separated IAM policies, CloudTrail monitoring, and recovery testing.
+
+Every screenshot receives a full-width, high-contrast header above the captured pixels containing local date, time, timezone, compliance framework, control number/title, optional Jira issue, system, source window, complete sanitized page URL, and a unique evidence ID. Enter or confirm the Page URL in the capture dialog; **Open URL & Capture** supplies it automatically. URL credentials and sensitive query/fragment values are redacted before rendering or persistence. The dedicated wrapping header never covers the evidence itself or truncates the URL. Filenames include the framework, control, optional Jira issue, custom evidence name, capture time, and evidence ID. The adjacent JSON manifest contains UTC time, classification metadata, Jira reference, source metadata, final pixel dimensions, redaction counts, the PNG SHA-256 digest, and the previous/current chain hashes. A successful upload adds a local receipt containing the server-signed time attestation and optional RFC 3161 timestamp token.
 
 Use **Search Evidence…** in the shield menu to filter screenshots by framework, control, review status, age, and system; search their filename, Jira issue, title, owner, tags, notes, or evidence ID; inspect thumbnails; and open or reveal a result. **Review Status…** moves an artifact through Draft, In Review, Approved, Rejected, and Superseded while preserving each decision in a hash-chained `.review.json` sidecar. Approval, rejection, and supersession require a rationale.
 

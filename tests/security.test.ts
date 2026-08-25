@@ -104,9 +104,10 @@ test("native upload route derives metadata from a signed manifest and strictly d
 });
 
 test("screenshot pipelines scan the exact persisted pixels and fail closed", async () => {
-  const [capture, scanner, collectors, evidence, nativeRoute, migration] = await Promise.all([
+  const [capture, scanner, sourceUrl, collectors, evidence, nativeRoute, migration] = await Promise.all([
     readFile(new URL("../macos/ScopeproofCapture/Sources/ScopeproofCapture/CaptureService.swift", import.meta.url), "utf8"),
     readFile(new URL("../macos/ScopeproofCapture/Sources/ScopeproofCapture/SensitiveDataScanner.swift", import.meta.url), "utf8"),
+    readFile(new URL("../macos/ScopeproofCapture/Sources/ScopeproofCapture/EvidenceSourceURL.swift", import.meta.url), "utf8"),
     readFile(new URL("../lib/server/collectors.ts", import.meta.url), "utf8"),
     readFile(new URL("../lib/server/evidence.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/api/native/evidence/route.ts", import.meta.url), "utf8"),
@@ -117,7 +118,12 @@ test("screenshot pipelines scan the exact persisted pixels and fail closed", asy
   assert.match(capture, /let exactScan = try requiredSafetyScan\(exactImage\)/);
   assert.ok(capture.indexOf("let exactScan") < capture.indexOf("imageData.write(to: imageURL"));
   assert.match(capture, /safetyScanSha256: digest/);
-  assert.match(capture, /components\.query = nil/);
+  assert.match(capture, /MAC MENU BAR DATE & TIME/);
+  assert.match(capture, /menuBarFormatter\.string\(from: now\)/);
+  assert.match(capture, /FULL URL/);
+  assert.match(sourceUrl, /components\.user = nil/);
+  assert.match(sourceUrl, /components\.password = nil/);
+  assert.match(sourceUrl, /value: "REDACTED"/);
   assert.match(scanner, /vision-ocr-sensitive-patterns-v1/);
   assert.doesNotMatch(collectors, /\/content`/);
   assert.match(collectors, /scanExactBrowserPixels/);

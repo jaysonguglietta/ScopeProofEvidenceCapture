@@ -84,6 +84,29 @@ struct SensitiveDataScannerTests {
         #expect(output.height > height)
     }
 
+    @Test("Combines scrolling sections with a visible separator")
+    @MainActor
+    func combinesScrollingSections() throws {
+        let first = makeImage(width: 960, height: 540, gray: 0.9)
+        let second = makeImage(width: 960, height: 540, gray: 0.7)
+        let service = CaptureService(preferences: CapturePreferences())
+        let output = try service.scrollingComposite(viewports: [first, second])
+
+        #expect(output.width == first.width)
+        #expect(output.height > first.height + second.height)
+    }
+
+    @Test("Rejects incomplete and resized scrolling captures")
+    @MainActor
+    func rejectsInvalidScrollingSections() {
+        let service = CaptureService(preferences: CapturePreferences())
+        let first = makeImage(width: 960, height: 540, gray: 0.9)
+        let resized = makeImage(width: 900, height: 540, gray: 0.7)
+
+        #expect(throws: CaptureFailure.self) { try service.scrollingComposite(viewports: [first]) }
+        #expect(throws: CaptureFailure.self) { try service.scrollingComposite(viewports: [first, resized]) }
+    }
+
     @Test("Scans sensitive values introduced only by the final header")
     @MainActor
     func scansFinalHeaderPixels() throws {
@@ -232,4 +255,12 @@ struct SensitiveDataScannerTests {
         #expect(comment.contains("GRC-42"))
         #expect(comment.contains(digest))
     }
+}
+
+private func makeImage(width: Int, height: Int, gray: CGFloat) -> CGImage {
+    let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)!
+    let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0, space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+    context.setFillColor(CGColor(gray: gray, alpha: 1))
+    context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+    return context.makeImage()!
 }

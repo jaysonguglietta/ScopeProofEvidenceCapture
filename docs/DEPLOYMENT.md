@@ -92,6 +92,10 @@ For managed distribution:
 
 The development build is ad-hoc signed with a stable designated requirement for `com.scopeproof.capture`; it is not a notarized production release. The Local Console is embedded in the native process, binds to a random loopback-only port, and stops when the app quits. It does not require or deploy the hosted Sites application.
 
+When native S3 evidence storage is enabled, complete the production profile in **AWS S3 Storage…**, use expiring IAM Identity Center/AssumeRole credentials, and deploy the monitoring template in `infra/aws/scopeproof-s3-observability.yaml`. The setup role, daily verifier/upload role, and optional browser role must be separate and prefix-scoped as documented in [AWS S3 evidence storage](S3_STORAGE.md). CloudTrail log-bucket names, KMS keys, replication roles/destinations, retention approval, and SNS subscriptions are environment-specific and are not deployed automatically with the Mac app.
+
+Long-lived IAM user keys are a Compatible S3 migration exception, not a production credential. If the exception is required, provision a dedicated no-console identity with no unrelated policies, use the exact bucket/prefix identity and KMS key-policy templates, and record an owner and removal date before distributing the Mac configuration.
+
 ## RFC 3161 verifier contract
 
 Scopeproof does not parse CMS itself. The configured verifier must use a maintained RFC 3161/CMS/X.509 implementation and reject non-granted status, wrong SHA-256 imprint or nonce, invalid CMS signatures, missing `id-kp-timeStamping` EKU, untrusted/expired chains, and failed revocation policy. Its response is a bounded JSON attestation signed over RFC 8785 JCS bytes with the pinned ECDSA P-256 verifier key; `signatureBase64` uses the 64-byte IEEE P1363 `r || s` form expected by WebCrypto. The attestation includes the token digest, request digest/nonce, TSA origin, generation/verification times, signer and trust-anchor fingerprints, chain fingerprints/expiry, revocation status, policy OID, and serial number.
@@ -125,7 +129,7 @@ npx tsc --noEmit
 npm test
 ```
 
-Run the native tests with the Xcode Swift toolchain, build the `.app`, confirm its bundle version/signature, and smoke-test the menu, one-time repository SBOM dialog/export/checksum, settings, capture classification, redaction review, search, Jira comment, and package export on non-production sources.
+Run the native tests with the Xcode Swift toolchain, build the `.app`, confirm its bundle version/signature, and smoke-test the menu, one-time repository SBOM dialog/export/checksum, S3 posture verification/upload/version browser/quarantined download, settings, capture classification, redaction review, search, Jira comment, and package export on non-production sources. Never use production AWS credentials in an automated test.
 
 ## Backup, retention, and recovery
 

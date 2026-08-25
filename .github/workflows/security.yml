@@ -57,16 +57,22 @@ jobs:
           test "$(defaults read "$PWD/DerivedData/Scopeproof Capture.app/Contents/Info" CFBundleIdentifier)" = "com.scopeproof.capture"
           ditto -c -k --sequesterRsrc --keepParent "DerivedData/Scopeproof Capture.app" "DerivedData/Scopeproof-Capture-development.zip"
           shasum -a 256 "DerivedData/Scopeproof-Capture-development.zip" > "DerivedData/Scopeproof-Capture-development.zip.sha256"
+      - name: Build and verify development-preview DMG
+        run: ./Scripts/build_development_dmg.sh --skip-build
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: scopeproof-macos-development
           path: |
             DerivedData/Scopeproof-Capture-development.zip
             DerivedData/Scopeproof-Capture-development.zip.sha256
+            DerivedData/Scopeproof-Capture-*-development-preview.dmg
+            DerivedData/Scopeproof-Capture-*-development-preview.dmg.sha256
           if-no-files-found: error
           retention-days: 14
       - name: Attest development build provenance
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
         with:
-          subject-path: DerivedData/Scopeproof-Capture-development.zip
+          subject-path: |
+            DerivedData/Scopeproof-Capture-development.zip
+            DerivedData/Scopeproof-Capture-*-development-preview.dmg
