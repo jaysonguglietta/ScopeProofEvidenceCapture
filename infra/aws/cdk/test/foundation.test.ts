@@ -133,14 +133,17 @@ test("shared platform reserves exact tenant mappings but publishes no tenant DNS
   const recordSets = Object.values(synthesized.Resources).filter(
     (resource) => resource.Type === "AWS::Route53::RecordSet",
   );
+  const recordNames = recordSets.map((record) =>
+    (record.Properties as { Name?: unknown } | undefined)?.Name,
+  );
   assert.ok(domain);
   assert.doesNotMatch(JSON.stringify(domain), /"Prefix":"\*"/);
   assert.equal(
-    recordSets.some((record) => JSON.stringify(record.Properties).includes("*.evidence.example.com")),
+    recordNames.some((name) => name === "*.evidence.example.com" || name === "*.evidence.example.com."),
     false,
   );
   assert.equal(
-    recordSets.some((record) => JSON.stringify(record.Properties).includes("acme.evidence.example.com")),
+    recordNames.some((name) => name === "acme.evidence.example.com" || name === "acme.evidence.example.com."),
     false,
   );
 

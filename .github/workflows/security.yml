@@ -29,9 +29,10 @@ jobs:
       - name: Verify the production dependency graph independently
         run: npm audit --omit=dev --audit-level=high
       - name: Enable the pinned AWS infrastructure package manager
-        run: |
-          corepack enable
-          corepack prepare pnpm@11.19.0 --activate
+        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        with:
+          version: 11.19.0
+          run_install: false
       - name: Validate and synthesize the AWS CDK foundation
         working-directory: infra/aws/cdk
         run: |
