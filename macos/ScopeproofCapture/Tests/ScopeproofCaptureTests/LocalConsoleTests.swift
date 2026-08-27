@@ -36,5 +36,10 @@ struct LocalConsoleTests {
         #expect(!LocalConsoleAssets.html.contains("<script>"))
         #expect(LocalConsoleAssets.javascript.contains("credentials: 'same-origin'"))
         #expect(LocalConsoleAssets.html.contains("Private to this Mac"))
+        #expect(LocalConsoleAssets.html.contains("storage-location"))
+        #expect(LocalConsoleAssets.html.contains("assessment-period"))
+        #expect(LocalConsoleAssets.html.contains("group-by"))
+        #expect(LocalConsoleAssets.javascript.contains("/api/library"))
+        #expect(!LocalConsoleAssets.javascript.localizedCaseInsensitiveContains("secretAccessKey"))
     }
 }

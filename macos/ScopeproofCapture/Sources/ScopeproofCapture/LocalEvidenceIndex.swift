@@ -157,7 +157,7 @@ final class LocalEvidenceIndex: @unchecked Sendable {
                 try bind([
                     .text(cleanSearch), .text(like), .text(query.complianceArea), .text(query.complianceArea),
                     .text(query.controlID), .text(query.controlID), .text(query.reviewStatus), .text(query.reviewStatus),
-                    .integer(Int64(max(1, min(limit, 1_000)))),
+                    .integer(Int64(max(1, min(limit, 5_000)))),
                 ], to: statement)
                 var records: [LocalEvidenceRecord] = []
                 while sqlite3_step(statement) == SQLITE_ROW {

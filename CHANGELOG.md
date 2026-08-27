@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Selected and documented an AWS-only multi-tenant hosting target using explicit Route 53 customer subdomains, Cognito, pay-per-use compute, a low-idle relational/control plane, and per-customer S3/KMS/IAM evidence boundaries. Added synthable shared/per-tenant CDK stacks with WAF, budgets, alarms, private release distribution, retained AWS audit storage, a database-provisioning state machine, and a GuardDuty/SQS evidence-promotion path that remains deliberately disabled for clean files until the hosted issuer and application audit transaction exist.
+- Added exact-host tenancy, verified-token and authoritative-membership contracts; role/action authorization; cross-tenant ID guards; checksum- and nonce-bound upload lifecycles; lease-safe job and retention models; a forced-RLS PostgreSQL tenant schema; a least-privilege runtime-role migration; and a validated offline tenant SQL renderer.
+- Added native Cognito authorization-code/PKCE security primitives and a tenant/issuer/client-bound Keychain refresh-token abstraction without embedding a client secret or AWS credentials in the Mac application.
+- Added a detailed AWS deployment and operations runbook plus an adversarial AWS security review. Both distinguish local validation, infrastructure deployment, database readiness, and customer activation, and record that no AWS environment was deployed or production-authorized by this change.
+- Expanded the native Local Console into a unified local/S3 screenshot library with storage badges, search, framework/control/assessment-period/status/storage filters, control/period/framework grouping, S3 version counts, and resilient local-only fallback. Local/S3 joins now require an exact schema-2 upload receipt; S3-only pairs remain visibly provenance-unverified, and on-demand previews validate the paired exact-version manifest plus PNG digest without exposing credentials, object keys, or filesystem paths to browser code.
 - Changed the default local evidence root from `~/Pictures/Scopeproof Evidence` to `~/Documents/Scopeproof Evidence`. Existing Pictures-based captures remain searchable, reviewable, uploadable, subject to configured retention, and assessor-exportable without an automatic file move.
 
 ## 1.8.1 — 2026-08-25

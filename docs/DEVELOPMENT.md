@@ -9,6 +9,7 @@
 | `db/schema.ts` | Drizzle/D1 schema. |
 | `drizzle/` | Ordered SQL migrations and snapshots. |
 | `macos/ScopeproofCapture/` | Swift Package for the macOS menu-bar app, embedded Local Console, SQLite index, and native tests. |
+| `infra/aws/cdk/` | AWS-only multi-tenant hosting foundation, tenant resource provisioning, and infrastructure assertions. |
 | `scripts/` and `Scripts/` | macOS build entry points retained for compatibility. |
 | `tests/` | Rendered-product and security regression tests. |
 | `.openai/hosting.json` | Logical Sites project, D1, and R2 declarations. |
@@ -49,7 +50,21 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
 
 On machines with multiple developer toolchains, select the full Xcode toolchain through `DEVELOPER_DIR`.
 
-The native Local Console is served directly by Scopeproof Capture. It is not the React development server and should remain usable with no hosted environment variables. When changing the console, verify its focused tests, release build, loopback-only listener, per-launch authentication, and unauthorized-request behavior.
+### AWS infrastructure validation
+
+The CDK project is deliberately independent from the current Cloudflare application dependencies. It can be built and synthesized without AWS credentials; deployment requires an owned domain, a Route 53 hosted zone, a bootstrapped AWS account, and the migration gates in [AWS multi-tenant hosting](AWS_MULTI_TENANT_HOSTING.md). Use the [AWS platform runbook](AWS_PLATFORM_RUNBOOK.md) for operator commands and the [AWS adversarial security review](AWS_SECURITY_REVIEW.md) for launch blockers; neither document authorizes deploying the legacy web runtime to tenant domains.
+
+```bash
+cd infra/aws/cdk
+pnpm install --frozen-lockfile
+pnpm run build
+pnpm test
+pnpm run synth
+```
+
+`jsontechology.com` is a planning placeholder. Do not deploy it unless the organization controls that exact domain. Infrastructure synthesis is not authorization to expose the current D1/R2 application to a second customer; the AWS application, tenant-aware PostgreSQL schema, Cognito membership enforcement, Mac enrollment, and migration/reconciliation work must be complete first.
+
+The native Local Console is served directly by Scopeproof Capture. It is not the React development server and should remain usable with no hosted environment variables. When changing the console, verify its focused tests, release build, loopback-only listener, per-launch authentication, and unauthorized-request behavior. The unified library may expose normalized display metadata and validated evidence IDs only. Keep filesystem paths, S3 keys/version IDs/ETags, and Keychain credentials inside the native process. S3 previews must remain explicit per-card actions, exact-version/ETag bound, at most 40 MiB, PNG-validated, and removed from private temporary storage after serving.
 
 New native evidence must write only beneath `~/Documents/Scopeproof Evidence`. The known-root compatibility layer may read the legacy `~/Pictures/Scopeproof Evidence` tree, but must resolve symlinks, reject every other path, and prefer the primary Documents copy when an evidence ID exists in both roots. Path changes require native regression coverage plus installation, operator, architecture, security, operations, in-app Help, and changelog updates.
 

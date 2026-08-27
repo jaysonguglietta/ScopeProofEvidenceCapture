@@ -1,5 +1,7 @@
 # Scopeproof Capture for macOS
 
+For a complete new-Mac walkthrough, including DMG and source installation, permissions, capture, review, export, S3, one-time SBOM, Jira, and troubleshooting, start with [the repository getting-started guide](../../docs/GETTING_STARTED.md).
+
 Scopeproof Capture 1.8.1 is a local-first menu-bar application for producing, finding, reviewing, storing, browsing, downloading, and packaging timestamped PCI DSS, HIPAA, FedRAMP, SOC 2, ISO 27001, and custom compliance evidence screenshots, plus one-time repository SBOM exports.
 
 Related guides: [installation and updates](../../docs/MACOS_INSTALLATION.md), [operator workflow](../../docs/OPERATOR_GUIDE.md), [AWS S3 evidence storage](../../docs/S3_STORAGE.md), [Jira handoff](../../docs/JIRA_HANDOFF.md), [repository SBOM generation](../../docs/SBOM_GUIDE.md), [assessor verification](../../docs/ASSESSOR_GUIDE.md), and [security model](../../docs/SECURITY.md).
@@ -22,7 +24,9 @@ Choose **Generate Repository SBOM…** from the shield menu for a direct one-tim
 
 ## Local Console
 
-The embedded console provides local overview metrics, preview cards, framework/control/status filters, lifecycle review, evidence reveal, workspace status, and Help. It binds only to `127.0.0.1`, uses a per-launch authenticated browser session, and stops when Scopeproof quits. Browser requests identify artifacts only by evidence ID; the server resolves and verifies the corresponding local files.
+The embedded console provides overview metrics and one organized screenshot library across local storage and the app's verified S3 prefix. It supports search plus framework, control, assessment-period, lifecycle, and storage filters; and groups cards by control, period, framework, or no grouping. A `Local + S3` label requires the local upload receipt to match the exact image/manifest keys, versions, ETags, S3 checksums, destination, and local digests. S3-only inventory is explicitly provenance-unverified and cannot be reviewed as valid evidence. Its opt-in preview fetches the paired exact-version manifest before the PNG, verifies their identity and SHA-256 relationship, serves bytes only to the authenticated loopback session, and removes the private temporary files. **S3 files…** opens the native exact-version download browser.
+
+The console binds only to `127.0.0.1`, uses a per-launch authenticated browser session, and stops when Scopeproof quits. Browser requests identify artifacts only by evidence ID; no filesystem path, S3 object key, or AWS credential enters the browser API. Without a configured and verified S3 destination, or when its temporary session is unavailable, the library continues in local-only mode and explains how to recover.
 
 Scopeproof maintains a rebuildable SQLite search index under the current user's Application Support folder. Immutable PNG manifests and `.review.json` lifecycle records remain authoritative. A separate append-only SQLite audit chain is HMAC-authenticated with a device-only Keychain key. Hosted synchronization and Jira Cloud remain optional.
 

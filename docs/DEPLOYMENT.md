@@ -1,5 +1,7 @@
 # Deployment and administration
 
+> This guide currently describes the single-tenant Sites deployment. The selected replacement is the [AWS-only multi-tenant hosting architecture](AWS_MULTI_TENANT_HOSTING.md). Use the separate [AWS platform runbook](AWS_PLATFORM_RUNBOOK.md) for that target and review its [adversarial security findings](AWS_SECURITY_REVIEW.md). Do not provision a second customer hostname on the current D1/R2 runtime.
+
 ## Prerequisites
 
 - Node.js 22.13 or newer and npm.

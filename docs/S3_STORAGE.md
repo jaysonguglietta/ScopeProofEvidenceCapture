@@ -51,6 +51,20 @@ After verification, the AWS account, principal ARN, exact destination/settings d
 
 Bucket, region, prefix, KMS ARN, retention, FIPS, lifecycle, replication, download, and automatic-upload selections are non-secret and remain in macOS preferences. Credentials are never written to preferences, manifests, receipts, logs, environment files, Git, or the CloudTrail template. **Disconnect** deletes both S3 Keychain items and preferences; it does not delete evidence.
 
+## Unified Local Console library
+
+The Local Console automatically selects its inventory source from the running app configuration:
+
+- without an S3 destination, it scans the current `~/Documents/Scopeproof Evidence` root plus the bounded legacy Pictures root;
+- with configured but unverified S3 settings, it continues to show local evidence and reports that verification is required; and
+- with current credentials, `s3:ListBucketVersions`, and a matching verified destination, it adds paired current PNG/manifest objects beneath that exact prefix. A local artifact is labeled `Local + S3` only when its local upload receipt binds the exact S3 keys, versions, ETags, and checksums; inventory-only objects are labeled `S3` with unverified provenance.
+
+The inventory accepts only the generated `<control>/<assessment-period>/<evidence-id>/<file>.png` plus same-basename `.json` manifest layout, and it never resurrects an older version when the current object is deleted. It groups immutable S3 versions by object key and displays one current screenshot card plus the version count. A matching evidence ID or filename is not proof of identity: joining to a local artifact additionally requires the exact schema-2 local `.s3.json` receipt, destination account/settings, key, version, ETag, S3 checksum, and local manifest digest to agree. If two different object keys claim the same evidence ID, the console omits that ambiguous ID instead of guessing. The browser API receives normalized display metadata, not an S3 object key, version ID, ETag, filesystem path, access key, secret, or session token. S3-only records remain explicitly lifecycle-invalid and provenance-unverified until a trusted receipt exists.
+
+S3 listing is limited to 5,000 object versions and cached in memory for 60 seconds. **Refresh** forces a new list. A list failure is fail-open only for local availability: local evidence remains visible and the console reports the S3 recovery steps, but it never invents S3 state.
+
+When validated downloads are enabled, **Load secure preview** retrieves only the selected card. The server first downloads the paired exact-version manifest and validates its schema, evidence ID, filename, version, and receipt digest when available. It then downloads the exact PNG version/ETag, applies the expected bucket owner and prefix, enforces 40 MiB, validates the S3 checksum, PNG signature, and manifest SHA-256, and rechecks any local receipt binding. Files pass through a private random temporary directory and are removed immediately after the authenticated loopback response. Automatic bulk preview fetching is intentionally avoided. Self-consistent S3-only pairs remain marked unverified because an S3 writer could replace both without a trusted receipt. Use **S3 files…** or **Browse S3 Evidence…** for explicit save. With only prefix-scoped `s3:ListBucketVersions`, metadata remains visible while preview/download controls are disabled.
+
 ## Object layout and receipts
 
 Objects use sanitized control-oriented keys:
@@ -242,7 +256,23 @@ Add an explicit statement for that user to the existing customer-managed KMS key
 
 This key-policy example also assumes SSE-KMS with S3 Bucket Keys enabled. It allows the named identity to generate data keys and decrypt only when KMS is called through S3 in the expected account for that bucket. It does not grant direct KMS API use, key administration, grants, deletion, rotation, or use with another bucket. If browsing is disabled, omit `kms:Decrypt` from both the key policy and IAM identity policy. Review any existing key-administrator statements separately: an administrator who can edit the key policy remains capable of changing these restrictions.
 
-### Optional browser additions
+### Local Console inventory permission
+
+The unified Local Console requires the following read-only list permission to show S3 metadata, even when previews and downloads remain disabled:
+
+```json
+{
+  "Sid": "ListScopeproofVersions",
+  "Effect": "Allow",
+  "Action": "s3:ListBucketVersions",
+  "Resource": "arn:aws:s3:::company-compliance-evidence",
+  "Condition": {"StringLike": {"s3:prefix": ["scopeproof-evidence/", "scopeproof-evidence/*"]}}
+}
+```
+
+Omit this statement when the Mac should remain local-only. Listing does not grant object-content access or KMS decrypt.
+
+### Optional preview and download additions
 
 Add these only when **Allow prefix-scoped browsing and validated downloads** is enabled:
 
@@ -250,13 +280,6 @@ Add these only when **Allow prefix-scoped browsing and validated downloads** is 
 {
   "Version": "2012-10-17",
   "Statement": [
-    {
-      "Sid": "ListScopeproofVersions",
-      "Effect": "Allow",
-      "Action": "s3:ListBucketVersions",
-      "Resource": "arn:aws:s3:::company-compliance-evidence",
-      "Condition": {"StringLike": {"s3:prefix": ["scopeproof-evidence/", "scopeproof-evidence/*"]}}
-    },
     {
       "Sid": "ReadExactScopeproofVersion",
       "Effect": "Allow",

@@ -258,6 +258,30 @@ test("native S3 evidence storage is destination-bound, integrity-checked, encryp
   assert.doesNotMatch(browser, /S3Credentials\s*[=:]/);
 });
 
+test("native Local Console merges local and S3 screenshots without moving AWS trust into browser code", async () => {
+  const server = await read("macos/ScopeproofCapture/Sources/ScopeproofCapture/LocalConsoleServer.swift");
+  const library = await read("macos/ScopeproofCapture/Sources/ScopeproofCapture/EvidenceLibrary.swift");
+  const assets = await read("macos/ScopeproofCapture/Sources/ScopeproofCapture/LocalConsoleAssets.swift");
+  assert.match(server, /KeychainStore\.readS3Credentials\(\)/);
+  assert.match(server, /binding\.matches\(settings\)/);
+  assert.match(server, /screenshot\.size <= 40 \* 1024 \* 1024/);
+  assert.match(server, /s3Service\.downloadObject/);
+  assert.match(server, /screenshot\.manifestObject/);
+  assert.match(server, /manifestDownload\.sha256/);
+  assert.match(server, /imageDownload\.sha256 == manifest\.sha256/);
+  assert.match(server, /removeItem\(at: previewDirectory\)/);
+  assert.match(library, /components\.count == 4/);
+  assert.match(library, /\^EV-\[A-Z0-9\]\+\$/);
+  assert.match(library, /verifiedReceiptBindings/);
+  assert.match(library, /receipt\.versionIDs\[imageKey\]/);
+  assert.match(library, /receiptBinding\?\.imageSHA256 == item\.sha256/);
+  assert.match(library, /lifecycleValid: false/);
+  assert.match(library, /storageLocation: s3 == nil \? \.local : \.localAndS3/);
+  assert.match(assets, /Load secure preview/);
+  assert.match(assets, /storage-location/);
+  assert.doesNotMatch(assets, /secretAccessKey|sessionToken|versionID|eTag|\.key\b/);
+});
+
 test("native evidence writes to Documents while legacy Pictures evidence remains bounded", async () => {
   const [capture, history, installation, operatorGuide, architecture, securityGuide] = await Promise.all([
     read("macos/ScopeproofCapture/Sources/ScopeproofCapture/CaptureService.swift"),

@@ -1,6 +1,6 @@
 # Production operations, recovery, and incident response
 
-This runbook is the minimum operational control set for using Scopeproof as a compliance-evidence system of record. Assign named owners and store completed records in an organization-controlled change/incident system. The application remains single-tenant: deploy a separate Sites project, D1 database, R2 bucket, identity policy, and key set for every legal entity or isolation boundary.
+This runbook is the minimum operational control set for using the current Scopeproof service as a compliance-evidence system of record. Assign named owners and store completed records in an organization-controlled change/incident system. The current application remains single-tenant: deploy a separate Sites project, D1 database, R2 bucket, identity policy, and key set for every legal entity or isolation boundary. The selected [AWS multi-tenant replacement](AWS_MULTI_TENANT_HOSTING.md) has its own [AWS platform runbook](AWS_PLATFORM_RUNBOOK.md) and [adversarial security review](AWS_SECURITY_REVIEW.md); it may serve additional customers only after its staged migration and Client A/Client B isolation gates pass.
 
 ## Service objectives
 

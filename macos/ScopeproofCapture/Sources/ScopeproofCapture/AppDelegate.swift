@@ -25,9 +25,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var repositorySBOMTask: Task<Void, Never>?
     private var s3RetryTask: Task<Void, Never>?
     private var s3ConfigurationTask: Task<Void, Never>?
-    private lazy var localConsole = LocalConsoleServer(evidenceRoot: captureService.outputDirectory, preferences: preferences) { [weak self] in
-        self?.chooseBrowserWindow()
-    }
+    private lazy var localConsole = LocalConsoleServer(
+        evidenceRoot: captureService.outputDirectory,
+        preferences: preferences,
+        s3Service: s3StorageService,
+        requestCapture: { [weak self] in self?.chooseBrowserWindow() },
+        openS3Browser: { [weak self] in
+            guard let self else { return }
+            self.s3ObjectBrowserController.show(settings: self.preferences.s3Storage)
+        }
+    )
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         configureStatusItem()

@@ -44,7 +44,7 @@ From Terminal, change to the repository root and run:
 
 The script builds a release executable, creates `DerivedData/Scopeproof Capture.app`, installs it at `~/Applications/Scopeproof Capture.app`, replaces an older per-user installation when present, and launches it. Administrator access is not required. Do not keep both the DMG-installed and source-installed copies running; quit Scopeproof and consistently open one installed path so macOS permissions remain associated with the intended bundle.
 
-Scopeproof appears as a shield in the menu bar and opens its Local Console in the default browser. The console is served by the running Mac app on a random `127.0.0.1` port and is not published to the LAN or internet. If the tab is closed, choose **Open Local Console** from the shield menu or press `Command-Shift-L`.
+Scopeproof appears as a shield in the menu bar and opens its Local Console in the default browser. The console is served by the running Mac app on a random `127.0.0.1` port and is not published to the LAN or internet. Its Evidence library shows local screenshots and, when the S3 destination is configured and verified, matching S3 screenshots with explicit storage badges and on-demand previews. If the tab is closed, choose **Open Local Console** from the shield menu or press `Command-Shift-L`.
 
 ## Grant capture permission
 

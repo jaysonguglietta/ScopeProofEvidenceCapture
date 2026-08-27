@@ -11,18 +11,29 @@ The repository contains two coordinated products:
 
 | Audience | Guide |
 | --- | --- |
+| New Mac users | [Start here: install and use Scopeproof Capture](docs/GETTING_STARTED.md) |
 | Mac users and endpoint administrators | [macOS installation and updates](docs/MACOS_INSTALLATION.md) |
 | Evidence collectors and reviewers | [Operator guide](docs/OPERATOR_GUIDE.md) |
 | Jira/GRC coordinators | [Jira evidence handoff](docs/JIRA_HANDOFF.md) |
 | External assessors | [Assessor package and verification guide](docs/ASSESSOR_GUIDE.md) |
 | Software inventory operators | [Repository SBOM generation](docs/SBOM_GUIDE.md) |
 | AWS storage administrators | [AWS S3 evidence storage](docs/S3_STORAGE.md) |
+| AWS platform and SaaS administrators | [AWS multi-tenant hosting](docs/AWS_MULTI_TENANT_HOSTING.md) |
+| AWS deployment operators | [AWS platform runbook](docs/AWS_PLATFORM_RUNBOOK.md) |
 | Platform administrators | [Deployment and administration](docs/DEPLOYMENT.md) |
-| Security and risk teams | [Security model and operating controls](docs/SECURITY.md) |
+| Security and risk teams | [Security model and operating controls](docs/SECURITY.md) and [AWS adversarial security review](docs/AWS_SECURITY_REVIEW.md) |
 | Engineers and maintainers | [Architecture](docs/ARCHITECTURE.md) and [development guide](docs/DEVELOPMENT.md) |
 | Release managers | [Changelog](CHANGELOG.md) |
 
-The native-specific build and usage reference remains in [macos/ScopeproofCapture/README.md](macos/ScopeproofCapture/README.md). The macOS application also includes **Help & How to Use…** in its shield menu.
+The native-specific build and usage reference remains in [macos/ScopeproofCapture/README.md](macos/ScopeproofCapture/README.md). The macOS application also includes **Help & How to Use…** in its shield menu. For a clean Mac-to-first-evidence walkthrough, use the [complete getting-started guide](docs/GETTING_STARTED.md).
+
+## AWS multi-tenant hosting direction
+
+The selected production target is an AWS-only hosted runtime with explicit tenant subdomains such as `acme.jsontechology.com`. `jsontechology.com` is a configurable placeholder and preserves the spelling supplied for planning. The low-idle-cost bridge architecture shares the AWS application/control plane while giving each customer a separate PostgreSQL identity, S3 evidence boundary, KMS key, and IAM role. Route 53 creates a tenant hostname only after provisioning; the hostname selects a tenant candidate, while Cognito identity plus a server-side active membership authorizes access.
+
+The synthable [AWS CDK foundation](infra/aws/cdk/README.md) creates the shared low-idle platform and explicit per-tenant resource boundaries. The [AWS platform runbook](docs/AWS_PLATFORM_RUNBOOK.md) separates local synthesis, reviewed deployment, database provisioning, and customer activation. Infrastructure or database readiness alone does not migrate or authorize the current application.
+
+The existing Sites/D1/R2 deployment remains the single-tenant legacy runtime until the staged migration and two-tenant security gates in the [AWS multi-tenant hosting guide](docs/AWS_MULTI_TENANT_HOSTING.md) are complete. Do not point a second customer hostname at the current hosted application.
 
 ## Download the Mac app
 
@@ -53,7 +64,7 @@ The first time you capture, macOS may ask for Screen Recording access. Allow **S
 - Assessor ZIPs embed approved artifacts, a PDF index, SHA-256 hashes, and an ECDSA P-256 signed manifest with its public verification key.
 - Mutating routes enforce same-origin requests. Worker responses add CSP, HSTS, no-sniff, referrer, and permissions headers.
 - Revocable Mac device tokens are stored as SHA-256 hashes server-side. Native uploads use a device-token HMAC over the exact manifest and PNG digests; the server derives metadata from the signed manifest and strictly decodes the PNG before storage.
-- The native Local Console binds only to `127.0.0.1`, requires an ephemeral HttpOnly SameSite session, rejects cross-origin mutations and path input, verifies artifact hashes, and maintains a disposable SQLite index plus an immutable Keychain-HMAC-authenticated local audit chain.
+- The native Local Console binds only to `127.0.0.1`, requires an ephemeral HttpOnly SameSite session, rejects cross-origin mutations and path input, verifies artifact hashes, and maintains a disposable SQLite index plus an immutable Keychain-HMAC-authenticated local audit chain. Its unified library groups local and S3 inventory by control/period/framework, but labels an artifact `Local + S3` only when a local upload receipt binds the exact S3 keys, versions, ETags, checksums, and manifest digest. S3-only pairs remain visibly provenance-unverified; on-demand previews validate the paired exact-version manifest and PNG digest without treating pair consistency as authorship.
 - Optional native S3 storage offers a production profile requiring expiring STS credentials, a Keychain-bound AWS account/destination, Block Public Access, versioning, BucketOwnerEnforced ownership, customer-managed KMS encryption, Object Lock, TLS/KMS bucket-policy enforcement, SHA-256 response verification, and exact-version downloads. The app supports FIPS endpoints, optional Deep Archive/replication, and a deployable CloudTrail alerting template. A documented Compatible S3 migration exception uses a dedicated no-console IAM identity restricted to one bucket/prefix and an S3-only KMS encryption context; production still requires temporary credentials.
 
 ## Provider evidence
@@ -78,7 +89,7 @@ The Mac app can build a local approved-only assessor ZIP filtered by framework a
 
 Jira Cloud uses hosted OAuth 2.0 authorization-code flow with rotating refresh tokens. OAuth tokens are encrypted under a Jira-specific key and never enter the Mac app; user-bound state, fixed Atlassian API hosts, site matching, project allowlists, and optimistic refresh leases constrain the connection. Operators connect Jira under **Connections**, approve an artifact locally, upload those exact bytes to Scopeproof, obtain hosted reviewer approval, and explicitly choose **Search Evidence… → Upload to Jira Cloud…**. The server revalidates both approvals, the issue, allowlist, PNG hash, safety state, and lifecycle chain before reserving an idempotent attachment operation and recording a signed immutable receipt. Ambiguous Jira outcomes stop for reconciliation instead of blindly retrying. **Copy Jira Comment** and manual attachment remain available as a fallback; uploads never run automatically.
 
-The app opens its **Local Console** at launch by default. The console provides overview metrics, preview cards, framework/control/status filters, lifecycle review, evidence reveal, local workspace status, and Help. The original PNG/manifests/lifecycle sidecars remain authoritative; SQLite is only a rebuildable search/audit index. Hosted upload remains optional. The app also includes native search, recent history, offline retry, configurable retention, Launch at Login, Screen Recording recovery, and secure release checks.
+The app opens its **Local Console** at launch by default. The console provides overview metrics, a unified local/S3 screenshot library, storage/framework/control/period/status filters, control/period/framework grouping, lifecycle review for local artifacts, verified local previews, paired-manifest S3 previews with explicit provenance state, evidence reveal, workspace status, and Help. Without a verified S3 configuration it stays local-only; an S3 failure never hides local evidence. The original PNG/manifests/lifecycle sidecars remain authoritative; SQLite is only a rebuildable search/audit index. Hosted upload remains optional. The app also includes native search, recent history, offline retry, configurable retention, Launch at Login, Screen Recording recovery, and secure release checks.
 
 ## Configuration
 

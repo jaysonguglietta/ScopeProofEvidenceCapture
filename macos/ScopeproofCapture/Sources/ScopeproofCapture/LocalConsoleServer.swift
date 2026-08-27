@@ -1,6 +1,7 @@
 @preconcurrency import AppKit
 import CryptoKit
 import Foundation
+import ImageIO
 import Network
 
 enum LocalConsoleFailure: LocalizedError {
@@ -34,21 +35,35 @@ final class LocalConsoleServer {
         let autoUpload: Bool
         let retentionDays: Int
         let summary: LocalEvidenceSummary
+        let s3Configured: Bool
+        let s3InventoryState: String
+        let s3Bucket: String
+        let s3Prefix: String
+        let s3DownloadsAllowed: Bool
     }
 
     private let evidenceRoot: URL
     private let preferences: CapturePreferences
+    private let s3Service: S3StorageService
     private let requestCapture: @MainActor () -> Void
+    private let openS3Browser: @MainActor () -> Void
     private let queue = DispatchQueue(label: "com.scopeproof.capture.local-console", qos: .userInitiated)
     private var listener: NWListener?
     private var port: UInt16?
     private let sessionToken = LocalConsoleServer.randomToken(byteCount: 32)
     private var storedIndex: LocalEvidenceIndex?
+    private var s3Cache: S3InventoryCache?
 
-    init(evidenceRoot: URL, preferences: CapturePreferences, requestCapture: @escaping @MainActor () -> Void) {
+    init(
+        evidenceRoot: URL, preferences: CapturePreferences, s3Service: S3StorageService,
+        requestCapture: @escaping @MainActor () -> Void,
+        openS3Browser: @escaping @MainActor () -> Void
+    ) {
         self.evidenceRoot = evidenceRoot.standardizedFileURL
         self.preferences = preferences
+        self.s3Service = s3Service
         self.requestCapture = requestCapture
+        self.openS3Browser = openS3Browser
     }
 
     var isRunning: Bool { listener != nil && port != nil }
@@ -163,7 +178,18 @@ final class LocalConsoleServer {
                 let server = preferences.serverURL?.absoluteString ?? ""
                 let hosted = BackendTrust.normalizedOrigin(preferences.serverURL).flatMap(KeychainStore.readToken(for:)) != nil
                 let auditValid = try index.verifyAuditChain()
-                return .codable(Status(localUser: NSFullUserName(), evidenceRoot: evidenceRoot.path, indexState: auditValid ? "Ready · loopback only · audit verified" : "Audit verification failed", hostedConnected: hosted, hostedServer: server, autoUpload: preferences.autoUpload, retentionDays: preferences.retentionDays, summary: try index.summary()))
+                let s3Settings = preferences.s3Storage
+                return .codable(Status(
+                    localUser: NSFullUserName(), evidenceRoot: evidenceRoot.path,
+                    indexState: auditValid ? "Ready · loopback only · audit verified" : "Audit verification failed",
+                    hostedConnected: hosted, hostedServer: server, autoUpload: preferences.autoUpload,
+                    retentionDays: preferences.retentionDays, summary: try index.summary(),
+                    s3Configured: s3Settings.isConfigured, s3InventoryState: s3InventoryState(settings: s3Settings),
+                    s3Bucket: s3Settings.bucket, s3Prefix: s3Settings.prefix,
+                    s3DownloadsAllowed: s3Settings.downloadsAllowed
+                ))
+            case ("GET", "/api/library"):
+                return .codable(try await libraryPayload(forceS3Refresh: request.query["refreshS3"] == "1"))
             case ("GET", "/api/evidence"):
                 let index = try evidenceIndex()
                 try index.sync(entries: CaptureHistory.entries(in: evidenceRoot))
@@ -180,9 +206,17 @@ final class LocalConsoleServer {
                 requestCapture()
                 try evidenceIndex().recordAudit(action: "capture.requested", resourceID: "menu-bar-app")
                 return .json(status: 202, object: ["ok": true])
+            case ("POST", "/api/actions/open-s3-browser"):
+                guard preferences.s3Storage.isConfigured else { throw S3StorageFailure.notConfigured }
+                openS3Browser()
+                try evidenceIndex().recordAudit(action: "s3.browser.opened", resourceID: "configured-prefix")
+                return .json(status: 200, object: ["ok": true])
             default:
                 if request.method == "GET", let evidenceID = routeEvidenceID(request.path, suffix: "/image") {
                     return try imageResponse(evidenceID: evidenceID)
+                }
+                if request.method == "GET", let evidenceID = routeEvidenceID(request.path, suffix: "/s3-image") {
+                    return try await s3ImageResponse(evidenceID: evidenceID)
                 }
                 if request.method == "POST", let evidenceID = routeEvidenceID(request.path, suffix: "/review") {
                     return try reviewResponse(evidenceID: evidenceID, request: request)
@@ -216,6 +250,143 @@ final class LocalConsoleServer {
             throw LocalConsoleFailure.invalidBody("The evidence image failed its integrity check.")
         }
         return .data(status: 200, contentType: "image/png", body: data, cache: "private, max-age=60")
+    }
+
+    private func s3ImageResponse(evidenceID: String) async throws -> HTTPResponse {
+        guard evidenceID.count <= 80,
+              evidenceID.range(of: #"^EV-[A-Z0-9]+$"#, options: .regularExpression) != nil,
+              let cache = s3Cache else {
+            throw LocalConsoleFailure.notFound
+        }
+        let settings = preferences.s3Storage
+        guard settings == cache.settings, settings.downloadsAllowed,
+              let credentials = KeychainStore.readS3Credentials(),
+              let binding = KeychainStore.readS3VerifiedDestination(), binding.matches(settings) else {
+            throw S3StorageFailure.verificationRequired
+        }
+        let entries = CaptureHistory.entries(in: evidenceRoot)
+        let receiptBindings = EvidenceLibraryBuilder.verifiedReceiptBindings(
+            entries: entries, settings: settings, destination: binding
+        )
+        let screenshots = EvidenceLibraryBuilder.s3Screenshots(
+            objects: cache.objects, prefix: settings.prefix, receiptBindings: receiptBindings
+        )
+        guard let screenshot = screenshots.first(where: { $0.evidenceID == evidenceID }),
+              screenshot.size >= 0, screenshot.size <= 40 * 1024 * 1024 else {
+            throw LocalConsoleFailure.notFound
+        }
+        if let localEntry = entries.first(where: { $0.manifest.evidenceID == evidenceID }) {
+            guard screenshot.receiptBinding?.imageSHA256 == localEntry.manifest.sha256 else {
+                throw S3StorageFailure.invalidEvidence
+            }
+        }
+        let previewDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("Scopeproof Console Preview-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: previewDirectory, withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        defer { try? FileManager.default.removeItem(at: previewDirectory) }
+        let previewURL = previewDirectory.appendingPathComponent("\(evidenceID).png", isDirectory: false)
+        let manifestURL = previewDirectory.appendingPathComponent("\(evidenceID).json", isDirectory: false)
+        let manifestDownload = try await s3Service.downloadObject(
+            screenshot.manifestObject, settings: settings, credentials: credentials,
+            binding: binding, to: manifestURL
+        )
+        let manifestData = try Data(contentsOf: manifestURL, options: [.mappedIfSafe])
+        guard manifestData.count <= 2 * 1024 * 1024,
+              manifestDownload.versionID == screenshot.manifestObject.versionID,
+              let manifest = try? JSONDecoder().decode(CaptureManifest.self, from: manifestData),
+              manifest.schemaVersion == 6,
+              manifest.evidenceID == screenshot.evidenceID,
+              manifest.screenshotFilename == screenshot.filename,
+              manifest.sha256.range(of: #"^[a-f0-9]{64}$"#, options: .regularExpression) != nil,
+              manifest.safetyScanSha256 == manifest.sha256,
+              screenshot.receiptBinding.map({
+                  $0.manifestVersionID == manifestDownload.versionID &&
+                  $0.manifestSHA256 == manifestDownload.sha256
+              }) ?? true else {
+            throw S3StorageFailure.invalidEvidence
+        }
+        let imageDownload = try await s3Service.downloadObject(
+            screenshot.object, settings: settings, credentials: credentials,
+            binding: binding, to: previewURL
+        )
+        let data = try Data(contentsOf: previewURL, options: [.mappedIfSafe])
+        guard data.count <= 40 * 1024 * 1024,
+              data.starts(with: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]),
+              imageDownload.versionID == screenshot.object.versionID,
+              imageDownload.sha256 == manifest.sha256,
+              validatedPNGDimensions(data, width: manifest.pixelWidth, height: manifest.pixelHeight),
+              screenshot.receiptBinding.map({
+                  $0.imageVersionID == imageDownload.versionID &&
+                  $0.imageSHA256 == imageDownload.sha256
+              }) ?? true else {
+            throw S3StorageFailure.unsupportedDownloadedContent
+        }
+        return .data(status: 200, contentType: "image/png", body: data)
+    }
+
+    private func libraryPayload(forceS3Refresh: Bool) async throws -> EvidenceLibraryPayload {
+        let index = try evidenceIndex()
+        let entries = CaptureHistory.entries(in: evidenceRoot)
+        try index.sync(entries: entries)
+        let local = try index.search(LocalEvidenceQuery(), limit: 5_000)
+        let settings = preferences.s3Storage
+        var s3: [S3ScreenshotSummary] = []
+        var state = s3InventoryState(settings: settings)
+        var warning: String?
+
+        if settings.isConfigured,
+           let credentials = KeychainStore.readS3Credentials(),
+            let binding = KeychainStore.readS3VerifiedDestination(), binding.matches(settings) {
+            do {
+                let objects: [S3StoredObject]
+                if !forceS3Refresh, let cache = s3Cache,
+                   cache.settings == settings, Date().timeIntervalSince(cache.loadedAt) < 60 {
+                    objects = cache.objects
+                } else {
+                    objects = try await s3Service.listObjects(settings: settings, credentials: credentials, binding: binding)
+                    s3Cache = S3InventoryCache(settings: settings, loadedAt: Date(), objects: objects)
+                }
+                let receiptBindings = EvidenceLibraryBuilder.verifiedReceiptBindings(
+                    entries: entries, settings: settings, destination: binding
+                )
+                s3 = EvidenceLibraryBuilder.s3Screenshots(
+                    objects: objects, prefix: settings.prefix, receiptBindings: receiptBindings
+                )
+                state = "Connected"
+            } catch {
+                state = "Unavailable"
+                warning = "S3 inventory is temporarily unavailable. Local evidence is still shown. Verify the destination, permissions, network, and temporary AWS session, then refresh."
+            }
+        } else if settings.isConfigured {
+            warning = "S3 is configured but not currently verified. Local evidence is shown; use S3 Evidence Storage in the menu-bar app to verify the destination."
+        }
+
+        let evidence = EvidenceLibraryBuilder.merge(local: local, s3: s3, s3PreviewsAllowed: settings.downloadsAllowed)
+        return EvidenceLibraryPayload(
+            evidence: evidence,
+            facets: .init(
+                frameworks: Array(Set(evidence.map(\.complianceArea))).sorted(),
+                controls: Array(Set(evidence.map(\.controlID))).sorted(),
+                assessmentPeriods: Array(Array(Set(evidence.map(\.assessmentPeriod).filter { !$0.isEmpty })).sorted().reversed()),
+                storageLocations: EvidenceStorageLocation.allDisplayValues
+            ),
+            storage: .init(
+                mode: state == "Connected" ? "Local + S3" : "Local", s3State: state,
+                bucket: settings.isConfigured ? settings.bucket : "", prefix: settings.isConfigured ? settings.prefix : "",
+                downloadsAllowed: settings.downloadsAllowed,
+                warning: warning, refreshedAt: ISO8601DateFormatter().string(from: Date())
+            )
+        )
+    }
+
+    private func s3InventoryState(settings: S3StorageSettings) -> String {
+        guard settings.isConfigured else { return "Not configured" }
+        guard KeychainStore.readS3Credentials() != nil,
+              KeychainStore.readS3VerifiedDestination()?.matches(settings) == true else { return "Verification required" }
+        return "Ready"
     }
 
     private func reviewResponse(evidenceID: String, request: HTTPRequest) throws -> HTTPResponse {
@@ -270,6 +441,18 @@ final class LocalConsoleServer {
 
     private var sessionCookie: String { "scopeproof_local=\(sessionToken); Path=/; HttpOnly; SameSite=Strict; Max-Age=43200" }
     private func sha256(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
+
+    private func validatedPNGDimensions(_ data: Data, width: Int, height: Int) -> Bool {
+        guard width > 0, height > 0, width <= 32_768, height <= 32_768,
+              width.multipliedReportingOverflow(by: height).overflow == false,
+              width * height <= 100_000_000,
+              let source = CGImageSourceCreateWithData(data as CFData, nil),
+              CGImageSourceGetCount(source) == 1,
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue == width,
+              (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue == height else { return false }
+        return true
+    }
     private static func randomToken(byteCount: Int) -> String {
         Data((0..<byteCount).map { _ in UInt8.random(in: .min ... .max) }).base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
     }
@@ -281,6 +464,37 @@ private struct EvidencePayload: Encodable {
     struct Facets: Encodable { let frameworks: [String]; let controls: [String] }
     let evidence: [LocalEvidenceRecord]
     let facets: Facets
+}
+
+private struct EvidenceLibraryPayload: Encodable {
+    struct Facets: Encodable {
+        let frameworks: [String]
+        let controls: [String]
+        let assessmentPeriods: [String]
+        let storageLocations: [String]
+    }
+    struct Storage: Encodable {
+        let mode: String
+        let s3State: String
+        let bucket: String
+        let prefix: String
+        let downloadsAllowed: Bool
+        let warning: String?
+        let refreshedAt: String
+    }
+    let evidence: [EvidenceLibraryRecord]
+    let facets: Facets
+    let storage: Storage
+}
+
+private struct S3InventoryCache {
+    let settings: S3StorageSettings
+    let loadedAt: Date
+    let objects: [S3StoredObject]
+}
+
+private extension EvidenceStorageLocation {
+    static let allDisplayValues = [local.rawValue, s3.rawValue, localAndS3.rawValue]
 }
 
 private struct HTTPRequest {

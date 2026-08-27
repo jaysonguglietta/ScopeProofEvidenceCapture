@@ -28,6 +28,17 @@ jobs:
         run: npm audit --audit-level=high
       - name: Verify the production dependency graph independently
         run: npm audit --omit=dev --audit-level=high
+      - name: Enable the pinned AWS infrastructure package manager
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.19.0 --activate
+      - name: Validate and synthesize the AWS CDK foundation
+        working-directory: infra/aws/cdk
+        run: |
+          pnpm install --frozen-lockfile --ignore-scripts
+          pnpm test
+          pnpm run synth
+          pnpm audit --audit-level high
       - name: Generate CycloneDX SBOM
         run: npm sbom --sbom-format=cyclonedx > scopeproof-sbom.cdx.json
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
