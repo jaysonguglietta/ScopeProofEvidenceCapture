@@ -360,14 +360,13 @@ coverage with no-build analysis on Linux, and initializes Swift with
 Every language uses the `security-extended` query suite. GitHub actions are
 pinned to immutable commit SHAs and checkout credentials are not persisted.
 
-After this workflow is merged to `main`, switch the repository from default
-setup to advanced setup under **Settings → Advanced Security → CodeQL
-analysis**. Do not disable a working default configuration before the advanced
-workflow exists on the default branch. Require all three advanced checks—Swift,
-JavaScript/TypeScript, and Actions—and confirm the CodeQL tool-status page shows
-current coverage for each language. GitHub's default setup blocks custom
-CodeQL analysis uploads while it is enabled, so this repository-setting change
-is an explicit post-merge gate rather than a source-code side effect.
+GitHub default setup was disabled on 2026-08-27 after the advanced workflow was
+opened in the pull request, because default setup rejects custom CodeQL result
+uploads. Merge this workflow to `main` promptly; until then, the default branch
+does not contain the replacement workflow. Require all three advanced checks—
+Swift, JavaScript/TypeScript, and Actions—and confirm the CodeQL tool-status page
+shows current coverage for each language after the merge. Existing alerts are
+preserved by GitHub during the setup transition.
 
 ## Known external dependencies
 

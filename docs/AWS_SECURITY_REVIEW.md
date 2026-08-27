@@ -475,10 +475,12 @@ deployed.
   require public update keys to be canonical, currently valid, unique P-256
   points. No workflow run, Apple submission, artifact publication, or updater
   discovery test has occurred.
-- **Advanced CodeQL needs repository activation:** The SHA-pinned workflow uses
-  a manual arm64 Swift build and separate JavaScript/TypeScript and Actions
-  jobs. GitHub default setup must be disabled in favor of advanced setup, and
-  all three checks must be required and observed passing.
+- **Advanced CodeQL is repository-activated but not yet on `main`:** The
+  SHA-pinned workflow uses a manual arm64 Swift build and separate
+  JavaScript/TypeScript and Actions jobs. GitHub default setup was disabled on
+  2026-08-27 so advanced-analysis uploads are accepted. Until this pull request
+  is merged, `main` does not contain that workflow; merge promptly, require all
+  three checks, and confirm current coverage for every language.
 - **Placeholder domain:** `jsontechology.com` generates a warning, not a hard deployment refusal. `hostedZoneId` is optional and can create a new public zone. Production should require proof of an owned delegated zone and approved certificate/DNS change procedure.
 - **No source-connected Amplify build:** `CfnApp` has no repository configuration and the branch disables automatic builds. This is good evidence that nothing was deployed, but it is also a production blocker requiring a controlled, signed build pipeline.
 - **Manual alert confirmation:** Email SNS subscriptions require confirmation. Infrastructure creation does not mean notification delivery works.
