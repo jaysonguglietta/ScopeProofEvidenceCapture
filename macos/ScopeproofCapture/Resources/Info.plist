@@ -5,6 +5,7 @@
   <key>ScopeproofUpdatePublicKeys</key><array/>
   <key>ScopeproofUpdateTeamIdentifier</key><string></string>
   <key>ScopeproofUpdateDesignatedRequirement</key><string></string>
+  <key>ScopeproofUpdateDownloadOrigin</key><string></string>
   <key>CFBundleDisplayName</key><string>Scopeproof Capture</string>
   <key>CFBundleExecutable</key><string>ScopeproofCapture</string>
   <key>CFBundleIdentifier</key><string>com.scopeproof.capture</string>

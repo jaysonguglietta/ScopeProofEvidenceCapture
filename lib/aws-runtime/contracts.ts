@@ -35,11 +35,13 @@ export type TenantSecurityErrorCode =
   | "UPLOAD_INTENT_EXPIRED"
   | "UPLOAD_INTENT_REPLAYED"
   | "UPLOAD_MISMATCH"
+  | "RATE_LIMITED"
   | "ILLEGAL_STATE_TRANSITION"
   | "CONCURRENT_MODIFICATION"
   | "INVALID_AUDIT_EVENT"
   | "INVALID_JOB"
   | "RETENTION_VIOLATION"
+  | "LEGAL_HOLD_PRECONDITION_DRIFT"
   | "LEGAL_HOLD_ACTIVE";
 
 export class TenantSecurityError extends Error {
@@ -181,7 +183,7 @@ const structuralObjectKeys = new Set(["__proto__", "constructor", "prototype"]);
 
 export function assertSafeJson(value: unknown, label = "Details", depth = 0): JsonValue {
   if (depth > 8) throw new TenantSecurityError("INVALID_AUDIT_EVENT", `${label} is too deeply nested.`);
-  if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+  if (value === null || typeof value === "string" || typeof value === "boolean") return value as JsonPrimitive;
   if (typeof value === "number" && Number.isFinite(value)) return value;
   if (Array.isArray(value)) {
     if (value.length > 200) throw new TenantSecurityError("INVALID_AUDIT_EVENT", `${label} contains too many entries.`);

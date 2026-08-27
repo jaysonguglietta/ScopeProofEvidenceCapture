@@ -3,7 +3,7 @@ import { createHash, createPrivateKey, createPublicKey, sign } from "node:crypto
 import { readFile, writeFile } from "node:fs/promises";
 import { basename, resolve } from "node:path";
 
-const required = ["SCOPEPROOF_UPDATE_PRIVATE_KEY", "SCOPEPROOF_UPDATE_PUBLIC_KEY_X963_BASE64", "SCOPEPROOF_UPDATE_KEY_ID", "SCOPEPROOF_RELEASE_VERSION", "SCOPEPROOF_RELEASE_SEQUENCE", "SCOPEPROOF_RELEASE_URL", "SCOPEPROOF_RELEASE_TEAM_ID", "SCOPEPROOF_RELEASE_REQUIREMENT"];
+const required = ["SCOPEPROOF_UPDATE_PRIVATE_KEY", "SCOPEPROOF_UPDATE_PUBLIC_KEY_X963_BASE64", "SCOPEPROOF_UPDATE_KEY_ID", "SCOPEPROOF_RELEASE_VERSION", "SCOPEPROOF_RELEASE_SEQUENCE", "SCOPEPROOF_RELEASE_URL", "SCOPEPROOF_RELEASE_DOWNLOAD_ORIGIN", "SCOPEPROOF_RELEASE_TEAM_ID", "SCOPEPROOF_RELEASE_REQUIREMENT"];
 for (const name of required) if (!process.env[name]) throw new Error(`${name} is required.`);
 const artifactPath = resolve(process.argv[2] || "");
 const outputPath = resolve(process.argv[3] || "macos-release-envelope.json");
@@ -24,7 +24,24 @@ const manifest = {
   keyId: process.env.SCOPEPROOF_UPDATE_KEY_ID,
   notes: process.env.SCOPEPROOF_RELEASE_NOTES || `Scopeproof Capture ${process.env.SCOPEPROOF_RELEASE_VERSION}`,
 };
-if (!/^\d+\.\d+\.\d+$/.test(manifest.version) || !Number.isSafeInteger(manifest.sequence) || manifest.sequence < 1 || !/^https:\/\//.test(manifest.downloadUrl) || !/^[A-Z0-9]{10}$/.test(manifest.teamIdentifier)) throw new Error("Release manifest inputs are invalid.");
+let downloadOrigin;
+let downloadUrl;
+try {
+  downloadOrigin = new URL(process.env.SCOPEPROOF_RELEASE_DOWNLOAD_ORIGIN);
+  downloadUrl = new URL(manifest.downloadUrl);
+} catch {
+  throw new Error("Release download origin and URL must be valid absolute URLs.");
+}
+const expectedArtifactName = `Scopeproof-Capture-${manifest.version}.zip`;
+const expectedDownloadUrl = `${downloadOrigin.origin}/macos/${manifest.version}/${expectedArtifactName}`;
+if (!/^\d+\.\d+\.\d+$/.test(manifest.version) || !Number.isSafeInteger(manifest.sequence) || manifest.sequence < 1
+    || downloadOrigin.protocol !== "https:" || downloadOrigin.username || downloadOrigin.password || downloadOrigin.port
+    || downloadOrigin.search || downloadOrigin.hash || downloadOrigin.pathname !== "/"
+    || process.env.SCOPEPROOF_RELEASE_DOWNLOAD_ORIGIN !== downloadOrigin.origin
+    || downloadUrl.href !== expectedDownloadUrl
+    || basename(artifactPath) !== expectedArtifactName || !/^[A-Z0-9]{10}$/.test(manifest.teamIdentifier)) {
+  throw new Error("Release manifest inputs or immutable download path are invalid.");
+}
 const payload = ["scopeproof-update-manifest-v1", manifest.schemaVersion, manifest.version, manifest.sequence, manifest.downloadUrl, manifest.sha256, manifest.byteSize, manifest.publishedAt, manifest.expiresAt, manifest.minimumSystemVersion, manifest.teamIdentifier, manifest.designatedRequirement, manifest.keyId, Buffer.from(manifest.notes, "utf8").toString("base64")].join("\n");
 const privateKey = createPrivateKey(await readFile(resolve(process.env.SCOPEPROOF_UPDATE_PRIVATE_KEY), "utf8"));
 const publicJwk = createPublicKey(privateKey).export({ format: "jwk" });

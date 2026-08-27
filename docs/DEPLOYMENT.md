@@ -85,13 +85,13 @@ The GitHub Releases page may also contain an explicitly labeled development-prev
 
 For managed distribution:
 
-1. Build with `./Scripts/build_macos_capture.sh`.
-2. For managed production distribution, set `SCOPEPROOF_CODESIGN_IDENTITY` to a trusted Developer ID Application identity.
-3. Set `SCOPEPROOF_NOTARY_PROFILE` to a Keychain profile created for `xcrun notarytool` when notarization is required.
+1. Create the production candidate with the protected `.github/workflows/macos-production-release.yml` workflow for the approved full commit.
+2. Download its exact seven-file artifact set; do not rebuild or re-archive the ZIP during publication.
+3. Verify the candidate on macOS with `./Scripts/publish_release.sh`, including `SCOPEPROOF_RELEASE_CANDIDATE_DIR`, `SCOPEPROOF_RELEASE_ATTESTATION_REPOSITORY`, and `SCOPEPROOF_RELEASE_EXPECTED_COMMIT`.
 4. Generate an offline P-256 release key, compile its X9.63 public key and validity window into `ScopeproofUpdatePublicKeys` in `Info.plist`, and keep the private key outside the repository.
    `./Scripts/configure_macos_release_identity.sh` validates and writes the public release identity from `SCOPEPROOF_UPDATE_*` and `SCOPEPROOF_RELEASE_*` variables. Review and commit only that public metadata.
-5. Set the `SCOPEPROOF_UPDATE_*` and `SCOPEPROOF_RELEASE_*` variables required by `./Scripts/publish_release.sh`. The script refuses unsigned, non-notarized, identity-mismatched, or key-mismatched releases and emits `DerivedData/macos-release-envelope.json`.
-6. Publish the exact ZIP to its final HTTPS origin. Store only the envelope's `manifest` as `MACOS_RELEASE_MANIFEST_JSON`, its `signatureDERBase64` as `MACOS_RELEASE_SIGNATURE_DER_BASE64`, and configure the exact hostname in `MACOS_RELEASE_ALLOWED_HOSTS`.
+5. Compile the exact HTTPS `ScopeproofUpdateDownloadOrigin` into `Info.plist`, then set the remaining `SCOPEPROOF_UPDATE_*` and `SCOPEPROOF_RELEASE_*` variables required by `./Scripts/publish_release.sh`. The final URL must be `<compiled-origin>/macos/<version>/Scopeproof-Capture-<version>.zip`. The script privately snapshots all seven candidate files before verification, refuses unattested, checksum/provenance-mismatched, unsigned, non-notarized, identity-mismatched, or key-mismatched candidates, and emits an envelope under `DerivedData/Publication/` over the exact snapshot ZIP.
+6. Publish the exact ZIP to that immutable versioned HTTPS path. Store only the envelope's `manifest` as `MACOS_RELEASE_MANIFEST_JSON`, its `signatureDERBase64` as `MACOS_RELEASE_SIGNATURE_DER_BASE64`, and configure the exact hostname in `MACOS_RELEASE_ALLOWED_HOSTS`. The client derives the URL from its compiled origin, rejects redirects, verifies the embedded bundle identifier/version, and stores a device-only Keychain `(sequence, version, SHA-256)` tuple to prevent rollback and same-sequence equivocation.
 7. If hosted synchronization is enabled, enroll each Mac separately from **Connections**. Revoke devices when reassigned, lost, or retired. Leave the native Server URL blank when policy requires local-only operation.
 8. Approve Documents Folder access and verify that `~/Documents/Scopeproof Evidence` is covered by the intended FileVault, backup, DLP, retention, and recovery policies. Disable or explicitly approve iCloud Drive and enterprise synchronization for that evidence classification. Inventory the legacy `~/Pictures/Scopeproof Evidence` root until its retained evidence expires or is dispositioned.
 

@@ -15,7 +15,7 @@ test("neutralizes spreadsheet formulas in every server CSV cell", () => {
 
 test("strictly validates signed release envelopes and approved download hosts", () => {
   const now = new Date("2026-08-11T12:00:00Z");
-  const manifest = { schemaVersion: 1 as const, version: "2.0.0", sequence: 20, downloadUrl: "https://downloads.example.test/Scopeproof-Capture.zip", sha256: "a".repeat(64), byteSize: 1024, publishedAt: "2026-08-11T11:00:00.000Z", expiresAt: "2026-09-01T12:00:00.000Z", minimumSystemVersion: "14.0", teamIdentifier: "ABCDE12345", designatedRequirement: 'identifier "com.scopeproof.capture" and anchor apple generic', keyId: "release-2026", notes: "Security release" };
+  const manifest = { schemaVersion: 1 as const, version: "2.0.0", sequence: 20, downloadUrl: "https://downloads.example.test/macos/2.0.0/Scopeproof-Capture-2.0.0.zip", sha256: "a".repeat(64), byteSize: 1024, publishedAt: "2026-08-11T11:00:00.000Z", expiresAt: "2026-09-01T12:00:00.000Z", minimumSystemVersion: "14.0", teamIdentifier: "ABCDE12345", designatedRequirement: 'identifier "com.scopeproof.capture" and anchor apple generic', keyId: "release-2026", notes: "Security release" };
   const env = { MACOS_RELEASE_MANIFEST_JSON: JSON.stringify(manifest), MACOS_RELEASE_SIGNATURE_DER_BASE64: "A".repeat(96), MACOS_RELEASE_ALLOWED_HOSTS: "downloads.example.test" } as ScopeproofEnv;
   assert.deepEqual(configuredMacRelease(env, now).manifest, manifest);
   assert.match(releaseSigningPayload(manifest), /^scopeproof-update-manifest-v1\n1\n2\.0\.0\n20\n/);
@@ -45,7 +45,7 @@ test("production hardening bounds abuse, claims jobs atomically, and enforces re
   assert.match(packages, /status = 'approved' AND expires_at > \?/); assert.match(packages, /csvCell/);
   for (const table of ["rate_limit_buckets", "retention_holds"]) assert.ok(migration.includes(`CREATE TABLE \`${table}\``));
   assert.match(backend, /productionOrigins/); assert.match(backend, /completionHandler\(nil\)/); assert.match(backend, /sameOrigin/);
-  assert.match(updater, /isValidSignature/); assert.match(updater, /codesign/); assert.match(updater, /TeamIdentifier/); assert.match(updater, /stapler/); assert.match(updater, /highestUpdateSequence/);
+  assert.match(updater, /isValidSignature/); assert.match(updater, /codesign/); assert.match(updater, /TeamIdentifier/); assert.match(updater, /stapler/); assert.match(updater, /previousRelease/);
   assert.match(releaseRoute, /configuredMacRelease/);
 });
 

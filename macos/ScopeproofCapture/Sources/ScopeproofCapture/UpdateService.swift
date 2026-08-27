@@ -34,6 +34,20 @@ struct TrustedUpdateKey: Sendable {
     let notAfter: Date
 }
 
+struct VerifiedUpdateRelease: Codable, Equatable, Sendable {
+    let schemaVersion: Int
+    let sequence: Int
+    let version: String
+    let sha256: String
+
+    init(sequence: Int, version: String, sha256: String) {
+        self.schemaVersion = 1
+        self.sequence = sequence
+        self.version = version
+        self.sha256 = sha256
+    }
+}
+
 enum UpdateFailure: LocalizedError {
     case invalidMetadata(String)
     case untrustedSignature
@@ -70,12 +84,29 @@ enum ReleaseVerifier {
         }
     }
 
-    static func verify(_ envelope: ReleaseEnvelope, keys: [TrustedUpdateKey], expectedTeamIdentifier: String, expectedDesignatedRequirement: String, installedVersion: String, highestSequence: Int, now: Date = Date()) throws -> ReleaseManifest {
+    static func configuredDownloadOrigin(bundle: Bundle = .main) -> URL? {
+        guard let value = bundle.object(forInfoDictionaryKey: "ScopeproofUpdateDownloadOrigin") as? String,
+              let url = URL(string: value), url.scheme == "https", url.user == nil, url.password == nil,
+              url.query == nil, url.fragment == nil, url.port == nil, url.path.isEmpty,
+              let host = url.host, !host.isEmpty, value == "https://\(host)" else { return nil }
+        return url
+    }
+
+    static func approvedDownloadURL(_ url: URL, version: String, origin: URL) -> Bool {
+        url.absoluteString == "\(origin.absoluteString)/macos/\(version)/Scopeproof-Capture-\(version).zip"
+    }
+
+    static func approvedBundleMetadata(identifier: String, version: String, manifest: ReleaseManifest) -> Bool {
+        identifier == "com.scopeproof.capture" && version == manifest.version
+    }
+
+    static func verify(_ envelope: ReleaseEnvelope, keys: [TrustedUpdateKey], expectedTeamIdentifier: String, expectedDesignatedRequirement: String, expectedDownloadOrigin: URL, installedVersion: String, previousRelease: VerifiedUpdateRelease?, now: Date = Date()) throws -> ReleaseManifest {
         let manifest = envelope.manifest
         let formatter = ISO8601DateFormatter()
         guard manifest.schemaVersion == 1, manifest.version.range(of: "^\\d+\\.\\d+\\.\\d+$", options: .regularExpression) != nil, manifest.sequence > 0, manifest.byteSize > 0, manifest.byteSize <= 500 * 1024 * 1024,
               manifest.sha256.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil,
               manifest.teamIdentifier == expectedTeamIdentifier, manifest.designatedRequirement == expectedDesignatedRequirement,
+              approvedDownloadURL(manifest.downloadUrl, version: manifest.version, origin: expectedDownloadOrigin),
               let published = formatter.date(from: manifest.publishedAt), let expires = formatter.date(from: manifest.expiresAt),
               published <= now.addingTimeInterval(300), expires > now, expires.timeIntervalSince(published) <= 45 * 86_400,
               compareVersions(currentSystemVersion(), manifest.minimumSystemVersion) != .orderedAscending else {
@@ -87,7 +118,14 @@ enum ReleaseVerifier {
               let publicKey = try? P256.Signing.PublicKey(x963Representation: keyData),
               let signature = try? P256.Signing.ECDSASignature(derRepresentation: signatureData),
               publicKey.isValidSignature(signature, for: manifest.signingPayload) else { throw UpdateFailure.untrustedSignature }
-        if manifest.sequence < highestSequence || compareVersions(manifest.version, installedVersion) == .orderedAscending { throw UpdateFailure.rollback }
+        if let previousRelease {
+            if manifest.sequence < previousRelease.sequence { throw UpdateFailure.rollback }
+            if manifest.sequence == previousRelease.sequence,
+               (manifest.version != previousRelease.version || manifest.sha256 != previousRelease.sha256) {
+                throw UpdateFailure.rollback
+            }
+        }
+        if compareVersions(manifest.version, installedVersion) == .orderedAscending { throw UpdateFailure.rollback }
         return manifest
     }
 
@@ -105,7 +143,6 @@ enum ReleaseVerifier {
 }
 
 actor UpdateService {
-    private let approvedDownloadOrigins: Set<String> = ["https://scopeproof-pci.jayson-guglietta.chatgpt.site", "https://github.com"]
     private var appVersion: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.8.1" }
 
     func check(serverURL: URL?) async throws -> ReleaseManifest? {
@@ -118,14 +155,17 @@ actor UpdateService {
         let (data, response) = try await BackendHTTP.data(for: request, audience: server)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode), data.count <= 32 * 1024,
               let envelope = try? JSONDecoder().decode(ReleaseEnvelope.self, from: data) else { throw UploadFailure.invalidResponse }
-        guard let identity = ReleaseVerifier.configuredIdentity() else { throw UpdateFailure.invalidMetadata("the compiled update identity is not configured") }
-        let release = try ReleaseVerifier.verify(envelope, keys: ReleaseVerifier.trustedKeys(), expectedTeamIdentifier: identity.teamIdentifier, expectedDesignatedRequirement: identity.designatedRequirement, installedVersion: appVersion, highestSequence: KeychainStore.highestUpdateSequence())
+        guard let identity = ReleaseVerifier.configuredIdentity(), let downloadOrigin = ReleaseVerifier.configuredDownloadOrigin() else { throw UpdateFailure.invalidMetadata("the compiled update identity or download origin is not configured") }
+        let release = try ReleaseVerifier.verify(envelope, keys: ReleaseVerifier.trustedKeys(), expectedTeamIdentifier: identity.teamIdentifier, expectedDesignatedRequirement: identity.designatedRequirement, expectedDownloadOrigin: downloadOrigin, installedVersion: appVersion, previousRelease: KeychainStore.verifiedUpdateFloor())
         return ReleaseVerifier.compareVersions(release.version, appVersion) == .orderedSame ? nil : release
     }
 
     func downloadAndVerify(_ manifest: ReleaseManifest) async throws -> URL {
-        guard manifest.downloadUrl.pathExtension.lowercased() == "zip" else { throw UpdateFailure.invalidArtifact("Only signed ZIP releases are accepted.") }
-        let (download, _) = try await BackendHTTP.download(manifest.downloadUrl, approvedOrigins: approvedDownloadOrigins, maximumBytes: manifest.byteSize)
+        guard let downloadOrigin = ReleaseVerifier.configuredDownloadOrigin(),
+              ReleaseVerifier.approvedDownloadURL(manifest.downloadUrl, version: manifest.version, origin: downloadOrigin) else {
+            throw UpdateFailure.unapprovedDownload
+        }
+        let (download, _) = try await BackendHTTP.download(manifest.downloadUrl, approvedOrigins: [downloadOrigin.absoluteString], maximumBytes: manifest.byteSize)
         defer { try? FileManager.default.removeItem(at: download) }
         let data = try Data(contentsOf: download, options: [.mappedIfSafe])
         guard data.count == manifest.byteSize, SHA256.hash(data: data).map({ String(format: "%02x", $0) }).joined() == manifest.sha256 else { throw UpdateFailure.invalidArtifact("SHA-256 or byte size does not match the signed manifest.") }
@@ -140,6 +180,12 @@ actor UpdateService {
         let apps = extracted.filter { $0.lastPathComponent == "Scopeproof Capture.app" }
         guard apps.count == 1, (try apps[0].resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) != true else { throw UpdateFailure.invalidArtifact("The archive must contain exactly one non-symlink Scopeproof Capture.app.") }
         let app = apps[0]
+        let infoPlist = app.appendingPathComponent("Contents/Info.plist")
+        let bundleIdentifier = try run("/usr/bin/plutil", ["-extract", "CFBundleIdentifier", "raw", "-o", "-", infoPlist.path]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let bundleVersion = try run("/usr/bin/plutil", ["-extract", "CFBundleShortVersionString", "raw", "-o", "-", infoPlist.path]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard ReleaseVerifier.approvedBundleMetadata(identifier: bundleIdentifier, version: bundleVersion, manifest: manifest) else {
+            throw UpdateFailure.invalidArtifact("The signed app bundle identity or version does not match the release manifest.")
+        }
         _ = try run("/usr/bin/codesign", ["--verify", "--deep", "--strict", "--verbose=2", "-R", manifest.designatedRequirement, app.path])
         let signing = try run("/usr/bin/codesign", ["-dv", "--verbose=4", app.path], includeStandardError: true)
         guard signing.contains("TeamIdentifier=\(manifest.teamIdentifier)") else { throw UpdateFailure.invalidArtifact("Developer ID team does not match the signed manifest.") }
@@ -151,7 +197,7 @@ actor UpdateService {
         if FileManager.default.fileExists(atPath: destination.path) { try FileManager.default.removeItem(at: destination) }
         try FileManager.default.copyItem(at: download, to: destination)
         try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
-        try KeychainStore.saveHighestUpdateSequence(manifest.sequence)
+        try KeychainStore.saveVerifiedUpdateRelease(VerifiedUpdateRelease(sequence: manifest.sequence, version: manifest.version, sha256: manifest.sha256))
         return destination
     }
 

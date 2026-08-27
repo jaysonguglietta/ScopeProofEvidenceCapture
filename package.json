@@ -16,7 +16,7 @@
   },
   "dependencies": {
     "drizzle-orm": "0.45.2",
-    "fflate": "^0.8.2",
+    "fflate": "0.8.2",
     "image-size": "file:vendor/image-size",
     "react": "19.2.8",
     "react-dom": "19.2.8",

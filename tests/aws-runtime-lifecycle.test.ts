@@ -90,6 +90,7 @@ test("audit events are tenant-chained, deterministic, and secret-safe", async ()
   assert.throws(() => assertAuditContinuation(first, crossTenant), hasCode("INVALID_AUDIT_EVENT"));
   await assert.rejects(createTenantAuditEvent({ ...first, id: `evt_${"8".repeat(32)}`, details: { apiKey: "must-not-be-logged" } }), hasCode("INVALID_AUDIT_EVENT"));
   await assert.rejects(createTenantAuditEvent({ ...first, id: `evt_${"9".repeat(32)}`, details: JSON.parse('{"__proto__":{"polluted":true}}') }), hasCode("INVALID_AUDIT_EVENT"));
+  await assert.rejects(createTenantAuditEvent({ ...first, id: `evt_${"a".repeat(32)}`, details: ["not", "an", "object"] }), hasCode("INVALID_AUDIT_EVENT"));
 });
 
 test("jobs enforce exact tenant envelopes, leases, retries, DLQ, and privileged redrive", () => {

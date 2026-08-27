@@ -7,9 +7,26 @@ export interface TenantDefinition {
 }
 
 export interface TenantDatabaseIdentifiers {
+  readonly controlUsername: string;
   readonly databaseName: string;
+  readonly ingestUsername: string;
+  readonly legalApiUsername: string;
   readonly ownerUsername: string;
   readonly runtimeUsername: string;
+}
+
+export function tenantEvidenceControlRoleName(tenant: TenantDefinition): string {
+  if (!/^ten_[a-f0-9]{32}$/.test(tenant.id) || !/^(?=.{1,48}$)[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(tenant.slug)) {
+    throw new Error("Tenant evidence-control role names require a validated tenant.");
+  }
+  const directName = `sp-${tenant.slug}-evidence-control`;
+  if (directName.length <= 64) return directName;
+
+  // Preserve both a readable slug stem and an immutable tenant-id suffix so
+  // long slugs with a shared prefix cannot collapse to the same IAM role name.
+  const name = `sp-${tenant.slug.slice(0, 31)}-${tenant.id.slice(4, 16)}-evidence-control`;
+  if (name.length > 64) throw new Error("Derived evidence-control IAM role name exceeds AWS's limit.");
+  return name;
 }
 
 export function validateAlertEmail(value: unknown): string | undefined {
@@ -131,12 +148,18 @@ export function tenantDatabaseIdentifiers(tenant: TenantDefinition): TenantDatab
   const roleStem = normalizedSlug.slice(0, 11);
   const tenantSuffix = tenant.id.slice(4);
   const identifiers = {
+    controlUsername: `tenant_${roleStem}_${tenantSuffix}_control`,
     databaseName: `scopeproof_${normalizedSlug}`,
+    ingestUsername: `tenant_${roleStem}_${tenantSuffix}_ingest`,
+    legalApiUsername: `tenant_${roleStem}_${tenantSuffix}_legal_api`,
     ownerUsername: `scopeproof_${roleStem}_${tenantSuffix}_owner`,
     runtimeUsername: `tenant_${roleStem}_${tenantSuffix}_app_runtime`,
   };
   if (
+    identifiers.controlUsername.length > 63 ||
     identifiers.databaseName.length > 63 ||
+    identifiers.ingestUsername.length > 63 ||
+    identifiers.legalApiUsername.length > 63 ||
     identifiers.ownerUsername.length > 63 ||
     identifiers.runtimeUsername.length > 63
   ) {

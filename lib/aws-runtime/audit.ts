@@ -37,7 +37,7 @@ export interface TenantAuditEvent {
   readonly resourceId: ResourceId;
   readonly requestId: string;
   readonly outcome: "succeeded" | "denied" | "failed";
-  readonly details: JsonValue;
+  readonly details: Readonly<Record<string, JsonValue>>;
   readonly previousHash: Sha256Hex | "GENESIS";
   readonly eventHash: Sha256Hex;
 }
@@ -60,7 +60,11 @@ export async function createTenantAuditEvent(input: Omit<TenantAuditEvent, "sche
   const requestId = assertBoundedText(input.requestId, "Audit request id", 3, 200);
   if (!/^[a-z][a-z0-9_.:-]*$/.test(action) || !/^[a-z][a-z0-9_.:-]*$/.test(resourceType)) throw new TenantSecurityError("INVALID_AUDIT_EVENT", "Audit action or resource type is invalid.");
   if (!['succeeded', 'denied', 'failed'].includes(input.outcome)) throw new TenantSecurityError("INVALID_AUDIT_EVENT", "Audit outcome is invalid.");
-  const details = assertSafeJson(input.details);
+  const safeDetails = assertSafeJson(input.details);
+  if (!safeDetails || typeof safeDetails !== "object" || Array.isArray(safeDetails)) {
+    throw new TenantSecurityError("INVALID_AUDIT_EVENT", "Audit details must be a JSON object.");
+  }
+  const details = Object.freeze(safeDetails as Record<string, JsonValue>);
   const occurredAt = canonicalInstant(input.occurredAt, "Audit timestamp");
   const unsigned = {
     schemaVersion: 1 as const,

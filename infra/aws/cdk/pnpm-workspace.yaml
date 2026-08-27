@@ -1,0 +1,8 @@
+allowBuilds:
+  # CDK uses this pinned compiler only to produce the reviewed Lambda bundle.
+  esbuild: true
+
+# Quarantine newly published packages for one day to reduce dependency-confusion
+# and compromised-release exposure. Security fixes can use an explicitly reviewed
+# temporary exception in a dedicated change; there is no standing bypass list.
+minimumReleaseAge: 1440

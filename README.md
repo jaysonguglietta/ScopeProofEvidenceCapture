@@ -20,6 +20,8 @@ The repository contains two coordinated products:
 | AWS storage administrators | [AWS S3 evidence storage](docs/S3_STORAGE.md) |
 | AWS platform and SaaS administrators | [AWS multi-tenant hosting](docs/AWS_MULTI_TENANT_HOSTING.md) |
 | AWS deployment operators | [AWS platform runbook](docs/AWS_PLATFORM_RUNBOOK.md) |
+| Hosted runtime engineers | [AWS runtime security and evidence lifecycle](docs/AWS_RUNTIME_IMPLEMENTATION.md) |
+| Recovery and release operators | [AWS recovery and production macOS release](docs/AWS_RECOVERY_AND_MACOS_RELEASE.md) |
 | Platform administrators | [Deployment and administration](docs/DEPLOYMENT.md) |
 | Security and risk teams | [Security model and operating controls](docs/SECURITY.md) and [AWS adversarial security review](docs/AWS_SECURITY_REVIEW.md) |
 | Engineers and maintainers | [Architecture](docs/ARCHITECTURE.md) and [development guide](docs/DEVELOPMENT.md) |
@@ -32,6 +34,39 @@ The native-specific build and usage reference remains in [macos/ScopeproofCaptur
 The selected production target is an AWS-only hosted runtime with explicit tenant subdomains such as `acme.jsontechology.com`. `jsontechology.com` is a configurable placeholder and preserves the spelling supplied for planning. The low-idle-cost bridge architecture shares the AWS application/control plane while giving each customer a separate PostgreSQL identity, S3 evidence boundary, KMS key, and IAM role. Route 53 creates a tenant hostname only after provisioning; the hostname selects a tenant candidate, while Cognito identity plus a server-side active membership authorizes access.
 
 The synthable [AWS CDK foundation](infra/aws/cdk/README.md) creates the shared low-idle platform and explicit per-tenant resource boundaries. The [AWS platform runbook](docs/AWS_PLATFORM_RUNBOOK.md) separates local synthesis, reviewed deployment, database provisioning, and customer activation. Infrastructure or database readiness alone does not migrate or authorize the current application.
+
+The repository now includes a production-shaped, tenant-specific API Gateway/
+Lambda source path at `api-<tenant>.<domain>`. API Gateway answers `GET /health`
+without invoking Lambda; Lambda serves authenticated `GET /v1/me` and
+`POST /v1/upload-intents`. Those protected routes compose
+strict Cognito RS256/JWKS validation, exact app-client and hostname binding,
+active PostgreSQL membership/RBAC checks, temporary tenant-role credentials,
+and retry-safe DynamoDB/Aurora upload-intent reconciliation. Promotion uses
+KMS-signed receipts and replay-safe exact-version verification. The repository
+also contains a durable two-person `REQUESTED` → `APPROVED` → `APPLYING`
+→ `APPLIED` exact-version legal-hold domain workflow with stale-request
+expiry, a DynamoDB global control table,
+same-account cross-region S3/Aurora recovery with existing-version Batch
+Replication and exact replica verification, a protected macOS Developer ID/
+notarization workflow, and manual-build Swift CodeQL.
+
+These are source- and template-tested components, not a live AWS service. No AWS
+stack was deployed, no live PostgreSQL/AWS recovery drill was run, and no Apple
+artifact was submitted or notarized by this work. The Amplify customer UI still
+has no approved source/release connection; membership administration and most
+product routes remain absent. The CDK wires authenticated
+`POST /v1/legal-hold-requests` and `POST /v1/legal-hold-approvals` to a separate
+least-privilege Lambda and schedules an approved-only exact-version reconciler
+with KMS-signed audit receipts and failure/age alarms. No legal-hold UI or live
+AWS two-tenant test exists; those remain production gates.
+
+> **Existing AWS deployment stop:** the control-plane resource now synthesizes as
+> `AWS::DynamoDB::GlobalTable`. Never apply that template directly over a stack
+> that already owns the earlier `AWS::DynamoDB::Table`; CloudFormation does not
+> perform this resource-type transition as an in-place data-preserving update.
+> Use the reviewed retain/remove/convert/import migration in the
+> [AWS platform runbook](docs/AWS_PLATFORM_RUNBOOK.md#existing-control-table-migration-stop).
+> Fresh deployments are unaffected.
 
 The existing Sites/D1/R2 deployment remains the single-tenant legacy runtime until the staged migration and two-tenant security gates in the [AWS multi-tenant hosting guide](docs/AWS_MULTI_TENANT_HOSTING.md) are complete. Do not point a second customer hostname at the current hosted application.
 
@@ -106,7 +141,7 @@ Provider-specific values are documented in `.env.example`. Browser capture addit
 
 Repository SBOM generation is available in two places. The hosted console supports managed organization access or an exact one-time GitHub URL and token, then creates assessment-scoped evidence with review, comparison, approval, and package inclusion. The Mac shield menu also provides **Generate Repository SBOM…** for a direct one-time CycloneDX or SPDX export plus checksum without a hosted account. In both one-time modes the masked token is cleared on submission and never persisted. Use a repository-scoped credential with only **Metadata: read** and **Contents: read**, then revoke it after the run. See the [repository SBOM guide](docs/SBOM_GUIDE.md) for workflow differences, supported lockfiles, safety limits, and auditor interpretation.
 
-Native updates use `MACOS_RELEASE_MANIFEST_JSON`, `MACOS_RELEASE_SIGNATURE_DER_BASE64`, and `MACOS_RELEASE_ALLOWED_HOSTS`. The signed manifest binds the version, monotonic sequence, URL, digest, size, validity window, release key, Developer ID team, and designated requirement. The Mac downloads without credentials or redirects and locally verifies the signature, digest, code identity, Gatekeeper acceptance, and stapled notarization before opening the local ZIP. RFC 3161 requires the TSA and pinned-verifier settings documented in `.env.example`; configuring only a TSA URL does not create trusted time. Device enrollment and revocation are managed in **Connections → Mac capture devices**.
+Native updates use `MACOS_RELEASE_MANIFEST_JSON`, `MACOS_RELEASE_SIGNATURE_DER_BASE64`, and `MACOS_RELEASE_ALLOWED_HOSTS` at the hosted API boundary. A production app must also compile one exact `ScopeproofUpdateDownloadOrigin` such as `https://downloads.<owned-domain>` into `Info.plist`; the client derives the only allowed immutable ZIP path as `/macos/<version>/Scopeproof-Capture-<version>.zip` and rejects redirects or an alternate signed URL. The signed manifest binds the version, monotonic sequence, digest, size, validity window, release key, Developer ID team, and designated requirement. The Mac stores the last accepted `(sequence, version, digest)` tuple in a device-only Keychain item to reject rollback and same-sequence equivocation, then verifies the download digest, embedded bundle identity/version, code identity, Gatekeeper acceptance, and stapled notarization before opening the local ZIP. RFC 3161 requires the TSA and pinned-verifier settings documented in `.env.example`; configuring only a TSA URL does not create trusted time. Device enrollment and revocation are managed in **Connections → Mac capture devices**.
 
 Jira Cloud requires `JIRA_OAUTH_CLIENT_ID`, `JIRA_OAUTH_CLIENT_SECRET`, an exact `JIRA_OAUTH_CALLBACK_URL`, and a distinct base64-encoded 32-byte `JIRA_OAUTH_TOKEN_ENCRYPTION_KEY`. Create one OAuth 2.0 (3LO) integration in the Atlassian developer console with `read:jira-work` and `write:jira-work`; Scopeproof requests `offline_access` for rotating refresh tokens.
 

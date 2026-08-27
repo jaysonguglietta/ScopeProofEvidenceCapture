@@ -13,3 +13,10 @@ updates:
       interval: weekly
       day: monday
     open-pull-requests-limit: 5
+  - package-ecosystem: npm
+    directory: /infra/aws/cdk
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 10
+    versioning-strategy: increase-if-necessary

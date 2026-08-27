@@ -1,0 +1,168 @@
+name: macOS production release candidate
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Three-component version already committed in Info.plist
+        required: true
+        type: string
+      build_number:
+        description: Positive CFBundleVersion already committed in Info.plist
+        required: true
+        type: string
+      expected_commit:
+        description: Full approved 40-character commit SHA to release
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-production-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-sign-notarize:
+    if: github.ref == 'refs/heads/main'
+    runs-on: macos-15
+    timeout-minutes: 75
+    environment: production-release
+    permissions:
+      attestations: write
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out the approved source without persisted credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify the immutable release input
+        env:
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          test "$EXPECTED_COMMIT" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=normal)"
+
+      - name: Select the release evidence runtime
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22.13.0"
+
+      - name: Test the native release source before loading credentials
+        working-directory: macos/ScopeproofCapture
+        run: swift test --arch arm64
+
+      - name: Import the Developer ID identity into an ephemeral Keychain
+        env:
+          DEVELOPER_ID_P12_BASE64: ${{ secrets.MACOS_DEVELOPER_ID_P12_BASE64 }}
+          DEVELOPER_ID_P12_PASSWORD: ${{ secrets.MACOS_DEVELOPER_ID_P12_PASSWORD }}
+          NOTARY_API_KEY_P8_BASE64: ${{ secrets.MACOS_NOTARY_API_KEY_P8_BASE64 }}
+          NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+          NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+        run: |
+          set -euo pipefail
+          set +x
+          umask 077
+          for secret_name in DEVELOPER_ID_P12_BASE64 DEVELOPER_ID_P12_PASSWORD NOTARY_API_KEY_P8_BASE64 NOTARY_ISSUER_ID NOTARY_KEY_ID; do
+            test -n "${!secret_name:-}"
+          done
+
+          keychain="$RUNNER_TEMP/scopeproof-release-${GITHUB_RUN_ID}.keychain-db"
+          password_file="$RUNNER_TEMP/scopeproof-keychain-password"
+          p12_file="$RUNNER_TEMP/scopeproof-developer-id.p12"
+          api_key_file="$RUNNER_TEMP/AuthKey_${NOTARY_KEY_ID}.p8"
+          profile="scopeproof-production-${GITHUB_RUN_ID}"
+          cleanup_import_files() { rm -f "$p12_file" "$api_key_file"; }
+          trap cleanup_import_files EXIT HUP INT TERM
+
+          /usr/bin/openssl rand -base64 48 > "$password_file"
+          chmod 0600 "$password_file"
+          keychain_password="$(<"$password_file")"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 7200 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security list-keychains -d user -s "$keychain"
+
+          printf '%s' "$DEVELOPER_ID_P12_BASE64" | /usr/bin/base64 -D > "$p12_file"
+          chmod 0600 "$p12_file"
+          security import "$p12_file" -k "$keychain" -P "$DEVELOPER_ID_P12_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security >/dev/null
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" >/dev/null
+
+          identity_count="$(security find-identity -v -p codesigning "$keychain" | grep -c '"Developer ID Application:' || true)"
+          test "$identity_count" = "1"
+          identity="$(security find-identity -v -p codesigning "$keychain" | awk -F '"' '/Developer ID Application:/ { print $2; exit }')"
+          test -n "$identity"
+
+          printf '%s' "$NOTARY_API_KEY_P8_BASE64" | /usr/bin/base64 -D > "$api_key_file"
+          chmod 0600 "$api_key_file"
+          SCOPEPROOF_NOTARY_PROFILE="$profile" \
+          SCOPEPROOF_NOTARY_KEYCHAIN="$keychain" \
+          SCOPEPROOF_NOTARY_API_KEY_PATH="$api_key_file" \
+          SCOPEPROOF_NOTARY_KEY_ID="$NOTARY_KEY_ID" \
+          SCOPEPROOF_NOTARY_ISSUER_ID="$NOTARY_ISSUER_ID" \
+            ./Scripts/configure_macos_notary_profile.sh
+
+          rm -f "$p12_file" "$api_key_file" "$password_file"
+          {
+            echo "SCOPEPROOF_CODESIGN_IDENTITY=$identity"
+            echo "SCOPEPROOF_NOTARY_KEYCHAIN=$keychain"
+            echo "SCOPEPROOF_NOTARY_PROFILE=$profile"
+          } >> "$GITHUB_ENV"
+
+      - name: Build, sign, notarize, staple, and validate
+        env:
+          SCOPEPROOF_RELEASE_BUILD_NUMBER: ${{ inputs.build_number }}
+          SCOPEPROOF_RELEASE_OUTPUT_DIR: DerivedData/Production
+          SCOPEPROOF_RELEASE_TEAM_ID: ${{ secrets.MACOS_RELEASE_TEAM_ID }}
+          SCOPEPROOF_RELEASE_VERSION: ${{ inputs.version }}
+        run: ./Scripts/build_macos_production_release.sh
+
+      - name: Destroy temporary release credentials before artifact actions
+        if: always()
+        run: |
+          set -euo pipefail
+          set +x
+          security default-keychain -d user -s login.keychain-db
+          security list-keychains -d user -s "$HOME/Library/Keychains/login.keychain-db"
+          keychain="${SCOPEPROOF_NOTARY_KEYCHAIN:-$RUNNER_TEMP/scopeproof-release-${GITHUB_RUN_ID}.keychain-db}"
+          if [[ -f "$keychain" ]]; then
+            security delete-keychain "$keychain"
+          fi
+          test ! -e "$keychain"
+          rm -f \
+            "$RUNNER_TEMP/scopeproof-keychain-password" \
+            "$RUNNER_TEMP/scopeproof-developer-id.p12"
+
+      - name: Attest the signed release candidate
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: |
+            DerivedData/Production/Scopeproof-Capture-${{ inputs.version }}.zip
+            DerivedData/Production/Scopeproof-Capture-${{ inputs.version }}.zip.sha256
+            DerivedData/Production/Scopeproof-Capture-${{ inputs.version }}.dmg
+            DerivedData/Production/Scopeproof-Capture-${{ inputs.version }}.dmg.sha256
+            DerivedData/Production/Scopeproof-Capture-${{ inputs.version }}.notary-receipt.json
+            DerivedData/Production/Scopeproof-Capture-${{ inputs.version }}.sbom.cdx.json
+            DerivedData/Production/Scopeproof-Capture-${{ inputs.version }}.provenance.intoto.json
+
+      - name: Upload the signed release candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: scopeproof-macos-production-${{ inputs.version }}-${{ github.sha }}
+          path: |
+            DerivedData/Production/Scopeproof-Capture-${{ inputs.version }}.zip
+            DerivedData/Production/Scopeproof-Capture-${{ inputs.version }}.zip.sha256
+            DerivedData/Production/Scopeproof-Capture-${{ inputs.version }}.dmg
+            DerivedData/Production/Scopeproof-Capture-${{ inputs.version }}.dmg.sha256
+            DerivedData/Production/Scopeproof-Capture-${{ inputs.version }}.notary-receipt.json
+            DerivedData/Production/Scopeproof-Capture-${{ inputs.version }}.sbom.cdx.json
+            DerivedData/Production/Scopeproof-Capture-${{ inputs.version }}.provenance.intoto.json
+          if-no-files-found: error
+          retention-days: 30

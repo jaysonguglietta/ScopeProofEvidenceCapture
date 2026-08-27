@@ -17,13 +17,18 @@ import {
   GetChangeCommand,
   Route53Client,
 } from "@aws-sdk/client-route-53";
+import { transactionToken } from "./idempotency.mjs";
 
 const required = [
   "ADMIN_SECRET_ARN",
+  "API_HOSTNAME",
+  "AUDIT_SIGNING_KEY_ARN",
   "AWS_ACCOUNT_ID_EXPECTED",
   "AWS_REGION_EXPECTED",
   "CANONICAL_HOSTNAME",
   "CONTROL_TABLE_NAME",
+  "CONTROL_DATABASE_SECRET_ARN",
+  "CONTROL_DATABASE_USERNAME",
   "DATABASE_CLUSTER_ARN",
   "DATABASE_NAME",
   "DATABASE_OWNER",
@@ -34,6 +39,10 @@ const required = [
   "EVIDENCE_BUCKET_NAME",
   "EVIDENCE_KEY_ARN",
   "HOSTED_ZONE_ID",
+  "INGEST_DATABASE_SECRET_ARN",
+  "INGEST_DATABASE_USERNAME",
+  "LEGAL_API_DATABASE_SECRET_ARN",
+  "LEGAL_API_DATABASE_USERNAME",
   "QUARANTINE_BUCKET_NAME",
   "RETENTION_DAYS",
   "RETENTION_MODE",
@@ -47,11 +56,15 @@ for (const name of required) {
 
 const config = Object.freeze({
   adminSecretArn: process.env.ADMIN_SECRET_ARN,
+  apiHostname: process.env.API_HOSTNAME,
+  auditSigningKeyArn: process.env.AUDIT_SIGNING_KEY_ARN,
   awsAccountId: process.env.AWS_ACCOUNT_ID_EXPECTED,
   awsRegion: process.env.AWS_REGION_EXPECTED,
   canonicalHostname: process.env.CANONICAL_HOSTNAME,
   clusterArn: process.env.DATABASE_CLUSTER_ARN,
   controlTable: process.env.CONTROL_TABLE_NAME,
+  controlDatabaseSecretArn: process.env.CONTROL_DATABASE_SECRET_ARN,
+  controlDatabaseUsername: process.env.CONTROL_DATABASE_USERNAME,
   databaseName: process.env.DATABASE_NAME,
   databaseOwner: process.env.DATABASE_OWNER,
   databaseSecretArn: process.env.DATABASE_SECRET_ARN,
@@ -61,6 +74,10 @@ const config = Object.freeze({
   evidenceKeyArn: process.env.EVIDENCE_KEY_ARN,
   hostname: process.env.DOMAIN_HOSTNAME,
   hostedZoneId: process.env.HOSTED_ZONE_ID,
+  ingestDatabaseSecretArn: process.env.INGEST_DATABASE_SECRET_ARN,
+  ingestDatabaseUsername: process.env.INGEST_DATABASE_USERNAME,
+  legalApiDatabaseSecretArn: process.env.LEGAL_API_DATABASE_SECRET_ARN,
+  legalApiDatabaseUsername: process.env.LEGAL_API_DATABASE_USERNAME,
   quarantineBucket: process.env.QUARANTINE_BUCKET_NAME,
   retentionDays: Number(process.env.RETENTION_DAYS),
   retentionMode: process.env.RETENTION_MODE,
@@ -75,6 +92,15 @@ if (!/^scopeproof_[a-z0-9_]{1,48}$/.test(config.databaseName)) {
 if (!/^tenant_[a-z0-9_]{3,56}_runtime$/.test(config.databaseUsername)) {
   throw new Error("Unsafe tenant database role identifier.");
 }
+if (!/^tenant_[a-z0-9_]{3,56}_ingest$/.test(config.ingestDatabaseUsername)) {
+  throw new Error("Unsafe tenant ingest database role identifier.");
+}
+if (!/^tenant_[a-z0-9_]{3,56}_control$/.test(config.controlDatabaseUsername)) {
+  throw new Error("Unsafe tenant evidence-control database role identifier.");
+}
+if (!/^tenant_[a-z0-9_]{3,56}_legal_api$/.test(config.legalApiDatabaseUsername)) {
+  throw new Error("Unsafe tenant legal-hold API database role identifier.");
+}
 if (!/^scopeproof_[a-z0-9_]{1,46}_owner$/.test(config.databaseOwner)) {
   throw new Error("Unsafe tenant database owner identifier.");
 }
@@ -83,6 +109,12 @@ if (!/^ten_[a-f0-9]{32}$/.test(config.tenantId)) {
 }
 if (!/^[a-z0-9-]{1,48}(?:\.[a-z0-9-]{1,63})+$/.test(config.hostname)) {
   throw new Error("Unsafe tenant hostname.");
+}
+if (
+  !/^[a-z0-9-]{1,63}(?:\.[a-z0-9-]{1,63})+$/.test(config.apiHostname) ||
+  config.apiHostname === config.hostname
+) {
+  throw new Error("Unsafe tenant API hostname.");
 }
 if (
   !/^Z[A-Z0-9]{8,31}$/.test(config.hostedZoneId) ||
@@ -117,13 +149,20 @@ if (
   config.quarantineBucket === config.evidenceBucket ||
   !new RegExp(
     `^arn:(aws|aws-us-gov|aws-cn):kms:${escapedRegion}:${escapedAccount}:key/[0-9a-f-]{36}$`,
-  ).test(config.evidenceKeyArn)
+  ).test(config.evidenceKeyArn) ||
+  !new RegExp(
+    `^arn:(aws|aws-us-gov|aws-cn):kms:${escapedRegion}:${escapedAccount}:key/[0-9a-f-]{36}$`,
+  ).test(config.auditSigningKeyArn) ||
+  config.auditSigningKeyArn === config.evidenceKeyArn
 ) {
   throw new Error("Unsafe tenant storage metadata.");
 }
 
 const tenantSchemaSql = readFileSync("/var/task/database/001_tenant_schema.sql", "utf8");
 const runtimeRoleSql = readFileSync("/var/task/database/002_runtime_role.sql", "utf8");
+const ingestRoleSql = readFileSync("/var/task/database/003_ingest_role.sql", "utf8");
+const controlRoleSql = readFileSync("/var/task/database/004_evidence_control_role.sql", "utf8");
+const legalApiRoleSql = readFileSync("/var/task/database/005_legal_hold_api_role.sql", "utf8");
 const tenantSchemaSha256 = createHash("sha256").update(tenantSchemaSql).digest("hex");
 const tenantSchemaMarker = `scopeproof:001:sha256:${tenantSchemaSha256}`;
 const isolatedTables = Object.freeze([
@@ -139,6 +178,7 @@ const isolatedTables = Object.freeze([
   "memberships",
   "principals",
   "retention_holds",
+  "legal_hold_operations",
   "support_access_grants",
   "tenant_domains",
   "upload_intents",
@@ -150,12 +190,54 @@ const baselineTables = Object.freeze([
 ].sort());
 const baselineFunctions = Object.freeze([
   "advance_audit_head",
+  "acknowledge_legal_hold_recovery_publication",
+  "append_signed_audit_event",
+  "approve_exact_version_legal_hold",
+  "assert_actor_permission",
   "assert_database_tenant",
+  "claim_promotion_fence",
+  "confirm_exact_version_legal_hold",
+  "begin_exact_version_legal_hold_application",
+  "create_upload_intent",
   "current_tenant_id",
+  "expire_stale_exact_version_legal_hold_requests",
+  "list_pending_exact_version_legal_holds",
+  "list_unaudited_applied_legal_holds",
+  "list_unaudited_expired_legal_holds",
   "protect_immutable_security_fields",
+  "record_exact_version_legal_hold_reconciliation_failure",
+  "read_tenant_audit_head",
+  "read_exact_version_legal_hold_operation",
+  "read_promoted_evidence_receipt",
+  "resolve_active_membership",
+  "reconcile_promoted_evidence",
+  "reserve_exact_version_legal_hold",
+]);
+const controlRoleAllowedFunctions = Object.freeze([
+  "acknowledge_legal_hold_recovery_publication",
+  "current_tenant_id",
+  "append_signed_audit_event",
+  "read_exact_version_legal_hold_operation",
+  "begin_exact_version_legal_hold_application",
+  "confirm_exact_version_legal_hold",
+  "expire_stale_exact_version_legal_hold_requests",
+  "list_pending_exact_version_legal_holds",
+  "list_unaudited_applied_legal_holds",
+  "list_unaudited_expired_legal_holds",
+  "record_exact_version_legal_hold_reconciliation_failure",
+  "read_tenant_audit_head",
 ]);
 if (!runtimeRoleSql.includes("__SCOPEPROOF_RUNTIME_ROLE__")) {
   throw new Error("Runtime grant migration token is missing.");
+}
+if (!ingestRoleSql.includes("__SCOPEPROOF_INGEST_ROLE__")) {
+  throw new Error("Ingest grant migration token is missing.");
+}
+if (!controlRoleSql.includes("__SCOPEPROOF_CONTROL_ROLE__")) {
+  throw new Error("Evidence-control grant migration token is missing.");
+}
+if (!legalApiRoleSql.includes("__SCOPEPROOF_LEGAL_API_ROLE__")) {
+  throw new Error("Legal-hold API grant migration token is missing.");
 }
 
 const dynamo = new DynamoDBClient({});
@@ -288,32 +370,41 @@ function validateExecutionId(value) {
 
 async function setProvisioning(executionId) {
   const now = new Date().toISOString();
+  const clientRequestToken = transactionToken({
+    action: "acquire",
+    apiHostname: config.apiHostname,
+    executionId,
+    hostname: config.hostname,
+    now,
+    tenantId: config.tenantId,
+  });
   try {
     await dynamo.send(
       new TransactWriteItemsCommand({
-        ClientRequestToken: stableToken(executionId, "acquire"),
+        ClientRequestToken: clientRequestToken,
         TransactItems: registryKeys().map((key, index) => ({
           Update: {
             ConditionExpression:
               "(#status IN (:provisioning, :failed)) AND (attribute_not_exists(#executionId) OR #executionId = :executionId)" +
-              (index === 1 ? " AND #tenantId = :tenantId" : ""),
+              (index > 0 ? " AND #tenantId = :tenantId" : ""),
             ExpressionAttributeNames: {
               "#executionId": "provisionExecutionId",
+              "#lastExecutionId": "lastProvisionExecutionId",
               "#lastError": "lastProvisionError",
               "#status": "status",
-              ...(index === 1 ? { "#tenantId": "tenantId" } : {}),
+              ...(index > 0 ? { "#tenantId": "tenantId" } : {}),
             },
             ExpressionAttributeValues: {
               ":executionId": { S: executionId },
               ":failed": { S: "FAILED" },
               ":now": { S: now },
               ":provisioning": { S: "PROVISIONING" },
-              ...(index === 1 ? { ":tenantId": { S: config.tenantId } } : {}),
+              ...(index > 0 ? { ":tenantId": { S: config.tenantId } } : {}),
             },
             Key: key,
             TableName: config.controlTable,
             UpdateExpression:
-              "SET #status = :provisioning, #executionId = :executionId, provisionStartedAt = :now REMOVE #lastError",
+              "SET #status = :provisioning, #executionId = :executionId, provisionStartedAt = :now REMOVE #lastError, #lastExecutionId",
           },
         })),
       }),
@@ -328,21 +419,32 @@ async function setProvisioning(executionId) {
 
 async function setTerminalStatus(executionId, status, errorName) {
   const now = new Date().toISOString();
+  const clientRequestToken = transactionToken({
+    action: "terminal",
+    apiHostname: config.apiHostname,
+    errorName: errorName ?? null,
+    executionId,
+    hostname: config.hostname,
+    now,
+    schemaSha256: status === "ACTIVE" ? tenantSchemaSha256 : null,
+    status,
+    tenantId: config.tenantId,
+  });
   await dynamo.send(
     new TransactWriteItemsCommand({
-      ClientRequestToken: stableToken(executionId, status),
+      ClientRequestToken: clientRequestToken,
       TransactItems: registryKeys().map((key, index) => ({
         Update: {
           ConditionExpression:
-            (status === "ACTIVE"
-              ? "((#status = :provisioning AND #executionId = :executionId) OR #status = :status)"
-              : "#status = :provisioning AND #executionId = :executionId") +
-            (index === 1 ? " AND #tenantId = :tenantId" : ""),
+            "((#status = :provisioning AND #executionId = :executionId) OR " +
+            "(#status = :status AND #lastExecutionId = :executionId))" +
+            (index > 0 ? " AND #tenantId = :tenantId" : ""),
           ExpressionAttributeNames: {
-            "#executionId": "provisionExecutionId",
+              "#executionId": "provisionExecutionId",
+              "#lastExecutionId": "lastProvisionExecutionId",
             "#lastError": "lastProvisionError",
             "#status": "status",
-            ...(index === 1 ? { "#tenantId": "tenantId" } : {}),
+            ...(index > 0 ? { "#tenantId": "tenantId" } : {}),
           },
           ExpressionAttributeValues: {
             ":executionId": { S: executionId },
@@ -356,14 +458,14 @@ async function setTerminalStatus(executionId, status, errorName) {
                   ":schemaVersion": { N: "1" },
                 }
               : {}),
-            ...(index === 1 ? { ":tenantId": { S: config.tenantId } } : {}),
+            ...(index > 0 ? { ":tenantId": { S: config.tenantId } } : {}),
           },
           Key: key,
           TableName: config.controlTable,
           UpdateExpression:
             status === "FAILED"
-              ? "SET #status = :status, #lastError = :lastError, provisionCompletedAt = :now REMOVE #executionId"
-              : "SET #status = :status, databaseSchemaVersion = :schemaVersion, databaseMigrationSha256 = :schemaSha256, provisionCompletedAt = :now REMOVE #executionId, #lastError",
+              ? "SET #status = :status, #lastExecutionId = :executionId, #lastError = :lastError, provisionCompletedAt = :now REMOVE #executionId"
+              : "SET #status = :status, #lastExecutionId = :executionId, databaseSchemaVersion = :schemaVersion, databaseMigrationSha256 = :schemaSha256, provisionCompletedAt = :now REMOVE #executionId, #lastError",
         },
       })),
     }),
@@ -371,24 +473,54 @@ async function setTerminalStatus(executionId, status, errorName) {
 }
 
 async function initializeDatabase() {
-  const [runtimeResponse, adminResponse] = await Promise.all([
+  const [runtimeResponse, ingestResponse, controlResponse, legalApiResponse, adminResponse] = await Promise.all([
     secrets.send(new GetSecretValueCommand({ SecretId: config.databaseSecretArn })),
+    secrets.send(new GetSecretValueCommand({ SecretId: config.ingestDatabaseSecretArn })),
+    secrets.send(new GetSecretValueCommand({ SecretId: config.controlDatabaseSecretArn })),
+    secrets.send(new GetSecretValueCommand({ SecretId: config.legalApiDatabaseSecretArn })),
     secrets.send(new GetSecretValueCommand({ SecretId: config.adminSecretArn })),
   ]);
   const secret = JSON.parse(runtimeResponse.SecretString ?? "{}");
+  const ingestSecret = JSON.parse(ingestResponse.SecretString ?? "{}");
+  const controlSecret = JSON.parse(controlResponse.SecretString ?? "{}");
+  const legalApiSecret = JSON.parse(legalApiResponse.SecretString ?? "{}");
   const adminSecret = JSON.parse(adminResponse.SecretString ?? "{}");
   const adminUsername = String(adminSecret.username ?? "");
   const password = String(secret.password ?? "");
+  const ingestPassword = String(ingestSecret.password ?? "");
+  const controlPassword = String(controlSecret.password ?? "");
+  const legalApiPassword = String(legalApiSecret.password ?? "");
   if (
     secret.username !== config.databaseUsername ||
+    ingestSecret.username !== config.ingestDatabaseUsername ||
+    controlSecret.username !== config.controlDatabaseUsername ||
+    legalApiSecret.username !== config.legalApiDatabaseUsername ||
     !/^[A-Za-z0-9]{32,128}$/.test(password) ||
+    !/^[A-Za-z0-9]{32,128}$/.test(ingestPassword) ||
+    !/^[A-Za-z0-9]{32,128}$/.test(controlPassword) ||
+    !/^[A-Za-z0-9]{32,128}$/.test(legalApiPassword) ||
     !/^[A-Za-z_][A-Za-z0-9_]{0,62}$/.test(adminUsername) ||
-    new Set([config.databaseUsername, config.databaseOwner]).has(adminUsername)
+    new Set([
+      config.databaseUsername,
+      config.ingestDatabaseUsername,
+      config.controlDatabaseUsername,
+      config.legalApiDatabaseUsername,
+      config.databaseOwner,
+    ]).has(adminUsername) ||
+    new Set([
+      config.databaseUsername,
+      config.ingestDatabaseUsername,
+      config.controlDatabaseUsername,
+      config.legalApiDatabaseUsername,
+    ]).size !== 4
   ) {
     throw new Error("Database credentials did not meet the provisioning contract.");
   }
 
   const runtimeRole = quoteIdentifier(config.databaseUsername);
+  const ingestRole = quoteIdentifier(config.ingestDatabaseUsername);
+  const controlRole = quoteIdentifier(config.controlDatabaseUsername);
+  const legalApiRole = quoteIdentifier(config.legalApiDatabaseUsername);
   const ownerRole = quoteIdentifier(config.databaseOwner);
   const adminRole = quoteIdentifier(adminUsername);
   const database = quoteIdentifier(config.databaseName);
@@ -396,6 +528,9 @@ async function initializeDatabase() {
   // PostgreSQL's native SCRAM verifier so the reusable plaintext secret never
   // appears in CREATE/ALTER ROLE SQL or CloudWatch database logs.
   const passwordVerifier = quoteLiteral(scramSha256Verifier(password));
+  const ingestPasswordVerifier = quoteLiteral(scramSha256Verifier(ingestPassword));
+  const controlPasswordVerifier = quoteLiteral(scramSha256Verifier(controlPassword));
+  const legalApiPasswordVerifier = quoteLiteral(scramSha256Verifier(legalApiPassword));
   await executeAdmin(
     "scopeproof_admin",
     `DO $scopeproof$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = ${quoteLiteral(config.databaseOwner)}) THEN CREATE ROLE ${ownerRole} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS; ELSE ALTER ROLE ${ownerRole} NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS; END IF; END $scopeproof$;`,
@@ -403,6 +538,18 @@ async function initializeDatabase() {
   await executeAdmin(
     "scopeproof_admin",
     `DO $scopeproof$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = ${quoteLiteral(config.databaseUsername)}) THEN CREATE ROLE ${runtimeRole} LOGIN PASSWORD ${passwordVerifier} NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS; ELSE ALTER ROLE ${runtimeRole} LOGIN PASSWORD ${passwordVerifier} NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS; END IF; END $scopeproof$;`,
+  );
+  await executeAdmin(
+    "scopeproof_admin",
+    `DO $scopeproof$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = ${quoteLiteral(config.ingestDatabaseUsername)}) THEN CREATE ROLE ${ingestRole} LOGIN PASSWORD ${ingestPasswordVerifier} NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS; ELSE ALTER ROLE ${ingestRole} LOGIN PASSWORD ${ingestPasswordVerifier} NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS; END IF; END $scopeproof$;`,
+  );
+  await executeAdmin(
+    "scopeproof_admin",
+    `DO $scopeproof$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = ${quoteLiteral(config.controlDatabaseUsername)}) THEN CREATE ROLE ${controlRole} LOGIN PASSWORD ${controlPasswordVerifier} NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS; ELSE ALTER ROLE ${controlRole} LOGIN PASSWORD ${controlPasswordVerifier} NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS; END IF; END $scopeproof$;`,
+  );
+  await executeAdmin(
+    "scopeproof_admin",
+    `DO $scopeproof$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = ${quoteLiteral(config.legalApiDatabaseUsername)}) THEN CREATE ROLE ${legalApiRole} LOGIN PASSWORD ${legalApiPasswordVerifier} NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS; ELSE ALTER ROLE ${legalApiRole} LOGIN PASSWORD ${legalApiPasswordVerifier} NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS; END IF; END $scopeproof$;`,
   );
 
   // The cluster administrator receives temporary SET ROLE membership only for
@@ -429,6 +576,9 @@ async function initializeDatabase() {
     await executeAdmin("scopeproof_admin", "REVOKE CONNECT ON DATABASE scopeproof_admin FROM PUBLIC");
     await executeAdmin("scopeproof_admin", `REVOKE CONNECT ON DATABASE ${database} FROM PUBLIC`);
     await executeAdmin("scopeproof_admin", `GRANT CONNECT ON DATABASE ${database} TO ${runtimeRole}`);
+    await executeAdmin("scopeproof_admin", `GRANT CONNECT ON DATABASE ${database} TO ${ingestRole}`);
+    await executeAdmin("scopeproof_admin", `GRANT CONNECT ON DATABASE ${database} TO ${controlRole}`);
+    await executeAdmin("scopeproof_admin", `GRANT CONNECT ON DATABASE ${database} TO ${legalApiRole}`);
 
     const migrationState = await executeAdmin(
       config.databaseName,
@@ -446,6 +596,26 @@ async function initializeDatabase() {
         config.databaseOwner,
         tenantSchemaMarker,
       );
+    } else {
+      // 001 is an immutable pre-deployment baseline, not an in-place upgrade
+      // script. Refuse to seed or re-grant an older/modified schema. Once a
+      // tenant has been deployed, every DDL change must ship as a separately
+      // versioned forward migration with its own reviewed compatibility path.
+      const baseline = await executeAdmin(
+        config.databaseName,
+        "SELECT count(*)::bigint, min(version), max(version), min(name), max(name), obj_description('scopeproof.schema_migrations'::regclass, 'pg_class') FROM scopeproof.schema_migrations",
+      );
+      const row = baseline.records?.[0] ?? [];
+      if (
+        fieldNumber(row[0]) !== 1 ||
+        fieldNumber(row[1]) !== 1 ||
+        fieldNumber(row[2]) !== 1 ||
+        fieldString(row[3]) !== "tenant_security_baseline" ||
+        fieldString(row[4]) !== "tenant_security_baseline" ||
+        fieldString(row[5]) !== tenantSchemaMarker
+      ) {
+        throw new Error("Tenant schema is not the exact packaged baseline; a reviewed forward migration is required.");
+      }
     }
 
     await runTransaction(config.adminSecretArn, [
@@ -456,8 +626,8 @@ async function initializeDatabase() {
       {
         sql: [
           "INSERT INTO scopeproof.tenant_identity",
-          "(tenant_id, slug, display_name, status, canonical_hostname, retention_days, retention_mode, aws_account_id, aws_region, quarantine_bucket, evidence_bucket, evidence_kms_key_arn)",
-          "VALUES (:tenant_id, :slug, :display_name, 'PROVISIONING', :hostname, :retention_days, :retention_mode, :account_id, :region, :quarantine_bucket, :evidence_bucket, :key_arn)",
+          "(tenant_id, slug, display_name, status, canonical_hostname, retention_days, retention_mode, aws_account_id, aws_region, quarantine_bucket, evidence_bucket, evidence_kms_key_arn, audit_signing_key_arn)",
+          "VALUES (:tenant_id, :slug, :display_name, 'PROVISIONING', :hostname, :retention_days, :retention_mode, :account_id, :region, :quarantine_bucket, :evidence_bucket, :key_arn, :signing_key_arn)",
           "ON CONFLICT (tenant_id) DO NOTHING",
         ].join(" "),
         parameters: tenantIdentityParameters(),
@@ -483,6 +653,30 @@ async function initializeDatabase() {
       throw new Error("Runtime role migration rendering failed.");
     }
     await applyMigration(renderedRuntimeGrant, config.adminSecretArn);
+    const renderedIngestGrant = ingestRoleSql.replaceAll(
+      "__SCOPEPROOF_INGEST_ROLE__",
+      config.ingestDatabaseUsername,
+    );
+    if (renderedIngestGrant.includes("__SCOPEPROOF_INGEST_ROLE__")) {
+      throw new Error("Ingest role migration rendering failed.");
+    }
+    await applyMigration(renderedIngestGrant, config.adminSecretArn);
+    const renderedControlGrant = controlRoleSql.replaceAll(
+      "__SCOPEPROOF_CONTROL_ROLE__",
+      config.controlDatabaseUsername,
+    );
+    if (renderedControlGrant.includes("__SCOPEPROOF_CONTROL_ROLE__")) {
+      throw new Error("Evidence-control role migration rendering failed.");
+    }
+    await applyMigration(renderedControlGrant, config.adminSecretArn);
+    const renderedLegalApiGrant = legalApiRoleSql.replaceAll(
+      "__SCOPEPROOF_LEGAL_API_ROLE__",
+      config.legalApiDatabaseUsername,
+    );
+    if (renderedLegalApiGrant.includes("__SCOPEPROOF_LEGAL_API_ROLE__")) {
+      throw new Error("Legal-hold API role migration rendering failed.");
+    }
+    await applyMigration(renderedLegalApiGrant, config.adminSecretArn);
     // Keep only the narrow control-plane access needed to verify and change the
     // activation status after owner membership is revoked.
     await executeAdmin("scopeproof_admin", `GRANT CONNECT ON DATABASE ${database} TO ${adminRole}`);
@@ -559,7 +753,7 @@ async function verifyDatabase(allowedIdentityStatuses = ["PROVISIONING"]) {
     {
       sql: [
         "SELECT count(*) FILTER (WHERE (",
-        "(t.tgname = 'protect_immutable_fields' AND c.relname IN ('jobs', 'upload_intents', 'evidence_artifacts', 'retention_holds', 'support_access_grants') AND p.proname = 'protect_immutable_security_fields')",
+        "(t.tgname = 'protect_immutable_fields' AND c.relname IN ('jobs', 'upload_intents', 'evidence_artifacts', 'retention_holds', 'legal_hold_operations', 'support_access_grants') AND p.proname = 'protect_immutable_security_fields')",
         "OR (t.tgname = 'append_audit_chain' AND c.relname = 'audit_events' AND p.proname = 'advance_audit_head')))::bigint, count(*)::bigint",
         "FROM pg_catalog.pg_trigger t",
         "JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid",
@@ -590,7 +784,7 @@ async function verifyDatabase(allowedIdentityStatuses = ["PROVISIONING"]) {
     },
     {
       sql: [
-        "SELECT (SELECT count(*)::bigint FROM scopeproof.tenant_identity), tenant_id, slug, display_name, status, canonical_hostname, retention_days, retention_mode, aws_account_id, aws_region, quarantine_bucket, evidence_bucket, evidence_kms_key_arn",
+        "SELECT (SELECT count(*)::bigint FROM scopeproof.tenant_identity), tenant_id, slug, display_name, status, canonical_hostname, retention_days, retention_mode, aws_account_id, aws_region, quarantine_bucket, evidence_bucket, evidence_kms_key_arn, audit_signing_key_arn",
         "FROM scopeproof.tenant_identity WHERE singleton",
       ].join(" "),
     },
@@ -632,6 +826,7 @@ async function verifyDatabase(allowedIdentityStatuses = ["PROVISIONING"]) {
       config.quarantineBucket,
       config.evidenceBucket,
       config.evidenceKeyArn,
+      config.auditSigningKeyArn,
     ]),
   );
   if (
@@ -652,8 +847,8 @@ async function verifyDatabase(allowedIdentityStatuses = ["PROVISIONING"]) {
     tableOwners.some((field) => fieldNumber(field) !== baselineTables.length) ||
     rls.length !== 6 ||
     rls.some((field) => fieldNumber(field) !== isolatedTables.length) ||
-    fieldNumber(securityTriggers[0]) !== 6 ||
-    fieldNumber(securityTriggers[1]) !== 21 ||
+    fieldNumber(securityTriggers[0]) !== 7 ||
+    fieldNumber(securityTriggers[1]) !== 23 ||
     functionOwners.length !== 3 ||
     functionOwners.some((field) => fieldNumber(field) !== baselineFunctions.length) ||
     fieldNumber(domainOwners[0]) !== 2 ||
@@ -672,6 +867,10 @@ async function verifyDatabase(allowedIdentityStatuses = ["PROVISIONING"]) {
     throw new Error("Tenant database ownership, schema, identity, or RLS verification failed.");
   }
   await verifyOwnerRole(adminUsername);
+  await verifyRuntimeControlIsolation();
+  await verifyIngestRole();
+  await verifyControlRole();
+  await verifyLegalApiRole();
   await verifyWrongTenantDenied();
 }
 
@@ -697,6 +896,200 @@ async function verifyOwnerRole(adminUsername) {
   const row = response.records?.[0] ?? [];
   if (row.length !== 7 || row.some((field) => field?.booleanValue !== false)) {
     throw new Error("Tenant database owner must remain NOLOGIN, unprivileged, and ungranted.");
+  }
+}
+
+async function verifyIngestRole() {
+  const isolatedTableList = isolatedTables.map(quoteLiteral).join(", ");
+  const results = await runTransaction(config.ingestDatabaseSecretArn, [
+    {
+      sql: "SELECT set_config('scopeproof.tenant_id', :tenant_id, true)",
+      parameters: [stringParameter("tenant_id", config.tenantId)],
+    },
+    {
+      sql: "SELECT current_user, current_database(), has_schema_privilege(current_user, 'scopeproof', 'USAGE'), has_schema_privilege(current_user, 'scopeproof', 'CREATE')",
+    },
+    {
+      sql: "SELECT rolcanlogin, rolsuper, rolcreaterole, rolcreatedb, rolreplication, rolbypassrls FROM pg_catalog.pg_roles WHERE rolname = current_user",
+    },
+    {
+      sql: [
+        "SELECT count(*) FILTER (WHERE has_function_privilege(current_user, p.oid, 'EXECUTE'))::bigint,",
+        "count(*) FILTER (WHERE p.proname IN ('claim_promotion_fence', 'current_tenant_id', 'read_promoted_evidence_receipt', 'reconcile_promoted_evidence') AND has_function_privilege(current_user, p.oid, 'EXECUTE'))::bigint",
+        "FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace",
+        "WHERE n.nspname = 'scopeproof'",
+      ].join(" "),
+    },
+    {
+      sql: [
+        "SELECT count(*) FILTER (WHERE",
+        "has_table_privilege(current_user, format('scopeproof.%I', expected.name), 'SELECT') OR",
+        "has_table_privilege(current_user, format('scopeproof.%I', expected.name), 'INSERT') OR",
+        "has_table_privilege(current_user, format('scopeproof.%I', expected.name), 'UPDATE') OR",
+        "has_table_privilege(current_user, format('scopeproof.%I', expected.name), 'DELETE'))::bigint",
+        `FROM unnest(ARRAY[${isolatedTableList}]::text[]) AS expected(name)`,
+      ].join(" "),
+    },
+  ]);
+  const session = results[1].records?.[0] ?? [];
+  const role = results[2].records?.[0] ?? [];
+  const functions = results[3].records?.[0] ?? [];
+  const tables = results[4].records?.[0] ?? [];
+  if (
+    fieldString(session[0]) !== config.ingestDatabaseUsername ||
+    fieldString(session[1]) !== config.databaseName ||
+    session[2]?.booleanValue !== true ||
+    session[3]?.booleanValue !== false ||
+    role.length !== 6 ||
+    role[0]?.booleanValue !== true ||
+    role.slice(1).some((field) => field?.booleanValue !== false) ||
+    fieldNumber(functions[0]) !== 4 ||
+    fieldNumber(functions[1]) !== 4 ||
+    fieldNumber(tables[0]) !== 0
+  ) {
+    throw new Error("Tenant ingest role is not an execute-only reconciliation identity.");
+  }
+}
+
+async function verifyRuntimeControlIsolation() {
+  const isolatedTableList = isolatedTables.map(quoteLiteral).join(", ");
+  const results = await runTransaction(config.databaseSecretArn, [
+    {
+      sql: "SELECT set_config('scopeproof.tenant_id', :tenant_id, true)",
+      parameters: [stringParameter("tenant_id", config.tenantId)],
+    },
+    {
+      sql: [
+        "SELECT count(*) FILTER (WHERE has_function_privilege(current_user, p.oid, 'EXECUTE'))::bigint,",
+        "count(*) FILTER (WHERE p.proname IN ('current_tenant_id', 'resolve_active_membership', 'create_upload_intent') AND has_function_privilege(current_user, p.oid, 'EXECUTE'))::bigint",
+        "FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace",
+        "WHERE n.nspname = 'scopeproof'",
+      ].join(" "),
+    },
+    {
+      sql: [
+        "SELECT count(*) FILTER (WHERE",
+        "has_table_privilege(current_user, format('scopeproof.%I', expected.name), 'SELECT') OR",
+        "has_table_privilege(current_user, format('scopeproof.%I', expected.name), 'INSERT') OR",
+        "has_table_privilege(current_user, format('scopeproof.%I', expected.name), 'UPDATE') OR",
+        "has_table_privilege(current_user, format('scopeproof.%I', expected.name), 'DELETE'))::bigint",
+        `FROM unnest(ARRAY[${isolatedTableList}]::text[]) AS expected(name)`,
+      ].join(" "),
+    },
+  ]);
+  const functions = results[1].records?.[0] ?? [];
+  const operations = results[2].records?.[0] ?? [];
+  if (
+    fieldNumber(functions[0]) !== 3 ||
+    fieldNumber(functions[1]) !== 3 ||
+    fieldNumber(operations[0]) !== 0
+  ) {
+    throw new Error("Tenant upload runtime is not an execute-only membership and upload identity.");
+  }
+}
+
+async function verifyControlRole() {
+  const isolatedTableList = isolatedTables.map(quoteLiteral).join(", ");
+  const allowedFunctionList = controlRoleAllowedFunctions.map(quoteLiteral).join(", ");
+  const results = await runTransaction(config.controlDatabaseSecretArn, [
+    {
+      sql: "SELECT set_config('scopeproof.tenant_id', :tenant_id, true)",
+      parameters: [stringParameter("tenant_id", config.tenantId)],
+    },
+    {
+      sql: "SELECT current_user, current_database(), has_schema_privilege(current_user, 'scopeproof', 'USAGE'), has_schema_privilege(current_user, 'scopeproof', 'CREATE')",
+    },
+    {
+      sql: "SELECT rolcanlogin, rolsuper, rolcreaterole, rolcreatedb, rolreplication, rolbypassrls FROM pg_catalog.pg_roles WHERE rolname = current_user",
+    },
+    {
+      sql: [
+        "SELECT count(*) FILTER (WHERE has_function_privilege(current_user, p.oid, 'EXECUTE'))::bigint,",
+        `count(*) FILTER (WHERE p.proname IN (${allowedFunctionList}) AND has_function_privilege(current_user, p.oid, 'EXECUTE'))::bigint`,
+        "FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace",
+        "WHERE n.nspname = 'scopeproof'",
+      ].join(" "),
+    },
+    {
+      sql: [
+        "SELECT count(*) FILTER (WHERE",
+        "has_table_privilege(current_user, format('scopeproof.%I', expected.name), 'SELECT') OR",
+        "has_table_privilege(current_user, format('scopeproof.%I', expected.name), 'INSERT') OR",
+        "has_table_privilege(current_user, format('scopeproof.%I', expected.name), 'UPDATE') OR",
+        "has_table_privilege(current_user, format('scopeproof.%I', expected.name), 'DELETE'))::bigint",
+        `FROM unnest(ARRAY[${isolatedTableList}]::text[]) AS expected(name)`,
+      ].join(" "),
+    },
+  ]);
+  const session = results[1].records?.[0] ?? [];
+  const role = results[2].records?.[0] ?? [];
+  const functions = results[3].records?.[0] ?? [];
+  const tables = results[4].records?.[0] ?? [];
+  if (
+    fieldString(session[0]) !== config.controlDatabaseUsername ||
+    fieldString(session[1]) !== config.databaseName ||
+    session[2]?.booleanValue !== true ||
+    session[3]?.booleanValue !== false ||
+    role.length !== 6 ||
+    role[0]?.booleanValue !== true ||
+    role.slice(1).some((field) => field?.booleanValue !== false) ||
+    fieldNumber(functions[0]) !== controlRoleAllowedFunctions.length ||
+    fieldNumber(functions[1]) !== controlRoleAllowedFunctions.length ||
+    fieldNumber(tables[0]) !== 0
+  ) {
+    throw new Error("Tenant evidence-control role is not an execute-only control identity.");
+  }
+}
+
+async function verifyLegalApiRole() {
+  const isolatedTableList = isolatedTables.map(quoteLiteral).join(", ");
+  const results = await runTransaction(config.legalApiDatabaseSecretArn, [
+    {
+      sql: "SELECT set_config('scopeproof.tenant_id', :tenant_id, true)",
+      parameters: [stringParameter("tenant_id", config.tenantId)],
+    },
+    {
+      sql: "SELECT current_user, current_database(), has_schema_privilege(current_user, 'scopeproof', 'USAGE'), has_schema_privilege(current_user, 'scopeproof', 'CREATE')",
+    },
+    {
+      sql: "SELECT rolcanlogin, rolsuper, rolcreaterole, rolcreatedb, rolreplication, rolbypassrls FROM pg_catalog.pg_roles WHERE rolname = current_user",
+    },
+    {
+      sql: [
+        "SELECT count(*) FILTER (WHERE has_function_privilege(current_user, p.oid, 'EXECUTE'))::bigint,",
+        "count(*) FILTER (WHERE p.proname IN ('current_tenant_id', 'resolve_active_membership', 'reserve_exact_version_legal_hold', 'approve_exact_version_legal_hold') AND has_function_privilege(current_user, p.oid, 'EXECUTE'))::bigint",
+        "FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace",
+        "WHERE n.nspname = 'scopeproof'",
+      ].join(" "),
+    },
+    {
+      sql: [
+        "SELECT count(*) FILTER (WHERE",
+        "has_table_privilege(current_user, format('scopeproof.%I', expected.name), 'SELECT') OR",
+        "has_table_privilege(current_user, format('scopeproof.%I', expected.name), 'INSERT') OR",
+        "has_table_privilege(current_user, format('scopeproof.%I', expected.name), 'UPDATE') OR",
+        "has_table_privilege(current_user, format('scopeproof.%I', expected.name), 'DELETE'))::bigint",
+        `FROM unnest(ARRAY[${isolatedTableList}]::text[]) AS expected(name)`,
+      ].join(" "),
+    },
+  ]);
+  const session = results[1].records?.[0] ?? [];
+  const role = results[2].records?.[0] ?? [];
+  const functions = results[3].records?.[0] ?? [];
+  const tables = results[4].records?.[0] ?? [];
+  if (
+    fieldString(session[0]) !== config.legalApiDatabaseUsername ||
+    fieldString(session[1]) !== config.databaseName ||
+    session[2]?.booleanValue !== true ||
+    session[3]?.booleanValue !== false ||
+    role.length !== 6 ||
+    role[0]?.booleanValue !== true ||
+    role.slice(1).some((field) => field?.booleanValue !== false) ||
+    fieldNumber(functions[0]) !== 4 ||
+    fieldNumber(functions[1]) !== 4 ||
+    fieldNumber(tables[0]) !== 0
+  ) {
+    throw new Error("Tenant legal-hold API role is not an execute-only request and approval identity.");
   }
 }
 
@@ -815,6 +1208,7 @@ function tenantIdentityParameters() {
     stringParameter("quarantine_bucket", config.quarantineBucket),
     stringParameter("evidence_bucket", config.evidenceBucket),
     stringParameter("key_arn", config.evidenceKeyArn),
+    stringParameter("signing_key_arn", config.auditSigningKeyArn),
   ];
 }
 
@@ -942,6 +1336,7 @@ function registryKeys() {
   return [
     { PK: { S: `TENANT#${config.tenantId}` }, SK: { S: "METADATA" } },
     { PK: { S: `DOMAIN#${config.hostname}` }, SK: { S: "METADATA" } },
+    { PK: { S: `DOMAIN#${config.apiHostname}` }, SK: { S: "METADATA" } },
   ];
 }
 
@@ -966,11 +1361,6 @@ function scramSha256Verifier(password) {
 function sanitizeErrorName(value) {
   const name = String(value ?? "TenantProvisioningError").replace(/[^A-Za-z0-9_.:-]/g, "");
   return name.slice(0, 120) || "TenantProvisioningError";
-}
-
-function stableToken(executionId, operation) {
-  const digest = createHash("sha256").update(executionId).update("\0").update(operation).digest("hex");
-  return `scopeproof-${operation}-${digest.slice(0, 16)}`;
 }
 
 function namedError(name, message) {

@@ -5,6 +5,10 @@
     "@aws-cdk/aws-route53-targets:userPoolDomainNameMethodWithoutCustomResource": true,
     "rootDomain": "jsontechology.com",
     "branchName": "main",
+    "deploymentEnvironment": "dev",
+    "recovery": {
+      "mode": "disabled"
+    },
     "tenants": []
   }
 }

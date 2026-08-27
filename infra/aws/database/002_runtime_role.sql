@@ -29,21 +29,20 @@ BEGIN
 
   EXECUTE format('GRANT CONNECT ON DATABASE %I TO %I', current_database(), runtime_role);
   EXECUTE format('GRANT USAGE ON SCHEMA scopeproof TO %I', runtime_role);
+  -- This migration is an allow-list reset. Reapplying it removes legacy table
+  -- grants before restoring only the three reviewed SECURITY DEFINER entrypoints.
+  EXECUTE format('REVOKE ALL ON ALL TABLES IN SCHEMA scopeproof FROM %I', runtime_role);
+  EXECUTE format('REVOKE ALL ON ALL SEQUENCES IN SCHEMA scopeproof FROM %I', runtime_role);
+  EXECUTE format('REVOKE ALL ON ALL FUNCTIONS IN SCHEMA scopeproof FROM %I', runtime_role);
   EXECUTE format('GRANT EXECUTE ON FUNCTION scopeproof.current_tenant_id() TO %I', runtime_role);
-
   EXECUTE format(
-    'GRANT SELECT ON scopeproof.tenant_identity, scopeproof.tenant_domains TO %I',
+    'GRANT EXECUTE ON FUNCTION scopeproof.resolve_active_membership(text) TO %I',
     runtime_role
   );
   EXECUTE format(
-    'GRANT SELECT, INSERT, UPDATE ON scopeproof.principals, scopeproof.memberships, scopeproof.device_enrollments, scopeproof.assessments, scopeproof.integrations, scopeproof.jobs, scopeproof.upload_intents, scopeproof.evidence_artifacts, scopeproof.retention_holds, scopeproof.export_receipts, scopeproof.support_access_grants TO %I',
+    'GRANT EXECUTE ON FUNCTION scopeproof.create_upload_intent(scopeproof.resource_identifier, text, scopeproof.resource_identifier, scopeproof.resource_identifier, scopeproof.resource_identifier, scopeproof.resource_identifier, text, text, text, bigint, text, timestamptz, timestamptz, text, text, text, text, text, text, timestamptz, timestamptz, jsonb) TO %I',
     runtime_role
   );
-  EXECUTE format('GRANT SELECT, INSERT ON scopeproof.ingest_receipts TO %I', runtime_role);
-  EXECUTE format('GRANT SELECT, INSERT ON scopeproof.audit_events TO %I', runtime_role);
-  EXECUTE format('GRANT SELECT ON scopeproof.audit_heads TO %I', runtime_role);
-  EXECUTE format('GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA scopeproof TO %I', runtime_role);
-
   EXECUTE format('ALTER ROLE %I SET search_path = pg_catalog, scopeproof', runtime_role);
   EXECUTE format('ALTER ROLE %I SET row_security = on', runtime_role);
   EXECUTE format('ALTER ROLE %I SET statement_timeout = %L', runtime_role, '15s');

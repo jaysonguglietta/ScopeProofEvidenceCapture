@@ -12,6 +12,7 @@ enum KeychainStore {
     private static let account = "capture-device-token"
     private static let packageSigningAccount = "assessor-package-signing-key-v2-user-presence"
     private static let updateSequenceAccount = "verified-update-highest-sequence-v1"
+    private static let updateReleaseAccount = "verified-update-release-v2"
     private static let localAuditAccount = "local-console-audit-hmac-v1"
     private static let s3CredentialsAccount = "aws-s3-evidence-credentials-v1"
     private static let s3DestinationAccount = "aws-s3-verified-destination-v1"
@@ -177,17 +178,53 @@ enum KeychainStore {
         return bytes
     }
 
-    static func highestUpdateSequence() -> Int {
-        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: updateSequenceAccount, kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
+    private static func keychainData(account: String) -> Data? {
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account, kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
         var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess, let data = item as? Data, let text = String(data: data, encoding: .utf8), let value = Int(text) else { return 0 }
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess else { return nil }
+        return item as? Data
+    }
+
+    static func verifiedUpdateRelease() -> VerifiedUpdateRelease? {
+        guard let data = keychainData(account: updateReleaseAccount),
+              let release = try? JSONDecoder().decode(VerifiedUpdateRelease.self, from: data),
+              release.schemaVersion == 1, release.sequence > 0,
+              release.version.range(of: "^\\d+\\.\\d+\\.\\d+$", options: .regularExpression) != nil,
+              release.sha256.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil else { return nil }
+        return release
+    }
+
+    static func verifiedUpdateFloor() -> VerifiedUpdateRelease? {
+        if let release = verifiedUpdateRelease() { return release }
+        let legacySequence = legacyHighestUpdateSequence()
+        return legacySequence > 0 ? VerifiedUpdateRelease(sequence: legacySequence, version: "", sha256: "") : nil
+    }
+
+    static func legacyHighestUpdateSequence() -> Int {
+        guard let data = keychainData(account: updateSequenceAccount),
+              let text = String(data: data, encoding: .utf8), let value = Int(text), value > 0 else { return 0 }
         return value
     }
 
-    static func saveHighestUpdateSequence(_ sequence: Int) throws {
-        guard sequence >= highestUpdateSequence() else { return }
-        let data = Data(String(sequence).utf8)
-        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: updateSequenceAccount]
+    static func saveVerifiedUpdateRelease(_ release: VerifiedUpdateRelease) throws {
+        guard release.schemaVersion == 1, release.sequence > 0,
+              release.version.range(of: "^\\d+\\.\\d+\\.\\d+$", options: .regularExpression) != nil,
+              release.sha256.range(of: "^[a-f0-9]{64}$", options: .regularExpression) != nil else {
+            throw UpdateFailure.invalidMetadata("the verified release tuple is malformed")
+        }
+        if release.sequence < legacyHighestUpdateSequence() { throw UpdateFailure.rollback }
+        if let previous = verifiedUpdateRelease() {
+            if release.sequence < previous.sequence { throw UpdateFailure.rollback }
+            if release.sequence == previous.sequence {
+                guard release == previous else { throw UpdateFailure.rollback }
+                return
+            }
+        } else if release.sequence == legacyHighestUpdateSequence(), legacyHighestUpdateSequence() > 0 {
+            // The v1 record has no artifact digest. Never let an equal sequence acquire a new identity.
+            throw UpdateFailure.rollback
+        }
+        let data = try JSONEncoder().encode(release)
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: updateReleaseAccount]
         let attributes: [String: Any] = [kSecValueData as String: data, kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly]
         let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
         if status == errSecItemNotFound {
@@ -195,6 +232,17 @@ enum KeychainStore {
             let createStatus = SecItemAdd(create as CFDictionary, nil)
             guard createStatus == errSecSuccess else { throw NSError(domain: NSOSStatusErrorDomain, code: Int(createStatus)) }
         } else if status != errSecSuccess { throw NSError(domain: NSOSStatusErrorDomain, code: Int(status)) }
+
+        // Preserve a sequence-only floor for downgrade protection across upgrades from older builds.
+        let sequenceData = Data(String(release.sequence).utf8)
+        let sequenceQuery: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: updateSequenceAccount]
+        let sequenceAttributes: [String: Any] = [kSecValueData as String: sequenceData, kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly]
+        let sequenceStatus = SecItemUpdate(sequenceQuery as CFDictionary, sequenceAttributes as CFDictionary)
+        if sequenceStatus == errSecItemNotFound {
+            var create = sequenceQuery; sequenceAttributes.forEach { create[$0.key] = $0.value }
+            let createStatus = SecItemAdd(create as CFDictionary, nil)
+            guard createStatus == errSecSuccess else { throw NSError(domain: NSOSStatusErrorDomain, code: Int(createStatus)) }
+        } else if sequenceStatus != errSecSuccess { throw NSError(domain: NSOSStatusErrorDomain, code: Int(sequenceStatus)) }
     }
 
     static func readPackageSigningKey() -> Data? {

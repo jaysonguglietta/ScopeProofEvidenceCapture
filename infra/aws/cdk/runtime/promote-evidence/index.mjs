@@ -1,20 +1,49 @@
 import { createHash } from "node:crypto";
-import { DynamoDBClient, GetItemCommand, TransactWriteItemsCommand } from "@aws-sdk/client-dynamodb";
+import { DynamoDBClient, GetItemCommand, QueryCommand, TransactWriteItemsCommand } from "@aws-sdk/client-dynamodb";
+import { SignCommand, VerifyCommand, KMSClient } from "@aws-sdk/client-kms";
 import {
-  CopyObjectCommand,
+  BeginTransactionCommand,
+  CommitTransactionCommand,
+  ExecuteStatementCommand,
+  RDSDataClient,
+  RollbackTransactionCommand,
+} from "@aws-sdk/client-rds-data";
+import {
   DeleteObjectCommand,
+  GetObjectCommand,
   GetObjectTaggingCommand,
   HeadObjectCommand,
+  PutObjectCommand,
   S3Client,
 } from "@aws-sdk/client-s3";
+import {
+  buildAuthoritativePromotionReceiptItem,
+  parseAuthoritativePromotionReceiptItem,
+  parseCommittedPromotionReceipt,
+  verifyCommittedPromotionReceipt,
+} from "./promotion-receipt.mjs";
+import { buildPromotionRecoveryChangeItem } from "../reconcile-recovery/change-ledger.mjs";
+import { derivePromotionRetention } from "./retention-contract.mjs";
+import {
+  buildPromotionCopyAttemptItem,
+  createOrAdoptImmutableDestination,
+  derivePromotionLease,
+  promotionCopyAttemptSortKey,
+  promotionCopyMetadata,
+  promotionLeaseDurationMilliseconds,
+} from "./promotion-fence.mjs";
 
 const required = [
   "AWS_ACCOUNT_ID_EXPECTED",
   "AWS_REGION_EXPECTED",
+  "AUDIT_SIGNING_KEY_ARN",
   "CONTROL_TABLE_NAME",
+  "DATABASE_CLUSTER_ARN",
+  "DATABASE_NAME",
   "EVIDENCE_BUCKET_NAME",
   "EVIDENCE_KEY_ARN",
   "INGEST_BUCKET_NAME",
+  "INGEST_DATABASE_SECRET_ARN",
   "MALWARE_PROTECTION_PLAN_ARN",
   "MAX_OBJECT_BYTES",
   "RETENTION_DAYS",
@@ -28,10 +57,14 @@ for (const name of required) {
 const config = Object.freeze({
   accountId: process.env.AWS_ACCOUNT_ID_EXPECTED,
   awsRegion: process.env.AWS_REGION_EXPECTED,
+  auditSigningKeyArn: process.env.AUDIT_SIGNING_KEY_ARN,
   controlTable: process.env.CONTROL_TABLE_NAME,
+  databaseClusterArn: process.env.DATABASE_CLUSTER_ARN,
+  databaseName: process.env.DATABASE_NAME,
   evidenceBucket: process.env.EVIDENCE_BUCKET_NAME,
   evidenceKeyArn: process.env.EVIDENCE_KEY_ARN,
   ingestBucket: process.env.INGEST_BUCKET_NAME,
+  ingestDatabaseSecretArn: process.env.INGEST_DATABASE_SECRET_ARN,
   malwarePlanArn: process.env.MALWARE_PROTECTION_PLAN_ARN,
   maxObjectBytes: Number(process.env.MAX_OBJECT_BYTES),
   retentionDays: Number(process.env.RETENTION_DAYS),
@@ -41,6 +74,21 @@ const config = Object.freeze({
 if (!/^ten_[a-f0-9]{32}$/.test(config.tenantId)) throw new Error("Unsafe tenant identifier.");
 if (!/^\d{12}$/.test(config.accountId) || !/^[a-z]{2}(?:-gov)?-[a-z]+-\d$/.test(config.awsRegion)) {
   throw new Error("Unsafe AWS deployment identity.");
+}
+const escapedRegion = config.awsRegion.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const escapedAccount = config.accountId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const kmsKeyArnPattern = new RegExp(`^arn:(aws|aws-us-gov|aws-cn):kms:${escapedRegion}:${escapedAccount}:key/[0-9a-f-]{36}$`);
+const clusterArnPattern = new RegExp(`^arn:(aws|aws-us-gov|aws-cn):rds:${escapedRegion}:${escapedAccount}:cluster:[A-Za-z0-9-]{1,63}$`);
+const secretArnPattern = new RegExp(`^arn:(aws|aws-us-gov|aws-cn):secretsmanager:${escapedRegion}:${escapedAccount}:secret:[A-Za-z0-9/_+=.@-]{1,512}$`);
+if (
+  !kmsKeyArnPattern.test(config.auditSigningKeyArn) ||
+  !kmsKeyArnPattern.test(config.evidenceKeyArn) ||
+  !clusterArnPattern.test(config.databaseClusterArn) ||
+  !secretArnPattern.test(config.ingestDatabaseSecretArn) ||
+  !/^scopeproof_[a-z0-9_]{1,48}$/.test(config.databaseName) ||
+  config.auditSigningKeyArn === config.evidenceKeyArn
+) {
+  throw new Error("Unsafe evidence reconciliation identity.");
 }
 if (!Number.isInteger(config.maxObjectBytes) || config.maxObjectBytes !== 25 * 1024 * 1024) {
   throw new Error("Hosted evidence must use the 25 MiB upload contract.");
@@ -60,15 +108,27 @@ const mimeExtensions = new Map([
   ["text/csv", "csv"],
   ["text/plain", "txt"],
 ]);
+const scanReconciliationGraceMilliseconds = 7 * 24 * 60 * 60 * 1_000;
 const dynamo = new DynamoDBClient({});
-const s3 = new S3Client({});
+const kms = new KMSClient({});
+const rds = new RDSDataClient({});
+// Conditional PutObject is deliberately single-attempt. An ambiguous network
+// result is recovered by exact-key HeadObject; SDK-level replay is unnecessary.
+const s3 = new S3Client({ maxAttempts: 1 });
 
 export async function handler(event) {
   const failures = [];
   for (const record of event?.Records ?? []) {
     try {
       await promoteRecord(record);
-    } catch {
+    } catch (error) {
+      const rawMessageId = String(record?.messageId ?? "unknown");
+      console.error(JSON.stringify({
+        event: "scopeproof.evidence_promotion_failed",
+        errorName: safeErrorName(error),
+        messageIdSha256: digestHex(rawMessageId).slice(0, 24),
+        tenantId: config.tenantId,
+      }));
       failures.push({ itemIdentifier: String(record?.messageId ?? "unknown") });
     }
   }
@@ -102,10 +162,11 @@ async function promoteRecord(record) {
     throw new Error("The scan result does not identify the configured versioned ingest object.");
   }
   const keyMatch = key.match(
-    new RegExp(`^tenants/${config.tenantId}/quarantine/(upl_[a-f0-9]{32})\\.upload$`),
+    new RegExp(`^tenants/${config.tenantId}/controls/([A-Za-z0-9][A-Za-z0-9._-]{0,63})/quarantine/(upl_[a-f0-9]{32})\\.upload$`),
   );
   if (!keyMatch) throw new Error("The object key is not an opaque tenant upload key.");
-  const intentId = keyMatch[1];
+  const controlId = keyMatch[1];
+  const intentId = keyMatch[2];
   const intentKey = {
     PK: { S: `TENANT#${config.tenantId}` },
     SK: { S: `UPLOAD#${intentId}` },
@@ -113,7 +174,7 @@ async function promoteRecord(record) {
   const intentResponse = await dynamo.send(
     new GetItemCommand({ ConsistentRead: true, Key: intentKey, TableName: config.controlTable }),
   );
-  const intent = parseIntent(intentResponse.Item, intentId, key);
+  const intent = parseIntent(intentResponse.Item, intentId, controlId, key);
   if (intent.status === "promoted") {
     if (intent.sourceVersionId !== versionId) {
       throw new Error("A promoted upload intent cannot be replayed with another object version.");
@@ -133,7 +194,7 @@ async function promoteRecord(record) {
       VersionId: versionId,
     }),
   );
-  validateHeadAgainstIntent(head, intent, source.eTag);
+  const uploadedAt = validateHeadAgainstIntent(head, intent, source.eTag);
   const tags = await s3.send(
     new GetObjectTaggingCommand({ Bucket: bucket, Key: key, VersionId: versionId }),
   );
@@ -146,21 +207,67 @@ async function promoteRecord(record) {
     PK: { S: `TENANT#${config.tenantId}` },
     SK: { S: `PROMOTION#${receiptHash}` },
   };
+  const committedReceipt = await readCommittedPromotionReceipt(intent, {
+    uploadedAt,
+    versionId,
+  });
+  if (committedReceipt) {
+    if (intent.status !== "validated" || intent.revision !== 2) {
+      throw new Error("A committed database promotion conflicts with the upload lifecycle state.");
+    }
+    const committedDestination = await findCompletedCopy(
+      intent.finalKey,
+      versionId,
+      intent.expectedSha256,
+      committedReceipt.facts.evidenceVersionId,
+      new Date(committedReceipt.facts.retainUntil),
+      committedReceipt.facts.uploadedAt,
+      committedReceipt.facts.copyAttemptId,
+      committedReceipt.facts.copyFence,
+    );
+    if (
+      committedDestination?.versionId !== committedReceipt.facts.evidenceVersionId ||
+      committedDestination.retainUntil.toISOString() !== committedReceipt.facts.retainUntil
+    ) {
+      throw new Error("The signed database receipt does not match the exact immutable S3 version.");
+    }
+    await completePromotion({
+      databaseReconciliation: committedReceipt,
+      facts: committedReceipt.facts,
+      intent,
+      intentKey,
+      nowIso: new Date().toISOString(),
+      receiptKey,
+      recovered: true,
+      versionId,
+    });
+    await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: key, VersionId: versionId }));
+    return;
+  }
   const eventId = String(envelope.id ?? "");
   if (!/^[a-f0-9-]{16,64}$/i.test(eventId)) throw new Error("Invalid GuardDuty event identifier.");
   const leaseId = digestHex(`${eventId}\0${messageId}`);
-  const now = new Date();
-  const nowIso = now.toISOString();
-  const leaseExpiresAt = new Date(now.getTime() + 5 * 60_000).toISOString();
+  const nowIso = new Date().toISOString();
+  const lease = derivePromotionLease({
+    currentFence: intent.promotionFence,
+    intentId,
+    leaseId,
+    now: nowIso,
+    sourceVersionId: versionId,
+    tenantId: config.tenantId,
+  });
 
   if (intent.status === "issued") {
     await claimIssuedIntent({
+      attemptId: lease.attemptId,
       eventId,
+      fence: lease.fence,
       intent,
       intentKey,
       leaseId,
-      leaseExpiresAt,
+      leaseExpiresAt: lease.leaseExpiresAt,
       nowIso,
+      uploadedAt,
       receiptHash,
       receiptKey,
       versionId,
@@ -170,47 +277,102 @@ async function promoteRecord(record) {
     intent.sourceVersionId = versionId;
   } else {
     if (intent.sourceVersionId !== versionId) throw new Error("Upload intent source version mismatch.");
-    await renewLease(intentKey, intent, leaseId, leaseExpiresAt, nowIso);
+    await takeOverLease({
+      attemptId: lease.attemptId,
+      fence: lease.fence,
+      intent,
+      intentKey,
+      leaseId,
+      leaseExpiresAt: lease.leaseExpiresAt,
+      nowIso,
+      receiptHash,
+      receiptKey,
+    });
   }
+  intent.promotionAttemptId = lease.attemptId;
+  intent.promotionFence = lease.fence;
+  intent.promotionLeaseExpiresAt = lease.leaseExpiresAt;
+  intent.promotionLeaseId = leaseId;
 
   if (intent.status === "quarantined") {
-    await markValidated(intentKey, intent, leaseId, head, nowIso, versionId);
+    await markValidated(intentKey, intent, lease, leaseId, head, nowIso, versionId);
     intent.status = "validated";
     intent.revision = 2;
   }
 
-  const requiredRetention = new Date(intent.requiredRetentionUntil);
-  const configuredRetention = new Date(now.getTime() + config.retentionDays * 86_400_000);
-  const retainUntil = requiredRetention > configuredRetention ? requiredRetention : configuredRetention;
+  // Publish the Dynamo fencing token to the independent database boundary
+  // before any irreversible S3 operation. A newer Dynamo lease advances this
+  // row and makes every older worker fail database reconciliation.
+  await claimPromotionFenceDatabase(intent, lease);
+
+  let retainUntil = derivePromotionRetention({
+    requiredRetentionUntil: intent.requiredRetentionUntil,
+    retentionDays: config.retentionDays,
+    uploadedAt,
+  }).retainUntil;
   const encryptionContext = Buffer.from(
     JSON.stringify({ scopeproofPurpose: "immutable-evidence", scopeproofTenantId: config.tenantId }),
   ).toString("base64");
 
+  const copyMetadata = promotionCopyMetadata(lease);
   let destination = await findCompletedCopy(
     intent.finalKey,
     versionId,
     intent.expectedSha256,
     undefined,
     retainUntil,
+    uploadedAt,
   );
+  if (destination) await ensureTrackedCopyOutcome(destination, receiptHash);
+  let currentAttemptPermitted = false;
   let providerRequestId = destination?.providerRequestId;
   if (!destination) {
-    const copy = await s3.send(
-      new CopyObjectCommand({
+    await prepareCopyAttempt({
+      intent,
+      intentKey,
+      lease,
+      leaseId,
+      receiptHash,
+      receiptKey,
+      versionId,
+    });
+    currentAttemptPermitted = true;
+    const sourceObject = await s3.send(new GetObjectCommand({
+      Bucket: bucket,
+      ChecksumMode: "ENABLED",
+      IfMatch: head.ETag,
+      Key: key,
+      VersionId: versionId,
+    }));
+    const expectedBase64 = Buffer.from(intent.expectedSha256, "hex").toString("base64");
+    if (
+      !sourceObject.Body || sourceObject.VersionId !== versionId ||
+      sourceObject.ContentLength !== intent.expectedSize ||
+      sourceObject.ChecksumSHA256 !== expectedBase64 ||
+      normalizeEtag(sourceObject.ETag) !== normalizeEtag(head.ETag)
+    ) {
+      throw new Error("The exact quarantine stream changed before conditional promotion.");
+    }
+    const write = await createOrAdoptImmutableDestination({
+      createDestination: () => s3.send(new PutObjectCommand({
         Bucket: config.evidenceBucket,
+        Body: sourceObject.Body,
         ChecksumAlgorithm: "SHA256",
+        ChecksumSHA256: expectedBase64,
+        ContentLength: intent.expectedSize,
         ContentType: intent.contentType,
-        CopySource: copySource(bucket, key, versionId),
-        CopySourceIfMatch: head.ETag,
+        IfNoneMatch: "*",
         Key: intent.finalKey,
         Metadata: {
+          "control-id": intent.controlId,
           "intent-id": intentId,
+          ...copyMetadata,
           "resource-id": intent.resourceId,
           sha256: intent.expectedSha256,
           "source-version": versionId,
           "tenant-id": config.tenantId,
+          "uploaded-at": uploadedAt,
         },
-        MetadataDirective: "REPLACE",
         ObjectLockMode: config.retentionMode,
         ObjectLockRetainUntilDate: retainUntil,
         ServerSideEncryption: "aws:kms",
@@ -220,42 +382,125 @@ async function promoteRecord(record) {
           "malware-status": "NO_THREATS_FOUND",
           "tenant-id": config.tenantId,
         }).toString(),
-        TaggingDirective: "REPLACE",
-      }),
-    );
-    const expectedBase64 = Buffer.from(intent.expectedSha256, "hex").toString("base64");
-    if (!copy.VersionId || copy.CopyObjectResult?.ChecksumSHA256 !== expectedBase64) {
-      throw new Error("S3 did not attest the copied object's expected SHA-256 checksum and version.");
+      })),
+      isConditionalConflict: isConditionalWriteConflict,
+      // Another fenced attempt may win the one-and-only destination write.
+      // Recover its exact tracked version rather than creating another
+      // Object-Locked version. The attempt ledger is reconciled below.
+      readWinner: () => findCompletedCopy(
+        intent.finalKey,
+        versionId,
+        intent.expectedSha256,
+        undefined,
+        retainUntil,
+        uploadedAt,
+      ),
+    });
+    const put = write.result;
+    if (!write.created) {
+      destination = write.destination;
+      await ensureTrackedCopyOutcome(destination, receiptHash);
     }
-    providerRequestId = copy.$metadata?.requestId;
-    destination = await findCompletedCopy(
-      intent.finalKey,
-      versionId,
-      intent.expectedSha256,
-      copy.VersionId,
-      retainUntil,
-    );
-    if (!destination) throw new Error("The immutable destination failed post-copy verification.");
+    if (put && validVersionId(put.VersionId)) {
+      await recordCopyOutcome({
+        attemptId: lease.attemptId,
+        completedAt: new Date().toISOString(),
+        destinationVersionId: put.VersionId,
+        fence: lease.fence,
+        observedChecksumSha256: String(put.ChecksumSHA256 ?? ""),
+        providerRequestId: String(put.$metadata?.requestId ?? ""),
+        receiptHash,
+      });
+    }
+    if (put && (!put.VersionId || put.ChecksumSHA256 !== expectedBase64)) {
+      throw new Error("S3 did not attest the conditionally written object's expected SHA-256 checksum and version.");
+    }
+    if (put) {
+      providerRequestId = put.$metadata?.requestId;
+      destination = await findCompletedCopy(
+        intent.finalKey,
+        versionId,
+        intent.expectedSha256,
+        put.VersionId,
+        retainUntil,
+        uploadedAt,
+        lease.attemptId,
+        lease.fence,
+      );
+      if (!destination) throw new Error("The immutable destination failed post-write verification.");
+      await ensureTrackedCopyOutcome(destination, receiptHash);
+    } else {
+      providerRequestId = destination?.providerRequestId;
+    }
   }
+  if (
+    currentAttemptPermitted &&
+    (destination.promotionFence !== lease.fence || destination.promotionAttemptId !== lease.attemptId)
+  ) {
+    await markCopyAttemptAdopted({
+      adoptedAttemptId: destination.promotionAttemptId,
+      adoptedFence: destination.promotionFence,
+      adoptedVersionId: destination.versionId,
+      attemptId: lease.attemptId,
+      fence: lease.fence,
+      receiptHash,
+    });
+  }
+  await resolveOrphanedCopyAttempts(destination, receiptHash);
+  retainUntil = destination.retainUntil;
 
-  await completePromotion({
+  const exactProviderRequestId = providerRequestId ?? destination.providerRequestId;
+  if (!validProviderRequestId(exactProviderRequestId)) {
+    throw new Error("S3 did not return a valid promotion request identifier.");
+  }
+  const promotedAt = new Date().toISOString();
+  const reconciliationLeaseExpiresAt = await renewActiveLease(intentKey, intent, lease, leaseId, promotedAt);
+  const reconciliationLease = Object.freeze({ ...lease, leaseExpiresAt: reconciliationLeaseExpiresAt });
+  // Re-claiming is idempotent for the exact attempt and rejects a worker whose
+  // fence was superseded between S3 and RDS.
+  await claimPromotionFenceDatabase(intent, reconciliationLease);
+  const promotionFacts = buildPromotionFacts({
+    copyAttemptId: destination.promotionAttemptId,
+    copyFence: destination.promotionFence,
     destinationVersionId: destination.versionId,
     intent,
-    intentKey,
-    leaseId,
-    nowIso,
-    providerRequestId: providerRequestId ?? "unknown",
-    receiptKey,
+    nowIso: promotedAt,
+    promotionAttemptId: lease.attemptId,
+    promotionFence: lease.fence,
+    providerRequestId: exactProviderRequestId,
     retainUntil,
+    uploadedAt,
+    versionId,
+  });
+  const databaseReconciliation = await reconcilePromotionDatabase(promotionFacts, intent, reconciliationLease);
+  const completionTime = new Date().toISOString();
+  await renewActiveLease(intentKey, intent, lease, leaseId, completionTime);
+  await completePromotion({
+    databaseReconciliation,
+    facts: promotionFacts,
+    intent,
+    intentKey,
+    lease,
+    leaseId,
+    nowIso: completionTime,
+    receiptKey,
+    recovered: false,
     versionId,
   });
   await s3.send(new DeleteObjectCommand({ Bucket: bucket, Key: key, VersionId: versionId }));
 }
 
-function parseIntent(item, expectedIntentId, expectedKey) {
+function parseIntent(item, expectedIntentId, expectedControlId, expectedKey) {
   if (!item) throw new Error("A strongly consistent upload intent is required.");
   const intent = {
     contentType: item.contentType?.S,
+    controlId: item.controlId?.S,
+    databaseEvidenceRevision: item.databaseEvidenceRevision?.N === undefined
+      ? NaN
+      : Number(item.databaseEvidenceRevision.N),
+    databaseUploadRevision: item.databaseUploadRevision?.N === undefined
+      ? NaN
+      : Number(item.databaseUploadRevision.N),
     expectedSha256: item.expectedSha256?.S,
     expectedSize: item.expectedSize?.N === undefined ? NaN : Number(item.expectedSize.N),
     expiresAt: item.expiresAt?.S,
@@ -268,17 +513,42 @@ function parseIntent(item, expectedIntentId, expectedKey) {
         ? NaN
         : Number(item.promotionReceipt.M.byteSize.N),
       contentType: item.promotionReceipt?.M?.contentType?.S,
+      copyAttemptId: item.promotionReceipt?.M?.copyAttemptId?.S,
+      copyFence: item.promotionReceipt?.M?.copyFence?.N === undefined
+        ? NaN
+        : Number(item.promotionReceipt.M.copyFence.N),
+      databaseEvidenceRevision: item.promotionReceipt?.M?.databaseEvidenceRevision?.N === undefined
+        ? NaN
+        : Number(item.promotionReceipt.M.databaseEvidenceRevision.N),
+      databaseUploadRevision: item.promotionReceipt?.M?.databaseUploadRevision?.N === undefined
+        ? NaN
+        : Number(item.promotionReceipt.M.databaseUploadRevision.N),
+      databaseReceiptId: item.promotionReceipt?.M?.databaseReceiptId?.S,
+      databaseIdempotencyDigest: item.promotionReceipt?.M?.databaseIdempotencyDigest?.S,
       finalKey: item.promotionReceipt?.M?.finalKey?.S,
       finalVersionId: item.promotionReceipt?.M?.finalVersionId?.S,
       kmsKeyArn: item.promotionReceipt?.M?.kmsKeyArn?.S,
       objectLockMode: item.promotionReceipt?.M?.objectLockMode?.S,
+      promotionAttemptId: item.promotionReceipt?.M?.promotionAttemptId?.S,
+      promotionFence: item.promotionReceipt?.M?.promotionFence?.N === undefined
+        ? NaN
+        : Number(item.promotionReceipt.M.promotionFence.N),
+      promotedAt: item.promotionReceipt?.M?.promotedAt?.S,
+      providerRequestId: item.promotionReceipt?.M?.providerRequestId?.S,
       retainUntil: item.promotionReceipt?.M?.retainUntil?.S,
       sha256: item.promotionReceipt?.M?.sha256?.S,
       sourceKey: item.promotionReceipt?.M?.sourceKey?.S,
       sourceVersionId: item.promotionReceipt?.M?.sourceVersionId?.S,
       tenantId: item.promotionReceipt?.M?.tenantId?.S,
+      uploadedAt: item.promotionReceipt?.M?.uploadedAt?.S,
     },
     quarantineKey: item.quarantineKey?.S,
+    quarantineBucket: item.quarantineBucket?.S,
+    quarantineKmsKeyArn: item.quarantineKmsKeyArn?.S,
+    promotionAttemptId: item.promotionAttemptId?.S,
+    promotionFence: item.promotionFence?.N === undefined ? undefined : Number(item.promotionFence.N),
+    promotionLeaseExpiresAt: item.promotionLeaseExpiresAt?.S,
+    promotionLeaseId: item.promotionLeaseId?.S,
     requiredRetentionUntil: item.requiredRetentionUntil?.S,
     resourceId: item.resourceId?.S,
     revision: item.revision?.N === undefined ? NaN : Number(item.revision.N),
@@ -289,34 +559,61 @@ function parseIntent(item, expectedIntentId, expectedKey) {
   };
   const extension = mimeExtensions.get(intent.contentType);
   const expectedFinalPattern = new RegExp(
-    `^tenants/${config.tenantId}/evidence/(evd_[a-f0-9]{32})\\.${escapeRegex(extension ?? "invalid")}$`,
+    `^tenants/${config.tenantId}/controls/${escapeRegex(expectedControlId)}/evidence/(evd_[a-f0-9]{32})\\.${escapeRegex(extension ?? "invalid")}$`,
   );
   const finalMatch = String(intent.finalKey ?? "").match(expectedFinalPattern);
   const expectedRevision = { issued: 0, quarantined: 1, validated: 2, promoted: 3 }[intent.status];
   const promotedReceiptValid = intent.status !== "promoted" || (
     intent.promotionReceipt.byteSize === intent.expectedSize &&
     intent.promotionReceipt.contentType === intent.contentType &&
+    /^pat_[a-f0-9]{32}$/.test(intent.promotionReceipt.copyAttemptId ?? "") &&
+    Number.isSafeInteger(intent.promotionReceipt.copyFence) &&
+    intent.promotionReceipt.copyFence >= 1 &&
+    intent.promotionReceipt.databaseEvidenceRevision === intent.databaseEvidenceRevision + 1 &&
+    intent.promotionReceipt.databaseUploadRevision === intent.databaseUploadRevision + 1 &&
+    /^rcp_[a-f0-9]{32}$/.test(intent.promotionReceipt.databaseReceiptId ?? "") &&
+    /^[a-f0-9]{64}$/.test(intent.promotionReceipt.databaseIdempotencyDigest ?? "") &&
     intent.promotionReceipt.finalKey === intent.finalKey &&
     validVersionId(intent.promotionReceipt.finalVersionId) &&
     intent.promotionReceipt.kmsKeyArn === config.evidenceKeyArn &&
     intent.promotionReceipt.objectLockMode === config.retentionMode &&
+    /^pat_[a-f0-9]{32}$/.test(intent.promotionReceipt.promotionAttemptId ?? "") &&
+    Number.isSafeInteger(intent.promotionReceipt.promotionFence) &&
+    intent.promotionReceipt.promotionFence >= 1 &&
+    validInstant(intent.promotionReceipt.promotedAt) &&
+    validProviderRequestId(intent.promotionReceipt.providerRequestId) &&
     validInstant(intent.promotionReceipt.retainUntil) &&
     Date.parse(intent.promotionReceipt.retainUntil) >= Date.parse(intent.requiredRetentionUntil) &&
     intent.promotionReceipt.sha256 === intent.expectedSha256 &&
     intent.promotionReceipt.sourceKey === intent.quarantineKey &&
     intent.promotionReceipt.sourceVersionId === intent.sourceVersionId &&
-    intent.promotionReceipt.tenantId === config.tenantId
+    intent.promotionReceipt.tenantId === config.tenantId &&
+    validInstant(intent.promotionReceipt.uploadedAt) &&
+    Date.parse(intent.promotionReceipt.promotedAt) >= Date.parse(intent.promotionReceipt.uploadedAt)
   );
+  const promotionCoordinationValid = intent.status === "issued"
+    ? intent.promotionFence === undefined && intent.promotionAttemptId === undefined &&
+      intent.promotionLeaseId === undefined && intent.promotionLeaseExpiresAt === undefined
+    : Number.isSafeInteger(intent.promotionFence) && intent.promotionFence >= 1 &&
+      /^pat_[a-f0-9]{32}$/.test(intent.promotionAttemptId ?? "") &&
+      (intent.status === "promoted"
+        ? intent.promotionLeaseId === undefined && intent.promotionLeaseExpiresAt === undefined
+        : /^[a-f0-9]{64}$/.test(intent.promotionLeaseId ?? "") && validInstant(intent.promotionLeaseExpiresAt));
   if (
     item.kind?.S !== "UploadLifecycle" ||
     intent.schemaVersion !== 1 ||
     intent.id !== expectedIntentId ||
     intent.tenantId !== config.tenantId ||
+    intent.controlId !== expectedControlId ||
+    intent.quarantineBucket !== config.ingestBucket ||
+    intent.quarantineKmsKeyArn !== config.evidenceKeyArn ||
     intent.quarantineKey !== expectedKey ||
     !/^usr_[a-f0-9]{32}$/.test(item.requestedBy?.S ?? "") ||
     !/^evd_[a-f0-9]{32}$/.test(intent.resourceId ?? "") ||
     !/^[a-f0-9]{64}$/.test(intent.expectedSha256 ?? "") ||
     !Number.isSafeInteger(intent.expectedSize) ||
+    intent.databaseEvidenceRevision !== 0 ||
+    intent.databaseUploadRevision !== 0 ||
     intent.expectedSize < 1 ||
     intent.expectedSize > config.maxObjectBytes ||
     !extension ||
@@ -326,12 +623,13 @@ function parseIntent(item, expectedIntentId, expectedKey) {
     !Number.isSafeInteger(intent.revision) ||
     intent.revision !== expectedRevision ||
     !promotedReceiptValid ||
+    !promotionCoordinationValid ||
     !validInstant(intent.issuedAt) ||
     !validInstant(intent.expiresAt) ||
     !validInstant(intent.requiredRetentionUntil) ||
     Date.parse(intent.issuedAt) > Date.now() ||
     Date.parse(intent.expiresAt) - Date.parse(intent.issuedAt) > 10 * 60_000 ||
-    (intent.status === "issued" && Date.parse(intent.expiresAt) <= Date.now()) ||
+    Date.parse(intent.expiresAt) + scanReconciliationGraceMilliseconds <= Date.now() ||
     Date.parse(intent.requiredRetentionUntil) <= Date.parse(intent.expiresAt) ||
     Date.parse(intent.requiredRetentionUntil) > Date.now() + 3650 * 86_400_000
   ) {
@@ -365,6 +663,12 @@ async function verifyCompletedPromotion(intent, intentId, sourceVersionId) {
     item?.destinationBucket?.S !== config.evidenceBucket ||
     item?.destinationKey?.S !== intent.finalKey ||
     item?.destinationVersionId?.S !== intent.promotionReceipt.finalVersionId ||
+    item?.databaseReceiptId?.S !== intent.promotionReceipt.databaseReceiptId ||
+    item?.databaseIdempotencyDigest?.S !== intent.promotionReceipt.databaseIdempotencyDigest ||
+    item?.copyAttemptId?.S !== intent.promotionReceipt.copyAttemptId ||
+    item?.copyFence?.N !== String(intent.promotionReceipt.copyFence) ||
+    item?.promotionAttemptId?.S !== intent.promotionReceipt.promotionAttemptId ||
+    item?.promotionFence?.N !== String(intent.promotionReceipt.promotionFence) ||
     item?.sha256?.S !== intent.expectedSha256 ||
     item?.retainUntil?.S !== intent.promotionReceipt.retainUntil
   ) {
@@ -376,9 +680,53 @@ async function verifyCompletedPromotion(intent, intentId, sourceVersionId) {
     intent.expectedSha256,
     intent.promotionReceipt.finalVersionId,
     new Date(intent.promotionReceipt.retainUntil),
+    intent.promotionReceipt.uploadedAt,
+    intent.promotionReceipt.copyAttemptId,
+    intent.promotionReceipt.copyFence,
   );
   if (destination?.versionId !== intent.promotionReceipt.finalVersionId) {
     throw new Error("The recorded immutable evidence version failed revalidation.");
+  }
+  const reconciliation = await readCommittedPromotionReceipt(intent, {
+    uploadedAt: intent.promotionReceipt.uploadedAt,
+    versionId: sourceVersionId,
+  });
+  if (
+    !reconciliation ||
+    reconciliation.uploadRevision !== intent.promotionReceipt.databaseUploadRevision ||
+    reconciliation.evidenceRevision !== intent.promotionReceipt.databaseEvidenceRevision ||
+    reconciliation.receiptId !== intent.promotionReceipt.databaseReceiptId ||
+    reconciliation.idempotencyDigest !== intent.promotionReceipt.databaseIdempotencyDigest
+  ) {
+    throw new Error("The completed promotion database revisions are inconsistent.");
+  }
+  await verifyAuthoritativeRecoveryReceipt(receiptHash, reconciliation);
+}
+
+async function verifyAuthoritativeRecoveryReceipt(receiptHash, databaseReceipt) {
+  const response = await dynamo.send(new GetItemCommand({
+    ConsistentRead: true,
+    Key: {
+      PK: { S: `RECOVERY#TENANT#${config.tenantId}` },
+      SK: { S: `PROMOTION#${receiptHash}` },
+    },
+    TableName: config.controlTable,
+  }));
+  if (!response.Item) throw new Error("The authoritative recovery receipt is missing.");
+  const parsed = parseAuthoritativePromotionReceiptItem(response.Item, {
+    receiptHash,
+    signingKeyArn: config.auditSigningKeyArn,
+    tenantId: config.tenantId,
+    verificationTime: new Date().toISOString(),
+  });
+  await verifyCommittedPromotionReceipt(parsed.snapshot, (verifyInput) => kms.send(new VerifyCommand(verifyInput)));
+  if (
+    parsed.snapshot.receiptId !== databaseReceipt.receiptId ||
+    parsed.snapshot.idempotencyDigest !== databaseReceipt.idempotencyDigest ||
+    parsed.snapshot.receiptDigest !== databaseReceipt.receiptDigest ||
+    stableJson(parsed.snapshot.facts) !== stableJson(databaseReceipt.facts)
+  ) {
+    throw new Error("The authoritative recovery receipt conflicts with the signed database row.");
   }
 }
 
@@ -390,6 +738,18 @@ function validateHeadAgainstIntent(head, intent, eventEtag) {
   const actual = Buffer.from(head.ChecksumSHA256, "base64").toString("hex");
   if (actual !== intent.expectedSha256) throw new Error("Evidence SHA-256 does not match the intent.");
   if (normalizeEtag(eventEtag) !== normalizeEtag(head.ETag)) throw new Error("GuardDuty scanned a different ETag.");
+  if (!(head.LastModified instanceof Date) || !Number.isFinite(head.LastModified.getTime())) {
+    throw new Error("S3 did not return the exact upload modification time.");
+  }
+  const uploadedAt = head.LastModified.getTime();
+  if (
+    uploadedAt < Date.parse(intent.issuedAt) - 60_000 ||
+    uploadedAt > Date.parse(intent.expiresAt) + 1_000 ||
+    uploadedAt > Date.now() + 60_000
+  ) {
+    throw new Error("The exact S3 version was not uploaded inside the signed intent window.");
+  }
+  return head.LastModified.toISOString();
 }
 
 async function claimIssuedIntent(input) {
@@ -400,16 +760,17 @@ async function claimIssuedIntent(input) {
         {
           Update: {
             ConditionExpression:
-              "#status = :issued AND #revision = :zero AND #expiresAt > :now AND quarantineKey = :sourceKey AND finalKey = :finalKey AND expectedSha256 = :sha256 AND expectedSize = :size AND contentType = :contentType",
-            ExpressionAttributeNames: { "#expiresAt": "expiresAt", "#revision": "revision", "#status": "status" },
+              "#status = :issued AND #revision = :zero AND attribute_not_exists(promotionFence) AND attribute_not_exists(promotionAttemptId) AND quarantineKey = :sourceKey AND finalKey = :finalKey AND expectedSha256 = :sha256 AND expectedSize = :size AND contentType = :contentType",
+            ExpressionAttributeNames: { "#revision": "revision", "#status": "status" },
             ExpressionAttributeValues: {
               ":contentType": { S: input.intent.contentType },
               ":consumedAt": { S: input.nowIso },
               ":leaseId": { S: input.leaseId },
+              ":attemptId": { S: input.attemptId },
               ":expires": { S: input.leaseExpiresAt },
+              ":fence": { N: String(input.fence) },
               ":finalKey": { S: input.intent.finalKey },
               ":issued": { S: "issued" },
-              ":now": { S: input.nowIso },
               ":one": { N: "1" },
               ":receipt": {
                 M: {
@@ -417,7 +778,7 @@ async function claimIssuedIntent(input) {
                   contentType: { S: input.intent.contentType },
                   key: { S: input.intent.quarantineKey },
                   providerRequestId: { S: input.eventId },
-                  receivedAt: { S: input.nowIso },
+                  receivedAt: { S: input.uploadedAt },
                   sha256: { S: input.intent.expectedSha256 },
                   tenantId: { S: config.tenantId },
                   versionId: { S: input.versionId },
@@ -432,7 +793,7 @@ async function claimIssuedIntent(input) {
             Key: input.intentKey,
             TableName: config.controlTable,
             UpdateExpression:
-              "SET #status = :status, #revision = :one, consumedAt = :consumedAt, quarantineReceipt = :receipt, promotionLeaseId = :leaseId, promotionLeaseExpiresAt = :expires",
+              "SET #status = :status, #revision = :one, consumedAt = :consumedAt, quarantineReceipt = :receipt, promotionLeaseId = :leaseId, promotionLeaseExpiresAt = :expires, promotionAttemptId = :attemptId, promotionFence = :fence",
           },
         },
         {
@@ -444,6 +805,8 @@ async function claimIssuedIntent(input) {
               destinationKey: { S: input.intent.finalKey },
               intentId: { S: input.intent.id },
               kind: { S: "EvidencePromotionReceipt" },
+              promotionAttemptId: { S: input.attemptId },
+              promotionFence: { N: String(input.fence) },
               receiptHash: { S: input.receiptHash },
               sha256: { S: input.intent.expectedSha256 },
               sourceBucket: { S: config.ingestBucket },
@@ -461,27 +824,51 @@ async function claimIssuedIntent(input) {
   );
 }
 
-async function renewLease(intentKey, intent, leaseId, leaseExpiresAt, nowIso) {
+async function takeOverLease(input) {
   await dynamo.send(
     new TransactWriteItemsCommand({
-      ClientRequestToken: token(`${leaseId}\0${nowIso}`, "renew"),
+      ClientRequestToken: token(`${input.leaseId}\0${input.attemptId}\0${input.nowIso}`, "takeover"),
       TransactItems: [
         {
           Update: {
             ConditionExpression:
-              "#status = :status AND #revision = :revision AND quarantineReceipt.versionId = :versionId AND (attribute_not_exists(promotionLeaseExpiresAt) OR promotionLeaseExpiresAt < :now)",
+              "#status = :status AND #revision = :revision AND promotionFence = :currentFence AND promotionAttemptId = :currentAttemptId AND quarantineReceipt.versionId = :versionId AND promotionLeaseExpiresAt <= :now",
             ExpressionAttributeNames: { "#revision": "revision", "#status": "status" },
             ExpressionAttributeValues: {
-              ":expires": { S: leaseExpiresAt },
-              ":leaseId": { S: leaseId },
-              ":now": { S: nowIso },
-              ":revision": { N: String(intent.revision) },
-              ":status": { S: intent.status },
-              ":versionId": { S: intent.sourceVersionId },
+              ":attemptId": { S: input.attemptId },
+              ":currentAttemptId": { S: input.intent.promotionAttemptId },
+              ":currentFence": { N: String(input.intent.promotionFence) },
+              ":expires": { S: input.leaseExpiresAt },
+              ":fence": { N: String(input.fence) },
+              ":leaseId": { S: input.leaseId },
+              ":now": { S: input.nowIso },
+              ":revision": { N: String(input.intent.revision) },
+              ":status": { S: input.intent.status },
+              ":versionId": { S: input.intent.sourceVersionId },
             },
-            Key: intentKey,
+            Key: input.intentKey,
             TableName: config.controlTable,
-            UpdateExpression: "SET promotionLeaseId = :leaseId, promotionLeaseExpiresAt = :expires",
+            UpdateExpression: "SET promotionLeaseId = :leaseId, promotionLeaseExpiresAt = :expires, promotionAttemptId = :attemptId, promotionFence = :fence",
+          },
+        },
+        {
+          Update: {
+            ConditionExpression:
+              "#status = :copying AND tenantId = :tenantId AND intentId = :intentId AND receiptHash = :receiptHash AND promotionFence = :currentFence AND promotionAttemptId = :currentAttemptId",
+            ExpressionAttributeNames: { "#status": "status" },
+            ExpressionAttributeValues: {
+              ":attemptId": { S: input.attemptId },
+              ":copying": { S: "COPYING" },
+              ":currentAttemptId": { S: input.intent.promotionAttemptId },
+              ":currentFence": { N: String(input.intent.promotionFence) },
+              ":fence": { N: String(input.fence) },
+              ":intentId": { S: input.intent.id },
+              ":receiptHash": { S: input.receiptHash },
+              ":tenantId": { S: config.tenantId },
+            },
+            Key: input.receiptKey,
+            TableName: config.controlTable,
+            UpdateExpression: "SET promotionAttemptId = :attemptId, promotionFence = :fence",
           },
         },
       ],
@@ -489,7 +876,7 @@ async function renewLease(intentKey, intent, leaseId, leaseExpiresAt, nowIso) {
   );
 }
 
-async function markValidated(intentKey, intent, leaseId, head, nowIso, versionId) {
+async function markValidated(intentKey, intent, lease, leaseId, head, nowIso, versionId) {
   const scannerPolicy = "aws-guardduty-s3-malware-protection-v1";
   const scannerDigest = digestHex(`${scannerPolicy}\n${config.malwarePlanArn}`);
   const expectedBase64 = Buffer.from(intent.expectedSha256, "hex").toString("base64");
@@ -501,10 +888,13 @@ async function markValidated(intentKey, intent, leaseId, head, nowIso, versionId
         {
           Update: {
             ConditionExpression:
-              "#status = :quarantined AND #revision = :one AND promotionLeaseId = :leaseId AND quarantineReceipt.versionId = :versionId",
+              "#status = :quarantined AND #revision = :one AND promotionLeaseId = :leaseId AND promotionAttemptId = :attemptId AND promotionFence = :fence AND promotionLeaseExpiresAt > :now AND quarantineReceipt.versionId = :versionId",
             ExpressionAttributeNames: { "#revision": "revision", "#status": "status" },
             ExpressionAttributeValues: {
+              ":attemptId": { S: lease.attemptId },
+              ":fence": { N: String(lease.fence) },
               ":leaseId": { S: leaseId },
+              ":now": { S: nowIso },
               ":one": { N: "1" },
               ":quarantined": { S: "quarantined" },
               ":two": { N: "2" },
@@ -535,12 +925,292 @@ async function markValidated(intentKey, intent, leaseId, head, nowIso, versionId
   );
 }
 
+async function prepareCopyAttempt(input) {
+  const permittedAt = new Date().toISOString();
+  const leaseExpiresAt = new Date(Date.parse(permittedAt) + promotionLeaseDurationMilliseconds).toISOString();
+  const attemptItem = buildPromotionCopyAttemptItem({
+    attemptId: input.lease.attemptId,
+    destinationBucket: config.evidenceBucket,
+    destinationKey: input.intent.finalKey,
+    expectedSha256: input.intent.expectedSha256,
+    fence: input.lease.fence,
+    intentId: input.intent.id,
+    leaseExpiresAt,
+    leaseId: input.leaseId,
+    permittedAt,
+    receiptHash: input.receiptHash,
+    sourceBucket: config.ingestBucket,
+    sourceKey: input.intent.quarantineKey,
+    sourceVersionId: input.versionId,
+    tenantId: config.tenantId,
+  });
+  await dynamo.send(new TransactWriteItemsCommand({
+    ClientRequestToken: token(`${input.lease.attemptId}\0${permittedAt}`, "permit-copy"),
+    TransactItems: [
+      {
+        Update: {
+          ConditionExpression:
+            "#status = :validated AND #revision = :two AND promotionLeaseId = :leaseId AND promotionAttemptId = :attemptId AND promotionFence = :fence AND promotionLeaseExpiresAt > :now AND quarantineReceipt.versionId = :versionId",
+          ExpressionAttributeNames: { "#revision": "revision", "#status": "status" },
+          ExpressionAttributeValues: {
+            ":attemptId": { S: input.lease.attemptId },
+            ":expires": { S: leaseExpiresAt },
+            ":fence": { N: String(input.lease.fence) },
+            ":leaseId": { S: input.leaseId },
+            ":now": { S: permittedAt },
+            ":two": { N: "2" },
+            ":validated": { S: "validated" },
+            ":versionId": { S: input.versionId },
+          },
+          Key: input.intentKey,
+          TableName: config.controlTable,
+          UpdateExpression: "SET promotionLeaseExpiresAt = :expires",
+        },
+      },
+      {
+        Update: {
+          ConditionExpression:
+            "#status = :copying AND tenantId = :tenantId AND intentId = :intentId AND receiptHash = :receiptHash AND promotionAttemptId = :attemptId AND promotionFence = :fence",
+          ExpressionAttributeNames: { "#status": "status" },
+          ExpressionAttributeValues: {
+            ":attemptId": { S: input.lease.attemptId },
+            ":copying": { S: "COPYING" },
+            ":fence": { N: String(input.lease.fence) },
+            ":intentId": { S: input.intent.id },
+            ":permittedAt": { S: permittedAt },
+            ":receiptHash": { S: input.receiptHash },
+            ":tenantId": { S: config.tenantId },
+          },
+          Key: input.receiptKey,
+          TableName: config.controlTable,
+          UpdateExpression: "SET copyPermittedAt = :permittedAt",
+        },
+      },
+      {
+        Put: {
+          ConditionExpression: "attribute_not_exists(PK) AND attribute_not_exists(SK)",
+          Item: attemptItem,
+          TableName: config.controlTable,
+        },
+      },
+    ],
+  }));
+}
+
+async function renewActiveLease(intentKey, intent, lease, leaseId, nowIso) {
+  const leaseExpiresAt = new Date(Date.parse(nowIso) + promotionLeaseDurationMilliseconds).toISOString();
+  await dynamo.send(new TransactWriteItemsCommand({
+    ClientRequestToken: token(`${lease.attemptId}\0${nowIso}`, "assert-lease"),
+    TransactItems: [{
+      Update: {
+        ConditionExpression:
+          "#status = :validated AND #revision = :two AND promotionLeaseId = :leaseId AND promotionAttemptId = :attemptId AND promotionFence = :fence AND promotionLeaseExpiresAt > :now AND quarantineReceipt.versionId = :versionId",
+        ExpressionAttributeNames: { "#revision": "revision", "#status": "status" },
+        ExpressionAttributeValues: {
+          ":attemptId": { S: lease.attemptId },
+          ":expires": { S: leaseExpiresAt },
+          ":fence": { N: String(lease.fence) },
+          ":leaseId": { S: leaseId },
+          ":now": { S: nowIso },
+          ":two": { N: "2" },
+          ":validated": { S: "validated" },
+          ":versionId": { S: intent.sourceVersionId },
+        },
+        Key: intentKey,
+        TableName: config.controlTable,
+        UpdateExpression: "SET promotionLeaseExpiresAt = :expires",
+      },
+    }],
+  }));
+  return leaseExpiresAt;
+}
+
+async function recordCopyOutcome(input) {
+  if (!validVersionId(input.destinationVersionId)) throw new Error("S3 did not return an exact destination version.");
+  const checksum = /^[A-Za-z0-9+/]{43}=$/.test(input.observedChecksumSha256)
+    ? input.observedChecksumSha256
+    : "UNVERIFIED";
+  try {
+    await dynamo.send(new TransactWriteItemsCommand({
+      ClientRequestToken: token(`${input.attemptId}\0${input.destinationVersionId}`, "record-copy"),
+      TransactItems: [{
+        Update: {
+          ConditionExpression:
+            "#status = :permitted AND attemptId = :attemptId AND fence = :fence AND receiptHash = :receiptHash AND attribute_not_exists(destinationVersionId)",
+          ExpressionAttributeNames: { "#status": "status" },
+          ExpressionAttributeValues: {
+            ":attemptId": { S: input.attemptId },
+            ":checksum": { S: checksum },
+            ":completedAt": { S: input.completedAt },
+            ":copied": { S: "COPIED" },
+            ":destinationVersionId": { S: input.destinationVersionId },
+            ":fence": { N: String(input.fence) },
+            ":providerRequestIdSha256": { S: digestHex(input.providerRequestId) },
+            ":receiptHash": { S: input.receiptHash },
+            ":permitted": { S: "COPY_PERMITTED" },
+          },
+          Key: {
+            PK: { S: `TENANT#${config.tenantId}` },
+            SK: { S: promotionCopyAttemptSortKey(input.receiptHash, input.fence) },
+          },
+          TableName: config.controlTable,
+          UpdateExpression:
+            "SET #status = :copied, completedAt = :completedAt, destinationVersionId = :destinationVersionId, observedChecksumSha256 = :checksum, providerRequestIdSha256 = :providerRequestIdSha256",
+        },
+      }],
+    }));
+  } catch (error) {
+    if (!isConditionalWriteConflict(error)) throw error;
+  }
+  await readTrackedCopyAttempt(input.receiptHash, input.fence, input.attemptId, input.destinationVersionId);
+}
+
+async function ensureTrackedCopyOutcome(destination, receiptHash) {
+  const existing = await readTrackedCopyAttempt(
+    receiptHash,
+    destination.promotionFence,
+    destination.promotionAttemptId,
+    destination.versionId,
+    true,
+    destination,
+  );
+  if (existing.status === "COPY_PERMITTED") {
+    await recordCopyOutcome({
+      attemptId: destination.promotionAttemptId,
+      completedAt: new Date().toISOString(),
+      destinationVersionId: destination.versionId,
+      fence: destination.promotionFence,
+      observedChecksumSha256: Buffer.from(destination.checksumSha256, "hex").toString("base64"),
+      providerRequestId: String(destination.providerRequestId ?? ""),
+      receiptHash,
+    });
+  }
+}
+
+async function markCopyAttemptAdopted(input) {
+  try {
+    await dynamo.send(new TransactWriteItemsCommand({
+      ClientRequestToken: token(`${input.attemptId}\0${input.adoptedVersionId}`, "adopt-copy"),
+      TransactItems: [{
+        Update: {
+          ConditionExpression:
+            "#status = :permitted AND attemptId = :attemptId AND fence = :fence AND receiptHash = :receiptHash AND attribute_not_exists(destinationVersionId)",
+          ExpressionAttributeNames: { "#status": "status" },
+          ExpressionAttributeValues: {
+            ":adopted": { S: "ADOPTED" },
+            ":adoptedAttemptId": { S: input.adoptedAttemptId },
+            ":adoptedFence": { N: String(input.adoptedFence) },
+            ":adoptedVersionId": { S: input.adoptedVersionId },
+            ":attemptId": { S: input.attemptId },
+            ":fence": { N: String(input.fence) },
+            ":receiptHash": { S: input.receiptHash },
+            ":permitted": { S: "COPY_PERMITTED" },
+            ":resolvedAt": { S: new Date().toISOString() },
+          },
+          Key: {
+            PK: { S: `TENANT#${config.tenantId}` },
+            SK: { S: promotionCopyAttemptSortKey(input.receiptHash, input.fence) },
+          },
+          TableName: config.controlTable,
+          UpdateExpression:
+            "SET #status = :adopted, resolvedAt = :resolvedAt, adoptedAttemptId = :adoptedAttemptId, adoptedFence = :adoptedFence, adoptedVersionId = :adoptedVersionId",
+        },
+      }],
+    }));
+  } catch (error) {
+    if (!isConditionalWriteConflict(error)) throw error;
+  }
+}
+
+async function resolveOrphanedCopyAttempts(destination, receiptHash) {
+  const response = await dynamo.send(new QueryCommand({
+    ConsistentRead: true,
+    ExpressionAttributeValues: {
+      ":pk": { S: `TENANT#${config.tenantId}` },
+      ":prefix": { S: `PROMOTION_ATTEMPT#${receiptHash}#` },
+    },
+    KeyConditionExpression: "PK = :pk AND begins_with(SK, :prefix)",
+    Limit: 100,
+    TableName: config.controlTable,
+  }));
+  if (response.LastEvaluatedKey) {
+    throw new Error("Promotion orphan recovery exceeded its bounded attempt limit.");
+  }
+  for (const item of response.Items ?? []) {
+    const fence = Number(item?.fence?.N);
+    const attemptId = item?.attemptId?.S;
+    if (
+      item?.kind?.S !== "EvidencePromotionCopyAttempt" ||
+      item?.tenantId?.S !== config.tenantId ||
+      item?.receiptHash?.S !== receiptHash ||
+      !Number.isSafeInteger(fence) || fence < 1 ||
+      !/^pat_[a-f0-9]{32}$/.test(String(attemptId ?? ""))
+    ) {
+      throw new Error("Promotion orphan recovery found a malformed attempt.");
+    }
+    if (item.status?.S === "COPY_PERMITTED" &&
+        (fence !== destination.promotionFence || attemptId !== destination.promotionAttemptId)) {
+      await markCopyAttemptAdopted({
+        adoptedAttemptId: destination.promotionAttemptId,
+        adoptedFence: destination.promotionFence,
+        adoptedVersionId: destination.versionId,
+        attemptId,
+        fence,
+        receiptHash,
+      });
+    }
+  }
+}
+
+async function readTrackedCopyAttempt(
+  receiptHash,
+  fence,
+  attemptId,
+  destinationVersionId,
+  allowPermitted = false,
+  expectedDestination,
+) {
+  const response = await dynamo.send(new GetItemCommand({
+    ConsistentRead: true,
+    Key: {
+      PK: { S: `TENANT#${config.tenantId}` },
+      SK: { S: promotionCopyAttemptSortKey(receiptHash, fence) },
+    },
+    TableName: config.controlTable,
+  }));
+  const item = response.Item;
+  const status = item?.status?.S;
+  const versionMatches = item?.destinationVersionId?.S === destinationVersionId;
+  if (
+    item?.kind?.S !== "EvidencePromotionCopyAttempt" ||
+    item?.tenantId?.S !== config.tenantId ||
+    item?.receiptHash?.S !== receiptHash ||
+    item?.attemptId?.S !== attemptId ||
+    item?.fence?.N !== String(fence) ||
+    (expectedDestination !== undefined && (
+      item?.destinationBucket?.S !== config.evidenceBucket ||
+      item?.destinationKey?.S !== expectedDestination.destinationKey ||
+      item?.expectedSha256?.S !== expectedDestination.checksumSha256 ||
+      item?.sourceBucket?.S !== config.ingestBucket ||
+      item?.sourceVersionId?.S !== expectedDestination.sourceVersionId
+    )) ||
+    !new Set(["COPY_PERMITTED", "COPIED", "RECONCILED"]).has(status) ||
+    (status === "COPY_PERMITTED" ? (!allowPermitted || item?.destinationVersionId !== undefined) : !versionMatches)
+  ) {
+    throw new Error("The immutable destination does not have a durable promotion attempt.");
+  }
+  return Object.freeze({ status });
+}
+
 async function findCompletedCopy(
   destinationKey,
   sourceVersionId,
   expectedSha256,
   exactVersionId,
   expectedRetainUntil,
+  expectedUploadedAt,
+  expectedPromotionAttemptId,
+  expectedPromotionFence,
 ) {
   try {
     const destination = await s3.send(
@@ -557,6 +1227,11 @@ async function findCompletedCopy(
     if (
       destination.Metadata?.["source-version"] !== sourceVersionId ||
       destination.Metadata?.sha256 !== expectedSha256 ||
+      destination.Metadata?.["uploaded-at"] !== expectedUploadedAt ||
+      (expectedPromotionAttemptId !== undefined &&
+        destination.Metadata?.["promotion-attempt-id"] !== expectedPromotionAttemptId) ||
+      (expectedPromotionFence !== undefined &&
+        destination.Metadata?.["promotion-fence"] !== String(expectedPromotionFence)) ||
       checksum !== expectedSha256 ||
       !destination.VersionId ||
       destination.ServerSideEncryption !== "aws:kms" ||
@@ -565,42 +1240,425 @@ async function findCompletedCopy(
       !destination.ObjectLockRetainUntilDate ||
       destination.ObjectLockRetainUntilDate.getTime() < expectedRetainUntil.getTime()
     ) return undefined;
-    return { providerRequestId: destination.$metadata?.requestId, versionId: destination.VersionId };
+    const promotionAttemptId = destination.Metadata?.["promotion-attempt-id"];
+    const promotionFence = Number(destination.Metadata?.["promotion-fence"]);
+    if (!/^pat_[a-f0-9]{32}$/.test(String(promotionAttemptId ?? "")) ||
+        !Number.isSafeInteger(promotionFence) || promotionFence < 1) return undefined;
+    return {
+      checksumSha256: checksum,
+      destinationKey,
+      promotionAttemptId,
+      promotionFence,
+      providerRequestId: destination.$metadata?.requestId,
+      retainUntil: destination.ObjectLockRetainUntilDate,
+      sourceVersionId,
+      versionId: destination.VersionId,
+    };
   } catch (error) {
     if (error?.name === "NotFound" || error?.$metadata?.httpStatusCode === 404) return undefined;
     throw error;
   }
 }
 
+function buildPromotionFacts(input) {
+  return Object.freeze({
+    schemaVersion: 1,
+    tenantId: config.tenantId,
+    uploadIntentId: input.intent.id,
+    evidenceId: input.intent.resourceId,
+    controlId: input.intent.controlId,
+    quarantineBucket: config.ingestBucket,
+    quarantineKey: input.intent.quarantineKey,
+    quarantineVersionId: input.versionId,
+    evidenceBucket: config.evidenceBucket,
+    evidenceKey: input.intent.finalKey,
+    evidenceVersionId: input.destinationVersionId,
+    sha256: input.intent.expectedSha256,
+    byteSize: input.intent.expectedSize,
+    contentType: input.intent.contentType,
+    copyAttemptId: input.copyAttemptId,
+    copyFence: input.copyFence,
+    kmsKeyArn: config.evidenceKeyArn,
+    objectLockMode: config.retentionMode,
+    promotionAttemptId: input.promotionAttemptId,
+    promotionFence: input.promotionFence,
+    retainUntil: input.retainUntil.toISOString(),
+    uploadedAt: input.uploadedAt,
+    promotedAt: input.nowIso,
+    providerRequestId: input.providerRequestId,
+  });
+}
+
+async function claimPromotionFenceDatabase(intent, lease) {
+  const transaction = await rds.send(new BeginTransactionCommand({
+    database: config.databaseName,
+    resourceArn: config.databaseClusterArn,
+    secretArn: config.ingestDatabaseSecretArn,
+  }));
+  if (!transaction.transactionId || !/^[A-Za-z0-9-]{8,256}$/.test(transaction.transactionId)) {
+    throw new Error("RDS Data API did not establish a promotion fence transaction.");
+  }
+  const transactionId = transaction.transactionId;
+  try {
+    await executePromotionStatement(transactionId, {
+      sql: "SELECT pg_catalog.set_config('scopeproof.tenant_id', :tenant_id, true)",
+      parameters: [stringParameter("tenant_id", config.tenantId)],
+    });
+    const response = await executePromotionStatement(transactionId, {
+      formatRecordsAs: "JSON",
+      sql: [
+        "SELECT committed_fence, committed_attempt_id, committed_lease_expires_at",
+        "FROM scopeproof.claim_promotion_fence(",
+        "  CAST(:upload_intent_id AS scopeproof.resource_identifier), CAST(:promotion_fence AS bigint),",
+        "  :promotion_attempt_id, CAST(:lease_expires_at AS timestamptz)",
+        ")",
+      ].join("\n"),
+      parameters: [
+        stringParameter("upload_intent_id", intent.id),
+        stringParameter("promotion_fence", String(lease.fence)),
+        stringParameter("promotion_attempt_id", lease.attemptId),
+        stringParameter("lease_expires_at", lease.leaseExpiresAt),
+      ],
+    });
+    let rows;
+    try { rows = JSON.parse(response.formattedRecords ?? "[]"); } catch {
+      throw new Error("The promotion fence database response is invalid.");
+    }
+    const committedLeaseExpiry = typeof rows?.[0]?.committed_lease_expires_at === "string"
+      ? new Date(rows[0].committed_lease_expires_at)
+      : undefined;
+    if (
+      !Array.isArray(rows) || rows.length !== 1 ||
+      rows[0]?.committed_fence !== lease.fence ||
+      rows[0]?.committed_attempt_id !== lease.attemptId ||
+      !committedLeaseExpiry || !Number.isFinite(committedLeaseExpiry.getTime()) ||
+      committedLeaseExpiry.toISOString() !== lease.leaseExpiresAt
+    ) {
+      throw new Error("The promotion fence database response is invalid.");
+    }
+    await rds.send(new CommitTransactionCommand({
+      resourceArn: config.databaseClusterArn,
+      secretArn: config.ingestDatabaseSecretArn,
+      transactionId,
+    }));
+  } catch (error) {
+    try {
+      await rds.send(new RollbackTransactionCommand({
+        resourceArn: config.databaseClusterArn,
+        secretArn: config.ingestDatabaseSecretArn,
+        transactionId,
+      }));
+    } catch {
+      // Preserve the fence claim failure; an exact retry is idempotent.
+    }
+    throw error;
+  }
+}
+
+async function readCommittedPromotionReceipt(intent, input) {
+  const transaction = await rds.send(new BeginTransactionCommand({
+    database: config.databaseName,
+    resourceArn: config.databaseClusterArn,
+    secretArn: config.ingestDatabaseSecretArn,
+  }));
+  if (!transaction.transactionId || !/^[A-Za-z0-9-]{8,256}$/.test(transaction.transactionId)) {
+    throw new Error("RDS Data API did not establish a promotion receipt lookup transaction.");
+  }
+  const transactionId = transaction.transactionId;
+  try {
+    await executePromotionStatement(transactionId, {
+      sql: "SELECT pg_catalog.set_config('scopeproof.tenant_id', :tenant_id, true)",
+      parameters: [stringParameter("tenant_id", config.tenantId)],
+    });
+    const response = await executePromotionStatement(transactionId, {
+      formatRecordsAs: "JSON",
+      sql: [
+        "SELECT receipt_id::text, committed_upload_revision, committed_evidence_revision,",
+        "       committed_idempotency_digest, committed_promotion_facts, committed_canonical_receipt,",
+        "       committed_receipt_sha256, committed_signing_key_arn, committed_signing_algorithm,",
+        "       committed_signature, committed_signed_at",
+        "FROM scopeproof.read_promoted_evidence_receipt(CAST(:upload_intent_id AS scopeproof.resource_identifier))",
+      ].join("\n"),
+      parameters: [stringParameter("upload_intent_id", intent.id)],
+    });
+    const snapshot = parseCommittedPromotionReceipt(response.formattedRecords ?? "[]", {
+      allowMissing: true,
+      evidenceRevision: intent.databaseEvidenceRevision + 1,
+      invariants: {
+        byteSize: intent.expectedSize,
+        contentType: intent.contentType,
+        controlId: intent.controlId,
+        evidenceBucket: config.evidenceBucket,
+        evidenceId: intent.resourceId,
+        evidenceKey: intent.finalKey,
+        kmsKeyArn: config.evidenceKeyArn,
+        minimumRetainUntil: intent.requiredRetentionUntil,
+        objectLockMode: config.retentionMode,
+        quarantineBucket: config.ingestBucket,
+        quarantineKey: intent.quarantineKey,
+        quarantineVersionId: input.versionId,
+        sha256: intent.expectedSha256,
+        tenantId: config.tenantId,
+        uploadIntentId: intent.id,
+        uploadedAt: input.uploadedAt,
+      },
+      signingKeyArn: config.auditSigningKeyArn,
+      uploadRevision: intent.databaseUploadRevision + 1,
+      verificationTime: new Date().toISOString(),
+    });
+    if (snapshot) {
+      await verifyCommittedPromotionReceipt(snapshot, (verifyInput) => kms.send(new VerifyCommand(verifyInput)));
+    }
+    await rds.send(new CommitTransactionCommand({
+      resourceArn: config.databaseClusterArn,
+      secretArn: config.ingestDatabaseSecretArn,
+      transactionId,
+    }));
+    return snapshot;
+  } catch (error) {
+    try {
+      await rds.send(new RollbackTransactionCommand({
+        resourceArn: config.databaseClusterArn,
+        secretArn: config.ingestDatabaseSecretArn,
+        transactionId,
+      }));
+    } catch {
+      // Preserve the authoritative lookup or KMS verification failure.
+    }
+    throw error;
+  }
+}
+
+async function reconcilePromotionDatabase(facts, intent, lease) {
+  if (
+    facts.promotionFence !== lease?.fence ||
+    facts.promotionAttemptId !== lease?.attemptId ||
+    !Number.isSafeInteger(lease?.fence) || lease.fence < 1 ||
+    !/^pat_[a-f0-9]{32}$/.test(String(lease?.attemptId ?? "")) ||
+    !validInstant(lease?.leaseExpiresAt) ||
+    Date.parse(lease.leaseExpiresAt) <= Date.now() ||
+    Date.parse(lease.leaseExpiresAt) > Date.now() + 15 * 60_000
+  ) {
+    throw new Error("Promotion database reconciliation requires the active fencing attempt.");
+  }
+  const canonicalFacts = stableJson(facts);
+  const idempotencyDigest = digestHex(`scopeproof-promotion-reconciliation-v1\n${canonicalFacts}`);
+  const receiptDigest = digestHex(`scopeproof-promotion-receipt-v1\n${canonicalFacts}`);
+  const receiptId = `rcp_${digestHex(`scopeproof-promotion-receipt-id-v1\n${canonicalFacts}`).slice(0, 32)}`;
+  const signedAt = new Date().toISOString();
+  if (Date.parse(signedAt) < Date.parse(facts.promotedAt)) {
+    throw new Error("Promotion receipt time predates the immutable S3 copy.");
+  }
+  const signed = await kms.send(new SignCommand({
+    KeyId: config.auditSigningKeyArn,
+    Message: Buffer.from(receiptDigest, "hex"),
+    MessageType: "DIGEST",
+    SigningAlgorithm: "RSASSA_PSS_SHA_256",
+  }));
+  if (
+    signed.KeyId !== config.auditSigningKeyArn ||
+    signed.SigningAlgorithm !== "RSASSA_PSS_SHA_256" ||
+    !(signed.Signature instanceof Uint8Array) ||
+    signed.Signature.byteLength !== 384
+  ) {
+    throw new Error("KMS did not return the configured RSA-3072 promotion receipt signature.");
+  }
+  const transaction = await rds.send(new BeginTransactionCommand({
+    database: config.databaseName,
+    resourceArn: config.databaseClusterArn,
+    secretArn: config.ingestDatabaseSecretArn,
+  }));
+  if (!transaction.transactionId || !/^[A-Za-z0-9-]{8,256}$/.test(transaction.transactionId)) {
+    throw new Error("RDS Data API did not establish a promotion transaction.");
+  }
+  const transactionId = transaction.transactionId;
+  try {
+    await executePromotionStatement(transactionId, {
+      sql: "SELECT pg_catalog.set_config('scopeproof.tenant_id', :tenant_id, true)",
+      parameters: [stringParameter("tenant_id", config.tenantId)],
+    });
+    await executePromotionStatement(transactionId, {
+      sql: [
+        "SELECT committed_fence FROM scopeproof.claim_promotion_fence(",
+        "  CAST(:upload_intent_id AS scopeproof.resource_identifier), CAST(:promotion_fence AS bigint),",
+        "  :promotion_attempt_id, CAST(:lease_expires_at AS timestamptz)",
+        ")",
+      ].join("\n"),
+      parameters: [
+        stringParameter("upload_intent_id", intent.id),
+        stringParameter("promotion_fence", String(lease.fence)),
+        stringParameter("promotion_attempt_id", lease.attemptId),
+        stringParameter("lease_expires_at", lease.leaseExpiresAt),
+      ],
+    });
+    const response = await executePromotionStatement(transactionId, {
+      formatRecordsAs: "JSON",
+      sql: [
+        "SELECT receipt_id::text, was_created, committed_upload_revision, committed_evidence_revision,",
+        "       committed_idempotency_digest, committed_promotion_facts, committed_canonical_receipt,",
+        "       committed_receipt_sha256, committed_signing_key_arn, committed_signing_algorithm,",
+        "       committed_signature, committed_signed_at",
+        "FROM scopeproof.reconcile_promoted_evidence(",
+        "  CAST(:receipt_id AS scopeproof.resource_identifier), CAST(:upload_intent_id AS scopeproof.resource_identifier),",
+        "  CAST(:evidence_id AS scopeproof.resource_identifier), :quarantine_version_id, :evidence_version_id, :checksum_sha256,",
+        "  :kms_key_arn, :object_lock_mode, CAST(:retain_until AS timestamptz), CAST(:required_retention_until AS timestamptz),",
+        "  CAST(:expected_upload_revision AS integer), CAST(:expected_evidence_revision AS integer), CAST(:promotion_fence AS bigint),",
+        "  :promotion_attempt_id, :idempotency_digest,",
+        "  CAST(:promotion_facts AS jsonb), :canonical_receipt, :receipt_sha256, :signing_key_arn, :signing_algorithm,",
+        "  :signature, CAST(:signed_at AS timestamptz), CAST(:reconciled_at AS timestamptz)",
+        ")",
+      ].join("\n"),
+      parameters: [
+        stringParameter("receipt_id", receiptId),
+        stringParameter("upload_intent_id", facts.uploadIntentId),
+        stringParameter("evidence_id", facts.evidenceId),
+        stringParameter("quarantine_version_id", facts.quarantineVersionId),
+        stringParameter("evidence_version_id", facts.evidenceVersionId),
+        stringParameter("checksum_sha256", facts.sha256),
+        stringParameter("kms_key_arn", facts.kmsKeyArn),
+        stringParameter("object_lock_mode", facts.objectLockMode),
+        stringParameter("retain_until", facts.retainUntil),
+        stringParameter("required_retention_until", intent.requiredRetentionUntil),
+        stringParameter("expected_upload_revision", String(intent.databaseUploadRevision)),
+        stringParameter("expected_evidence_revision", String(intent.databaseEvidenceRevision)),
+        stringParameter("promotion_fence", String(lease.fence)),
+        stringParameter("promotion_attempt_id", lease.attemptId),
+        stringParameter("idempotency_digest", idempotencyDigest),
+        stringParameter("promotion_facts", canonicalFacts),
+        stringParameter("canonical_receipt", canonicalFacts),
+        stringParameter("receipt_sha256", receiptDigest),
+        stringParameter("signing_key_arn", config.auditSigningKeyArn),
+        stringParameter("signing_algorithm", "RSASSA_PSS_SHA_256"),
+        stringParameter("signature", Buffer.from(signed.Signature).toString("base64")),
+        stringParameter("signed_at", signedAt),
+        stringParameter("reconciled_at", facts.promotedAt),
+      ],
+    });
+    const snapshot = parseCommittedPromotionReceipt(response.formattedRecords, {
+      canonicalFacts,
+      evidenceRevision: intent.databaseEvidenceRevision + 1,
+      requireOutcome: true,
+      signingKeyArn: config.auditSigningKeyArn,
+      uploadRevision: intent.databaseUploadRevision + 1,
+      verificationTime: signedAt,
+    });
+    if (
+      snapshot.receiptId !== receiptId ||
+      snapshot.idempotencyDigest !== idempotencyDigest
+    ) {
+      throw new Error("The promotion database returned a different deterministic receipt identity.");
+    }
+    await verifyCommittedPromotionReceipt(snapshot, (verifyInput) => kms.send(new VerifyCommand(verifyInput)));
+    await rds.send(new CommitTransactionCommand({
+      resourceArn: config.databaseClusterArn,
+      secretArn: config.ingestDatabaseSecretArn,
+      transactionId,
+    }));
+    return snapshot;
+  } catch (error) {
+    try {
+      await rds.send(new RollbackTransactionCommand({
+        resourceArn: config.databaseClusterArn,
+        secretArn: config.ingestDatabaseSecretArn,
+        transactionId,
+      }));
+    } catch {
+      // Preserve the original reconciliation error for SQS retry and alerting.
+    }
+    throw error;
+  }
+}
+
+function executePromotionStatement(transactionId, statement) {
+  return rds.send(new ExecuteStatementCommand({
+    database: config.databaseName,
+    formatRecordsAs: statement.formatRecordsAs,
+    parameters: statement.parameters,
+    resourceArn: config.databaseClusterArn,
+    secretArn: config.ingestDatabaseSecretArn,
+    sql: statement.sql,
+    transactionId,
+  }));
+}
+
+function stableJson(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(",")}}`;
+}
+
+function stringParameter(name, value) {
+  return { name, value: { stringValue: value } };
+}
+
 async function completePromotion(input) {
+  const facts = input.facts;
+  const publishedAt = new Date().toISOString();
+  const receiptHash = input.receiptKey.SK.S.slice("PROMOTION#".length);
+  const authoritativeReceipt = buildAuthoritativePromotionReceiptItem({
+    publishedAt,
+    receiptHash,
+    snapshot: input.databaseReconciliation,
+    tenantId: config.tenantId,
+  });
+  const recoveryChange = buildPromotionRecoveryChangeItem({
+    facts,
+    publishedAt,
+    receiptHash,
+    tenantId: config.tenantId,
+  });
   const promotionReceipt = {
     M: {
-      byteSize: { N: String(input.intent.expectedSize) },
-      contentType: { S: input.intent.contentType },
-      finalKey: { S: input.intent.finalKey },
-      finalVersionId: { S: input.destinationVersionId },
-      kmsKeyArn: { S: config.evidenceKeyArn },
-      objectLockMode: { S: config.retentionMode },
-      promotedAt: { S: input.nowIso },
-      providerRequestId: { S: input.providerRequestId },
-      retainUntil: { S: input.retainUntil.toISOString() },
-      sha256: { S: input.intent.expectedSha256 },
-      sourceKey: { S: input.intent.quarantineKey },
-      sourceVersionId: { S: input.versionId },
-      tenantId: { S: config.tenantId },
+      byteSize: { N: String(facts.byteSize) },
+      contentType: { S: facts.contentType },
+      copyAttemptId: { S: facts.copyAttemptId },
+      copyFence: { N: String(facts.copyFence) },
+      databaseEvidenceRevision: { N: String(input.databaseReconciliation.evidenceRevision) },
+      databaseIdempotencyDigest: { S: input.databaseReconciliation.idempotencyDigest },
+      databaseReceiptId: { S: input.databaseReconciliation.receiptId },
+      databaseUploadRevision: { N: String(input.databaseReconciliation.uploadRevision) },
+      finalKey: { S: facts.evidenceKey },
+      finalVersionId: { S: facts.evidenceVersionId },
+      kmsKeyArn: { S: facts.kmsKeyArn },
+      objectLockMode: { S: facts.objectLockMode },
+      promotionAttemptId: { S: facts.promotionAttemptId },
+      promotionFence: { N: String(facts.promotionFence) },
+      promotedAt: { S: facts.promotedAt },
+      providerRequestId: { S: facts.providerRequestId },
+      retainUntil: { S: facts.retainUntil },
+      sha256: { S: facts.sha256 },
+      sourceKey: { S: facts.quarantineKey },
+      sourceVersionId: { S: facts.quarantineVersionId },
+      tenantId: { S: facts.tenantId },
+      uploadedAt: { S: facts.uploadedAt },
     },
   };
   await dynamo.send(
     new TransactWriteItemsCommand({
-      ClientRequestToken: token(`${input.leaseId}\0${input.nowIso}`, "complete"),
+      ClientRequestToken: token(`${input.leaseId ?? input.databaseReconciliation.receiptId}\0${input.nowIso}`, "complete"),
       TransactItems: [
         {
           Update: {
-            ConditionExpression:
-              "#status = :validated AND #revision = :two AND promotionLeaseId = :leaseId AND quarantineReceipt.versionId = :sourceVersion",
+            ConditionExpression: [
+              "#status = :validated AND #revision = :two",
+              "databaseUploadRevision = :databaseUploadRevision",
+              "databaseEvidenceRevision = :databaseEvidenceRevision",
+              input.recovered ? undefined : "promotionLeaseId = :leaseId",
+              input.recovered ? undefined : "promotionAttemptId = :attemptId",
+              input.recovered ? undefined : "promotionFence = :fence",
+              input.recovered ? undefined : "promotionLeaseExpiresAt > :completedAt",
+              "quarantineReceipt.versionId = :sourceVersion",
+            ].filter(Boolean).join(" AND "),
             ExpressionAttributeNames: { "#revision": "revision", "#status": "status" },
             ExpressionAttributeValues: {
-              ":leaseId": { S: input.leaseId },
+              ...(input.recovered ? {} : {
+                ":attemptId": { S: input.lease.attemptId },
+                ":completedAt": { S: input.nowIso },
+                ":fence": { N: String(input.lease.fence) },
+                ":leaseId": { S: input.leaseId },
+              }),
+              ":databaseEvidenceRevision": { N: String(input.intent.databaseEvidenceRevision) },
+              ":databaseUploadRevision": { N: String(input.intent.databaseUploadRevision) },
               ":promoted": { S: "promoted" },
               ":receipt": promotionReceipt,
               ":sourceVersion": { S: input.versionId },
@@ -622,13 +1680,19 @@ async function completePromotion(input) {
             ExpressionAttributeValues: {
               ":complete": { S: "COMPLETE" },
               ":completedAt": { S: input.nowIso },
+              ":copyAttemptId": { S: facts.copyAttemptId },
+              ":copyFence": { N: String(facts.copyFence) },
               ":copying": { S: "COPYING" },
               ":destinationBucket": { S: config.evidenceBucket },
               ":destinationKey": { S: input.intent.finalKey },
-              ":destinationVersion": { S: input.destinationVersionId },
+              ":destinationVersion": { S: facts.evidenceVersionId },
+              ":databaseIdempotencyDigest": { S: input.databaseReconciliation.idempotencyDigest },
+              ":databaseReceiptId": { S: input.databaseReconciliation.receiptId },
               ":intentId": { S: input.intent.id },
-              ":receiptHash": { S: input.receiptKey.SK.S.slice("PROMOTION#".length) },
-              ":retainUntil": { S: input.retainUntil.toISOString() },
+              ":receiptHash": { S: receiptHash },
+              ":promotionAttemptId": { S: facts.promotionAttemptId },
+              ":promotionFence": { N: String(facts.promotionFence) },
+              ":retainUntil": { S: facts.retainUntil },
               ":sha256": { S: input.intent.expectedSha256 },
               ":sourceBucket": { S: config.ingestBucket },
               ":sourceKey": { S: input.intent.quarantineKey },
@@ -638,7 +1702,47 @@ async function completePromotion(input) {
             Key: input.receiptKey,
             TableName: config.controlTable,
             UpdateExpression:
-              "SET #status = :complete, completedAt = :completedAt, destinationVersionId = :destinationVersion, retainUntil = :retainUntil",
+              "SET #status = :complete, completedAt = :completedAt, destinationVersionId = :destinationVersion, retainUntil = :retainUntil, databaseReceiptId = :databaseReceiptId, databaseIdempotencyDigest = :databaseIdempotencyDigest, copyAttemptId = :copyAttemptId, copyFence = :copyFence, promotionAttemptId = :promotionAttemptId, promotionFence = :promotionFence",
+          },
+        },
+        {
+          Put: {
+            ConditionExpression: "attribute_not_exists(#pk) AND attribute_not_exists(#sk)",
+            ExpressionAttributeNames: { "#pk": "PK", "#sk": "SK" },
+            Item: authoritativeReceipt,
+            TableName: config.controlTable,
+          },
+        },
+        {
+          Put: {
+            ConditionExpression: "attribute_not_exists(#pk) AND attribute_not_exists(#sk)",
+            ExpressionAttributeNames: { "#pk": "PK", "#sk": "SK" },
+            Item: recoveryChange,
+            TableName: config.controlTable,
+          },
+        },
+        {
+          Update: {
+            ConditionExpression:
+              "#status = :copied AND attemptId = :attemptId AND fence = :fence AND receiptHash = :receiptHash AND destinationVersionId = :destinationVersion",
+            ExpressionAttributeNames: { "#status": "status" },
+            ExpressionAttributeValues: {
+              ":attemptId": { S: facts.copyAttemptId },
+              ":copied": { S: "COPIED" },
+              ":databaseReceiptId": { S: input.databaseReconciliation.receiptId },
+              ":destinationVersion": { S: facts.evidenceVersionId },
+              ":fence": { N: String(facts.copyFence) },
+              ":receiptHash": { S: receiptHash },
+              ":reconciled": { S: "RECONCILED" },
+              ":reconciledAt": { S: input.nowIso },
+            },
+            Key: {
+              PK: { S: `TENANT#${config.tenantId}` },
+              SK: { S: promotionCopyAttemptSortKey(receiptHash, facts.copyFence) },
+            },
+            TableName: config.controlTable,
+            UpdateExpression:
+              "SET #status = :reconciled, reconciledAt = :reconciledAt, databaseReceiptId = :databaseReceiptId",
           },
         },
       ],
@@ -648,6 +1752,20 @@ async function completePromotion(input) {
 
 function validVersionId(value) {
   return /^[A-Za-z0-9][A-Za-z0-9._:+/=-]{0,511}$/.test(value);
+}
+
+function isConditionalWriteConflict(error) {
+  if (!error || typeof error !== "object") return false;
+  if (new Set(["ConditionalCheckFailedException", "ConditionalRequestConflict", "PreconditionFailed"])
+    .has(error.name)) return true;
+  if (error.$metadata?.httpStatusCode === 409 || error.$metadata?.httpStatusCode === 412) return true;
+  return error.name === "TransactionCanceledException" &&
+    Array.isArray(error.CancellationReasons) &&
+    error.CancellationReasons.some((reason) => reason?.Code === "ConditionalCheckFailed");
+}
+
+function validProviderRequestId(value) {
+  return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9_.:+/-]{2,199}$/.test(value);
 }
 
 function validInstant(value) {
@@ -664,15 +1782,15 @@ function digestHex(value) {
   return createHash("sha256").update(value).digest("hex");
 }
 
+function safeErrorName(error) {
+  const name = error && typeof error === "object" && "name" in error ? String(error.name) : "UnknownError";
+  return /^[A-Za-z][A-Za-z0-9_.-]{0,79}$/.test(name) ? name : "UnknownError";
+}
+
 function token(eventId, operation) {
   return `sp-${operation}-${digestHex(`${eventId}\0${operation}`).slice(0, 20)}`.slice(0, 36);
 }
 
 function escapeRegex(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function copySource(bucket, key, versionId) {
-  const encodedKey = key.split("/").map(encodeURIComponent).join("/");
-  return `/${bucket}/${encodedKey}?versionId=${encodeURIComponent(versionId)}`;
 }

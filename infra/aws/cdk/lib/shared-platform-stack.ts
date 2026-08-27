@@ -33,6 +33,8 @@ import * as subscriptions from "aws-cdk-lib/aws-sns-subscriptions";
 import * as sqs from "aws-cdk-lib/aws-sqs";
 import * as wafv2 from "aws-cdk-lib/aws-wafv2";
 import { Construct } from "constructs";
+import { RecoveryConfiguration } from "./recovery-config";
+import { configureAuroraRecovery } from "./recovery-support";
 
 export interface SharedPlatformStackProps extends StackProps {
   readonly rootDomain: string;
@@ -41,13 +43,14 @@ export interface SharedPlatformStackProps extends StackProps {
   readonly tenantSlugs: readonly string[];
   readonly alertEmail?: string;
   readonly monthlyBudgetUsd?: number;
+  readonly recovery?: RecoveryConfiguration;
 }
 
 export class SharedPlatformStack extends Stack {
   public readonly rootDomain: string;
   public readonly branchName: string;
   public readonly hostedZone: route53.IHostedZone;
-  public readonly controlTable: dynamodb.Table;
+  public readonly controlTable: dynamodb.TableV2;
   public readonly userPool: cognito.UserPool;
   public readonly databaseCluster: rds.DatabaseCluster;
   public readonly jobsQueue: sqs.Queue;
@@ -88,21 +91,32 @@ export class SharedPlatformStack extends Stack {
           comment: "Scopeproof placeholder zone; delegate the domain before deployment.",
         });
 
-    this.controlTable = new dynamodb.Table(this, "ControlPlaneTable", {
-      partitionKey: { name: "PK", type: dynamodb.AttributeType.STRING },
-      sortKey: { name: "SK", type: dynamodb.AttributeType.STRING },
-      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
-      encryption: dynamodb.TableEncryption.AWS_MANAGED,
-      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
-      removalPolicy: RemovalPolicy.RETAIN,
+    const controlPlaneReplicas: dynamodb.ReplicaTableProps[] = props.recovery?.mode === "enabled"
+      ? [{
+          deletionProtection: true,
+          pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
+          region: props.recovery.region!,
+        }]
+      : [];
+    this.controlTable = new dynamodb.TableV2(this, "ControlPlaneTable", {
+      billing: dynamodb.Billing.onDemand(),
       deletionProtection: true,
-      timeToLiveAttribute: "expiresAt",
-    });
-    this.controlTable.addGlobalSecondaryIndex({
-      indexName: "GSI1",
-      partitionKey: { name: "GSI1PK", type: dynamodb.AttributeType.STRING },
-      sortKey: { name: "GSI1SK", type: dynamodb.AttributeType.STRING },
-      projectionType: dynamodb.ProjectionType.ALL,
+      encryption: dynamodb.TableEncryptionV2.dynamoOwnedKey(),
+      globalSecondaryIndexes: [{
+        indexName: "GSI1",
+        partitionKey: { name: "GSI1PK", type: dynamodb.AttributeType.STRING },
+        projectionType: dynamodb.ProjectionType.ALL,
+        sortKey: { name: "GSI1SK", type: dynamodb.AttributeType.STRING },
+      }],
+      globalTableSettingsReplicationMode: dynamodb.GlobalTableSettingsReplicationMode.ALL,
+      partitionKey: { name: "PK", type: dynamodb.AttributeType.STRING },
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
+      replicas: controlPlaneReplicas,
+      sortKey: { name: "SK", type: dynamodb.AttributeType.STRING },
+      removalPolicy: RemovalPolicy.RETAIN,
+      // Lifecycle records retain canonical ISO timestamps for CAS comparisons;
+      // DynamoDB TTL requires a distinct numeric epoch-seconds attribute.
+      timeToLiveAttribute: "ttlEpochSeconds",
     });
 
     this.userPool = new cognito.UserPool(this, "UserPool", {
@@ -227,8 +241,20 @@ export class SharedPlatformStack extends Stack {
       enforceSSL: true,
       masterKey: operationsKey,
     });
+    // An encrypted SNS topic does not implicitly authorize CloudWatch to use
+    // its KMS key. Without this grant alarms can enter ALARM while delivery is
+    // silently rejected by KMS.
+    this.operationsTopic.grantPublish(new iam.ServicePrincipal("cloudwatch.amazonaws.com"));
     if (props.alertEmail) {
       this.operationsTopic.addSubscription(new subscriptions.EmailSubscription(props.alertEmail));
+    }
+    if (props.recovery?.mode === "enabled") {
+      configureAuroraRecovery(this, {
+        configuration: props.recovery,
+        databaseCluster: this.databaseCluster,
+        databaseKey,
+        operationsTopic: this.operationsTopic,
+      });
     }
 
     new cloudwatch.Alarm(this, "JobsDeadLetterAlarm", {
@@ -282,7 +308,26 @@ export class SharedPlatformStack extends Stack {
       assumedBy: new iam.ServicePrincipal("amplify.amazonaws.com"),
       description: "Minimal shared SSR role; assumes an authorized tenant role for tenant data.",
     });
-    this.controlTable.grantReadData(this.amplifyComputeRole);
+    this.amplifyComputeRole.addToPolicy(new iam.PolicyStatement({
+      actions: ["dynamodb:GetItem"],
+      conditions: {
+        Null: { "dynamodb:LeadingKeys": "false" },
+        "ForAllValues:StringLike": {
+          "dynamodb:LeadingKeys": ["DOMAIN#*"],
+        },
+      },
+      resources: [this.controlTable.tableArn],
+    }));
+    this.amplifyComputeRole.addToPolicy(new iam.PolicyStatement({
+      actions: ["dynamodb:PutItem"],
+      conditions: {
+        Null: { "dynamodb:LeadingKeys": "false" },
+        "ForAllValues:StringEquals": {
+          "dynamodb:LeadingKeys": ["EDGE_REPLAY#GLOBAL"],
+        },
+      },
+      resources: [this.controlTable.tableArn],
+    }));
     this.jobsQueue.grantSendMessages(this.amplifyComputeRole);
 
     this.jobWorkerRole = new iam.Role(this, "JobWorkerRole", {
@@ -292,27 +337,7 @@ export class SharedPlatformStack extends Stack {
         iam.ManagedPolicy.fromAwsManagedPolicyName("service-role/AWSLambdaBasicExecutionRole"),
       ],
     });
-    this.controlTable.grantReadData(this.jobWorkerRole);
     this.jobsQueue.grantConsumeMessages(this.jobWorkerRole);
-
-    const tenantDataRolePattern = this.formatArn({
-      arnFormat: ArnFormat.SLASH_RESOURCE_NAME,
-      region: "",
-      resource: "role",
-      resourceName: "scopeproof/tenants/sp-*-data",
-      service: "iam",
-    });
-    const assumeTenantRole = new iam.PolicyStatement({
-      actions: ["sts:AssumeRole"],
-      resources: [tenantDataRolePattern],
-    });
-    this.amplifyComputeRole.addToPolicy(assumeTenantRole);
-    this.jobWorkerRole.addToPolicy(
-      new iam.PolicyStatement({
-        actions: ["sts:AssumeRole"],
-        resources: [tenantDataRolePattern],
-      }),
-    );
 
     const amplifyServiceRole = new iam.Role(this, "AmplifyServiceRole", {
       assumedBy: new iam.ServicePrincipal("amplify.amazonaws.com"),
@@ -340,6 +365,7 @@ export class SharedPlatformStack extends Stack {
       this.rootDomain,
       `downloads.${this.rootDomain}`,
       ...props.tenantSlugs.map((slug) => `${slug}.${this.rootDomain}`),
+      ...props.tenantSlugs.map((slug) => `api-${slug}.${this.rootDomain}`),
     ];
     this.webAcl = new wafv2.CfnWebACL(this, "WebAcl", {
       defaultAction: { allow: {} },

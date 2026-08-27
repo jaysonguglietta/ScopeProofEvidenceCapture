@@ -3,7 +3,8 @@
     "alwaysStrict": true,
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
-    "lib": ["ES2023"],
+    "lib": ["DOM", "DOM.Iterable", "ES2023"],
+    "allowImportingTsExtensions": true,
     "module": "CommonJS",
     "moduleResolution": "Node",
     "noFallthroughCasesInSwitch": true,
@@ -17,5 +18,5 @@
     "target": "ES2022",
     "types": ["node"]
   },
-  "include": ["bin/**/*.ts", "lib/**/*.ts", "test/**/*.ts"]
+  "include": ["bin/**/*.ts", "lib/**/*.ts", "runtime/**/*.ts", "test/**/*.ts"]
 }

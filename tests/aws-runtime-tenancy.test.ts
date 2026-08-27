@@ -30,6 +30,8 @@ const MEMBER_A = asMembershipId(`mem_${"3".repeat(32)}`);
 const RESOURCE_A = asResourceId(`evd_${"4".repeat(32)}`);
 const RESOURCE_B = asResourceId(`evd_${"5".repeat(32)}`);
 const NOW = new Date("2026-08-27T16:00:00.000Z");
+const CLIENT_A = "scopeproof-web";
+const CLIENT_B = "scopeproof-bravo";
 
 function hasCode(code: string): (error: unknown) => boolean {
   return (error: unknown): boolean => {
@@ -41,8 +43,8 @@ function hasCode(code: string): (error: unknown) => boolean {
 
 function directory(): TenantDirectory {
   const tenants: TenantRecord[] = [
-    { id: TENANT_A, slug: "acme", displayName: "Acme Compliance", status: "active" },
-    { id: TENANT_B, slug: "bravo", displayName: "Bravo Security", status: "active" },
+    { id: TENANT_A, slug: "acme", displayName: "Acme Compliance", appClientId: CLIENT_A, status: "active" },
+    { id: TENANT_B, slug: "bravo", displayName: "Bravo Security", appClientId: CLIENT_B, status: "active" },
   ];
   const domains: TenantDomainRecord[] = [
     { tenantId: TENANT_A, hostname: canonicalHostname("acme.jsontechology.com"), status: "active", canonical: true },
@@ -109,16 +111,23 @@ test("tenant resolution accepts only an exact canonical hostname", () => {
 
 test("tenant resolution fails closed for inactive domains and tenants", () => {
   const domainDisabled = new TenantDirectory(
-    [{ id: TENANT_A, slug: "acme", displayName: "Acme", status: "active" }],
+    [{ id: TENANT_A, slug: "acme", displayName: "Acme", appClientId: CLIENT_A, status: "active" }],
     [{ tenantId: TENANT_A, hostname: canonicalHostname("acme.jsontechology.com"), status: "disabled", canonical: true }],
   );
   assert.throws(() => domainDisabled.resolve({ source: "direct", host: "acme.jsontechology.com" }), hasCode("TENANT_NOT_FOUND"));
 
   const tenantSuspended = new TenantDirectory(
-    [{ id: TENANT_A, slug: "acme", displayName: "Acme", status: "suspended" }],
+    [{ id: TENANT_A, slug: "acme", displayName: "Acme", appClientId: CLIENT_A, status: "suspended" }],
     [{ tenantId: TENANT_A, hostname: canonicalHostname("acme.jsontechology.com"), status: "active", canonical: true }],
   );
   assert.throws(() => tenantSuspended.resolve({ source: "direct", host: "acme.jsontechology.com" }), hasCode("TENANT_INACTIVE"));
+});
+
+test("tenant records require one exact bounded Cognito app client binding", () => {
+  assert.throws(() => new TenantDirectory(
+    [{ id: TENANT_A, slug: "acme", displayName: "Acme", appClientId: "bad client id", status: "active" }],
+    [{ tenantId: TENANT_A, hostname: canonicalHostname("acme.jsontechology.com"), status: "active", canonical: true }],
+  ), hasCode("INVALID_IDENTIFIER"));
 });
 
 test("authentication validates issuer, audience, token use, age, and expiry", () => {

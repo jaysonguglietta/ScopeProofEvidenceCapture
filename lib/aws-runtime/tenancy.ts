@@ -20,6 +20,8 @@ export interface TenantRecord {
   id: TenantId;
   slug: string;
   displayName: string;
+  /** Exact Cognito app client authorized for this tenant. */
+  appClientId: string;
   status: TenantStatus;
 }
 
@@ -34,7 +36,32 @@ export type HostAuthority =
   | { source: "direct"; host: string }
   | { source: "trusted_edge"; viewerHost: string; edgeProofVerified: true };
 
+export interface ResolvedTenantAuthority {
+  readonly tenant: TenantRecord;
+  readonly domain: TenantDomainRecord;
+}
+
+/**
+ * Resolves the one authoritative tenant associated with a request hostname.
+ *
+ * In-memory callers can return synchronously while production adapters can
+ * perform a strongly consistent registry read. Callers must always await the
+ * result and must not infer a tenant from an unverified Host header.
+ */
+export interface TenantAuthorityResolver {
+  resolve(authority: HostAuthority): ResolvedTenantAuthority | Promise<ResolvedTenantAuthority>;
+}
+
 const dnsLabelPattern = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+const cognitoClientIdPattern = /^[A-Za-z0-9_.:+/=_~-]{3,128}$/;
+
+export function assertTenantCognitoClientId(value: string): string {
+  const exact = String(value || "");
+  if (!cognitoClientIdPattern.test(exact)) {
+    throw new TenantSecurityError("INVALID_IDENTIFIER", "Tenant Cognito client identifier is invalid.", 500);
+  }
+  return exact;
+}
 
 export function canonicalHostname(value: string): CanonicalHostname {
   const raw = String(value || "");
@@ -48,7 +75,7 @@ export function canonicalHostname(value: string): CanonicalHostname {
   return raw as CanonicalHostname;
 }
 
-function authorityHost(authority: HostAuthority): CanonicalHostname {
+export function canonicalAuthorityHostname(authority: HostAuthority): CanonicalHostname {
   if (authority.source === "trusted_edge") {
     if (authority.edgeProofVerified !== true) {
       throw new TenantSecurityError("UNTRUSTED_HOST_SOURCE", "Tenant hostname did not come from the trusted edge.", 421);
@@ -58,7 +85,7 @@ function authorityHost(authority: HostAuthority): CanonicalHostname {
   return canonicalHostname(authority.host);
 }
 
-export class TenantDirectory {
+export class TenantDirectory implements TenantAuthorityResolver {
   readonly #tenants: ReadonlyMap<TenantId, TenantRecord>;
   readonly #domains: ReadonlyMap<CanonicalHostname, TenantDomainRecord>;
 
@@ -68,7 +95,12 @@ export class TenantDirectory {
       const id = asTenantId(tenant.id);
       if (tenantMap.has(id)) throw new TenantSecurityError("INVALID_IDENTIFIER", "Tenant directory contains a duplicate tenant.");
       if (!dnsLabelPattern.test(tenant.slug) || tenant.slug.length > 63) throw new TenantSecurityError("INVALID_IDENTIFIER", "Tenant slug is invalid.");
-      tenantMap.set(id, Object.freeze({ ...tenant, id, displayName: assertBoundedText(tenant.displayName, "Tenant name", 1, 160) }));
+      tenantMap.set(id, Object.freeze({
+        ...tenant,
+        id,
+        appClientId: assertTenantCognitoClientId(tenant.appClientId),
+        displayName: assertBoundedText(tenant.displayName, "Tenant name", 1, 160),
+      }));
     }
     const domainMap = new Map<CanonicalHostname, TenantDomainRecord>();
     for (const domain of domains) {
@@ -82,8 +114,8 @@ export class TenantDirectory {
     this.#domains = domainMap;
   }
 
-  resolve(authority: HostAuthority): { tenant: TenantRecord; domain: TenantDomainRecord } {
-    const hostname = authorityHost(authority);
+  resolve(authority: HostAuthority): ResolvedTenantAuthority {
+    const hostname = canonicalAuthorityHostname(authority);
     const domain = this.#domains.get(hostname);
     if (!domain || domain.status !== "active") {
       throw new TenantSecurityError("TENANT_NOT_FOUND", "Tenant not found.", 404);
@@ -178,7 +210,7 @@ export function validatePrincipal(principal: AuthenticatedPrincipal, policy: Pri
 }
 
 export function authorizeTenantActor(input: {
-  resolved: ReturnType<TenantDirectory["resolve"]>;
+  resolved: ResolvedTenantAuthority;
   principal: AuthenticatedPrincipal;
   membership: TenantMembership | null;
   permission: TenantPermission;
