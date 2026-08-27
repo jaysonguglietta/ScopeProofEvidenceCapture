@@ -13,7 +13,46 @@ struct CaptureHistoryEntry: Sendable {
 }
 
 enum CaptureHistory {
+    static func defaultEvidenceRoot(homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) -> URL {
+        homeDirectory
+            .appendingPathComponent("Documents", isDirectory: true)
+            .appendingPathComponent("Scopeproof Evidence", isDirectory: true)
+    }
+
+    static func legacyEvidenceRoot(homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) -> URL {
+        homeDirectory
+            .appendingPathComponent("Pictures", isDirectory: true)
+            .appendingPathComponent("Scopeproof Evidence", isDirectory: true)
+    }
+
+    static func readableRoots(
+        for primaryDirectory: URL,
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> [URL] {
+        let primary = primaryDirectory.standardizedFileURL.resolvingSymlinksInPath()
+        guard primary == defaultEvidenceRoot(homeDirectory: homeDirectory).standardizedFileURL.resolvingSymlinksInPath() else { return [primary] }
+        return [primary, legacyEvidenceRoot(homeDirectory: homeDirectory).standardizedFileURL.resolvingSymlinksInPath()]
+    }
+
+    static func isWithinReadableRoots(
+        _ url: URL,
+        primaryDirectory: URL,
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
+    ) -> Bool {
+        let candidate = url.standardizedFileURL.resolvingSymlinksInPath().path
+        return readableRoots(for: primaryDirectory, homeDirectory: homeDirectory).contains { root in
+            candidate.hasPrefix(root.path + "/")
+        }
+    }
+
     static func entries(in directory: URL) -> [CaptureHistoryEntry] {
+        var seenEvidenceIDs = Set<String>()
+        return readableRoots(for: directory).flatMap { entriesOnly(in: $0) }.filter { entry in
+            seenEvidenceIDs.insert(entry.manifest.evidenceID).inserted
+        }.sorted { $0.manifest.capturedAt > $1.manifest.capturedAt }
+    }
+
+    private static func entriesOnly(in directory: URL) -> [CaptureHistoryEntry] {
         guard let enumerator = FileManager.default.enumerator(
             at: directory,
             includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
@@ -26,7 +65,7 @@ enum CaptureHistory {
             let receipt = url.deletingPathExtension().appendingPathExtension("receipt.json")
             guard FileManager.default.fileExists(atPath: image.path) else { return nil }
             return CaptureHistoryEntry(manifest: manifest, manifestURL: url, imageURL: image, receiptURL: receipt)
-        }.sorted { $0.manifest.capturedAt > $1.manifest.capturedAt }
+        }
     }
 
     static func removeExpired(in directory: URL, retentionDays: Int) throws -> Int {

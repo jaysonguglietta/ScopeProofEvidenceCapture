@@ -51,6 +51,8 @@ On machines with multiple developer toolchains, select the full Xcode toolchain 
 
 The native Local Console is served directly by Scopeproof Capture. It is not the React development server and should remain usable with no hosted environment variables. When changing the console, verify its focused tests, release build, loopback-only listener, per-launch authentication, and unauthorized-request behavior.
 
+New native evidence must write only beneath `~/Documents/Scopeproof Evidence`. The known-root compatibility layer may read the legacy `~/Pictures/Scopeproof Evidence` tree, but must resolve symlinks, reject every other path, and prefer the primary Documents copy when an evidence ID exists in both roots. Path changes require native regression coverage plus installation, operator, architecture, security, operations, in-app Help, and changelog updates.
+
 Native S3 changes must preserve generated regional AWS-only endpoints, redirect rejection, temporary-production credentials, expected-owner and destination binding, bounded XML/JSON parsing, KMS/Object Lock/posture checks, returned SHA-256 and version-ID enforcement, exact-version downloads, private temporary files, quarantine metadata, and the 5,000-version/250-MB bounds. Use only synthetic credentials and local request-construction/parser fixtures in tests; never contact S3 with a developer credential.
 
 ## Change discipline

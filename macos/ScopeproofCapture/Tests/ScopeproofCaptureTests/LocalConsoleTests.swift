@@ -4,6 +4,19 @@ import Testing
 
 @Suite("Local evidence console", .serialized)
 struct LocalConsoleTests {
+    @Test("Uses Documents for new evidence and retains the legacy Pictures root")
+    func usesDocumentsEvidenceRootWithLegacyCompatibility() {
+        let home = URL(fileURLWithPath: "/Users/tester", isDirectory: true)
+        let primary = CaptureHistory.defaultEvidenceRoot(homeDirectory: home)
+        let legacy = CaptureHistory.legacyEvidenceRoot(homeDirectory: home)
+        #expect(primary.path == "/Users/tester/Documents/Scopeproof Evidence")
+        #expect(legacy.path == "/Users/tester/Pictures/Scopeproof Evidence")
+        #expect(CaptureHistory.readableRoots(for: primary, homeDirectory: home) == [primary.standardizedFileURL, legacy.standardizedFileURL])
+        #expect(CaptureHistory.isWithinReadableRoots(primary.appendingPathComponent("PCI/8.3/evidence.png"), primaryDirectory: primary, homeDirectory: home))
+        #expect(CaptureHistory.isWithinReadableRoots(legacy.appendingPathComponent("PCI/8.3/evidence.png"), primaryDirectory: primary, homeDirectory: home))
+        #expect(!CaptureHistory.isWithinReadableRoots(home.appendingPathComponent("Downloads/evidence.png"), primaryDirectory: primary, homeDirectory: home))
+    }
+
     @Test("Creates a durable SQLite index with a verifiable immutable audit chain")
     func createsIndexAndAuditChain() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("scopeproof-local-console-\(UUID().uuidString)", isDirectory: true)

@@ -9,6 +9,7 @@ The Mac app can generate a direct, one-time repository SBOM without a hosted acc
 - macOS 14 or newer.
 - An Apple Silicon (`arm64`) Mac for the current 1.8.1 development-preview DMG.
 - Screen Recording permission for browser-window capture.
+- Documents Folder access when macOS requests it for local evidence storage.
 - HTTPS access to `api.github.com` when using local repository SBOM generation.
 - HTTPS access to the configured region-specific AWS S3 and STS endpoints (or their FIPS variants) when using optional S3 storage.
 
@@ -60,11 +61,11 @@ If Scopeproof is not listed, attempt one capture first so macOS can register the
 
 Open **Capture & Jira Settings…** from the shield menu. Leave **Server URL** blank to prevent hosted synchronization. The Local Console, capture, search, review, Jira comment generation, and local assessor-package export continue to work.
 
-Evidence is stored under `~/Pictures/Scopeproof Evidence/<framework>/<control>/`. The Local Console's SQLite search index lives in the current user's Application Support folder and can be rebuilt from the immutable evidence manifests and lifecycle sidecars.
+New evidence is stored under `~/Documents/Scopeproof Evidence/<framework>/<control>/`. Existing captures under `~/Pictures/Scopeproof Evidence` remain searchable, reviewable, uploadable, and exportable; Scopeproof does not move or delete them automatically. The Local Console's SQLite search index lives in the current user's Application Support folder and can be rebuilt from the immutable evidence manifests and lifecycle sidecars.
 
 ## Update the DMG installation
 
-Download the newer release DMG and checksum, verify them, quit Scopeproof, and replace the existing app in `/Applications`. Evidence under `~/Pictures/Scopeproof Evidence`, Keychain items, and user preferences are not removed. Do not overwrite a production-notarized installation with a development preview unless your organization has approved that downgrade in release trust.
+Download the newer release DMG and checksum, verify them, quit Scopeproof, and replace the existing app in `/Applications`. Evidence under `~/Documents/Scopeproof Evidence` or the legacy `~/Pictures/Scopeproof Evidence` location, Keychain items, and user preferences are not removed. Do not overwrite a production-notarized installation with a development preview unless your organization has approved that downgrade in release trust.
 
 ## Update or rebuild from source
 
@@ -74,14 +75,14 @@ Pull or copy the updated repository source, then run the installation command ag
 ./Scripts/run_macos_capture.sh
 ```
 
-The script quits a running Scopeproof process before replacing the application. Evidence under `~/Pictures/Scopeproof Evidence`, Keychain keys, and user preferences are not removed. Use `./Scripts/run_macos_capture.sh --no-launch` when installation should finish without opening the app.
+The script quits a running Scopeproof process before replacing the application. Evidence under `~/Documents/Scopeproof Evidence` or the legacy `~/Pictures/Scopeproof Evidence` location, Keychain keys, and user preferences are not removed. Use `./Scripts/run_macos_capture.sh --no-launch` when installation should finish without opening the app.
 
 ## Verify the installation
 
 - `/Applications/Scopeproof Capture.app` exists for a DMG installation, or `~/Applications/Scopeproof Capture.app` exists for a source installation.
 - The shield is visible in the menu bar.
 - **Open Local Console** opens a browser page while Scopeproof is running.
-- **Open Evidence Folder** opens `~/Pictures/Scopeproof Evidence`.
+- **Open Evidence Folder** opens `~/Documents/Scopeproof Evidence`.
 - **Generate Repository SBOM…** opens a masked one-time GitHub credential dialog and offers CycloneDX 1.6 or SPDX 2.3 JSON.
 - **AWS S3 Storage…** opens the security-profile, KMS/Object Lock, lifecycle/replication, FIPS, and Keychain credential configuration. Use **Save & Verify** for an existing bucket or **Create & Harden Bucket** after reviewing the irreversible retention warning.
 - **Browse S3 Evidence…** searches and sorts immutable versions under the verified prefix and downloads one selected PNG/JSON version to an explicit quarantined local destination.
@@ -99,6 +100,7 @@ The script quits a running Scopeproof process before replacing the application. 
 | Settings fields or checkbox labels are clipped | Install build 20 or newer. **Capture & Jira Settings…** separates the bounded form into **Capture & Local** and **Jira** tabs. |
 | Browser reports unauthorized | Do not reuse an old loopback URL; reopen the console from the shield menu to establish a fresh per-launch session. |
 | Capture permission repeats | Confirm the enabled entry matches the installed copy you launch, remove obsolete copies, then fully quit and reopen Scopeproof. |
+| Evidence cannot be saved under Documents | Open **System Settings → Privacy & Security → Files & Folders**, allow Scopeproof Capture to access Documents, then quit and reopen the same installed copy. Confirm any iCloud Drive or enterprise sync policy is approved for compliance evidence. |
 | Menu says `Waiting for evidence review…` | Close the menu and use the review workspace Scopeproof placed above the browser. Save or discard it before starting another operation. |
 | Capture cannot find the intended window | Use **Choose Browser Window…** and select the exact browser/window title. |
 | Repository SBOM authentication fails | Create a fresh fine-grained token selected only for the repository with Metadata: read and Contents: read, then submit a new run. The app never retains or retries a one-time token. |

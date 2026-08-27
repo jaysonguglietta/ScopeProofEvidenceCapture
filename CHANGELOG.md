@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-No unreleased changes.
+- Changed the default local evidence root from `~/Pictures/Scopeproof Evidence` to `~/Documents/Scopeproof Evidence`. Existing Pictures-based captures remain searchable, reviewable, uploadable, subject to configured retention, and assessor-exportable without an automatic file move.
 
 ## 1.8.1 — 2026-08-25
 

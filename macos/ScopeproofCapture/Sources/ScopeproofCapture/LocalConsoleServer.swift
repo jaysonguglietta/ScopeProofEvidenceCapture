@@ -236,7 +236,8 @@ final class LocalConsoleServer {
     private func entry(for evidenceID: String) throws -> CaptureHistoryEntry {
         guard evidenceID.count <= 80, evidenceID.range(of: #"^EV-[A-Z0-9]+$"#, options: .regularExpression) != nil,
               let entry = CaptureHistory.entries(in: evidenceRoot).first(where: { $0.manifest.evidenceID == evidenceID }),
-              entry.imageURL.standardizedFileURL.path.hasPrefix(evidenceRoot.path + "/"), entry.manifestURL.standardizedFileURL.path.hasPrefix(evidenceRoot.path + "/") else { throw LocalConsoleFailure.notFound }
+              CaptureHistory.isWithinReadableRoots(entry.imageURL, primaryDirectory: evidenceRoot),
+              CaptureHistory.isWithinReadableRoots(entry.manifestURL, primaryDirectory: evidenceRoot) else { throw LocalConsoleFailure.notFound }
         return entry
     }
 

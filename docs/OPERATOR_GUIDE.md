@@ -51,7 +51,7 @@ Each saved item can contain:
 - `.review.json`: hash-chained lifecycle decisions and review notes.
 - `.receipt.json`: server evidence identity and signed timestamp receipt, when uploaded.
 
-Files are stored under `~/Pictures/Scopeproof Evidence` and are private to the current macOS account.
+New files are stored under `~/Documents/Scopeproof Evidence` and use current-account-only permissions. Evidence created by earlier versions under `~/Pictures/Scopeproof Evidence` remains available to search, review, pending-upload, retention, and assessor-export workflows; it is not moved automatically. Before collection, confirm that iCloud Drive, enterprise file synchronization, backup, and DLP settings for Documents are approved for the evidence classification.
 
 The visible menu-bar clock is useful corroborating context, but it is controlled by the endpoint and does not independently prove time. For scrolling evidence, Scopeproof captures the menu-bar strip when you choose **Finish & review**, rather than when the first viewport was taken. For stronger evidence, use the signed Scopeproof server-time receipt and, when configured and verified, the RFC 3161 timestamp attestation included with the artifact.
 

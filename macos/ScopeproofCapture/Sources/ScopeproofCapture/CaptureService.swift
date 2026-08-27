@@ -144,8 +144,7 @@ final class CaptureService {
     }
 
     var outputDirectory: URL {
-        let pictures = fileManager.urls(for: .picturesDirectory, in: .userDomainMask).first ?? fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Pictures")
-        return pictures.appendingPathComponent("Scopeproof Evidence", isDirectory: true)
+        CaptureHistory.defaultEvidenceRoot(homeDirectory: fileManager.homeDirectoryForCurrentUser)
     }
 
     var hasScreenRecordingPermission: Bool { CGPreflightScreenCaptureAccess() }

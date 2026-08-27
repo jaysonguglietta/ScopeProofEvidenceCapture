@@ -40,7 +40,7 @@ Scopeproof combines a private Cloudflare-hosted evidence console with a local ma
 5. Scopeproof adds a header above the redacted evidence pixels with the complete sanitized source URL on a dedicated wrapping line. URL credentials are removed, known-sensitive query values are replaced with `REDACTED`, and a sensitive fragment is replaced before rendering or recording; ordinary path, query, and fragment context is preserved.
 6. The menu-bar/header/source composite is scanned again, then the review workspace permits additional irreversible manual masks.
 7. Scopeproof encodes the reviewed PNG in memory, decodes and scans those exact bytes, and fails closed if the scan cannot complete or detects remaining sensitive content.
-8. The same verified bytes are atomically written and hashed. The manifest records that digest as both the artifact and safety-scan digest with the policy/version and completion time.
+8. The same verified bytes are atomically written and hashed under `~/Documents/Scopeproof Evidence`. The manifest records that digest as both the artifact and safety-scan digest with the policy/version and completion time. Discovery also reads the bounded legacy `~/Pictures/Scopeproof Evidence` root so existing artifacts retain search, lifecycle, upload, retention, and export behavior without an automatic move; new writes never target the legacy root.
 9. Review decisions are recorded in a separate hash-chained lifecycle sidecar.
 10. Optional upload returns a signed server receipt. Only Approved evidence is eligible for local assessor export.
 

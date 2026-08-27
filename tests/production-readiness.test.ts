@@ -257,3 +257,23 @@ test("native S3 evidence storage is destination-bound, integrity-checked, encryp
   assert.match(monitoring, /DisableKey/);
   assert.doesNotMatch(browser, /S3Credentials\s*[=:]/);
 });
+
+test("native evidence writes to Documents while legacy Pictures evidence remains bounded", async () => {
+  const [capture, history, installation, operatorGuide, architecture, securityGuide] = await Promise.all([
+    read("macos/ScopeproofCapture/Sources/ScopeproofCapture/CaptureService.swift"),
+    read("macos/ScopeproofCapture/Sources/ScopeproofCapture/CaptureHistory.swift"),
+    read("docs/MACOS_INSTALLATION.md"),
+    read("docs/OPERATOR_GUIDE.md"),
+    read("docs/ARCHITECTURE.md"),
+    read("docs/SECURITY.md"),
+  ]);
+  assert.match(capture, /CaptureHistory\.defaultEvidenceRoot/);
+  assert.match(history, /appendingPathComponent\("Documents"/);
+  assert.match(history, /appendingPathComponent\("Pictures"/);
+  assert.match(history, /resolvingSymlinksInPath/);
+  assert.match(history, /seenEvidenceIDs/);
+  assert.match(installation, /~\/Documents\/Scopeproof Evidence/);
+  assert.match(operatorGuide, /iCloud Drive/);
+  assert.match(architecture, /new writes never target the legacy root/);
+  assert.match(securityGuide, /prevent unapproved iCloud Drive/);
+});
