@@ -265,9 +265,10 @@ test("release evidence is complete, redacted, digest-bound, and tamper evident",
   }
 });
 
-test("advanced CodeQL preserves JS, TS, and Actions coverage while manually building Swift", async () => {
+test("advanced CodeQL documents the managed-setup replacement and preserves complete coverage", async () => {
   const runbook = await readFile(releaseRunbookPath, "utf8");
-  assert.match(runbook, /switch the repository from default\s+setup to advanced setup/);
+  assert.match(runbook, /GitHub default setup was disabled on 2026-08-27/);
+  assert.match(runbook, /default branch\s+does not contain the replacement workflow/);
   assert.match(runbook, /JavaScript, TypeScript, and GitHub Actions\s+coverage/);
   assert.doesNotMatch(runbook, /Keep GitHub's managed\/default CodeQL setup enabled/);
 });
