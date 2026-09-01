@@ -71,7 +71,8 @@ test("Dynamo tenant resolver fails closed for inactive and unknown domains", asy
       tableName: "scopeproof-control",
     });
     await assert.rejects(resolver.resolve({ source: "direct", host: HOSTNAME }), (error: unknown) =>
-      error instanceof TenantSecurityError && error.code === "TENANT_NOT_FOUND" && error.safeStatus === 404 && !error.message.includes(HOSTNAME));
+      error instanceof TenantSecurityError && error.code === "TENANT_NOT_FOUND" &&
+        error.safeStatus === 404 && error.message === "Tenant not found.");
   }
 });
 

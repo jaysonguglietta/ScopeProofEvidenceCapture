@@ -240,8 +240,11 @@ test("Jira Cloud OAuth and attachment upload enforce trust boundaries", async ()
   assert.match(concurrencyMigration, /CREATE TABLE `jira_upload_operations`/);
   assert.match(concurrencyMigration, /ADD `token_version` integer/);
   assert.match(concurrencyMigration, /ADD `refresh_lease_id` text/);
-  assert.match(jiraSource, /https:\/\/auth\.atlassian\.com\/authorize/);
-  assert.match(jiraSource, /https:\/\/api\.atlassian\.com/);
+  const jiraStringLiterals = new Set(
+    Array.from(jiraSource.matchAll(/"([^"\r\n]*)"/g), (match) => match[1]),
+  );
+  assert.equal(jiraStringLiterals.has("https://auth.atlassian.com/authorize"), true);
+  assert.equal(jiraStringLiterals.has("https://api.atlassian.com"), true);
   assert.match(jiraSource, /JIRA_OAUTH_TOKEN_ENCRYPTION_KEY/);
   assert.match(jiraSource, /stateHash = await sha256\(state\)/);
   assert.match(jiraSource, /host\.endsWith\("\.atlassian\.net"\)/);

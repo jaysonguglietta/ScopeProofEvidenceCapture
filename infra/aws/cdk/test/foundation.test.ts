@@ -39,6 +39,16 @@ const developmentRecovery = parseRecoveryConfiguration({ mode: "disabled" }, {
   tenants: [],
 });
 
+function containsExactString(value: unknown, expected: string): boolean {
+  if (value === expected) return true;
+  if (Array.isArray(value)) return value.some((entry) => containsExactString(entry, expected));
+  if (value && typeof value === "object") {
+    return Object.values(value as Record<string, unknown>)
+      .some((entry) => containsExactString(entry, expected));
+  }
+  return false;
+}
+
 function foundation() {
   const app = new App({
     context: {
@@ -528,7 +538,7 @@ test("enabled recovery adds exact Aurora backup copies and evidence replication 
   });
   assert.ok(recoveryTenantDataPolicy);
   assert.doesNotMatch(JSON.stringify(recoveryTenantDataPolicy), /RECOVERY#TENANT#/);
-  assert.match(JSON.stringify(tenantJson), /batchoperations\.s3\.amazonaws\.com/);
+  assert.equal(containsExactString(tenantJson, "batchoperations.s3.amazonaws.com"), true);
   assert.match(JSON.stringify(tenantJson), /s3:Replication:OperationFailedReplication/);
   assert.match(JSON.stringify(tenantJson), /EvidenceRecoveryReconciliationSchedule/);
   assert.doesNotMatch(JSON.stringify(tenantJson), /s3:ReplicateDelete/);
@@ -665,7 +675,7 @@ test("shared edge, release, alerting, email, and cost controls are production bo
   ]) {
     assert.match(webAclJson, new RegExp(rule));
   }
-  assert.match(webAclJson, /acme\.evidence\.example\.com/);
+  assert.equal(containsExactString(webAcl, "acme.evidence.example.com"), true);
   assert.doesNotMatch(webAclJson, /"SearchString":"\*\./);
 
   template.resourceCountIs("AWS::CloudFront::Distribution", 1);
@@ -965,7 +975,7 @@ test("tenant stack is isolated, immutable, and remains provisioning", () => {
   assert.match(JSON.stringify(synthesized), /ten_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/);
   assert.match(JSON.stringify(synthesized), /route53:ChangeResourceRecordSets/);
   assert.match(JSON.stringify(synthesized), /ChangeResourceRecordSetsNormalizedRecordNames/);
-  assert.match(JSON.stringify(synthesized), /acme\.evidence\.example\.com/);
+  assert.equal(containsExactString(synthesized, "acme.evidence.example.com"), true);
   assert.match(JSON.stringify(synthesized), /ACTIVE_EXACT_INTENT_AND_DATABASE_RECONCILIATION/);
 });
 
