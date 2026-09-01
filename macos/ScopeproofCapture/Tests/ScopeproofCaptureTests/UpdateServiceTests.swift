@@ -1,4 +1,5 @@
 import Compression
+import CryptoKit
 import Foundation
 import Testing
 @testable import ScopeproofCapture
@@ -325,6 +326,67 @@ struct UpdateServiceTests {
         } catch {
             #expect(error is CancellationError)
         }
+    }
+
+    @Test("Commits the rollback floor before atomically replacing a verified archive")
+    func commitsRollbackFloorBeforeArchivePublication() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("scopeproof-update-commit-test-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let download = root.appendingPathComponent("download.zip")
+        let destination = root.appendingPathComponent("Scopeproof-Capture-99.0.0.zip")
+        let expectedBytes = Data("new verified archive".utf8)
+        let expectedDigest = SHA256.hash(data: expectedBytes).map { String(format: "%02x", $0) }.joined()
+        try expectedBytes.write(to: download)
+        try Data("previous verified archive".utf8).write(to: destination)
+        let staged = try VerifiedUpdateArtifactStore.stage(downloadedArchive: download, in: root)
+        try Data("mutated source bytes".utf8).write(to: download)
+
+        var observedPreviousDuringFloorCommit = false
+        #expect(throws: UpdateFailure.self) {
+            try VerifiedUpdateArtifactStore.commit(stagedArchive: staged, destination: destination, expectedByteSize: expectedBytes.count, expectedSHA256: expectedDigest) {
+                observedPreviousDuringFloorCommit = (try? Data(contentsOf: destination)) == Data("previous verified archive".utf8)
+                throw UpdateFailure.rollback
+            }
+        }
+        #expect(observedPreviousDuringFloorCommit)
+        #expect(try Data(contentsOf: destination) == Data("previous verified archive".utf8))
+        #expect(try FileManager.default.contentsOfDirectory(atPath: root.path).filter { $0.hasSuffix(".pending") }.isEmpty)
+
+        try expectedBytes.write(to: download)
+        let successfulStage = try VerifiedUpdateArtifactStore.stage(downloadedArchive: download, in: root)
+        var floorCommitted = false
+        try VerifiedUpdateArtifactStore.commit(stagedArchive: successfulStage, destination: destination, expectedByteSize: expectedBytes.count, expectedSHA256: expectedDigest) {
+            let previous = try Data(contentsOf: destination)
+            #expect(previous == Data("previous verified archive".utf8))
+            floorCommitted = true
+        }
+        #expect(floorCommitted)
+        #expect(try Data(contentsOf: destination) == Data("new verified archive".utf8))
+    }
+
+    @Test("Rejects a staged update mutated before rollback-floor persistence")
+    func rejectsMutatedStagedArchive() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("scopeproof-update-mutation-test-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let expectedBytes = Data("signed update bytes".utf8)
+        let expectedDigest = SHA256.hash(data: expectedBytes).map { String(format: "%02x", $0) }.joined()
+        let download = root.appendingPathComponent("download.zip")
+        let destination = root.appendingPathComponent("Scopeproof-Capture-99.0.0.zip")
+        try expectedBytes.write(to: download)
+        try Data("previous archive!".utf8).write(to: destination)
+        let staged = try VerifiedUpdateArtifactStore.stage(downloadedArchive: download, in: root)
+        try Data(repeating: 0x58, count: expectedBytes.count).write(to: staged)
+
+        var floorWasPersisted = false
+        #expect(throws: UpdateFailure.self) {
+            try VerifiedUpdateArtifactStore.commit(stagedArchive: staged, destination: destination, expectedByteSize: expectedBytes.count, expectedSHA256: expectedDigest) {
+                floorWasPersisted = true
+            }
+        }
+        #expect(!floorWasPersisted)
+        #expect(try Data(contentsOf: destination) == Data("previous archive!".utf8))
     }
 
     private struct Entry {

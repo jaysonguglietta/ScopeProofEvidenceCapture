@@ -51,6 +51,7 @@ authorization inputs.
 | Exact-version DLP client | Sends one immutable quarantine coordinate set to a clean HTTPS scanner endpoint, validates a strict bounded response, and stores a canonical KMS-signed receipt before promotion | External scanner, Secrets Manager, tenant KMS audit key, DynamoDB |
 | `RdsDataSignedAuditReceiptStore` | Verifies and appends one KMS-signed event into the tenant hash chain | Tenant PostgreSQL database |
 | API audit outbox/signer | Durably records successful public API facts, leases a bounded batch, signs each canonical event with tenant KMS, atomically appends it to the hash chain, and retries/dead-letters poison rows | Tenant PostgreSQL, dedicated Lambda/database login, KMS, EventBridge, DLQ, CloudWatch |
+| Shared maintenance worker | Leases one scheduled sweep, expires untouched upload intents with an exact revision CAS, and flags stale quarantine/promotion state for operator reconciliation without promoting or deleting evidence | DynamoDB lifecycle/state rows, SQS, EventBridge, CloudWatch |
 | Exact-version legal-hold service | Separately commits requester-only `REQUESTED`, distinct-admin `APPROVED`, durable worker-only `APPLYING`, and exact-readback `APPLIED` state for one exact S3 `VersionId` | PostgreSQL plus S3 Object Lock |
 | Legal-hold API/worker | Authenticates request and approval in separate calls, sweeps approved/applying operations, appends or reuses an exact KMS-signed audit receipt, publishes the audit-bound recovery record, and clears the Aurora outbox only after publication acknowledgement | Separate API/worker Lambda roles, PostgreSQL, S3 Object Lock, KMS, DynamoDB, EventBridge, and CloudWatch |
 
@@ -250,6 +251,76 @@ current key to create anything. Do not rotate by simply removing the prior
 stage while retry rows may still exist, because the same client key would
 derive a new intent ID under the new key. A live rotation/retry drill remains a
 production gate.
+
+### Shared pending/orphan reconciliation
+
+EventBridge sends one exact versioned maintenance envelope to the shared SQS
+queue every fifteen minutes. The shared worker accepts only that queue ARN,
+Region, one-record batch, and exact envelope. Reserved concurrency is one. A
+deterministic message lease and strongly consistent state read make a lost
+Lambda response replay-safe; the worker advances its persisted scan cursor only
+after the bounded page and its metrics complete.
+
+The worker first reads a protected tenant directory whose base partition is
+`MAINTENANCE#TENANT_DIRECTORY`; tenant application roles cannot write that
+namespace. It then performs bounded, per-tenant `Query` operations against the
+sparse `UploadLifecycleByTenantV2` index. V2 partitions by the immutable base
+table `PK`, not by a caller-writable GSI partition attribute, so a compromised
+tenant role cannot place a row in another tenant's maintenance partition. Each
+directory page contains at most 25 tenants and each sweep examines a bounded
+share of at most 250 indexed work rows. One tenant can consume only its own
+share and cannot starve the other tenants in that page. The worker never uses a
+whole-table `Scan`.
+
+Only strict schema-1 `UploadLifecycle` authority is accepted. The worker
+validates `ttlEpochSeconds` as exactly the canonical intent expiry plus the same
+seven-day delayed GuardDuty/event reconciliation grace enforced by promotion,
+followed by a fifteen-day TTL retention buffer. An untouched `issued` intent
+remains eligible throughout the complete reconciliation grace and moves to
+`expired` only at its deadline through an exact status/revision/expiry/TTL/index
+CAS. A stale `quarantined` or `validated` row becomes `ACTION_REQUIRED`; the
+same transaction removes it from both maintenance indexes and creates a durable
+`OUTSTANDING` ledger record under the protected
+`MAINTENANCE#ACTION_REQUIRED#<tenant>` partition. Recovery, promotion, or
+terminal rejection resolves that exact ledger record transactionally and
+removes it from the sparse outstanding-action index. The ledger has no TTL.
+Repeated outstanding-count and oldest-age metrics keep unresolved work visible
+until that exact resolution rather than emitting a one-sweep pulse.
+
+A malformed row in a tenant's V2 partition is drained with an exact returned-key
+CAS even when it already carries partial reconciliation fields. Logs and the
+durable ledger retain only SHA-256 key digests, never raw attacker-controlled
+keys. Deterministic contract failures are isolated to that row. DynamoDB
+throttles, validation failures, network errors, and any transaction cancellation
+not proven to consist solely of conditional-check losers abort the sweep so SQS
+and its DLQ provide durable retry. The maintenance worker never fabricates a
+GuardDuty/DLP result, promotes an object, changes a tenant database, assumes a
+tenant role, reads S3, or deletes evidence.
+
+The role can query only the protected directory and the exact V2 index, update
+only allowlisted lifecycle attributes under `TENANT#ten_*`, transact only with
+the exact tenant/action-required partitions, update its
+`MAINTENANCE#SHARED` lease partition, consume its queue, write its pre-created
+encrypted log group, and publish only the `Scopeproof/SharedJobs` namespace. It
+has no S3, KMS, RDS Data, Secrets Manager, or tenant-role permission. The legacy
+`GSI1` schema is retained and lifecycle writers dual-write it during the staged
+V2 migration; terminal transitions remove both index fields. CloudFormation has
+an explicit worker dependency on the control table, so V2 creation completes
+before worker publication. Existing rows still require the separate manual
+exact-CAS migration: the safe `maintenanceLifecycleMode=backfill` default
+disables both the EventBridge rule and SQS event-source mapping while an
+unscheduled bounded Lambda processes one tenant/page at a time. Only after every
+page has zero malformed/conflict results, the final cursor is absent, and a full
+rerun reports zero upgrades with matching current/terminal totals may a second
+reviewed `maintenanceLifecycleMode=enabled` deployment activate both triggers.
+Follow the [AWS platform runbook](AWS_PLATFORM_RUNBOOK.md#upload-lifecycle-index-staged-upgrade).
+Do not remove GSI1 until the documented rollback window and V2 production
+canaries are complete. No AWS deployment or backfill was performed by this work.
+
+Alarms cover worker heartbeat, provider/item failures, durable outstanding
+actions, oldest outstanding-action age, oldest observed pending age, Lambda
+errors/throttles, queue age, and DLQ depth. These controls are source/template
+tested only; they have not been deployed or live-drilled.
 
 ## List and download immutable evidence
 
@@ -520,6 +591,14 @@ header, permanent AWS credentials, duplicate nonce, expired intent, wrong scan
 version, checksum/KMS/retention mismatch, database revision race, conflicting
 idempotency digest, forged KMS result, legal-hold current-version request, and an
 S3 legal-hold postcondition mismatch.
+For shared maintenance, also test duplicate and reordered SQS delivery, lease
+expiry/takeover, cursor wrap, conditional losers, malformed lifecycle rows,
+metric failure before completion, poison-message DLQ routing, bounded redrive,
+tenant-padding isolation, a delayed valid GuardDuty event through the complete
+seven-day grace, TTL ordering, durable action-ledger heartbeat and exact
+resolution, provider throttling/transaction cancellation retry, V2 GSI
+creation/backfill ordering, rollback dual-write behavior, and proof that the
+role cannot read S3, use KMS/secrets/RDS, or assume a tenant role.
 
 ## Deployment gates
 
@@ -556,4 +635,6 @@ Do not enable customer traffic until all of the following are true:
 
 The API source, adapters, and IaC policies are implemented and source-tested,
 but no AWS resource or customer-facing route was deployed by this work. The
-current Cloudflare/Sites application does not automatically use the AWS API.
+conditional legacy Cloudflare/Sites application source does not automatically
+use the AWS API, and this repository does not prove that a Sites deployment or
+its expected private identity dispatcher exists.

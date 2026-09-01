@@ -30,7 +30,7 @@ Set `GITHUB_ORG` to the one organization operators may inventory. Set `GITHUB_TO
 Do not grant write, administration, workflow, issue, or secret permissions. Rotate the credential using the platform secret manager; never put it in the browser, Mac app, repository, or D1.
 
 Apply every migration in journal order through
-`drizzle/0027_lonely_guardian.sql` before enabling the current
+`drizzle/0028_native_reconciliation_cursor.sql` before enabling the current
 application, and run `npm run db:verify` as a deployment preflight. Migration
 0012 creates the SBOM job domain; migrations through 0023 add membership,
 retry authorization, occurrence/lifecycle, audited mutation, immutable receipt,
@@ -44,12 +44,15 @@ key-rotation retry,
 action-required, and recovery state so a poisoned encrypted record cannot
 hot-loop or hide unrelated maintenance. Migration 0027 adds atomic leased
 checkpoint-delivery retry state, bounded backoff, stale-claim recovery, and a
-ten-attempt operator-action boundary. The populated preflight preserves
+ten-attempt operator-action boundary. Migration 0028 adds the sparse native
+reconciliation queue and independent durable pending/orphan cursors. The fresh
+and populated preflights preserve
 same-digest legacy evidence from different systems, verifies legacy device and
 occurrence backfills, checks catalog/scope/review/hold structures, proves
 checkpoint-attempt immutability and single-delivery constraints, exercises the
 key-rotation retry lifecycle, rejects malformed state, and runs SQLite integrity
-checking. If a GitHub App installation token is used, Scopeproof does not mint or
+checking; they also verify the reconciliation queue/cursor state and its revision
+CAS. If a GitHub App installation token is used, Scopeproof does not mint or
 refresh it; an external secret-rotation process must replace the expiring token
 in Sites. The console labels managed access **Not configured** until both
 variables are present; one-time access remains available.
@@ -86,7 +89,7 @@ All authorization is enforced by the API. A disabled button is not the security 
 4. Choose CycloneDX 1.6 JSON or SPDX 2.3 JSON.
 5. Generate the inventory. Review its repository, commit, archive digest, manifests, generator version, component counts, and changes from the prior run.
 6. Open the linked evidence, inspect the actual JSON and SHA-256 digest, and have an independent reviewer approve it.
-7. Export the assessment package. Approved, unexpired SBOM evidence is included under PCI DSS 6.3.2 like other evidence. Any accompanying native screenshot remains excluded unless its schema-7 P-256 provenance link is finalized on the enrolled device's monotonic chain and it has a matching independent server safety receipt.
+7. Export the assessment package. Approved, unexpired SBOM evidence is included under PCI DSS 6.3.2 like other evidence. Any accompanying native screenshot remains excluded unless its schema-8 P-256 provenance, exact tenant/workspace binding, and device-chain link are finalized and it has a matching independent server safety receipt.
 
 The direct **JSON** download is available as soon as generation completes. It is authenticated and audited; approval is required only for inclusion in the assessor package.
 

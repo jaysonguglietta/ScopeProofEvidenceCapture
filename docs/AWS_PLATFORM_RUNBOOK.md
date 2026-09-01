@@ -1,6 +1,6 @@
 # Scopeproof AWS platform operator runbook
 
-> **Pre-deployment status — 2026-09-01:** this repository contains an AWS CDK foundation and security-domain code, but no AWS resources have been deployed or validated by this project work. The current browser/API application is still the legacy Cloudflare/Sites, D1, and R2 single-tenant runtime. It is not the AWS multi-tenant service described here. Do not direct a second customer hostname to the legacy runtime. The current source adds production-required exact-version DLP, KMS-signed DLP receipts, cross-store reconciliation, schema version 3 forward hardening, and an execution-bound `CUSTOMER_ENABLED` activation approval; none is live-cloud evidence.
+> **Pre-deployment status — 2026-09-01:** this repository contains an AWS CDK foundation and security-domain code, but no AWS resources have been deployed or validated by this project work. The current browser/API source is still the legacy Cloudflare/Sites, D1, and R2 single-tenant runtime; the repository does not establish that a Sites deployment or its expected private identity dispatcher exists. It is not the AWS multi-tenant service described here. Never direct a second customer hostname to the legacy runtime. The current source adds production-required exact-version DLP, KMS-signed DLP receipts, cross-store reconciliation, schema version 3 forward hardening, and an execution-bound `CUSTOMER_ENABLED` activation approval; none is live-cloud evidence.
 >
 > **Production stop:** do not onboard a customer or serve traffic from the AWS hostname. The repository now implements the database boundary; a composed per-tenant API for `/health`, `/v1/me`, `/v1/upload-intents`, `/v1/evidence/search`, `/v1/evidence-download-intents`, and two-person legal-hold request/approval; strict JWT/scope/membership authorization; retry-safe upload reconciliation; a durable bounded KMS-signed public-API audit drain; KMS receipts; a scheduled exact-version legal-hold reconciliation/expiry worker; global-table/S3/Aurora recovery; a protected signing/notarization workflow; and advanced CodeQL with a manual Swift build. None is deployed or validated in a live AWS/PostgreSQL/Apple environment, and no artifact has been submitted to Apple. The Amplify customer UI still has no source connection or application release, no hosted Mac OAuth/session UI or legal-hold UI/operational drill exists, and most product routes are not migrated. A successful infrastructure deployment or database execution is not customer-service activation.
 
@@ -32,9 +32,8 @@ For every production tenant, provide all four DLP context fields together:
 unless the clean HTTPS scanner returns a strict `CLEAN` decision for the exact
 quarantine version and the canonical receipt is signed/verified with tenant
 KMS. Retain live clean/rejected/replay/tamper and DynamoDB/PostgreSQL
-reconciliation evidence before activation. This subsection supersedes older
-schema-version-2, eight-file, and infrastructure-only activation wording later
-in this runbook. No AWS resource was deployed by these source changes.
+reconciliation evidence before activation. No AWS resource was deployed by
+these source changes.
 
 Rejected-ingest recovery is bound to the durable queue contract. An exact
 DynamoDB-first receipt can replay idempotently even after 24 hours; when Aurora
@@ -74,7 +73,7 @@ that an exact replay converges while any changed fact is rejected.
 | Browser/API runtime | Legacy Cloudflare/Sites application | Single tenant; must not serve multiple customers |
 | macOS hosted auth | PKCE and Keychain primitives under `HostedOAuth.swift` and `HostedTokenStore.swift` | Not integrated with app UI, callback handling, token exchange, or device enrollment |
 
-The operator-facing source contracts are the [tenant schema](../infra/aws/database/001_tenant_schema.sql), [runtime](../infra/aws/database/002_runtime_role.sql), [ingest](../infra/aws/database/003_ingest_role.sql), [evidence-control worker](../infra/aws/database/004_evidence_control_role.sql), [legal-hold API](../infra/aws/database/005_legal_hold_api_role.sql), [evidence access API](../infra/aws/database/006_evidence_access_api.sql), [evidence-read role](../infra/aws/database/007_evidence_read_role.sql), and [API-audit signer role](../infra/aws/database/008_api_audit_signer_role.sql) migrations, [tenant provisioner](../infra/aws/cdk/runtime/provision-tenant/index.mjs), [evidence promoter](../infra/aws/cdk/runtime/promote-evidence/index.mjs), [API-audit signer](../infra/aws/cdk/runtime/sign-api-audit-outbox/index.ts), [HTTP/auth adapters](../lib/aws-runtime/http), [evidence adapters](../lib/aws-runtime/evidence), [tenancy boundary](../lib/aws-runtime/tenancy.ts), [OAuth/PKCE primitives](../macos/ScopeproofCapture/Sources/ScopeproofCapture/HostedOAuth.swift), and [Keychain token abstraction](../macos/ScopeproofCapture/Sources/ScopeproofCapture/HostedTokenStore.swift). Optional direct-storage identity and native-bucket building blocks are documented under [CloudFormation storage and authentication templates](../infra/aws/cloudformation/README.md). Treat their tests as source-level evidence, not deployed-service assurance.
+The operator-facing source contracts are the [tenant schema](../infra/aws/database/001_tenant_schema.sql), [runtime](../infra/aws/database/002_runtime_role.sql), [ingest](../infra/aws/database/003_ingest_role.sql), [evidence-control worker](../infra/aws/database/004_evidence_control_role.sql), [legal-hold API](../infra/aws/database/005_legal_hold_api_role.sql), [evidence access API](../infra/aws/database/006_evidence_access_api.sql), [evidence-read role](../infra/aws/database/007_evidence_read_role.sql), [API-audit signer role](../infra/aws/database/008_api_audit_signer_role.sql), and [runtime hardening](../infra/aws/database/009_runtime_hardening.sql) migrations, [tenant provisioner](../infra/aws/cdk/runtime/provision-tenant/index.mjs), [evidence promoter](../infra/aws/cdk/runtime/promote-evidence/index.mjs), [API-audit signer](../infra/aws/cdk/runtime/sign-api-audit-outbox/index.ts), [HTTP/auth adapters](../lib/aws-runtime/http), [evidence adapters](../lib/aws-runtime/evidence), [tenancy boundary](../lib/aws-runtime/tenancy.ts), [OAuth/PKCE primitives](../macos/ScopeproofCapture/Sources/ScopeproofCapture/HostedOAuth.swift), and [Keychain token abstraction](../macos/ScopeproofCapture/Sources/ScopeproofCapture/HostedTokenStore.swift). Optional direct-storage identity and native-bucket building blocks are documented under [CloudFormation storage and authentication templates](../infra/aws/cloudformation/README.md). Treat their tests as source-level evidence, not deployed-service assurance.
 
 ## 2. Account, ownership, and access model
 
@@ -365,6 +364,104 @@ account with production-shaped synthetic data. If any step, import support, or
 rollback behavior differs in the target AWS account, stop and update the change
 plan; do not improvise a dual-write or destructive replacement.
 
+### Upload-lifecycle index staged upgrade
+
+The maintenance design adds `UploadLifecycleByTenantV2`; it does not mutate the
+deployed `GSI1` key schema, which DynamoDB cannot change in place. The template
+preserves legacy `GSI1`, adds V2 with base `PK` plus `GSI1SK`, and makes every
+active lifecycle writer dual-write both index attributes. Terminal expiry,
+promotion, rejection, and action-required transitions remove both. The shared
+worker has an explicit CloudFormation dependency on the global table so the V2
+resource update and backfill must complete before the Lambda is updated to query
+V2.
+
+For an existing global control table, treat this as a two-deployment production
+change. The checked-in and validation default is
+`maintenanceLifecycleMode=backfill`. In that mode, both the fifteen-minute
+EventBridge rule and the SQS-to-maintenance-worker event-source mapping are
+disabled. Disabling the rule alone is insufficient because a retained queue
+message could invoke the V2 worker before migration completes.
+
+1. Freeze provisioning, upload issuance, promotion/rejection/expiry, and other
+   lifecycle/schema changes for the bounded migration window. Capture PITR/export
+   evidence, per-tenant lifecycle counts, the existing GSI definition, and a
+   reviewed change set. Reject a plan that replaces or mutates `GSI1`.
+2. Perform the first reviewed deployment explicitly with
+   `-c maintenanceLifecycleMode=backfill`, even though it is the safe default.
+   Confirm the EventBridge maintenance rule is `DISABLED` and the Lambda SQS
+   event-source mapping is `Disabled`; confirm no manual invocation of the V2
+   maintenance worker is possible through the change procedure. Preserve any
+   retained queue messages for the later controlled enablement.
+3. Wait for the table and `UploadLifecycleByTenantV2` to report `ACTIVE` and
+   confirm CloudFormation completed the table dependency before updating the
+   worker. Resolve `UploadLifecycleBackfillFunctionArn` from the deployed shared
+   stack output. The backfill Lambda is deliberately unscheduled, reserved to
+   one concurrent invocation, bounded to 100 rows, and has no S3, KMS, RDS,
+   tenant-role, promotion, or deletion permission.
+4. Invoke exactly one bounded page for exactly one approved tenant at a time.
+   Preserve each response in the change record. The first request has no cursor:
+
+   ```bash
+   aws lambda invoke \
+     --profile '<APPROVED_PROFILE>' \
+     --region '<PRIMARY_REGION>' \
+     --function-name '<UPLOAD_LIFECYCLE_BACKFILL_FUNCTION_ARN>' \
+     --cli-binary-format raw-in-base64-out \
+     --payload '{"schemaVersion":1,"type":"scopeproof.upload-lifecycle.backfill","mode":"APPLY_EXACT_CAS","tenantId":"ten_<32_LOWERCASE_HEX>","limit":100}' \
+     '<APPROVED_PRIVATE_DIRECTORY>/tenant-page-0001.json'
+   ```
+
+   If and only if that response contains `nextCursor`, copy its exact
+   `partitionKey` and `sortKey` into the next request without deriving, editing,
+   or skipping it:
+
+   ```bash
+   aws lambda invoke \
+     --profile '<APPROVED_PROFILE>' \
+     --region '<PRIMARY_REGION>' \
+     --function-name '<UPLOAD_LIFECYCLE_BACKFILL_FUNCTION_ARN>' \
+     --cli-binary-format raw-in-base64-out \
+     --payload '{"schemaVersion":1,"type":"scopeproof.upload-lifecycle.backfill","mode":"APPLY_EXACT_CAS","tenantId":"ten_<32_LOWERCASE_HEX>","limit":100,"cursor":{"partitionKey":"TENANT#ten_<32_LOWERCASE_HEX>","sortKey":"UPLOAD#upl_<32_LOWERCASE_HEX>"}}' \
+     '<APPROVED_PRIVATE_DIRECTORY>/tenant-page-0002.json'
+   ```
+
+   Continue serially until the final response omits `nextCursor`. Never loop the
+   Lambda internally, substitute a scan for its consistent partition query, or
+   run pages concurrently.
+5. Accept each page only when `counts.malformed == 0`, `counts.conflict == 0`,
+   and `counts.examined == counts.upgraded + counts.current + counts.terminal`.
+   A malformed or conditional-conflict count is a fail-closed incident: keep the
+   schedule and mapping disabled, preserve the exact rows and response, reconcile
+   authority through a reviewed repair, and restart the tenant from the first
+   page. Do not relabel, force-update, or omit the row.
+6. After one complete no-cursor pass for every tenant, rerun every tenant again
+   from the first page while lifecycle writes remain frozen. The verification
+   pass must again end without `nextCursor`, have zero `upgraded`, `malformed`,
+   and `conflict` across all pages, and report a total `current` count equal to
+   the first pass's total `upgraded + current`; its total `terminal` and
+   `examined` counts must also equal the first pass. Any count drift blocks
+   enablement. Independently query representative `issued`, `quarantined`, and
+   `validated` rows through V2 under their immutable `TENANT#<tenant>` base
+   partition, confirm the expected dual-write attributes, and confirm terminal
+   rows remain absent from both indexes.
+7. Require clean backfill Lambda error/throttle alarms, no failed invocation,
+   complete per-tenant page evidence, and Security/Operations approval. Then
+   review a second change set and deploy with
+   `-c maintenanceLifecycleMode=enabled`. Confirm both the EventBridge rule and
+   SQS event-source mapping are enabled only by this second deployment. Unfreeze
+   lifecycle traffic gradually and run duplicate-delivery, delayed-event,
+   cross-tenant poison, action-ledger, throttle/retry, heartbeat, alarm, DLQ, and
+   rollback canaries. Stop on any unexpected query, age, count, or action result.
+8. Roll back application code by continuing to read legacy `GSI1`; do not delete
+   V2 or its data during an incident. Keep dual writes in place throughout the
+   rollback window. Removing either index is a later separately approved schema
+   migration after PITR/restore evidence and production canaries prove it is no
+   longer required.
+
+No AWS deployment, backfill invocation, index transition, or lifecycle-worker
+enablement was performed by this repository work. This is a future operator
+procedure, not live-cloud evidence.
+
 ## 7. Bootstrap and deploy in dependency order
 
 > **Current project status:** the following commands have not been run by this project work. They are an operator procedure for a future approved environment, not a statement that resources exist.
@@ -467,7 +564,7 @@ Record CloudFormation events and stack outputs. Relevant shared outputs are `Roo
 
 ### DNS-last activation boundary
 
-The shared stack may create the exact Amplify subdomain mapping needed for certificate/domain preparation, but it does not publish the tenant Route 53 CNAME. The tenant provisioner re-runs database verification, UPSERTs only the stack-controlled exact CNAME through hosted-zone- and record-scoped IAM, waits for Route 53 `INSYNC`, then marks database and registry state `ACTIVE`. If a later activation write fails, the CNAME can remain, but both registry rows remain non-active and the database is restored to `PROVISIONING`. The tenant API must therefore return the same generic non-disclosing failure for unknown, `PROVISIONING`, `FAILED`, suspended, or unauthorized tenants before any customer data access. DNS remains routing, never authorization.
+The shared stack may create the exact Amplify subdomain mapping needed for certificate/domain preparation, but it does not publish the tenant Route 53 CNAME. The tenant provisioner re-runs database verification and then requires a strongly consistent `CUSTOMER_ENABLED` record bound to the exact tenant and current Step Functions execution. Only after that exact-execution approval does it UPSERT the stack-controlled CNAME through hosted-zone- and record-scoped IAM, wait for Route 53 `INSYNC`, and mark database and registry state `ACTIVE`. A prior execution's approval is invalid. If a later activation write fails, the CNAME can remain, but both registry rows remain non-active and the database is restored to `PROVISIONING`. The tenant API must therefore return the same generic non-disclosing failure for unknown, `PROVISIONING`, `FAILED`, suspended, or unauthorized tenants before any customer data access. DNS remains routing, never authorization; the approval is not proof that an application release or the remaining launch gates are complete.
 
 ## 8. Post-deployment shared-platform checks
 
@@ -624,10 +721,12 @@ Do not run these examples with a preview or ad-hoc-signed build. The current Mac
 Swift security scanning is defined in `.github/workflows/codeql-swift.yml` with
 CodeQL `build-mode: manual`; it executes the real arm64 Swift build on
 `macos-15`. The same advanced workflow preserves JavaScript/TypeScript and
-GitHub Actions analysis as separate no-build jobs. After this workflow exists
-on `main`, switch CodeQL from default to advanced setup, require all three
-checks, and confirm each language is current on the tool-status page; default
-setup blocks uploads from a custom advanced workflow while it remains enabled.
+GitHub Actions analysis as separate no-build jobs. GitHub default setup is
+disabled, and all three advanced checks are required on `main` together with
+`verify`, `macos`, and `dependency-review`. Confirm each language remains
+current on the CodeQL tool-status page after any workflow or branch-protection
+change; enabling default setup again would block uploads from this custom
+advanced workflow.
 
 ## 9. Tenant database schema and provisioning
 
@@ -641,7 +740,8 @@ setup blocks uploads from a custom advanced workflow while it remains enabled.
 - [Migration 006](../infra/aws/database/006_evidence_access_api.sql) is forward migration version `2`; it adds tenant-authorized keyset listing and exact evidence-record lookup without accepting storage coordinates from a caller.
 - [Migration 007](../infra/aws/database/007_evidence_read_role.sql) resets a fifth application login to only tenant context, active-membership resolution, evidence listing, and exact evidence read. It cannot create upload intents or access tables directly.
 - [Migration 008](../infra/aws/database/008_api_audit_signer_role.sql) resets a sixth application login to only tenant context, one-row outbox lease, audit-head read, exact outbox-bound append, bounded failure transition, and queue-health procedures. It has no table, generic audit-append, evidence, or legal-hold access.
-- The [tenant provisioner](../infra/aws/cdk/runtime/provision-tenant/index.mjs) is the apply/verify implementation packaged for Lambda. The asset contains all eight authoritative SQL files; it has not been deployed by this work.
+- [Migration 009](../infra/aws/database/009_runtime_hardening.sql) is forward schema version `3` for existing version-2 databases. It adds exact-version DLP fact validation, immutable rejected-ingest receipt/reconciliation state, and auditor-approved-only evidence reads without rewriting the historical baseline or evidence-access migration.
+- The [tenant provisioner](../infra/aws/cdk/runtime/provision-tenant/index.mjs) is the apply/verify implementation packaged for Lambda. The asset contains all nine authoritative SQL files; it has not been deployed by this work.
 - The [offline SQL renderer](../Scripts/render_aws_tenant_sql.mjs) is review/recovery tooling. It is not the payload used by the state machine.
 
 The CDK derives one owner and six separate application database identities from the validated tenant slug and opaque tenant ID:
@@ -688,7 +788,7 @@ node Scripts/render_aws_tenant_sql.mjs \
 shasum -a 256 '<APPROVED_TEMPORARY_DIRECTORY>/tenant-bootstrap.sql'
 ```
 
-The renderer validates/quotes every supplied value, writes mode `0600`, and refuses overwrite. Its output contains customer metadata and resource identifiers but no password. Never commit it. It includes a review-oriented seed with a pending database domain and does not render migration `008` or the API-audit signer identity; do not manually apply it over a database managed by the state machine or treat its hash as the deployed Lambda asset hash.
+The renderer validates/quotes every supplied value, writes mode `0600`, and refuses overwrite. Its output contains customer metadata and resource identifiers but no password. Never commit it. It includes a review-oriented seed with a pending database domain and does not render migrations `008` or `009` or the API-audit signer identity; do not manually apply it over a database managed by the state machine or treat its hash as the deployed Lambda asset hash.
 
 ### 9.3 What the state machine applies and verifies
 
@@ -700,13 +800,13 @@ The provisioner currently:
 2. Reads the generated runtime, ingest, evidence-control-worker, legal-hold-API, evidence-read, and API-audit-signer secrets without logging them; validates exact usernames/password shapes and requires six distinct credentials.
 3. Creates or hardens a NOLOGIN, non-privileged owner role and six distinct LOGIN, NOINHERIT, non-privileged application roles. Before and after migration it requires zero PostgreSQL membership edges involving any managed role; `NOINHERIT` alone is not treated as sufficient because a member could still use `SET ROLE`. It grants the database administrator temporary membership in the owner role only for the migration transaction and revokes that exact membership in a `finally` path.
 4. Creates the tenant database owned by the owner role; revokes `PUBLIC` connection and grants only the six application roles connection.
-5. Refuses an unversioned partial `scopeproof` schema. It applies immutable baseline migration `1` for a fresh database and forward migration `2` for evidence access, changing to the dedicated owner role and executing parsed statements through RDS Data API in explicit transactions. This makes the owner—not the cluster administrator—the schema/table/function owner and handles the Data API rule that one `ExecuteStatement` call cannot contain multiple statements; see [Troubleshooting RDS Data API](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/data-api.troubleshooting.html).
+5. Refuses an unversioned partial `scopeproof` schema. It applies immutable baseline migration `1` for a fresh database, forward migration `2` for evidence access, and forward migration `3` for runtime hardening, changing to the dedicated owner role and executing parsed statements through RDS Data API in explicit transactions. This makes the owner—not the cluster administrator—the schema/table/function owner and handles the Data API rule that one `ExecuteStatement` call cannot contain multiple statements; see [Troubleshooting RDS Data API](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/data-api.troubleshooting.html).
 6. In a transaction with the exact tenant context, seeds the immutable tenant identity and a verified canonical database-domain row from stack-controlled account, region, bucket, KMS, hostname, retention, and display metadata.
 7. Safely substitutes each validated role token and applies execute-only allow-list resets for runtime, ingest, evidence-control worker, legal-hold API, evidence-read, and API-audit signer. None receives direct access to any application or migration-metadata table.
-8. Computes an ordered digest of the live `scopeproof` function and index definitions and writes a versioned database marker that binds that catalog digest to the SHA-256 of all eight packaged SQL files. Existing databases must already carry the exact current marker or use the explicitly recognized owner-migration transition marker; operators cannot relabel an older schema by editing a registry hash.
-9. Connects using all six application secrets and verifies exact identities, `NOINHERIT`, schema `USAGE` but no `CREATE`, non-privileged role flags, exact procedure allowlists, absence of direct table grants or role memberships, migrations `1` and `2` plus the exact package-and-live-catalog marker, the exact table/domain/function set and owner, every expected forced-RLS policy, tenant foreign key, boundary/immutability/audit trigger, singleton tenant identity, and single verified canonical database-domain row. It also verifies the owner is NOLOGIN/unprivileged and is no longer granted to the administrator.
+8. Computes an ordered digest of the live `scopeproof` function and index definitions and writes a versioned database marker that binds that catalog digest to the SHA-256 of all nine packaged SQL files. Existing databases must already carry the exact current marker or use the explicitly recognized owner-migration transition marker; operators cannot relabel an older schema by editing a registry hash.
+9. Connects using all six application secrets and verifies exact identities, `NOINHERIT`, schema `USAGE` but no `CREATE`, non-privileged role flags, exact procedure allowlists, absence of direct table grants or role memberships, migrations `1`, `2`, and `3` plus the exact package-and-live-catalog marker, the exact table/domain/function set and owner, every expected forced-RLS policy, tenant foreign key, boundary/immutability/audit trigger, singleton tenant identity, and single verified canonical database-domain row. It also verifies the owner is NOLOGIN/unprivileged and is no longer granted to the administrator.
 10. Starts a separate runtime transaction with a different syntactically valid tenant context and requires a fully valid attempted write for the configured tenant to fail specifically under RLS or the tenant-boundary trigger.
-11. Re-runs database and catalog-attestation verification, publishes only the exact approved tenant CNAME, and waits for Route 53 `INSYNC`. It then marks the database identity and both DynamoDB registry rows `ACTIVE`, recording schema version `2` and the SHA-256 of all eight packaged SQL files. A terminal failure restores database state to `PROVISIONING` and leaves registry rows `FAILED` with a sanitized error name.
+11. Re-runs database and catalog-attestation verification, requires a strongly consistent `CUSTOMER_ENABLED` approval bound to this exact tenant and Step Functions execution, publishes only the exact approved tenant CNAME, and waits for Route 53 `INSYNC`. It then marks the database identity and both DynamoDB registry rows `ACTIVE`, recording schema version `3` and the SHA-256 of all nine packaged SQL files. A terminal failure restores database state to `PROVISIONING` and leaves registry rows `FAILED` with a sanitized error name.
 
 This is materially stronger than an operator-applied bundle, but it has not been run against an AWS environment in this project. Its local tests and synthesized permissions are not evidence that Aurora engine behavior, Data API statement parsing, transaction duration, IAM, or retry behavior works in the deployed account.
 
@@ -739,9 +839,9 @@ aws stepfunctions describe-execution \
 
 On `FAILED`, do not manually repair roles, schema, migrations, identity rows, or registry status. Preserve Step Functions/Lambda/CloudTrail metadata, identify the exact failing invariant in an incident/change, fix code in dev, and use a new execution after approval. The lease permits a reviewed retry from `FAILED`; do not force it with direct DynamoDB writes.
 
-On `SUCCEEDED`, use consistent reads to verify both registry rows are `ACTIVE`, refer to the same tenant ID/hostname, and report schema version `2`. Independently run the positive/negative database canary in the isolated test account. At minimum it must verify migration versions, exact identity, database owner/runtime/ingest/evidence-control-worker/legal-hold-API/evidence-read/API-audit-signer separation, each execute-only procedure allowlist, absence of direct application table grants, every RLS/`FORCE RLS` flag, trigger/grant/timeouts, and denial of wrong-tenant reads, writes, joins, and foreign keys.
+On `SUCCEEDED`, use consistent reads to verify both registry rows are `ACTIVE`, refer to the same tenant ID/hostname, report schema version `3`, bind the nine-file digest, and correspond to the exact-execution `CUSTOMER_ENABLED` approval. Independently run the positive/negative database canary in the isolated test account. At minimum it must verify migration versions, exact identity, database owner/runtime/ingest/evidence-control-worker/legal-hold-API/evidence-read/API-audit-signer separation, each execute-only procedure allowlist, absence of direct application table grants, every RLS/`FORCE RLS` flag, trigger/grant/timeouts, and denial of wrong-tenant reads, writes, joins, and foreign keys.
 
-`ACTIVE` currently means that the database boundary passed the provisioner's checks. It does **not** mean the customer service is launched: the source-defined tenant API is not deployed, the Amplify UI is not released, and no membership-administration flow, Mac enrollment, live issuer test, restore drill, or penetration test follows from this state. Keep customer access disabled until the remaining activation gates pass. Before a live multi-tenant product exists, introduce a separate externally controlled launch gate or a registry state that distinguishes database readiness from customer activation.
+`ACTIVE` currently means that the database boundary passed the provisioner's checks and that one exact-execution infrastructure activation approval was present. It does **not** mean the customer service is launched: the source-defined tenant API is not deployed, the Amplify UI is not released, and no membership-administration flow, Mac enrollment, live issuer test, restore drill, or penetration test follows from this state. Keep customer access disabled until the remaining launch gates pass. Before a live multi-tenant product exists, introduce a separately controlled post-provision service-launch state/UI gate that distinguishes this infrastructure approval from customer traffic authorization.
 
 ## 10. Cognito bootstrap, MFA, and membership
 
@@ -770,7 +870,7 @@ Bootstrap two tenant administrators only after a two-person approval and recover
 
 ## 11. Tenant activation gates
 
-The current state machine changes the tenant and domain registry rows to `ACTIVE` after database and DNS verification. In this foundation, `ACTIVE` means **infrastructure-ready only**; it is not a customer-launch authorization. Keep the external/customer launch gate closed until every item below has attached evidence and named approval. Do not let an `ACTIVE` registry value bypass that separate gate.
+The current state machine changes the tenant and domain registry rows to `ACTIVE` only after database verification, an exact-tenant/exact-execution `CUSTOMER_ENABLED` approval, and DNS verification. In this foundation, `ACTIVE` means **approved infrastructure-ready only**; it is not proof that the customer-facing service is released or authorized for traffic. Keep the post-provision customer launch gate closed until every item below has attached evidence and named approval. Do not let an `ACTIVE` registry value bypass that separate gate.
 
 - [ ] Account, region, domain, hosted-zone ID, tenant ID/slug, retention, and customer contract match the approved onboarding record.
 - [ ] Shared, tenant, and observability CloudFormation stacks are stable and drift checks are clean.
@@ -779,7 +879,7 @@ The current state machine changes the tenant and domain registry rows to `ACTIVE
 - [ ] An immutable, reviewed AWS web release is deployed through an approved OIDC pipeline. Direct Amplify origins cannot bypass tenant resolution.
 - [ ] Cognito issuer, signature, client audience, `token_use`, time, session, exact callback, and logout behaviors pass; required TOTP is demonstrated.
 - [ ] Tenant membership exists and revoked/missing/wrong-tenant users receive a non-disclosing failure.
-- [ ] The tenant state machine applies migrations `001`-`007`, records schema `2`, preserves owner/runtime/ingest/evidence-control-worker/legal-hold-API/evidence-read separation, and passes positive and negative RLS/procedure-grant tests in the deployed environment.
+- [ ] The tenant state machine applies migrations `001`-`009`, records schema `3` and the nine-file attestation, preserves owner/runtime/ingest/evidence-control-worker/legal-hold-API/evidence-read/API-audit-signer separation, consumes only the exact execution's approved `CUSTOMER_ENABLED` record, and passes positive and negative RLS/procedure-grant tests in the deployed environment.
 - [ ] The upload role can write only its exact tenant/control quarantine prefix,
   cannot list or read either bucket or decrypt evidence, and is denied every
   other tenant's S3, KMS, secret, and database boundary. The separate legal-hold
@@ -885,7 +985,7 @@ under the approved GuardDuty procedure in the isolated test account.
 
 ### Implemented alarms and logs
 
-The shared stack defines alarms for shared-job DLQ depth, oldest shared-job age above 15 minutes, and sustained Aurora capacity above 3 ACUs. Each tenant defines an ingest/promotion DLQ alarm plus API-audit signer alarms for any row failure, persistent database dead letters, oldest unsigned age of five minutes, missing health telemetry, Lambda errors/throttles, and the retained EventBridge invocation DLQ. The observability stack adds a multi-region CloudTrail with log-file validation, exact tenant ingest/evidence S3 data events, one-year CloudWatch logs, a compliance-locked audit bucket, and alarms for repeated denied AWS API calls and root-account use. WAF retains blocked-request logs for one year with sensitive headers redacted.
+The shared stack defines alarms for shared-job DLQ depth, oldest shared-job age above 15 minutes, reconciliation item failures, action-required upload lifecycles, oldest observed pending age above 30 minutes, worker errors/throttles, and sustained Aurora capacity above 3 ACUs. Each tenant defines an ingest/promotion DLQ alarm plus API-audit signer alarms for any row failure, persistent database dead letters, oldest unsigned age of five minutes, missing health telemetry, Lambda errors/throttles, and the retained EventBridge invocation DLQ. The observability stack adds a multi-region CloudTrail with log-file validation, exact tenant ingest/evidence S3 data events, one-year CloudWatch logs, a compliance-locked audit bucket, and alarms for repeated denied AWS API calls and root-account use. WAF retains blocked-request logs for one year with sensitive headers redacted.
 
 Confirm all alarms are `OK`, their SNS actions are enabled, and a controlled test changes and restores each expected alarm state. Attach screenshots/JSON evidence to the change record. Do not include customer payloads or credentials.
 
@@ -930,7 +1030,7 @@ For any DLQ alarm:
 2. Stop automated redrive. Do not purge the DLQ.
 3. Inspect Lambda, GuardDuty, S3, KMS, and CloudTrail metadata to classify transient dependency failure, permission drift, contract mismatch, malicious input, or software defect.
 4. For the evidence DLQ, verify the exact source bucket/key/version, tenant metadata, checksum, GuardDuty event and tag, destination state, monotonic lease/fence, durable copy-attempt ledger, and authoritative DynamoDB/PostgreSQL promotion receipts before any retry. If a conditional loser exists, confirm it adopted the sole destination `VersionId`; never issue an unconditional copy or manually delete a marker/version. Do not download or open an untrusted object on an operator workstation.
-5. For the shared jobs DLQ, do not redrive: the repository has no job-worker implementation and the maintenance rule is disabled.
+5. For the shared jobs DLQ, inspect the exact versioned envelope plus the `MAINTENANCE#SHARED` lease/message/cursor state, protected tenant-directory entry, V2 index state, affected lifecycle's exact status/revision/expiry/reconciliation disposition, and any exact `MAINTENANCE#ACTION_REQUIRED#<tenant>` ledger row. Never copy raw attacker-controlled keys into a ticket. Do not edit lifecycle, lease, cursor, action ledger, promotion, DLP, or storage facts. Fix and test the cause first; then use only a bounded approved SQS redrive while watching heartbeat, provider failure, outstanding-action/count/age, oldest-pending, queue-age, and DLQ metrics. Duplicate delivery must be a no-op or conditional loser. An action remains `OUTSTANDING` until promotion, recovery, or rejection resolves the exact row transactionally; a source-only edit is not resolution.
 6. Fix and deploy the cause in dev/stage, test idempotency and duplicate delivery, then obtain incident-owner approval.
 7. Redrive evidence messages at a bounded rate while watching errors, KMS/S3 activity, receipt state, and the destination version. AWS documents controlled DLQ redrive in [SQS dead-letter queue redrive](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-configure-dead-letter-queue-redrive.html).
 8. Reconcile every message and exact S3 version, close the alert, preserve evidence, and add a regression test.
@@ -1140,7 +1240,7 @@ Operational controls:
 | WAF returns 403 | Host not exact, request over 64 KiB, managed rule, reputation, or rate limit | Correlate redacted WAF log/request ID; fix caller or narrowly tune after review. Never globally allow. |
 | SNS alarm email absent | Subscription is pending or `alertEmail` omitted | Confirm the AWS email, inspect subscription state, and send a metadata-only test. |
 | SES cannot send to customer | Account sandbox, identity/DKIM/MX incomplete, or reputation issue | Verify SES account/identity and approved production access; do not switch to an unreviewed sender. |
-| Provisioning reports `ACTIVE`, but the service is unavailable | `ACTIVE` currently denotes database-boundary readiness, not customer activation | Confirm both registry rows and the state-machine evidence, then continue the remaining activation gates. Do not expose traffic or manually change status. |
+| Provisioning reports `ACTIVE`, but the service is unavailable | `ACTIVE` denotes verified database/infrastructure readiness plus the exact-execution `CUSTOMER_ENABLED` approval; it does not prove that a customer application release or post-provision launch gate is complete | Confirm both registry rows, the exact approval, and the state-machine evidence, then continue the remaining launch gates. Do not expose traffic or manually change status. |
 | Provisioner reports a Data API parse/transaction failure | The packaged statement-aware migrator encountered unsupported SQL, timeout, engine drift, or a partial pre-existing schema | Preserve the failed execution and Lambda metadata. Fix and test the parser/migration in source; do not split or apply statements manually and do not force the registry to `ACTIVE`. |
 | GuardDuty does not tag/scan | Plan not active, role/KMS/S3 notification drift, unsupported object, or upload preceded tagging | Keep object quarantined; inspect plan status/EventBridge/CloudTrail and alert. Never promote without exact clean event and tag. |
 | Evidence promotion enters DLQ | Event/tag/version/checksum/metadata/MIME/size/path mismatch or S3/KMS failure | Follow the DLQ procedure; do not purge or blindly redrive. |
@@ -1202,20 +1302,20 @@ As of this runbook's snapshot:
 2. The live browser/API code is still the legacy Cloudflare/Sites, D1, and R2 single-tenant application. Its routes and queries are not AWS adapters or multi-tenant persistence.
 3. `lib/aws-runtime` now has concrete exact-host/Dynamo, Cognito JWT/JWKS, active-membership/RDS Data, upload, evidence search/exact-download, reconciliation, S3 legal-hold, durable API-audit outbox/drain, and KMS receipt adapters. Per-tenant API Gateway composes a mock `/health`; data Lambda routes for `/v1/me` and `/v1/upload-intents`; a purpose-separated evidence-read Lambda for `/v1/evidence/search` and `/v1/evidence-download-intents`; separate legal-hold request/approval Lambda routes; and a scheduled bounded API-audit signer. They are source/template-tested, not deployed or live-integration-tested, and most product routes remain unmigrated.
 4. Amplify has no source connection, CI/CD pipeline, build artifact, or deployed runtime. Manual Amplify deployment does not solve SSR hosting.
-5. Exact tenant DNS is now created by the tenant provisioner only after database verification and Route 53 is awaited to `INSYNC`; however, the resulting `ACTIVE` status still means infrastructure/database readiness, not an application launch authorization.
+5. Exact tenant DNS is now created by the tenant provisioner only after database verification and a strongly consistent `CUSTOMER_ENABLED` approval bound to the exact tenant and current execution; Route 53 is then awaited to `INSYNC`. The resulting `ACTIVE` status still means approved infrastructure/database readiness, not an application release or post-provision customer-traffic authorization.
 6. Cognito has a shared user pool and tenant web clients, and strict access-token plus membership-read adapters exist, but no hosted callback/session composition, invitation/membership write workflow, federation, or account-recovery operations exist.
 7. A per-tenant Cognito client is not isolation. The data API and legal-hold API have separate entry/workflow roles scoped to their exact tenant; the shared Amplify role cannot assume tenant upload or evidence-control roles, and there is no shared wildcard `sts:AssumeRole` grant. Future shared runtimes must preserve this boundary; higher-assurance customers may still require account-per-tenant isolation.
-8. The database provisioner packages owner migrations `001` and `006` plus grant migrations `002`-`005`, `007`, and `008`, separates the owner from six runtime/ingest/evidence-control-worker/legal-hold-API/evidence-read/API-audit-signer logins, resets each application login to an execute-only procedure allowlist with no direct table grants, verifies ownership/RLS/identity/grants, and tests a wrong-tenant write denial, but none has been exercised against deployed Aurora/Data API.
-9. `ACTIVE` currently means database readiness and is written before API/UI deployment, membership administration, live upload/release, restore, and penetration-test gates. A separate externally controlled customer-activation state/gate is not implemented. The offline renderer remains review/recovery tooling only, and there is no down migration.
+8. The database provisioner packages owner migrations `001`, `006`, and forward-only `009` plus grant migrations `002`-`005`, `007`, and `008`, attests all nine files and the live catalog as schema version `3`, separates the owner from six runtime/ingest/evidence-control-worker/legal-hold-API/evidence-read/API-audit-signer logins, resets each application login to an execute-only procedure allowlist with no direct table grants, verifies ownership/RLS/identity/grants, and tests a wrong-tenant write denial, but none has been exercised against deployed Aurora/Data API.
+9. `ACTIVE` is written only after the source-defined exact-tenant/exact-execution `CUSTOMER_ENABLED` infrastructure approval, database verification, and DNS synchronization. It is still written before API/UI deployment, membership administration, live upload/release, restore, and penetration-test gates. A separately controlled post-provision customer-service launch state/UI gate is not implemented. The offline renderer remains review/recovery tooling only, and there is no down migration.
 10. No active tenant membership can be safely created through an implemented operator API/UI.
 11. CDK now defines separate public Cognito web and native clients with exact scopes, but the Mac hosted OAuth/JWKS/token-refresh/session primitives are not integrated into its user workflow. The Mac still uses the legacy exact-origin device-token flow for hosted synchronization.
 12. The upload issuer and composed `/v1/upload-intents` route implement canonical 256-bit client idempotency, server-managed retention derived from tenant policy, atomic member/tenant quotas (60/300 requests per minute and 500/5,000 new reservations per UTC day), tenant HMAC derivation, atomic Dynamo reservation, RDS projection, exact retry, ambiguous-commit recovery, and recovery-only lookup with one optional `AWSPREVIOUS` key. It has not been deployed; concurrency/quota canaries, an outstanding-retry rotation drill, and a verified prior-stage retirement procedure remain required before production use.
 13. `CleanMalwareScanResult` is enabled in synthesized IaC. The promoter uses a durable attempt ledger, monotonic DynamoDB/PostgreSQL fences, exact-version streaming, and single-attempt `If-None-Match: *` S3 creation so a delayed superseded worker can adopt but cannot append a second immutable destination version. Its KMS-signed receipt distinguishes copy provenance from reconciliation provenance and is verified before database commit and during authoritative recovery. None of this has been deployed or exercised against real GuardDuty events, S3 conditional-write races/Object Lock, KMS, or Data API.
-14. The shared jobs queue has no worker, and its maintenance schedule is disabled.
+14. The shared jobs queue now has a reserved-concurrency-one worker and a gated fifteen-minute schedule. The source default is the fail-closed `backfill` mode, which disables both EventBridge and the SQS mapping; `enabled` is permitted only by the separate reviewed second deployment described above. Once enabled, the worker's durable message lease and protected tenant-directory cursor bound each run to 25 tenants and 250 V2-indexed lifecycle/action rows, with independent per-tenant lifecycle and outstanding-action budgets. It uses the additive base-PK `UploadLifecycleByTenantV2` index, preserves legacy `GSI1` for staged rollback, retains issued intents through the full seven-day event grace plus a fifteen-day TTL buffer, drains deterministic malformed rows into a digest-only durable action ledger, retries unproven/provider transaction failures through SQS, and transactionally resolves exact action rows during promotion/recovery/rejection. It has no S3, KMS, RDS, secret, tenant-role, promotion, or deletion permission. Heartbeat, outstanding count/age, pending age, failure, Lambda, queue, and DLQ alarms are source/template-tested only; the staged-index, delayed-event, tenant-padding, duplicate-delivery, lease-takeover, provider-failure, alarm, DLQ, and bounded-redrive drills remain live production gates.
 15. The AWS runtime now exposes authenticated, tenant-scoped evidence search and exact-version download-intent APIs. The browser evidence-library UI and export workflow, tenant admin, Jira, GitHub/SBOM, integrations, devices, audit presentation, retention UI, support, and offboarding are not migrated.
 16. Durable exact-version S3 legal-hold code and PostgreSQL implement requester-derived `REQUESTED`, distinct-admin digest-bound `APPROVED`, worker-only durable `APPLYING`, and exact-readback `APPLIED` phases with separate public-API and reconciliation IAM/database roles. New request/approval timestamps must be within ±5 minutes of the database clock, approval must be within 24 hours of the request, and an exact old replay remains valid while a changed replay fails. The worker commits the KMS-signed audit receipt before publishing the audit-bound recovery projection; Aurora clears the durable publication outbox only after separately acknowledging the exact DynamoDB publication time. Source tests cover retry after the audit head advances and after publication ambiguity. CDK wires the two authenticated routes, five-minute bounded reconciliation/expiry/audit sweep, and failure/requested-age/approved-age alarms. No UI, deployed alert delivery, live Object Lock drill, or live proof of those audit/recovery partial-failure recoveries exists; do not expose the operation.
 17. SES infrastructure is not connected to application mail. Sandbox exit, bounce/complaint handling, and reputation monitoring are operational gaps.
-18. The protected macOS production workflow can Developer-ID sign, require Apple notarization acceptance, staple/assess, attest, and validate candidates with SBOM/provenance/redacted-receipt evidence; exact-candidate publication verification is scripted without rebuilding. Release configuration/build now reject non-canonical or invalid P-256 update keys, duplicate IDs, and expired/future/reversed validity windows. Advanced CodeQL preserves JavaScript/TypeScript/Actions analysis while using a manual arm64 Swift build. The repository setting must still be switched from default to advanced after merge and all three checks required. Apple credentials/protected settings are not configured here, no workflow has submitted an artifact, the release bucket remains empty, and AWS publication/updater discovery are separate gaps.
+18. The protected macOS production workflow can Developer-ID sign, require Apple notarization acceptance, staple/assess, attest, and validate candidates with SBOM/provenance/redacted-receipt evidence; exact-candidate publication verification is scripted without rebuilding. Release configuration/build now reject non-canonical or invalid P-256 update keys, duplicate IDs, and expired/future/reversed validity windows. GitHub default CodeQL setup is disabled, and the advanced JavaScript/TypeScript, Actions, and manual-arm64-Swift checks are all required on `main`. Apple credentials/protected settings are not configured here, no workflow has submitted an artifact, and no AWS artifact was published by this work; live AWS inventory was not used to infer bucket contents. AWS publication/updater discovery remain separate gaps.
 19. Monitoring covers selected AWS signals only. The API-audit signer now has row-failure, persistent-dead-letter, unsigned-age/missing-health, Lambda, throttle, and invocation-DLQ alarms, but none has been delivered or drilled; broader application, authentication, GuardDuty health, Lambda/Step Functions, CloudFront/SES, backup, key, and audit-chain checkpoint coverage remains incomplete.
 20. A DynamoDB global control table, same-account cross-region S3 live replication, S3 Batch existing-version backfill, recurring 24-hour exact-version cryptographic/metadata verification with a 36-hour freshness alarm, Aurora AWS Backup/Vault Lock, and regional 36-hour recovery-point freshness alarms are implemented, but are not deployed. Every generation still verifies immutable checksum/receipt/KMS/retention/metadata facts when a later legal-hold projection defers only the mutable hold comparison; a bounded destination inventory rejects delete markers and orphan versions before advancing the watermark. Existing `AWS::DynamoDB::Table` deployments require a retain/remove/convert/import migration. There is no recovery-account isolation, audit-bucket cross-region copy, automated restore/cutover, or demonstrated RPO/RTO.
 21. Tenant suspension, customer-facing legal-hold UI/operational release workflow, exact-version deletion, and offboarding are not implemented end to end; stack destruction is unsupported because data resources are retained/deletion-protected/Object-Locked.

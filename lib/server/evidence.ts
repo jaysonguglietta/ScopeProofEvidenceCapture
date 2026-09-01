@@ -4,6 +4,7 @@ import { decryptEvidence, encryptEvidence, randomId, sha256, stableJson } from "
 import { getEnv } from "./env";
 import { getAssessment } from "./assessments";
 import { evidenceSafetyReceiptSha256 } from "./image-safety";
+import { NATIVE_ORPHAN_GRACE_MS } from "./native-provenance-contract";
 import { redactJson, redactText, type RedactionFinding } from "./redaction";
 import { decodePageCursor, pageLimit, pageMeta, type PageMeta } from "./pagination";
 
@@ -164,6 +165,16 @@ export async function storeEvidence(input: EvidenceInput): Promise<StoreEvidence
   if (capturedMillis > receivedAt.getTime() + 5 * 60_000) throw new Response(JSON.stringify({ error: "Evidence capture time is too far in the future." }), { status: 422, headers: { "content-type": "application/json" } });
   const receivedAtISO = receivedAt.toISOString();
   const expiresAt = new Date(receivedAt.getTime() + (input.validityDays || 90) * 86_400_000).toISOString();
+  const nativeQueueDueAt = input.deviceId
+    ? new Date(receivedAt.getTime() + NATIVE_ORPHAN_GRACE_MS).toISOString()
+    : null;
+  if (input.deviceId && (!/^dev_[a-f0-9]{32}$/u.test(input.deviceId) || input.type !== "screenshot" ||
+      input.contentType !== "image/png" || !input.source.startsWith(`Scopeproof Capture / ${input.deviceId} / EV-`) ||
+      !/^[a-f0-9]{64}$/u.test(input.manifestSha256 || "") ||
+      !/^(GENESIS|[a-f0-9]{64})$/u.test(input.chainPreviousHash || "") ||
+      !/^[a-f0-9]{64}$/u.test(input.chainEventHash || ""))) {
+    throw new Response(JSON.stringify({ error: "Native evidence reconciliation authority is invalid." }), { status: 422, headers: { "content-type": "application/json" } });
+  }
   // SQLite's `=` never matches NULL. `IS ?` preserves scoped equality while also
   // making unscoped evidence participate in the same deduplication contract.
   const dedupeBindings = [digest, input.source, input.controlId, input.framework || "PCI DSS 4.0.1", input.system, input.environment || null, input.assessmentPeriod || null, input.assessmentId || null] as const;
@@ -246,6 +257,8 @@ export async function storeEvidence(input: EvidenceInput): Promise<StoreEvidence
     await executeAuditedBatch(input.createdBy, "evidence.created", "evidence", id, { controlId: input.controlId, source: input.source, jiraIssueKey: input.jiraIssueKey || null, sha256: digest, occurrenceId, redactionCount, byteSize: bytes.byteLength, replacesExpiredArtifactId: staleDuplicate?.id || null }, [
       ...(staleDuplicate ? [env.DB.prepare("UPDATE evidence_artifacts SET status = 'expired' WHERE id = ? AND status NOT IN ('expired', 'purged') AND expires_at <= ?").bind(staleDuplicate.id, receivedAtISO)] : []),
       insert,
+      ...(nativeQueueDueAt ? [env.DB.prepare(`INSERT INTO native_provenance_reconciliation_queue
+        (artifact_id, due_at, created_at) VALUES (?, ?, ?)`).bind(id, nativeQueueDueAt, receivedAtISO)] : []),
       occurrenceInsert(input, occurrenceId, id, capturedAt, receivedAtISO, expiresAt),
     ]);
   } catch (error) {

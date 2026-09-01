@@ -3,16 +3,16 @@
 Scopeproof has two deliberately separate native boundaries:
 
 - The shipping local workflow uses the menu-bar app, tenant/workspace-scoped device-only Keychain identities, local evidence files, and the authenticated loopback Local Console. It does not require hosted sign-in, an independent hosted scanner, an RFC 3161 authority, D1/R2, Cognito, S3, or AWS. The console exchanges a one-time URL-fragment nonce for an in-memory bearer and creates no localhost authentication cookie.
-- Optional synchronization to the current hosted service uses an audience-bound capture-device enrollment token. Production acceptance then adds schema-7 device provenance, independent exact-pixel OCR/DLP, a trusted RFC 3161 timestamp, and final server-side device-chain linkage.
+- Optional synchronization to an explicitly configured and authorized legacy hosted service uses an audience-bound capture-device enrollment token. Repository source does not establish that such a service or its private identity boundary is deployed. Production acceptance then adds schema-8 device and exact tenant/workspace provenance, independent exact-pixel OCR/DLP, a trusted RFC 3161 timestamp, and final server-side device-chain linkage.
 
-`HostedOAuth.swift` and `HostedTokenStore.swift` are still non-networking primitives for a future interactive Cognito user sign-in. They are not the credential path used by the current device-upload workflow and are intentionally not wired into `AppDelegate`. The AWS source defines a public native Cognito client and tenant-aware API contracts, but signed discovery, native token/JWKS/session execution, device-enrollment integration, and production activation remain incomplete. No AWS resources have been deployed by this repository work.
+`HostedOAuth.swift` and `HostedTokenStore.swift` are still non-networking primitives for a future interactive Cognito user sign-in. They are not the credential path used by the current device-upload workflow and are intentionally not wired into `AppDelegate`. The AWS source defines a public native Cognito client and tenant-aware API contracts, but signed discovery, native token/JWKS/session execution, device-enrollment integration, and production activation remain incomplete. No AWS resources were deployed by this repository work; this does not assert that the target account contains no pre-existing resources.
 
 ## Current capture-device authentication
 
 1. An administrator enrolls one Mac in **Connections → Mac capture devices** and copies the one-time `spdev_dev_…` token. The service retains only the token verifier/hash.
 2. The operator first selects the exact tenant/workspace, then enters the exact HTTPS Scopeproof Server URL and token under **Capture & Jira Settings…**. The origin must already appear in the signed app's `ScopeproofHostedAPIOrigins` allowlist. The checked-in `Info.plist` intentionally has an empty array; a release operator populates one exact pathless HTTPS origin with `SCOPEPROOF_HOSTED_API_ORIGIN` through `Scripts/configure_macos_release_identity.sh`. A normal local release build is therefore local-only and does not default to a developer, personal, or historical service. Development-only debug builds may use loopback HTTP for integration testing. The app binds the credential to that origin plus the tenant/workspace and stores it as `WhenUnlockedThisDeviceOnly` in macOS Keychain; changing any of those values deletes the incompatible token and requires a newly issued credential.
 3. For each upload, the app sends the token as a bearer credential and derives an HMAC over the exact manifest and image digests. The hosted API independently resolves the active, unrevoked device, token audience, owner, role, permission, and rate limit.
-4. The enrollment token is not the evidence-provenance key. New captures use a separate device-only P-256 signing identity. The app signs the canonical schema-7 manifest, whose fields bind the exact PNG digest, manifest metadata, local safety claim, contiguous chain sequence, previous hash, and event hash.
+4. The enrollment token is not the evidence-provenance key. New captures use a separate device-only P-256 signing identity. The app signs the canonical schema-8 manifest, whose fields bind the exact tenant/workspace, PNG digest, manifest metadata, local safety claim, contiguous chain sequence, previous hash, and event hash.
 
 Revoke the capture device when the Mac is lost, reassigned, or compromised. Rotate the 30-day enrollment token before expiry. A token rotation does not rewrite provenance, and a provenance-key change must begin a new explicitly authorized device/chain epoch rather than silently replacing the pinned key.
 
@@ -31,13 +31,17 @@ Every server-side read/preview, approval, package/export, and native Jira route 
 
 ## Upgrade, quarantine, and reconciliation
 
-Apply and verify migrations through `0024_big_chamber.sql` before enabling production native uploads. Migrations `0020`, `0022`, and `0023` remain the native-ingestion foundation; `0024` adds the current explicit assessment scope and durable review/finding/hold-release state used by downstream authorization:
+Apply and verify migrations through `0028_native_reconciliation_cursor.sql` before enabling production native uploads. Migrations `0020`, `0022`, and `0023` remain the native-ingestion foundation; `0024` adds the current explicit assessment scope and durable review/finding/hold-release state used by downstream authorization. Migrations `0025` through `0027` add append-only checkpoint delivery attempts, durable key-rotation retry state, and atomic checkpoint-delivery claims with bounded backoff and terminal action-required state. Migration `0028` adds the sparse native-reconciliation queue and independent durable circular cursors:
 
 - `0020_native_device_chain.sql` introduces the device signing-key and chain reservation state.
-- `0022_native_provenance_quarantine.sql` records immutable schema-7 sequence/event/key finalization and prevents native manifest updates/deletes.
+- `0022_native_provenance_quarantine.sql` records immutable native sequence/event/key finalization and prevents native manifest updates/deletes; the current route requires the schema-8 signed tenant/workspace binding before using those fields.
 - `0023_independent_image_safety.sql` records the exact digest-bound server safety result.
+- `0025_pink_malice.sql` records append-only independent-checkpoint delivery attempts.
+- `0026_omniscient_scarlet_witch.sql` records bounded per-record key-rotation retry and action-required state.
+- `0027_lonely_guardian.sql` records atomic checkpoint-delivery leases, backoff, stale-claim recovery, and terminal action-required state.
+- `0028_native_reconciliation_cursor.sql` records the sparse due-work queue, independent pending/orphan cursors, revision-CAS-protected cursor state, and indexes used by the two separately bounded reconciliation domains.
 
-Unsigned schema-6 captures remain an explicit, visibly unverified local browsing/migration path and cannot be uploaded as trusted evidence. Recapture them with the current Mac application. Existing hosted artifacts without the independent scan or finalized device-chain link remain quarantined and must be re-uploaded/rescanned from the original exact current pair. Never manufacture scan receipts, backfill provenance fields, directly change approval status, or blanket-grandfather old rows.
+Signed schema-7 captures remain locally verifiable under their earlier lifecycle contract but cannot cross the current hosted tenant/workspace boundary. Unsigned schema-6 and older captures remain an explicit, visibly unverified local browsing/migration path and cannot be uploaded as trusted evidence. Recapture unsigned material with the current Mac application. Existing hosted artifacts without the independent scan or finalized device-chain link remain quarantined and must be re-uploaded/rescanned from the original exact current pair. Never manufacture scan receipts, backfill provenance fields, directly change approval status, or blanket-grandfather old rows.
 
 ## Future interactive hosted user sign-in
 

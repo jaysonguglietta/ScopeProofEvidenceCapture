@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased — 1.10.0 (build 24)
+## Unreleased — 1.10.0 (build 25)
+
+- Advanced the unreleased macOS build from 24 to 25 so the hardened binary has a unique bundle identity and cannot be confused with an earlier local 1.10.0 build containing different bytes.
+- Restored current Mac-to-hosted compatibility by accepting only signed schema-8 native manifests at the hosted boundary and requiring their customer/workspace identifiers to exactly match the isolated deployment's `LEGACY_TENANT_ID` and `LEGACY_WORKSPACE_ID`; schema-7 evidence cannot be silently rebound across this boundary.
+- Fixed hosted schema-8 provenance verification to accept canonical DER-encoded P-256 signatures whose minimally encoded `r` or `s` value is shorter than 32 bytes and requires a leading positive sign octet. Redundant padding, negative or zero integers, over-width values, invalid lengths, and trailing bytes remain rejected, removing intermittent rejection of valid CryptoKit signatures without widening the signature trust boundary.
 
 ### 2026-09-01 security and product hardening
 
@@ -20,6 +24,7 @@
 - Added append-only audit-checkpoint delivery attempts in migration `0025_pink_malice.sql`. Failed or unconfigured same-head checkpoints retry the exact immutable signed envelope with digest idempotency; one signed receipt binding can win and checkpoint-verification caches invalidate immediately.
 - Isolated scheduled maintenance failure domains so retention, jobs, SBOMs, collectors, key rotation, checkpoints, and operational health cannot starve one another. Migration `0026_omniscient_scarlet_witch.sql` adds per-record key-rotation backoff, action-required state, recovery auditing, and poison-record isolation.
 - Added atomic audit-checkpoint retry claims in migration `0027_lonely_guardian.sql`. Concurrent schedulers can no longer bypass backoff or consume the retry budget together; stale claims are recoverable, delivery is capped at ten attempts, and terminal `action_required` state fails readiness until an operator repairs the witness path and a later audit head is checkpointed.
+- Added migration `0028_native_reconciliation_cursor.sql` and replaced broad native-orphan scans with a sparse due-work queue plus two independent durable circular keyset cursors. Each maintenance invocation may examine up to 25 expired reservations and, separately, up to 25 due orphan-queue entries; poison rows cannot pin either domain or consume the other domain's budget, and finalized, missing, or otherwise terminal artifacts are drained from the queue through audited exact-state transitions.
 - Added enforced web lint and TypeScript checks to CI, corrected collector scope typing, removed secret-bearing exception text from operational logs/audit failure records, replaced credential-shaped test literals with runtime-generated fixtures, and updated the transitive `browserslist` lock to 4.28.8 to clear the High-severity memory-exhaustion/crash advisories.
 
 #### AWS runtime and infrastructure source
@@ -30,7 +35,10 @@
 - Bound DLP facts into the KMS-signed promotion receipt, destination S3 metadata, DynamoDB state, and PostgreSQL reconciliation. Recovery verifies checksum, version, encryption, retention, audit, and DLP facts instead of trusting one store to repair another silently.
 - Made rejected-evidence reconciliation durable across a DynamoDB-first partial commit and delayed SQS/DLQ redrive. An exact stored receipt replays before freshness enforcement; a genuinely new relational recovery accepts the configured 14-day durable retry horizon while retaining canonical digest, tenant, intent, revision, and future-skew checks.
 - Added KMS/Secrets Manager least-privilege wiring for the DLP token secret and its customer-managed encryption key.
+- Added forward-only PostgreSQL migration `009_runtime_hardening.sql`, raised the tenant database contract to schema version 3, and expanded the database attestation to all nine packaged SQL files plus the live function/index catalog. Existing version-2 databases must take that reviewed forward path; historical migrations are not rewritten or relabeled.
+- Added an exact-tenant, exact-Step-Functions-execution `CUSTOMER_ENABLED` approval that must be read consistently before DNS publication and registry activation. This is an execution-bound infrastructure activation control, not proof that the UI/API release, memberships, DLP, recovery, or cross-tenant tests are production-ready.
 - Added tests for exact-version DLP contracts, OAuth scope wiring, signed promotion facts, and DynamoDB/PostgreSQL reconciliation. These are source/template tests only; this change did not deploy or mutate AWS resources.
+- Made `maintenanceLifecycleMode=backfill` the safe AWS shared-maintenance default. It disables both the fifteen-minute EventBridge rule and the SQS event-source mapping while an unscheduled, tenant-by-tenant, one-page exact-CAS Lambda migrates existing upload-lifecycle authority. Operators must complete a zero-malformed/zero-conflict pass and a zero-upgrade full verification rerun before a separate reviewed `maintenanceLifecycleMode=enabled` deployment activates both triggers. No backfill or AWS deployment was performed by this change.
 
 #### Scopeproof Capture for macOS
 
@@ -44,6 +52,8 @@
 - Centralized trust-bearing file reads through bounded, contained, regular-file validation and rejects symbolic links, hard links, oversized sidecars, unsafe roots, and digest mismatches. Legacy unsigned artifacts remain browsing-only.
 - Hardened local expiry cleanup. A `.s3.json` receipt is no longer sufficient: Scopeproof performs live exact-version S3 `HEAD` and Object Lock retention checks for every receipt object and verifies tenant prefix, account, version, ETag, checksum, SSE-KMS/DSSE-KMS settings, KMS key, and future COMPLIANCE retention before relying on S3 as a durable copy.
 - Hardened signed update ZIP handling before extraction with central/local directory and data-descriptor consistency checks, streamed raw-deflate/stored-byte and CRC verification, path/file-type/overlap rejection, actual per-file and aggregate expansion/ratio limits, available-disk checks, post-extraction regular-file validation, bounded command output, cancellation, and execution deadlines.
+- Re-verifies the signed update envelope, validity window, installed-version floor, and current Keychain rollback floor after asynchronous prompts/downloads and again immediately before commit. The download is copied once into a private same-volume pending archive; ZIP validation, extraction, and final publication use that exact file, whose regular-file identity, link count, byte size, and SHA-256 are checked before and after extraction and immediately before rollback-floor persistence and atomic rename.
+- Restored SwiftPM sandboxing for local and CI builds. Release publication independently verifies the canonical P-256 envelope signature and requires the selected update key to cover the signed envelope's complete publication-to-expiry window.
 
 #### Documentation and deployment state
 
@@ -59,10 +69,9 @@
 - Hardened local Mac replacement so build and install publish only fresh verified bundles through same-volume rename with rollback. The installer stops a running app even under `--no-launch`, preventing stale executable/resource mixtures.
 - Made production readiness require a structurally valid security-monitoring HTTPS endpoint and exact host allowlist, with the optional bearer token rejected unless it is bounded and header-safe.
 
-> **Not published:** these changes postdate
+> **Not published:** these source changes postdate
 > `v1.8.1-development-preview.1` (`8cd2d5c`) and are not present in that public
-> DMG. As of 2026-09-01 this working branch is not merged into the public default
-> branch. Version `1.10.0` and build `24` are allocated in source, but no 1.10.0
+> DMG. Version `1.10.0` and build `25` are allocated in source, but no 1.10.0
 > artifact exists; an independently verified new release is required before
 > these entries can be described as downloadable behavior.
 
@@ -82,7 +91,7 @@
 - Added nine opt-in CloudFormation storage/authentication building blocks for a retained native evidence bucket, native and hosted IAM Identity Center, Cognito/PKCE, Cognito Identity Pools, cross-account hosted ingest, IAM Roles Anywhere, and S3 Access Grants. Direct-reader roles include explicit outside-prefix read/list Denies, and retained buckets retain their enforcement policies. They are locally parsed, synthesized, and invariant-tested; no AWS resource was deployed.
 - Added custom Cognito OAuth scopes, separate web/native app clients, exact app-client allowlists, route-level scope enforcement, Aurora-backed evidence metadata listing with tenant-bound HMAC cursors, and a separately privileged exact-version download Lambda. Hosted clients cannot choose S3 bucket, key, KMS key, or version coordinates.
 - Bound the upload nonce digest into signed S3 metadata and require the promotion worker to verify all exact metadata before copying; the public upload API no longer returns the raw nonce.
-- Hardened tenant database activation so all six application roles are non-inheriting and unprivileged, no managed owner/application role participates in a PostgreSQL membership edge, and the temporary administrator-to-owner migration grant is removed and rechecked before activation. The database now attests the all-eight-file SQL bundle together with an ordered digest of live function/index definitions before activation.
+- Hardened tenant database activation so all six application roles are non-inheriting and unprivileged, no managed owner/application role participates in a PostgreSQL membership edge, and the temporary administrator-to-owner migration grant is removed and rechecked before activation. At that stage, the database attested the then-current eight-file SQL bundle together with an ordered digest of live function/index definitions; the schema-version-3 entry above supersedes that package boundary with migration 009 and all nine files.
 - Completed the production-shaped AWS tenant API adapters: exact API Gateway hostname authority, strict Cognito RS256/JWKS access-token verification, authoritative active PostgreSQL membership/RBAC, isolated runtime identities, bounded request parsing, and authenticated `GET /v1/me`, upload-intent, and two-person legal-hold routes. `GET /health` is an API Gateway mock and does not invoke the authenticated Lambda path.
 - Added atomic, rate-limited upload-intent issuance with server-derived retention, stable HMAC idempotency across current/prior secret rotation, exact checksum/header/KMS-bound presigned PUTs, DynamoDB reservation, PostgreSQL reconciliation, assessment/control-state enforcement, and quarantine-only temporary AWS permissions.
 - Replaced unfenced evidence copying with a single-winner exact-version stream into S3 using `If-None-Match: *`, durable monotonic promotion attempts, bounded recovery/adoption, Object Lock retention, KMS-signed promotion receipts, and database/DynamoDB reconciliation. Added an exact-version two-administrator legal-hold state machine with a durable `APPLYING` predecessor observation, drift detection, ambiguous-response recovery, KMS-signed audit outbox, and audit-bound recovery publication.
@@ -93,7 +102,7 @@
 - Added native Cognito authorization-code/PKCE security primitives and a tenant/issuer/client-bound Keychain refresh-token abstraction without embedding a client secret or AWS credentials in the Mac application.
 - Added a detailed AWS deployment and operations runbook plus an adversarial AWS security review. Both distinguish local validation, infrastructure deployment, database readiness, and customer activation, and record that no AWS environment was deployed or production-authorized by this change.
 - Expanded the native Local Console into a unified local/S3 screenshot library with storage badges, search, framework/control/assessment-period/status/storage filters, control/period/framework grouping, S3 version counts, and resilient local-only fallback. Local/S3 joins now require an exact schema-2 upload receipt; S3-only pairs remain visibly provenance-unverified, and on-demand previews validate the paired exact-version manifest plus PNG digest without exposing credentials, object keys, or filesystem paths to browser code.
-- Changed the default local evidence root from `~/Pictures/Scopeproof Evidence` to `~/Documents/Scopeproof Evidence`. Existing Pictures-based captures remain discoverable without an automatic file move; only signed schema-7 artifacts remain eligible for trust-bearing review, upload, retention/legal-hold, package, and Jira workflows, while unsigned schema-6 and older artifacts are browsing-only and must be recaptured.
+- Changed the default local evidence root from `~/Pictures/Scopeproof Evidence` to `~/Documents/Scopeproof Evidence`. Existing Pictures-based captures remain discoverable without an automatic file move. Current schema-8 artifacts add a signed tenant/workspace binding; schema-7 remains a locally verifiable migration format but cannot cross the current hosted boundary, while unsigned schema-6 and older artifacts are browsing-only. Recapture older material for current hosted trust-bearing workflows.
 
 ### Earlier production evidence correctness and operations
 

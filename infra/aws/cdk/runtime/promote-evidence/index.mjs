@@ -131,6 +131,7 @@ const mimeExtensions = new Map([
   ["text/plain", "txt"],
 ]);
 const scanReconciliationGraceMilliseconds = 7 * 24 * 60 * 60 * 1_000;
+const maintenanceOrphanGraceMilliseconds = 15 * 60 * 1_000;
 const dlpSigningAlgorithm = "RSASSA_PSS_SHA_256";
 const dynamo = new DynamoDBClient({});
 const kms = new KMSClient({});
@@ -326,6 +327,10 @@ async function promoteRecord(record) {
       receiptHash,
       receiptKey,
     });
+    intent.reconciliationActionKey = undefined;
+    intent.reconciliationDetectedAt = undefined;
+    intent.reconciliationDisposition = undefined;
+    intent.reconciliationReason = undefined;
   }
   intent.promotionAttemptId = lease.attemptId;
   intent.promotionFence = lease.fence;
@@ -605,6 +610,10 @@ function parseIntent(item, expectedIntentId, expectedControlId, expectedKey) {
     promotionFence: item.promotionFence?.N === undefined ? undefined : Number(item.promotionFence.N),
     promotionLeaseExpiresAt: item.promotionLeaseExpiresAt?.S,
     promotionLeaseId: item.promotionLeaseId?.S,
+    reconciliationActionKey: item.reconciliationActionKey?.S,
+    reconciliationDetectedAt: item.reconciliationDetectedAt?.S,
+    reconciliationDisposition: item.reconciliationDisposition?.S,
+    reconciliationReason: item.reconciliationReason?.S,
     requiredRetentionUntil: item.requiredRetentionUntil?.S,
     resourceId: item.resourceId?.S,
     revision: item.revision?.N === undefined ? NaN : Number(item.revision.N),
@@ -655,6 +664,13 @@ function parseIntent(item, expectedIntentId, expectedControlId, expectedKey) {
       (intent.status === "promoted"
         ? intent.promotionLeaseId === undefined && intent.promotionLeaseExpiresAt === undefined
         : /^[a-f0-9]{64}$/.test(intent.promotionLeaseId ?? "") && validInstant(intent.promotionLeaseExpiresAt));
+  const reconciliationActionValid = intent.reconciliationDisposition === undefined
+    ? intent.reconciliationActionKey === undefined && intent.reconciliationDetectedAt === undefined &&
+      intent.reconciliationReason === undefined
+    : intent.reconciliationDisposition === "ACTION_REQUIRED" &&
+      new RegExp(`^UPLOAD#${intent.id}#REVISION#${intent.revision}#EVENT#[a-f0-9]{32}$`).test(intent.reconciliationActionKey ?? "") &&
+      validInstant(intent.reconciliationDetectedAt) &&
+      /^(STALE_PROMOTION_LEASE|MISSING_PROMOTION_LEASE)$/.test(intent.reconciliationReason ?? "");
   if (
     item.kind?.S !== "UploadLifecycle" ||
     intent.schemaVersion !== 1 ||
@@ -680,6 +696,7 @@ function parseIntent(item, expectedIntentId, expectedControlId, expectedKey) {
     intent.revision !== expectedRevision ||
     !promotedReceiptValid ||
     !promotionCoordinationValid ||
+    !reconciliationActionValid ||
     !validInstant(intent.issuedAt) ||
     !validInstant(intent.expiresAt) ||
     !validInstant(intent.requiredRetentionUntil) ||
@@ -848,6 +865,8 @@ async function claimIssuedIntent(input) {
               ":finalKey": { S: input.intent.finalKey },
               ":issued": { S: "issued" },
               ":one": { N: "1" },
+              ":maintenancePartition": { S: `MAINTENANCE#UPLOAD#${config.tenantId}` },
+              ":maintenanceDue": { S: maintenanceDueSortKey(input.leaseExpiresAt, input.intent.id) },
               ":receipt": {
                 M: {
                   byteSize: { N: String(input.intent.expectedSize) },
@@ -869,7 +888,7 @@ async function claimIssuedIntent(input) {
             Key: input.intentKey,
             TableName: config.controlTable,
             UpdateExpression:
-              "SET #status = :status, #revision = :one, consumedAt = :consumedAt, quarantineReceipt = :receipt, promotionLeaseId = :leaseId, promotionLeaseExpiresAt = :expires, promotionAttemptId = :attemptId, promotionFence = :fence",
+              "SET #status = :status, #revision = :one, consumedAt = :consumedAt, quarantineReceipt = :receipt, promotionLeaseId = :leaseId, promotionLeaseExpiresAt = :expires, promotionAttemptId = :attemptId, promotionFence = :fence, GSI1PK = :maintenancePartition, GSI1SK = :maintenanceDue",
           },
         },
         {
@@ -901,53 +920,100 @@ async function claimIssuedIntent(input) {
 }
 
 async function takeOverLease(input) {
+  const hasMaintenanceAction = input.intent.reconciliationDisposition === "ACTION_REQUIRED";
+  const intentCondition = [
+    "#status = :status",
+    "#revision = :revision",
+    "promotionFence = :currentFence",
+    "promotionAttemptId = :currentAttemptId",
+    "quarantineReceipt.versionId = :versionId",
+    "promotionLeaseExpiresAt <= :now",
+    hasMaintenanceAction
+      ? "reconciliationDisposition = :action AND reconciliationActionKey = :actionKey AND reconciliationDetectedAt = :actionDetected AND reconciliationReason = :actionReason"
+      : "attribute_not_exists(reconciliationDisposition) AND attribute_not_exists(reconciliationActionKey)",
+  ].join(" AND ");
+  const transactions = [
+    {
+      Update: {
+        ConditionExpression: intentCondition,
+        ExpressionAttributeNames: { "#revision": "revision", "#status": "status" },
+        ExpressionAttributeValues: {
+          ...(hasMaintenanceAction ? {
+            ":action": { S: "ACTION_REQUIRED" },
+            ":actionDetected": { S: input.intent.reconciliationDetectedAt },
+            ":actionKey": { S: input.intent.reconciliationActionKey },
+            ":actionReason": { S: input.intent.reconciliationReason },
+          } : {}),
+          ":attemptId": { S: input.attemptId },
+          ":currentAttemptId": { S: input.intent.promotionAttemptId },
+          ":currentFence": { N: String(input.intent.promotionFence) },
+          ":expires": { S: input.leaseExpiresAt },
+          ":fence": { N: String(input.fence) },
+          ":leaseId": { S: input.leaseId },
+          ":maintenancePartition": { S: `MAINTENANCE#UPLOAD#${config.tenantId}` },
+          ":maintenanceDue": { S: maintenanceDueSortKey(input.leaseExpiresAt, input.intent.id) },
+          ":now": { S: input.nowIso },
+          ":revision": { N: String(input.intent.revision) },
+          ":status": { S: input.intent.status },
+          ":versionId": { S: input.intent.sourceVersionId },
+        },
+        Key: input.intentKey,
+        TableName: config.controlTable,
+        UpdateExpression: "SET promotionLeaseId = :leaseId, promotionLeaseExpiresAt = :expires, promotionAttemptId = :attemptId, promotionFence = :fence, GSI1PK = :maintenancePartition, GSI1SK = :maintenanceDue REMOVE reconciliationDisposition, reconciliationReason, reconciliationDetectedAt, reconciliationActionKey",
+      },
+    },
+    {
+      Update: {
+        ConditionExpression:
+          "#status = :copying AND tenantId = :tenantId AND intentId = :intentId AND receiptHash = :receiptHash AND promotionFence = :currentFence AND promotionAttemptId = :currentAttemptId",
+        ExpressionAttributeNames: { "#status": "status" },
+        ExpressionAttributeValues: {
+          ":attemptId": { S: input.attemptId },
+          ":copying": { S: "COPYING" },
+          ":currentAttemptId": { S: input.intent.promotionAttemptId },
+          ":currentFence": { N: String(input.intent.promotionFence) },
+          ":fence": { N: String(input.fence) },
+          ":intentId": { S: input.intent.id },
+          ":receiptHash": { S: input.receiptHash },
+          ":tenantId": { S: config.tenantId },
+        },
+        Key: input.receiptKey,
+        TableName: config.controlTable,
+        UpdateExpression: "SET promotionAttemptId = :attemptId, promotionFence = :fence",
+      },
+    },
+  ];
+  if (hasMaintenanceAction) {
+    transactions.push({
+      Update: {
+        ConditionExpression: "#status = :outstanding AND #kind = :kind AND schemaVersion = :schema AND tenantId = :tenantId AND id = :id AND sourceRevision = :sourceRevision AND detectedAt = :detected AND reason = :reason AND GSI1SK = :indexSk",
+        ExpressionAttributeNames: { "#kind": "kind", "#status": "status" },
+        ExpressionAttributeValues: {
+          ":detected": { S: input.intent.reconciliationDetectedAt },
+          ":id": { S: input.intent.id },
+          ":indexSk": { S: `${input.intent.reconciliationDetectedAt}#${config.tenantId}#${input.intent.id}#${input.intent.revision}` },
+          ":kind": { S: "UploadMaintenanceAction" },
+          ":outstanding": { S: "OUTSTANDING" },
+          ":reason": { S: input.intent.reconciliationReason },
+          ":resolved": { S: "RESOLVED" },
+          ":resolvedAt": { S: input.nowIso },
+          ":schema": { N: "1" },
+          ":sourceRevision": { N: String(input.intent.revision) },
+          ":tenantId": { S: config.tenantId },
+        },
+        Key: {
+          PK: { S: `MAINTENANCE#ACTION_REQUIRED#${config.tenantId}` },
+          SK: { S: input.intent.reconciliationActionKey },
+        },
+        TableName: config.controlTable,
+        UpdateExpression: "SET #status = :resolved, resolvedAt = :resolvedAt REMOVE GSI1SK",
+      },
+    });
+  }
   await dynamo.send(
     new TransactWriteItemsCommand({
       ClientRequestToken: token(`${input.leaseId}\0${input.attemptId}\0${input.nowIso}`, "takeover"),
-      TransactItems: [
-        {
-          Update: {
-            ConditionExpression:
-              "#status = :status AND #revision = :revision AND promotionFence = :currentFence AND promotionAttemptId = :currentAttemptId AND quarantineReceipt.versionId = :versionId AND promotionLeaseExpiresAt <= :now",
-            ExpressionAttributeNames: { "#revision": "revision", "#status": "status" },
-            ExpressionAttributeValues: {
-              ":attemptId": { S: input.attemptId },
-              ":currentAttemptId": { S: input.intent.promotionAttemptId },
-              ":currentFence": { N: String(input.intent.promotionFence) },
-              ":expires": { S: input.leaseExpiresAt },
-              ":fence": { N: String(input.fence) },
-              ":leaseId": { S: input.leaseId },
-              ":now": { S: input.nowIso },
-              ":revision": { N: String(input.intent.revision) },
-              ":status": { S: input.intent.status },
-              ":versionId": { S: input.intent.sourceVersionId },
-            },
-            Key: input.intentKey,
-            TableName: config.controlTable,
-            UpdateExpression: "SET promotionLeaseId = :leaseId, promotionLeaseExpiresAt = :expires, promotionAttemptId = :attemptId, promotionFence = :fence",
-          },
-        },
-        {
-          Update: {
-            ConditionExpression:
-              "#status = :copying AND tenantId = :tenantId AND intentId = :intentId AND receiptHash = :receiptHash AND promotionFence = :currentFence AND promotionAttemptId = :currentAttemptId",
-            ExpressionAttributeNames: { "#status": "status" },
-            ExpressionAttributeValues: {
-              ":attemptId": { S: input.attemptId },
-              ":copying": { S: "COPYING" },
-              ":currentAttemptId": { S: input.intent.promotionAttemptId },
-              ":currentFence": { N: String(input.intent.promotionFence) },
-              ":fence": { N: String(input.fence) },
-              ":intentId": { S: input.intent.id },
-              ":receiptHash": { S: input.receiptHash },
-              ":tenantId": { S: config.tenantId },
-            },
-            Key: input.receiptKey,
-            TableName: config.controlTable,
-            UpdateExpression: "SET promotionAttemptId = :attemptId, promotionFence = :fence",
-          },
-        },
-      ],
+      TransactItems: transactions,
     }),
   );
 }
@@ -1033,6 +1099,7 @@ async function prepareCopyAttempt(input) {
             ":expires": { S: leaseExpiresAt },
             ":fence": { N: String(input.lease.fence) },
             ":leaseId": { S: input.leaseId },
+            ":maintenanceDue": { S: maintenanceDueSortKey(leaseExpiresAt, input.intent.id) },
             ":now": { S: permittedAt },
             ":two": { N: "2" },
             ":validated": { S: "validated" },
@@ -1040,7 +1107,7 @@ async function prepareCopyAttempt(input) {
           },
           Key: input.intentKey,
           TableName: config.controlTable,
-          UpdateExpression: "SET promotionLeaseExpiresAt = :expires",
+          UpdateExpression: "SET promotionLeaseExpiresAt = :expires, GSI1SK = :maintenanceDue",
         },
       },
       {
@@ -1087,6 +1154,7 @@ async function renewActiveLease(intentKey, intent, lease, leaseId, nowIso) {
           ":expires": { S: leaseExpiresAt },
           ":fence": { N: String(lease.fence) },
           ":leaseId": { S: leaseId },
+          ":maintenanceDue": { S: maintenanceDueSortKey(leaseExpiresAt, intent.id) },
           ":now": { S: nowIso },
           ":two": { N: "2" },
           ":validated": { S: "validated" },
@@ -1094,7 +1162,7 @@ async function renewActiveLease(intentKey, intent, lease, leaseId, nowIso) {
         },
         Key: intentKey,
         TableName: config.controlTable,
-        UpdateExpression: "SET promotionLeaseExpiresAt = :expires",
+        UpdateExpression: "SET promotionLeaseExpiresAt = :expires, GSI1SK = :maintenanceDue",
       },
     }],
   }));
@@ -1922,6 +1990,10 @@ async function completePromotion(input) {
       uploadedAt: { S: facts.uploadedAt },
     },
   };
+  const hasMaintenanceAction = input.intent.reconciliationDisposition === "ACTION_REQUIRED";
+  const reconciliationCondition = hasMaintenanceAction
+    ? "reconciliationDisposition = :action AND reconciliationActionKey = :actionKey AND reconciliationDetectedAt = :actionDetected AND reconciliationReason = :actionReason"
+    : "attribute_not_exists(reconciliationDisposition) AND attribute_not_exists(reconciliationActionKey) AND attribute_not_exists(reconciliationDetectedAt) AND attribute_not_exists(reconciliationReason)";
   await dynamo.send(
     new TransactWriteItemsCommand({
       ClientRequestToken: token(`${input.leaseId ?? input.databaseReconciliation.receiptId}\0${input.nowIso}`, "complete"),
@@ -1937,6 +2009,7 @@ async function completePromotion(input) {
               input.recovered ? undefined : "promotionFence = :fence",
               input.recovered ? undefined : "promotionLeaseExpiresAt > :completedAt",
               "quarantineReceipt.versionId = :sourceVersion",
+              reconciliationCondition,
             ].filter(Boolean).join(" AND "),
             ExpressionAttributeNames: { "#revision": "revision", "#status": "status" },
             ExpressionAttributeValues: {
@@ -1946,6 +2019,12 @@ async function completePromotion(input) {
                 ":fence": { N: String(input.lease.fence) },
                 ":leaseId": { S: input.leaseId },
               }),
+              ...(hasMaintenanceAction ? {
+                ":action": { S: "ACTION_REQUIRED" },
+                ":actionDetected": { S: input.intent.reconciliationDetectedAt },
+                ":actionKey": { S: input.intent.reconciliationActionKey },
+                ":actionReason": { S: input.intent.reconciliationReason },
+              } : {}),
               ":databaseEvidenceRevision": { N: String(input.intent.databaseEvidenceRevision) },
               ":databaseUploadRevision": { N: String(input.intent.databaseUploadRevision) },
               ":promoted": { S: "promoted" },
@@ -1958,7 +2037,7 @@ async function completePromotion(input) {
             Key: input.intentKey,
             TableName: config.controlTable,
             UpdateExpression:
-              "SET #status = :promoted, #revision = :three, promotionReceipt = :receipt REMOVE promotionLeaseId, promotionLeaseExpiresAt",
+              "SET #status = :promoted, #revision = :three, promotionReceipt = :receipt REMOVE promotionLeaseId, promotionLeaseExpiresAt, GSI1PK, GSI1SK, reconciliationDisposition, reconciliationReason, reconciliationDetectedAt, reconciliationActionKey",
           },
         },
         {
@@ -2034,9 +2113,40 @@ async function completePromotion(input) {
               "SET #status = :reconciled, reconciledAt = :reconciledAt, databaseReceiptId = :databaseReceiptId",
           },
         },
+        ...(hasMaintenanceAction
+          ? [maintenanceActionResolution(input.intent, input.nowIso)]
+          : []),
       ],
     }),
   );
+}
+
+function maintenanceActionResolution(intent, resolvedAt) {
+  return {
+    Update: {
+      ConditionExpression: "#status = :outstanding AND #kind = :kind AND schemaVersion = :schema AND tenantId = :tenantId AND id = :id AND sourceRevision = :sourceRevision AND detectedAt = :detected AND reason = :reason AND GSI1SK = :indexSk",
+      ExpressionAttributeNames: { "#kind": "kind", "#status": "status" },
+      ExpressionAttributeValues: {
+        ":detected": { S: intent.reconciliationDetectedAt },
+        ":id": { S: intent.id },
+        ":indexSk": { S: `${intent.reconciliationDetectedAt}#${config.tenantId}#${intent.id}#${intent.revision}` },
+        ":kind": { S: "UploadMaintenanceAction" },
+        ":outstanding": { S: "OUTSTANDING" },
+        ":reason": { S: intent.reconciliationReason },
+        ":resolved": { S: "RESOLVED" },
+        ":resolvedAt": { S: resolvedAt },
+        ":schema": { N: "1" },
+        ":sourceRevision": { N: String(intent.revision) },
+        ":tenantId": { S: config.tenantId },
+      },
+      Key: {
+        PK: { S: `MAINTENANCE#ACTION_REQUIRED#${config.tenantId}` },
+        SK: { S: intent.reconciliationActionKey },
+      },
+      TableName: config.controlTable,
+      UpdateExpression: "SET #status = :resolved, resolvedAt = :resolvedAt REMOVE GSI1SK",
+    },
+  };
 }
 
 function validVersionId(value) {
@@ -2061,6 +2171,14 @@ function validInstant(value) {
   if (typeof value !== "string") return false;
   const parsed = new Date(value);
   return Number.isFinite(parsed.getTime()) && value === parsed.toISOString();
+}
+
+function maintenanceDueSortKey(leaseExpiresAt, intentId) {
+  if (!validInstant(leaseExpiresAt) || !/^upl_[a-f0-9]{32}$/.test(intentId)) {
+    throw new Error("Upload maintenance due authority is invalid.");
+  }
+  const dueAt = new Date(Date.parse(leaseExpiresAt) + maintenanceOrphanGraceMilliseconds).toISOString();
+  return `${dueAt}#${intentId}`;
 }
 
 function canonicalRsa3072Signature(value, label) {

@@ -127,7 +127,12 @@ test("Dynamo upload store reserves lifecycle and nonce atomically without overwr
   assert.equal(input.TransactItems[0].Put!.Item.expiresAt.S, "2026-08-27T16:05:00.000Z");
   assert.equal(
     input.TransactItems[0].Put!.Item.ttlEpochSeconds.N,
-    String((Date.parse("2026-08-27T16:05:00.000Z") / 1_000) + (7 * 24 * 60 * 60)),
+    String((Date.parse("2026-08-27T16:05:00.000Z") / 1_000) + (22 * 24 * 60 * 60)),
+  );
+  assert.equal(input.TransactItems[0].Put!.Item.GSI1PK.S, `MAINTENANCE#UPLOAD#${TENANT}`);
+  assert.equal(
+    input.TransactItems[0].Put!.Item.GSI1SK.S,
+    `2026-09-03T16:05:00.000Z#${INTENT}`,
   );
   assert.equal(
     input.TransactItems[1].Put!.Item.ttlEpochSeconds.N,
@@ -189,6 +194,138 @@ test("Dynamo upload store strongly reads and returns only an exact existing rese
   delete lifecycle.requestFingerprint;
   persisted.set(`UPLOAD#${INTENT}`, lifecycle);
   await assert.rejects(store.reserve(intent(), recovery), /malformed upload facts|malformed/);
+});
+
+test("Dynamo upload recovery exact-CAS upgrades a legacy lifecycle before returning it", async () => {
+  const persisted = new Map<string, Record<string, { S?: string; N?: string }>>();
+  const transactions: Array<TransactWriteItemsCommand<Record<string, unknown>>> = [];
+  const store = new DynamoConditionalUploadIntentStore({
+    client: {
+      async send(command) {
+        if (command instanceof GetItemCommand) {
+          const key = command.input.Key as Record<string, { S?: string }>;
+          return { Item: persisted.get(key.SK.S ?? "") };
+        }
+        const transaction = command as TransactWriteItemsCommand<{
+          TransactItems: Array<{
+            Put?: { Item: Record<string, { S?: string; N?: string }> };
+            Update?: {
+              Key: Record<string, { S?: string }>;
+              ExpressionAttributeValues: Record<string, { S?: string; N?: string }>;
+            };
+          }>;
+        }>;
+        transactions.push(transaction as TransactWriteItemsCommand<Record<string, unknown>>);
+        for (const entry of transaction.input.TransactItems) {
+          if (entry.Put) persisted.set(entry.Put.Item.SK.S ?? "", entry.Put.Item);
+          if (entry.Update) {
+            const sortKey = entry.Update.Key.SK.S ?? "";
+            const row = persisted.get(sortKey);
+            if (!row) continue;
+            const values = entry.Update.ExpressionAttributeValues;
+            persisted.set(sortKey, {
+              ...row,
+              ...(sortKey.startsWith("UPLOAD#") ? {
+                GSI1PK: values[":maintenancePk"],
+                GSI1SK: values[":maintenanceSk"],
+              } : {}),
+              ttlEpochSeconds: values[":newTtl"],
+            });
+          }
+        }
+        return {};
+      },
+    },
+    TransactWriteItemsCommand,
+    GetItemCommand,
+    tableName: "scopeproof-control",
+  });
+  const recovery = await recoveryProjection();
+  assert.equal((await store.reserve(intent(), recovery)).outcome, "created");
+  const legacyTtl = String((Date.parse(intent().expiresAt) / 1_000) + (7 * 24 * 60 * 60));
+  const lifecycleKey = `UPLOAD#${INTENT}`;
+  const requestKey = `UPLOAD_REQUEST#${"2".repeat(64)}`;
+  const lifecycle: Record<string, { S?: string; N?: string }> = {
+    ...persisted.get(lifecycleKey)!,
+    ttlEpochSeconds: { N: legacyTtl },
+  };
+  delete lifecycle.GSI1PK;
+  delete lifecycle.GSI1SK;
+  persisted.set(lifecycleKey, lifecycle);
+  persisted.set(requestKey, { ...persisted.get(requestKey)!, ttlEpochSeconds: { N: legacyTtl } });
+
+  const recovered = await store.recoverExact(intent(), recovery);
+  assert.equal(recovered?.outcome, "existing");
+  assert.equal(transactions.length, 2, "one exact legacy upgrade transaction is required");
+  const upgrade = transactions[1].input as {
+    ClientRequestToken: string;
+    TransactItems: Array<{ Update: { ConditionExpression: string; UpdateExpression: string } }>;
+  };
+  assert.equal(upgrade.TransactItems.length, 2);
+  assert.match(upgrade.TransactItems[0].Update.ConditionExpression, /attribute_not_exists\(GSI1PK\)/);
+  assert.match(upgrade.TransactItems[0].Update.UpdateExpression, /GSI1PK = :maintenancePk/);
+  assert.match(upgrade.TransactItems[1].Update.UpdateExpression, /ttlEpochSeconds = :newTtl/);
+  assert.equal(upgrade.ClientRequestToken.length, 36);
+  assert.equal(persisted.get(lifecycleKey)?.GSI1PK?.S, `MAINTENANCE#UPLOAD#${TENANT}`);
+  assert.equal(persisted.get(lifecycleKey)?.GSI1SK?.S, `2026-09-03T16:05:00.000Z#${INTENT}`);
+  assert.equal(
+    persisted.get(requestKey)?.ttlEpochSeconds?.N,
+    String((Date.parse(intent().expiresAt) / 1_000) + (22 * 24 * 60 * 60)),
+  );
+});
+
+test("Dynamo legacy lifecycle upgrade fails closed after one conflicting CAS", async () => {
+  const persisted = new Map<string, Record<string, { S?: string; N?: string }>>();
+  let getCount = 0;
+  let transactionCount = 0;
+  const store = new DynamoConditionalUploadIntentStore({
+    client: {
+      async send(command) {
+        if (command instanceof GetItemCommand) {
+          getCount += 1;
+          const key = command.input.Key as Record<string, { S?: string }>;
+          return { Item: persisted.get(key.SK.S ?? "") };
+        }
+        transactionCount += 1;
+        const transaction = command as TransactWriteItemsCommand<{
+          TransactItems: Array<{ Put?: { Item: Record<string, { S?: string; N?: string }> } }>;
+        }>;
+        if (transactionCount === 1) {
+          for (const entry of transaction.input.TransactItems) {
+            if (entry.Put) persisted.set(entry.Put.Item.SK.S ?? "", entry.Put.Item);
+          }
+          return {};
+        }
+        throw Object.assign(new Error("conditional conflict"), {
+          name: "TransactionCanceledException",
+          CancellationReasons: [{ Code: "ConditionalCheckFailed" }, { Code: "None" }],
+        });
+      },
+    },
+    TransactWriteItemsCommand,
+    GetItemCommand,
+    tableName: "scopeproof-control",
+  });
+  const recovery = await recoveryProjection();
+  assert.equal((await store.reserve(intent(), recovery)).outcome, "created");
+  const legacyTtl = String((Date.parse(intent().expiresAt) / 1_000) + (7 * 24 * 60 * 60));
+  const lifecycleKey = `UPLOAD#${INTENT}`;
+  const requestKey = `UPLOAD_REQUEST#${"2".repeat(64)}`;
+  const lifecycle: Record<string, { S?: string; N?: string }> = {
+    ...persisted.get(lifecycleKey)!,
+    ttlEpochSeconds: { N: legacyTtl },
+  };
+  delete lifecycle.GSI1PK;
+  delete lifecycle.GSI1SK;
+  persisted.set(lifecycleKey, lifecycle);
+  persisted.set(requestKey, { ...persisted.get(requestKey)!, ttlEpochSeconds: { N: legacyTtl } });
+
+  await assert.rejects(
+    store.recoverExact(intent(), recovery),
+    /maintenance authority changed while it was being upgraded/,
+  );
+  assert.equal(transactionCount, 2, "the conflicting migration must not retry recursively");
+  assert.equal(getCount, 7, "the migration performs exactly one initial read and one proof re-read");
 });
 
 test("Dynamo write attempt tokens change with issuance facts to avoid IdempotentParameterMismatch", async () => {

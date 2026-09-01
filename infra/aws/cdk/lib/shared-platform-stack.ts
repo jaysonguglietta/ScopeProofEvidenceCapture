@@ -6,6 +6,7 @@ import {
   Stack,
   StackProps,
 } from "aws-cdk-lib";
+import * as path from "node:path";
 import * as acm from "aws-cdk-lib/aws-certificatemanager";
 import * as amplify from "aws-cdk-lib/aws-amplify";
 import * as budgets from "aws-cdk-lib/aws-budgets";
@@ -21,6 +22,9 @@ import * as events from "aws-cdk-lib/aws-events";
 import * as eventTargets from "aws-cdk-lib/aws-events-targets";
 import * as iam from "aws-cdk-lib/aws-iam";
 import * as kms from "aws-cdk-lib/aws-kms";
+import * as lambda from "aws-cdk-lib/aws-lambda";
+import * as lambdaEventSources from "aws-cdk-lib/aws-lambda-event-sources";
+import * as lambdaNodejs from "aws-cdk-lib/aws-lambda-nodejs";
 import * as logs from "aws-cdk-lib/aws-logs";
 import * as rds from "aws-cdk-lib/aws-rds";
 import * as route53 from "aws-cdk-lib/aws-route53";
@@ -32,6 +36,7 @@ import * as subscriptions from "aws-cdk-lib/aws-sns-subscriptions";
 import * as sqs from "aws-cdk-lib/aws-sqs";
 import * as wafv2 from "aws-cdk-lib/aws-wafv2";
 import { Construct } from "constructs";
+import type { MaintenanceLifecycleMode } from "./config";
 import { RecoveryConfiguration } from "./recovery-config";
 import { configureAuroraRecovery } from "./recovery-support";
 
@@ -44,6 +49,7 @@ export interface SharedPlatformStackProps extends StackProps {
   readonly alertEmail?: string;
   readonly monthlyBudgetUsd?: number;
   readonly recovery?: RecoveryConfiguration;
+  readonly maintenanceLifecycleMode?: MaintenanceLifecycleMode;
 }
 
 export class SharedPlatformStack extends Stack {
@@ -77,6 +83,10 @@ export class SharedPlatformStack extends Stack {
     super(scope, id, props);
     this.rootDomain = props.rootDomain;
     this.branchName = props.branchName;
+    const maintenanceLifecycleMode = props.maintenanceLifecycleMode ?? "backfill";
+    if (maintenanceLifecycleMode !== "backfill" && maintenanceLifecycleMode !== "enabled") {
+      throw new Error("maintenanceLifecycleMode must be backfill or enabled.");
+    }
     const monthlyBudgetUsd = props.monthlyBudgetUsd ?? 100;
     if (!Number.isFinite(monthlyBudgetUsd) || monthlyBudgetUsd < 10 || monthlyBudgetUsd > 1_000_000) {
       throw new Error("monthlyBudgetUsd must be a number from 10 through 1000000.");
@@ -115,9 +125,25 @@ export class SharedPlatformStack extends Stack {
       dynamoStream: dynamodb.StreamViewType.NEW_AND_OLD_IMAGES,
       encryption: dynamodb.TableEncryptionV2.dynamoOwnedKey(),
       globalSecondaryIndexes: [{
+        // Preserve the deployed legacy index for rollback. DynamoDB cannot
+        // mutate an existing GSI key schema in place.
         indexName: "GSI1",
         partitionKey: { name: "GSI1PK", type: dynamodb.AttributeType.STRING },
         projectionType: dynamodb.ProjectionType.ALL,
+        sortKey: { name: "GSI1SK", type: dynamodb.AttributeType.STRING },
+      }, {
+        indexName: "UploadLifecycleByTenantV2",
+        nonKeyAttributes: [
+          "GSI1PK", "consumedAt", "detectedAt", "expiresAt", "id", "kind", "promotionLeaseExpiresAt", "promotionLeaseId", "reason",
+          "reconciliationDetectedAt", "reconciliationDisposition", "reconciliationReason",
+          "revision", "schemaVersion", "sourceRevision", "status",
+          "tenantId", "ttlEpochSeconds", "validation",
+        ],
+        // Reuse the immutable base-table partition key so a tenant-scoped role
+        // cannot forge another tenant's maintenance partition through a
+        // caller-controlled GSI partition attribute.
+        partitionKey: { name: "PK", type: dynamodb.AttributeType.STRING },
+        projectionType: dynamodb.ProjectionType.INCLUDE,
         sortKey: { name: "GSI1SK", type: dynamodb.AttributeType.STRING },
       }],
       globalTableSettingsReplicationMode: dynamodb.GlobalTableSettingsReplicationMode.ALL,
@@ -336,7 +362,9 @@ export class SharedPlatformStack extends Stack {
     }).addAlarmAction(new cloudwatchActions.SnsAction(this.operationsTopic));
     new events.Rule(this, "MaintenanceSchedule", {
       description: "Queues bounded tenant maintenance work every fifteen minutes.",
-      enabled: false,
+      // Existing tables start fail-closed while the bounded legacy lifecycle
+      // backfill is run and verified. A second reviewed deployment must opt in.
+      enabled: maintenanceLifecycleMode === "enabled",
       schedule: events.Schedule.rate(Duration.minutes(15)),
       targets: [
         new eventTargets.SqsQueue(this.jobsQueue, {
@@ -372,16 +400,306 @@ export class SharedPlatformStack extends Stack {
       },
       resources: [this.controlTable.tableArn],
     }));
-    this.jobsQueue.grantSendMessages(this.amplifyComputeRole);
-
     this.jobWorkerRole = new iam.Role(this, "JobWorkerRole", {
       assumedBy: new iam.ServicePrincipal("lambda.amazonaws.com"),
-      description: "Base role for future SQS workers; it has no tenant data access directly.",
-      managedPolicies: [
-        iam.ManagedPolicy.fromAwsManagedPolicyName("service-role/AWSLambdaBasicExecutionRole"),
-      ],
+      description: "Bounded shared lifecycle reconciliation worker with no S3, KMS, RDS, secret, or tenant-role access.",
     });
     this.jobsQueue.grantConsumeMessages(this.jobWorkerRole);
+    const uploadLifecycleAttributes = [
+      "PK", "SK", "GSI1PK", "GSI1SK", "consumedAt", "detectedAt", "expiredAt", "expiresAt", "id", "kind",
+      "promotionLeaseExpiresAt", "promotionLeaseId", "reconciledAt",
+      "reconciliationActionKey", "reconciliationDetectedAt", "reconciliationDisposition",
+      "reconciliationReason", "receiptSha256", "reason", "resolvedAt", "revision", "schemaVersion",
+      "sourceIndexSkSha256", "sourcePkSha256", "sourceRevision", "sourceSkSha256", "status",
+      "tenantId", "ttlEpochSeconds", "validation",
+    ];
+    this.jobWorkerRole.addToPolicy(new iam.PolicyStatement({
+      actions: ["dynamodb:Query"],
+      conditions: {
+        Null: {
+          "dynamodb:Attributes": "false",
+          "dynamodb:LeadingKeys": "false",
+        },
+        "ForAllValues:StringEquals": {
+          "dynamodb:Attributes": ["PK", "SK", "kind", "schemaVersion", "status", "tenantId"],
+          "dynamodb:LeadingKeys": "MAINTENANCE#TENANT_DIRECTORY",
+        },
+      },
+      resources: [this.controlTable.tableArn],
+    }));
+    this.jobWorkerRole.addToPolicy(new iam.PolicyStatement({
+      actions: ["dynamodb:Query"],
+      conditions: {
+        Null: { "dynamodb:Attributes": "false" },
+        "ForAllValues:StringEquals": { "dynamodb:Attributes": uploadLifecycleAttributes },
+      },
+      resources: [`${this.controlTable.tableArn}/index/UploadLifecycleByTenantV2`],
+    }));
+    this.jobWorkerRole.addToPolicy(new iam.PolicyStatement({
+      actions: ["dynamodb:GetItem", "dynamodb:UpdateItem"],
+      conditions: {
+        Null: { "dynamodb:LeadingKeys": "false" },
+        "ForAllValues:StringEquals": { "dynamodb:LeadingKeys": "MAINTENANCE#SHARED" },
+        StringEqualsIfExists: { "dynamodb:ReturnValues": ["NONE", "ALL_NEW"] },
+      },
+      resources: [this.controlTable.tableArn],
+    }));
+    this.jobWorkerRole.addToPolicy(new iam.PolicyStatement({
+      actions: ["dynamodb:UpdateItem"],
+      conditions: {
+        Null: {
+          "dynamodb:Attributes": "false",
+          "dynamodb:LeadingKeys": "false",
+        },
+        "ForAllValues:StringEquals": { "dynamodb:Attributes": uploadLifecycleAttributes },
+        "ForAllValues:StringLike": { "dynamodb:LeadingKeys": "TENANT#ten_*" },
+        StringEqualsIfExists: { "dynamodb:ReturnValues": "NONE" },
+      },
+      resources: [this.controlTable.tableArn],
+    }));
+    this.jobWorkerRole.addToPolicy(new iam.PolicyStatement({
+      actions: ["dynamodb:PutItem", "dynamodb:UpdateItem"],
+      conditions: {
+        Null: {
+          "dynamodb:Attributes": "false",
+          "dynamodb:LeadingKeys": "false",
+        },
+        "ForAllValues:StringEquals": { "dynamodb:Attributes": uploadLifecycleAttributes },
+        "ForAllValues:StringLike": {
+          "dynamodb:LeadingKeys": ["TENANT#ten_*", "MAINTENANCE#ACTION_REQUIRED#ten_*"],
+        },
+        StringEquals: { "dynamodb:EnclosingOperation": "TransactWriteItems" },
+        StringEqualsIfExists: { "dynamodb:ReturnValues": "NONE" },
+      },
+      resources: [this.controlTable.tableArn],
+    }));
+    this.jobWorkerRole.addToPolicy(new iam.PolicyStatement({
+      actions: ["cloudwatch:PutMetricData"],
+      conditions: { StringEquals: { "cloudwatch:namespace": "Scopeproof/SharedJobs" } },
+      resources: ["*"],
+    }));
+    const jobWorkerLogGroup = new logs.LogGroup(this, "JobWorkerLogs", {
+      encryptionKey: operationsKey,
+      removalPolicy: RemovalPolicy.RETAIN,
+      retention: logs.RetentionDays.ONE_YEAR,
+    });
+    this.jobWorkerRole.addToPolicy(new iam.PolicyStatement({
+      actions: ["logs:CreateLogStream", "logs:PutLogEvents"],
+      resources: [`${jobWorkerLogGroup.logGroupArn}:*`],
+    }));
+    const jobWorker = new lambdaNodejs.NodejsFunction(this, "SharedJobWorker", {
+      architecture: lambda.Architecture.ARM_64,
+      bundling: {
+        externalModules: [],
+        format: lambdaNodejs.OutputFormat.ESM,
+        minify: true,
+        sourceMap: false,
+        target: "node22",
+      },
+      depsLockFilePath: path.join(__dirname, "..", "pnpm-lock.yaml"),
+      description: "Leased, bounded reconciliation for expired and orphaned hosted upload lifecycle records",
+      entry: path.join(__dirname, "..", "runtime", "shared-jobs", "index.mjs"),
+      environment: {
+        CONTROL_TABLE_NAME: this.controlTable.tableName,
+        JOBS_QUEUE_ARN: this.jobsQueue.queueArn,
+        MAINTENANCE_INDEX_NAME: "UploadLifecycleByTenantV2",
+        MAXIMUM_EVALUATED_ITEMS: "250",
+        MAXIMUM_TENANTS_PER_SWEEP: "25",
+        ORPHAN_GRACE_SECONDS: "900",
+        SWEEP_LEASE_SECONDS: "300",
+      },
+      handler: "handler",
+      logGroup: jobWorkerLogGroup,
+      memorySize: 256,
+      projectRoot: path.join(__dirname, ".."),
+      reservedConcurrentExecutions: 1,
+      role: this.jobWorkerRole,
+      runtime: lambda.Runtime.NODEJS_22_X,
+      timeout: Duration.minutes(5),
+    });
+    // This explicit dependency is required for the in-place upgrade path from
+    // the deployed legacy GSI1 index. CloudFormation must finish creating and
+    // backfilling UploadLifecycleByTenantV2 before it updates the worker to
+    // query that index; otherwise scheduled invocations can race the GSI update.
+    jobWorker.node.addDependency(this.controlTable);
+    jobWorker.addEventSource(new lambdaEventSources.SqsEventSource(this.jobsQueue, {
+      batchSize: 1,
+      // Disabling only EventBridge is insufficient: retained queue messages
+      // could otherwise invoke the V2 worker before the manual backfill ends.
+      enabled: maintenanceLifecycleMode === "enabled",
+      reportBatchItemFailures: true,
+    }));
+
+    // This operator-invoked function is deliberately not attached to an event
+    // source. Existing lifecycle rows must be migrated tenant by tenant and
+    // verified before the scheduled V2 reconciler is enabled in a separate,
+    // reviewed deployment.
+    const lifecycleBackfillRole = new iam.Role(this, "UploadLifecycleBackfillRole", {
+      assumedBy: new iam.ServicePrincipal("lambda.amazonaws.com"),
+      description: "Manual, bounded tenant lifecycle-index backfill with no data-plane or tenant-role access.",
+    });
+    const lifecycleBackfillAttributes = [
+      "PK", "SK", "GSI1PK", "GSI1SK", "consumedAt", "evidenceProjectionDigest", "expiresAt", "id",
+      "idempotencyDigest", "intentId", "kind", "promotionLeaseExpiresAt", "promotionLeaseId",
+      "reconciliationActionKey", "reconciliationDetectedAt", "reconciliationDisposition",
+      "reconciliationReason", "requestFingerprint", "revision", "schemaVersion", "status", "tenantId",
+      "ttlEpochSeconds", "validation",
+    ];
+    lifecycleBackfillRole.addToPolicy(new iam.PolicyStatement({
+      actions: ["dynamodb:Query", "dynamodb:GetItem"],
+      conditions: {
+        Null: {
+          "dynamodb:Attributes": "false",
+          "dynamodb:LeadingKeys": "false",
+        },
+        "ForAllValues:StringEquals": { "dynamodb:Attributes": lifecycleBackfillAttributes },
+        "ForAllValues:StringLike": { "dynamodb:LeadingKeys": "TENANT#ten_*" },
+      },
+      resources: [this.controlTable.tableArn],
+    }));
+    lifecycleBackfillRole.addToPolicy(new iam.PolicyStatement({
+      actions: ["dynamodb:UpdateItem"],
+      conditions: {
+        Null: {
+          "dynamodb:Attributes": "false",
+          "dynamodb:LeadingKeys": "false",
+        },
+        "ForAllValues:StringEquals": { "dynamodb:Attributes": lifecycleBackfillAttributes },
+        "ForAllValues:StringLike": { "dynamodb:LeadingKeys": "TENANT#ten_*" },
+        StringEquals: { "dynamodb:EnclosingOperation": "TransactWriteItems" },
+        StringEqualsIfExists: { "dynamodb:ReturnValues": "NONE" },
+      },
+      resources: [this.controlTable.tableArn],
+    }));
+    const lifecycleBackfillLogGroup = new logs.LogGroup(this, "UploadLifecycleBackfillLogs", {
+      encryptionKey: operationsKey,
+      removalPolicy: RemovalPolicy.RETAIN,
+      retention: logs.RetentionDays.ONE_YEAR,
+    });
+    lifecycleBackfillRole.addToPolicy(new iam.PolicyStatement({
+      actions: ["logs:CreateLogStream", "logs:PutLogEvents"],
+      resources: [`${lifecycleBackfillLogGroup.logGroupArn}:*`],
+    }));
+    const lifecycleBackfill = new lambdaNodejs.NodejsFunction(this, "UploadLifecycleBackfill", {
+      architecture: lambda.Architecture.ARM_64,
+      bundling: {
+        externalModules: [],
+        format: lambdaNodejs.OutputFormat.ESM,
+        minify: true,
+        sourceMap: false,
+        target: "node22",
+      },
+      depsLockFilePath: path.join(__dirname, "..", "pnpm-lock.yaml"),
+      description: "Operator-invoked exact-CAS backfill for legacy hosted upload lifecycle authority",
+      entry: path.join(__dirname, "..", "runtime", "shared-jobs", "upload-lifecycle-backfill.mjs"),
+      environment: {
+        CONTROL_TABLE_NAME: this.controlTable.tableName,
+        MAXIMUM_BACKFILL_ITEMS: "100",
+      },
+      handler: "handler",
+      logGroup: lifecycleBackfillLogGroup,
+      memorySize: 256,
+      projectRoot: path.join(__dirname, ".."),
+      reservedConcurrentExecutions: 1,
+      role: lifecycleBackfillRole,
+      runtime: lambda.Runtime.NODEJS_22_X,
+      timeout: Duration.minutes(5),
+    });
+    lifecycleBackfill.node.addDependency(this.controlTable);
+    for (const alarm of [
+      new cloudwatch.Alarm(this, "UploadLifecycleBackfillErrorAlarm", {
+        alarmDescription: "A manual hosted lifecycle backfill invocation failed.",
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        evaluationPeriods: 1,
+        metric: lifecycleBackfill.metricErrors({ period: Duration.minutes(5), statistic: "Sum" }),
+        threshold: 1,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+      new cloudwatch.Alarm(this, "UploadLifecycleBackfillThrottleAlarm", {
+        alarmDescription: "A manual hosted lifecycle backfill invocation was throttled.",
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        evaluationPeriods: 1,
+        metric: lifecycleBackfill.metricThrottles({ period: Duration.minutes(5), statistic: "Sum" }),
+        threshold: 1,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+    ]) alarm.addAlarmAction(new cloudwatchActions.SnsAction(this.operationsTopic));
+    new CfnOutput(this, "UploadLifecycleBackfillFunctionArn", {
+      description: "Manual tenant-by-tenant lifecycle backfill; never invoke without the staged migration runbook.",
+      value: lifecycleBackfill.functionArn,
+    });
+
+    const sharedJobMetric = (metricName: string, statistic: string, period = Duration.minutes(5)) => new cloudwatch.Metric({
+      namespace: "Scopeproof/SharedJobs",
+      metricName,
+      dimensionsMap: { JobType: "PendingOrphanReconciliation" },
+      period,
+      statistic,
+    });
+    for (const alarm of [
+      new cloudwatch.Alarm(this, "SharedJobReconciliationFailureAlarm", {
+        alarmDescription: "At least one hosted upload lifecycle record failed bounded shared reconciliation.",
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        evaluationPeriods: 1,
+        metric: sharedJobMetric("Failures", "Maximum"),
+        threshold: 1,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+      new cloudwatch.Alarm(this, "SharedJobActionRequiredAlarm", {
+        alarmDescription: "At least one durable hosted maintenance action remains unresolved.",
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        evaluationPeriods: 1,
+        metric: sharedJobMetric("OutstandingActionRequired", "Maximum", Duration.hours(1)),
+        threshold: 1,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+      new cloudwatch.Alarm(this, "SharedJobOldestActionRequiredAlarm", {
+        alarmDescription: "The oldest unresolved hosted maintenance action is more than thirty minutes old.",
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        evaluationPeriods: 1,
+        metric: sharedJobMetric("OldestActionRequiredAgeSeconds", "Maximum", Duration.hours(1)),
+        threshold: 1_800,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+      new cloudwatch.Alarm(this, "SharedJobPendingAgeAlarm", {
+        alarmDescription: "A pending hosted upload lifecycle observed by shared maintenance is older than thirty minutes.",
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        evaluationPeriods: 1,
+        metric: sharedJobMetric("MaxPendingAgeSeconds", "Maximum"),
+        threshold: 1_800,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+      new cloudwatch.Alarm(this, "SharedJobHeartbeatAlarm", {
+        alarmDescription: "No successful shared maintenance heartbeat was published for two consecutive windows.",
+        comparisonOperator: cloudwatch.ComparisonOperator.LESS_THAN_THRESHOLD,
+        evaluationPeriods: 2,
+        metric: new cloudwatch.Metric({
+          namespace: "Scopeproof/SharedJobs",
+          metricName: "Invocations",
+          dimensionsMap: { JobType: "PendingOrphanReconciliation" },
+          period: Duration.minutes(30),
+          statistic: "Sum",
+        }),
+        threshold: 1,
+        treatMissingData: cloudwatch.TreatMissingData.BREACHING,
+      }),
+      new cloudwatch.Alarm(this, "SharedJobWorkerErrorAlarm", {
+        alarmDescription: "The shared maintenance Lambda returned an error.",
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        evaluationPeriods: 1,
+        metric: jobWorker.metricErrors({ period: Duration.minutes(5), statistic: "Sum" }),
+        threshold: 1,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+      new cloudwatch.Alarm(this, "SharedJobWorkerThrottleAlarm", {
+        alarmDescription: "The shared maintenance Lambda was throttled.",
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        evaluationPeriods: 1,
+        metric: jobWorker.metricThrottles({ period: Duration.minutes(5), statistic: "Sum" }),
+        threshold: 1,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+    ]) alarm.addAlarmAction(new cloudwatchActions.SnsAction(this.operationsTopic));
 
     const amplifyServiceRole = new iam.Role(this, "AmplifyServiceRole", {
       assumedBy: new iam.ServicePrincipal("amplify.amazonaws.com"),
@@ -525,7 +843,6 @@ export class SharedPlatformStack extends Stack {
       environmentVariables: [
         { name: "SCOPEPROOF_ROOT_DOMAIN", value: this.rootDomain },
         { name: "SCOPEPROOF_CONTROL_TABLE", value: this.controlTable.tableName },
-        { name: "SCOPEPROOF_JOBS_QUEUE_URL", value: this.jobsQueue.queueUrl },
       ],
       framework: "Next.js - SSR",
       stage: "PRODUCTION",

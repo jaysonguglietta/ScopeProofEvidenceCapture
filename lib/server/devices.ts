@@ -151,13 +151,39 @@ export async function finalizeCaptureDeviceChain(actor: AuthenticatedUser, devic
 }): Promise<void> {
   const env = getEnv();
   const manifestIdentity = `${device.id}:${input.evidenceId}`;
-  const exactExisting = async (): Promise<boolean> => Boolean(await env.DB.prepare(`SELECT 1 FROM native_evidence_manifests n JOIN capture_devices d ON d.id = n.device_id
-    WHERE n.id = ? AND n.device_id = ? AND n.local_evidence_id = ? AND n.artifact_id = ? AND n.manifest_sha256 = ? AND n.image_sha256 = ?
+  const exactManifestAuthority = `n.id = ? AND n.device_id = ? AND n.local_evidence_id = ? AND n.artifact_id = ? AND n.manifest_sha256 = ? AND n.image_sha256 = ?
       AND COALESCE(n.jira_issue_key, '') = COALESCE(?, '') AND n.chain_sequence = ? AND n.chain_event_hash = ?
-      AND n.provenance_key_id = ? AND d.chain_sequence >= n.chain_sequence AND d.provenance_key_id = n.provenance_key_id`)
-    .bind(manifestIdentity, device.id, input.evidenceId, input.artifactId, input.manifestSha256, input.imageSha256, input.jiraIssueKey,
-      input.sequence, input.eventHash, input.provenanceKeyId).first());
-  if (await exactExisting()) return;
+      AND n.provenance_key_id = ? AND d.chain_sequence >= n.chain_sequence AND d.provenance_key_id = n.provenance_key_id`;
+  const exactManifestBindings = [manifestIdentity, device.id, input.evidenceId, input.artifactId,
+    input.manifestSha256, input.imageSha256, input.jiraIssueKey, input.sequence, input.eventHash,
+    input.provenanceKeyId] as const;
+  const exactExisting = async (): Promise<boolean> => Boolean(await env.DB.prepare(`SELECT 1
+    FROM native_evidence_manifests n JOIN capture_devices d ON d.id = n.device_id
+    WHERE ${exactManifestAuthority}`).bind(...exactManifestBindings).first());
+  const drainFinalizedQueueReplay = async (): Promise<void> => {
+    const queueEntry = await env.DB.prepare("SELECT 1 FROM native_provenance_reconciliation_queue WHERE artifact_id = ?")
+      .bind(input.artifactId).first();
+    if (!queueEntry) return;
+    await executeAuditedBatch(actor, "native_provenance.queue_entry_drained", "maintenance_state", input.artifactId, {
+      deviceId: device.id,
+      evidenceId: input.evidenceId,
+      reason: "FINALIZED_REPLAY",
+    }, [
+      env.DB.prepare(`DELETE FROM native_provenance_reconciliation_queue WHERE artifact_id = ?
+        AND EXISTS (SELECT 1 FROM native_evidence_manifests n
+          JOIN capture_devices d ON d.id = n.device_id WHERE ${exactManifestAuthority})`)
+        .bind(input.artifactId, ...exactManifestBindings),
+    ], {
+      sql: `NOT EXISTS (SELECT 1 FROM native_provenance_reconciliation_queue WHERE artifact_id = ?)
+        AND EXISTS (SELECT 1 FROM native_evidence_manifests n
+          JOIN capture_devices d ON d.id = n.device_id WHERE ${exactManifestAuthority})`,
+      bindings: [input.artifactId, ...exactManifestBindings],
+    });
+  };
+  if (await exactExisting()) {
+    await drainFinalizedQueueReplay();
+    return;
+  }
   try {
     const results = await executeAuditedBatch(actor, "capture_device.uploaded", "evidence", input.artifactId, { deviceId: device.id, evidenceId: input.evidenceId, sequence: input.sequence, imageSha256: input.imageSha256, manifestSha256: input.manifestSha256, provenanceKeyId: input.provenanceKeyId }, [
       env.DB.prepare(`INSERT INTO native_evidence_manifests
@@ -173,13 +199,21 @@ export async function finalizeCaptureDeviceChain(actor: AuthenticatedUser, devic
           AND chain_pending_sequence = ? AND chain_pending_previous_hash = ? AND chain_pending_event_hash = ? AND chain_pending_evidence_id = ?`)
         .bind(input.sequence, input.eventHash, device.id, actor.id, input.provenanceKeyId, input.provenancePublicKey,
           input.sequence - 1, input.previousHash, input.leaseId, input.sequence, input.previousHash, input.eventHash, input.evidenceId),
+      env.DB.prepare("DELETE FROM native_provenance_reconciliation_queue WHERE artifact_id = ?")
+        .bind(input.artifactId),
     ], { sql: `EXISTS (SELECT 1 FROM native_evidence_manifests WHERE id = ? AND artifact_id = ? AND manifest_sha256 = ? AND image_sha256 = ?
         AND chain_sequence = ? AND chain_event_hash = ? AND provenance_key_id = ?)
-      AND EXISTS (SELECT 1 FROM capture_devices WHERE id = ? AND chain_sequence = ? AND chain_event_hash = ? AND chain_pending_lease_id IS NULL)`, bindings: [manifestIdentity, input.artifactId, input.manifestSha256, input.imageSha256,
-        input.sequence, input.eventHash, input.provenanceKeyId, device.id, input.sequence, input.eventHash] });
-    if (results.some((result) => !result.meta.changes)) throw new Error("Capture-chain finalization did not commit every required record.");
+      AND EXISTS (SELECT 1 FROM capture_devices WHERE id = ? AND chain_sequence = ? AND chain_event_hash = ? AND chain_pending_lease_id IS NULL)
+      AND NOT EXISTS (SELECT 1 FROM native_provenance_reconciliation_queue WHERE artifact_id = ?)`, bindings: [manifestIdentity, input.artifactId, input.manifestSha256, input.imageSha256,
+        input.sequence, input.eventHash, input.provenanceKeyId, device.id, input.sequence, input.eventHash, input.artifactId] });
+    if (results.length !== 3 || results.slice(0, 2).some((result) => !result.meta.changes)) {
+      throw new Error("Capture-chain finalization did not commit every required record.");
+    }
   } catch (error) {
-    if (await exactExisting()) return;
+    if (await exactExisting()) {
+      await drainFinalizedQueueReplay();
+      return;
+    }
     throw error;
   }
 }

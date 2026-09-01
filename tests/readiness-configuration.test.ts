@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { validateBootstrapAdministratorAllowlist, validateTrustedApplicationOrigins } from "../lib/server/identity-config.ts";
+import { validateBootstrapAdministratorAllowlist, validateLegacyTenantBinding, validateTrustedApplicationOrigins } from "../lib/server/identity-config.ts";
 import {
   validateAuditCheckpointConfiguration,
   validateSecurityMonitoringConfiguration,
@@ -39,6 +39,12 @@ test("legacy runtime readiness uses the same exact-origin and bootstrap parsers 
   for (const value of ["", "*@example.com", "not-an-email", `${"a".repeat(250)}@example.com`]) {
     assert.throws(() => validateBootstrapAdministratorAllowlist(value), /bootstrap allowlist/i);
   }
+
+  assert.deepEqual(validateLegacyTenantBinding("customer-a", "pci_2026"), { tenantID: "customer-a", workspaceID: "pci_2026" });
+  for (const [tenant, workspace] of [
+    [undefined, "default"], ["customer", undefined], ["Customer", "default"],
+    ["customer", "../other"], [" customer", "default"], ["-customer", "default"], ["customer", "workspace."],
+  ] as const) assert.throws(() => validateLegacyTenantBinding(tenant, workspace), /tenant and workspace binding/i);
 });
 
 test("screenshot scanner configuration rejects unsafe authorization tokens", () => {

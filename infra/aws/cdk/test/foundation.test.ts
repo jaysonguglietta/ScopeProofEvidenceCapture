@@ -10,6 +10,7 @@ import {
   tenantDatabaseIdentifiers,
   tenantEvidenceControlRoleName,
   validateBranchName,
+  validateMaintenanceLifecycleMode,
   validateRootDomain,
   validateTenant,
   validateTenantDeploymentSecurity,
@@ -59,6 +60,7 @@ function foundation() {
     branchName: "main",
     env,
     hostedZoneId: "Z1111111111111",
+    maintenanceLifecycleMode: "enabled",
     rootDomain: "evidence.example.com",
     tenantSlugs: ["acme"],
   });
@@ -218,6 +220,9 @@ test("configuration validation normalizes DNS and rejects ambiguous tenants", ()
   assert.equal(validateBranchName("Release-2026"), "release-2026");
   assert.throws(() => validateBranchName("feature/unsafe"), /Invalid branchName/);
   assert.throws(() => validateBranchName("bad.branch"), /Invalid branchName/);
+  assert.equal(validateMaintenanceLifecycleMode(undefined), "backfill");
+  assert.equal(validateMaintenanceLifecycleMode(" ENABLED "), "enabled");
+  assert.throws(() => validateMaintenanceLifecycleMode("automatic"), /backfill or enabled/);
 
   const sharedPrefix = "customer-long-shared-prefix";
   const firstIdentifiers = tenantDatabaseIdentifiers(validateTenant({
@@ -610,13 +615,144 @@ test("shared platform reserves exact tenant mappings but publishes no tenant DNS
       }),
     ]),
   });
-  template.hasResourceProperties("AWS::Events::Rule", { State: "DISABLED" });
+  template.hasResourceProperties("AWS::DynamoDB::GlobalTable", {
+    GlobalSecondaryIndexes: Match.arrayWith([
+      Match.objectLike({
+        IndexName: "GSI1",
+        KeySchema: [
+          { AttributeName: "GSI1PK", KeyType: "HASH" },
+          { AttributeName: "GSI1SK", KeyType: "RANGE" },
+        ],
+        Projection: { ProjectionType: "ALL" },
+      }),
+      Match.objectLike({
+        IndexName: "UploadLifecycleByTenantV2",
+        KeySchema: [
+          { AttributeName: "PK", KeyType: "HASH" },
+          { AttributeName: "GSI1SK", KeyType: "RANGE" },
+        ],
+        Projection: Match.objectLike({
+          NonKeyAttributes: Match.arrayWith(["sourceRevision"]),
+          ProjectionType: "INCLUDE",
+        }),
+      }),
+    ]),
+  });
+  template.hasResourceProperties("AWS::Events::Rule", {
+    ScheduleExpression: "rate(15 minutes)",
+    State: "ENABLED",
+  });
+  template.hasResourceProperties("AWS::Lambda::Function", {
+    Architectures: ["arm64"],
+    Environment: {
+      Variables: Match.objectLike({
+        MAXIMUM_EVALUATED_ITEMS: "250",
+        MAXIMUM_TENANTS_PER_SWEEP: "25",
+        MAINTENANCE_INDEX_NAME: "UploadLifecycleByTenantV2",
+        ORPHAN_GRACE_SECONDS: "900",
+        SWEEP_LEASE_SECONDS: "300",
+      }),
+    },
+    MemorySize: 256,
+    ReservedConcurrentExecutions: 1,
+    Runtime: "nodejs22.x",
+    Timeout: 300,
+  });
+  const controlTableEntry = Object.entries(synthesized.Resources).find(([, resource]) =>
+    resource.Type === "AWS::DynamoDB::GlobalTable" &&
+    JSON.stringify(resource).includes("UploadLifecycleByTenantV2")
+  );
+  const sharedJobFunctionEntry = Object.entries(synthesized.Resources).find(([, resource]) =>
+    resource.Type === "AWS::Lambda::Function" &&
+    JSON.stringify(resource).includes("MAINTENANCE_INDEX_NAME") &&
+    JSON.stringify(resource).includes("UploadLifecycleByTenantV2")
+  );
+  assert.ok(controlTableEntry);
+  assert.ok(sharedJobFunctionEntry);
+  const sharedJobDependencies = (sharedJobFunctionEntry[1] as { DependsOn?: string | string[] }).DependsOn;
+  assert.equal(
+    Array.isArray(sharedJobDependencies)
+      ? sharedJobDependencies.includes(controlTableEntry[0])
+      : sharedJobDependencies === controlTableEntry[0],
+    true,
+    "shared job worker must update only after the lifecycle V2 GSI is ACTIVE",
+  );
+  template.hasResourceProperties("AWS::Lambda::EventSourceMapping", {
+    BatchSize: 1,
+    Enabled: true,
+    FunctionResponseTypes: ["ReportBatchItemFailures"],
+  });
+  template.hasResourceProperties("AWS::Lambda::Function", {
+    Environment: {
+      Variables: Match.objectLike({
+        CONTROL_TABLE_NAME: Match.anyValue(),
+        MAXIMUM_BACKFILL_ITEMS: "100",
+      }),
+    },
+    MemorySize: 256,
+    ReservedConcurrentExecutions: 1,
+    Runtime: "nodejs22.x",
+    Timeout: 300,
+  });
+  const backfillFunctionEntry = Object.entries(synthesized.Resources).find(([, resource]) =>
+    resource.Type === "AWS::Lambda::Function" &&
+    JSON.stringify(resource).includes("MAXIMUM_BACKFILL_ITEMS")
+  );
+  assert.ok(backfillFunctionEntry);
+  const backfillDependencies = (backfillFunctionEntry[1] as { DependsOn?: string | string[] }).DependsOn;
+  assert.equal(
+    Array.isArray(backfillDependencies)
+      ? backfillDependencies.includes(controlTableEntry[0])
+      : backfillDependencies === controlTableEntry[0],
+    true,
+    "manual backfill must not run before the V2 lifecycle index table update completes",
+  );
+  assert.equal(
+    Object.values(synthesized.Resources).filter((resource) => resource.Type === "AWS::Lambda::EventSourceMapping").length,
+    1,
+    "the manual lifecycle backfill must not have an automatic event source",
+  );
+  const backfillPolicies = Object.values(synthesized.Resources).filter((resource) =>
+    resource.Type === "AWS::IAM::Policy" && JSON.stringify(resource).includes("UploadLifecycleBackfillRole"));
+  assert.ok(backfillPolicies.length > 0);
+  const backfillPolicyJson = JSON.stringify(backfillPolicies);
+  assert.match(backfillPolicyJson, /dynamodb:Query/);
+  assert.match(backfillPolicyJson, /dynamodb:GetItem/);
+  assert.match(backfillPolicyJson, /dynamodb:UpdateItem/);
+  assert.match(backfillPolicyJson, /dynamodb:EnclosingOperation/);
+  assert.match(backfillPolicyJson, /dynamodb:Attributes/);
+  assert.match(backfillPolicyJson, /evidenceProjectionDigest/);
+  assert.match(backfillPolicyJson, /reconciliationDisposition/);
+  assert.match(backfillPolicyJson, /TENANT#ten_\*/);
+  assert.doesNotMatch(backfillPolicyJson, /dynamodb:Scan|dynamodb:PutItem|sts:AssumeRole|s3:|kms:|rds-data:|secretsmanager:/);
+  assert.match(JSON.stringify(synthesized), /UploadLifecycleBackfillFunctionArn/);
+  assert.match(JSON.stringify(synthesized), /UploadLifecycleBackfillErrorAlarm/);
+  assert.match(JSON.stringify(synthesized), /UploadLifecycleBackfillThrottleAlarm/);
   assert.doesNotMatch(JSON.stringify(synthesized), /role\/scopeproof\/tenants\/sp-\*-(?:data|evidence-control)/);
   const jobWorkerPolicies = Object.values(synthesized.Resources).filter((resource) =>
     resource.Type === "AWS::IAM::Policy" && JSON.stringify(resource).includes("JobWorkerRole"));
   assert.ok(jobWorkerPolicies.length > 0);
-  assert.ok(jobWorkerPolicies.every((resource) => !/sts:AssumeRole/.test(JSON.stringify(resource))));
-  assert.ok(jobWorkerPolicies.every((resource) => !/dynamodb:/.test(JSON.stringify(resource))));
+  const jobWorkerPolicyJson = JSON.stringify(jobWorkerPolicies);
+  assert.match(jobWorkerPolicyJson, /dynamodb:Query/);
+  assert.doesNotMatch(jobWorkerPolicyJson, /dynamodb:Scan/);
+  assert.match(jobWorkerPolicyJson, /dynamodb:GetItem/);
+  assert.match(jobWorkerPolicyJson, /dynamodb:UpdateItem/);
+  assert.match(jobWorkerPolicyJson, /MAINTENANCE#SHARED/);
+  assert.match(jobWorkerPolicyJson, /MAINTENANCE#TENANT_DIRECTORY/);
+  assert.match(jobWorkerPolicyJson, /MAINTENANCE#ACTION_REQUIRED#ten_\*/);
+  assert.match(jobWorkerPolicyJson, /UploadLifecycleByTenantV2/);
+  assert.match(jobWorkerPolicyJson, /TENANT#ten_\*/);
+  assert.match(jobWorkerPolicyJson, /dynamodb:Attributes/);
+  assert.match(jobWorkerPolicyJson, /ttlEpochSeconds/);
+  assert.match(jobWorkerPolicyJson, /cloudwatch:PutMetricData/);
+  assert.doesNotMatch(jobWorkerPolicyJson, /sts:AssumeRole|s3:|kms:|rds-data:|secretsmanager:/);
+  assert.match(JSON.stringify(synthesized), /SharedJobReconciliationFailureAlarm/);
+  assert.match(JSON.stringify(synthesized), /SharedJobActionRequiredAlarm/);
+  assert.match(JSON.stringify(synthesized), /SharedJobOldestActionRequiredAlarm/);
+  assert.match(JSON.stringify(synthesized), /SharedJobHeartbeatAlarm/);
+  assert.match(JSON.stringify(synthesized), /SharedJobPendingAgeAlarm/);
+  assert.match(JSON.stringify(synthesized), /SharedJobWorkerErrorAlarm/);
+  assert.match(JSON.stringify(synthesized), /SharedJobWorkerThrottleAlarm/);
   const amplifyPolicies = JSON.stringify(
     Object.values(synthesized.Resources).filter((resource) =>
       resource.Type === "AWS::IAM::Policy" && JSON.stringify(resource).includes("AmplifyComputeRole")),
@@ -631,6 +767,28 @@ test("shared platform reserves exact tenant mappings but publishes no tenant DNS
     Object.values(synthesized.Resources).some((resource) => resource.Type === "Custom::AWS"),
     false,
   );
+});
+
+test("shared maintenance is fail-closed until lifecycle backfill is explicitly enabled", () => {
+  const app = new App({
+    context: {
+      "@aws-cdk/aws-route53-targets:userPoolDomainNameMethodWithoutCustomResource": true,
+    },
+  });
+  const shared = new SharedPlatformStack(app, "BackfillOnlyShared", {
+    branchName: "main",
+    env,
+    hostedZoneId: "Z1111111111111",
+    rootDomain: "evidence.example.com",
+    tenantSlugs: [],
+  });
+  Template.fromStack(shared).hasResourceProperties("AWS::Events::Rule", {
+    ScheduleExpression: "rate(15 minutes)",
+    State: "DISABLED",
+  });
+  Template.fromStack(shared).hasResourceProperties("AWS::Lambda::EventSourceMapping", {
+    Enabled: false,
+  });
 });
 
 test("multi-value IAM scoping keys cannot match vacuously when request context is absent", () => {
@@ -740,10 +898,49 @@ test("tenant stack is isolated, immutable, and remains provisioning", () => {
     PreventUserExistenceErrors: "ENABLED",
   });
   assert.match(JSON.stringify(synthesized), /PROVISIONING/);
+  assert.match(JSON.stringify(synthesized), /TenantMaintenanceRegistration/);
+  assert.match(JSON.stringify(synthesized), /MAINTENANCE#TENANT_DIRECTORY/);
   assert.doesNotMatch(JSON.stringify(synthesized), /#status = if_not_exists\(#status, :provisioning\)/);
   assert.match(JSON.stringify(synthesized), /attribute_not_exists\(provisionExecutionId\)/);
   assert.match(JSON.stringify(synthesized), /DOMAIN#acme\.evidence\.example\.com/);
   assert.doesNotMatch(JSON.stringify(synthesized), /AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}/);
+
+  const registerTenantResource = Object.entries(synthesized.Resources).find(([logicalId, resource]) =>
+    logicalId.startsWith("RegisterTenant") && resource.Type === "Custom::AWS");
+  assert.ok(registerTenantResource, "expected the tenant registration custom resource");
+  const registerTenantProperties = registerTenantResource[1].Properties as Record<string, unknown>;
+  for (const phase of ["Create", "Update"]) {
+    const transactionJson = JSON.stringify(registerTenantProperties[phase]);
+    assert.match(transactionJson, /MAINTENANCE#TENANT_DIRECTORY/);
+    assert.match(transactionJson, /TENANT#ten_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/);
+    assert.match(transactionJson, /TenantMaintenanceRegistration/);
+  }
+
+  const registerTenantPolicy = Object.entries(synthesized.Resources).find(([logicalId, resource]) =>
+    logicalId.startsWith("RegisterTenantCustomResourcePolicy") && resource.Type === "AWS::IAM::Policy");
+  assert.ok(registerTenantPolicy, "expected the tenant registration custom-resource policy");
+  const registerPolicyDocument = (registerTenantPolicy[1].Properties as {
+    PolicyDocument: { Statement: Array<Record<string, unknown>> };
+  }).PolicyDocument;
+  assert.equal(registerPolicyDocument.Statement.length, 1);
+  const registerStatement = registerPolicyDocument.Statement[0];
+  assert.equal(registerStatement.Action, "dynamodb:UpdateItem");
+  assert.equal(registerStatement.Effect, "Allow");
+  assert.notEqual(registerStatement.Resource, "*");
+  assert.deepEqual(registerStatement.Condition, {
+    Null: { "dynamodb:LeadingKeys": "false" },
+    "ForAllValues:StringEquals": {
+      "dynamodb:LeadingKeys": [
+        "TENANT#ten_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "MAINTENANCE#TENANT_DIRECTORY",
+        "DOMAIN#acme.evidence.example.com",
+        "DOMAIN#api-acme.evidence.example.com",
+      ],
+    },
+    StringEquals: { "dynamodb:EnclosingOperation": "TransactWriteItems" },
+    StringEqualsIfExists: { "dynamodb:ReturnValues": "NONE" },
+  });
+  assert.doesNotMatch(JSON.stringify(registerStatement), /MAINTENANCE#ACTION_REQUIRED|MAINTENANCE#\*/);
 
   const evidenceBucketPolicies = JSON.stringify(
     Object.values(synthesized.Resources).filter((resource) => resource.Type === "AWS::S3::BucketPolicy"),
@@ -774,6 +971,13 @@ test("tenant stack is isolated, immutable, and remains provisioning", () => {
   assert.match(policyJson, /s3:x-amz-server-side-encryption-aws-kms-key-id/);
   assert.doesNotMatch(policyJson, /s3:x-amz-server-side-encryption-context/);
   assert.match(policyJson, /tenants\/ten_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\/controls\/\*\/quarantine/);
+  assert.doesNotMatch(policyJson, /MAINTENANCE#TENANT_DIRECTORY|MAINTENANCE#ACTION_REQUIRED/);
+  const maintenanceResolverPolicies = Object.values(synthesized.Resources).filter((resource) =>
+    resource.Type === "AWS::IAM::Policy" &&
+    /EvidencePromoterServiceRole|RejectedEvidenceReconcilerServiceRole/.test(JSON.stringify(resource)));
+  assert.equal(maintenanceResolverPolicies.length, 2);
+  assert.ok(maintenanceResolverPolicies.every((resource) =>
+    JSON.stringify(resource).includes("MAINTENANCE#ACTION_REQUIRED#ten_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")));
   const evidenceControlPolicy = Object.values(synthesized.Resources).find((resource) => {
     if (resource.Type !== "AWS::IAM::Policy") return false;
     const roles = (resource.Properties as Record<string, unknown>).Roles;
@@ -813,7 +1017,10 @@ test("tenant stack is isolated, immutable, and remains provisioning", () => {
   assert.ok(legalWorkerExecutionPolicy);
   const legalWorkerExecutionJson = JSON.stringify(legalWorkerExecutionPolicy);
   assert.match(legalWorkerExecutionJson, /dynamodb:GetItem/);
-  assert.match(legalWorkerExecutionJson, /dynamodb:TransactWriteItems/);
+  assert.match(legalWorkerExecutionJson, /dynamodb:PutItem/);
+  assert.match(legalWorkerExecutionJson, /dynamodb:EnclosingOperation/);
+  assert.match(legalWorkerExecutionJson, /TransactWriteItems/);
+  assert.match(legalWorkerExecutionJson, /dynamodb:ReturnValues/);
   assert.match(legalWorkerExecutionJson, /RECOVERY#TENANT#ten_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/);
   assert.doesNotMatch(legalWorkerExecutionJson, /s3:PutObjectLegalHold|kms:Sign|rds-data:ExecuteStatement/);
   assert.match(JSON.stringify(synthesized), /legal-hold-requests/);
@@ -826,7 +1033,9 @@ test("tenant stack is isolated, immutable, and remains provisioning", () => {
   assert.match(JSON.stringify(synthesized), /LEGAL_HOLD_SWEEP_LIMIT/);
   assert.match(JSON.stringify(synthesized), /CONTROL_TABLE_NAME/);
   assert.match(JSON.stringify(synthesized), /RECOVERY#TENANT#ten_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/);
-  assert.match(JSON.stringify(synthesized), /dynamodb:TransactWriteItems/);
+  assert.doesNotMatch(JSON.stringify(synthesized), /dynamodb:TransactWriteItems/);
+  assert.match(JSON.stringify(synthesized), /dynamodb:EnclosingOperation/);
+  assert.match(JSON.stringify(synthesized), /dynamodb:ReturnValues/);
   const allTenantPolicies = JSON.stringify(
     Object.values(synthesized.Resources).filter((resource) => resource.Type === "AWS::IAM::Policy"),
   );
@@ -1103,7 +1312,9 @@ test("runtime assets enforce exact provisioning and single-writer promotion cont
   assert.match(promoter, /receivedAt: \{ S: input\.uploadedAt \}/);
   assert.match(promoter, /\^usr_\[a-f0-9\]\{32\}\$/);
   assert.match(promoter, /\^evd_\[a-f0-9\]\{32\}\$/);
-  assert.match(promoter, /promotionFence = :currentFence AND promotionAttemptId = :currentAttemptId[\s\S]*promotionLeaseExpiresAt <= :now/);
+  assert.match(promoter, /"promotionFence = :currentFence"/);
+  assert.match(promoter, /"promotionAttemptId = :currentAttemptId"/);
+  assert.match(promoter, /"promotionLeaseExpiresAt <= :now"/);
   assert.doesNotMatch(promoter, /promotionLeaseId = :eventId OR promotionLeaseExpiresAt/);
   assert.match(promoter, /verifyCompletedPromotion/);
   assert.match(promoter, /VerifyCommand/);

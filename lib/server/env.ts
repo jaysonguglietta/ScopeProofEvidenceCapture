@@ -21,6 +21,8 @@ export interface ScopeproofEnv {
   BOOTSTRAP_ADMIN_EMAILS?: string;
   TRUSTED_APP_ORIGINS?: string;
   LEGACY_SINGLE_TENANT_ACKNOWLEDGEMENT?: string;
+  LEGACY_TENANT_ID?: string;
+  LEGACY_WORKSPACE_ID?: string;
   AWS_ACCESS_KEY_ID?: string;
   AWS_SECRET_ACCESS_KEY?: string;
   AWS_SESSION_TOKEN?: string;

@@ -2,7 +2,8 @@
 set -eu
 
 database="$(mktemp "${TMPDIR:-/tmp}/scopeproof-migrations.XXXXXX")"
-trap 'rm -f "$database"' EXIT HUP INT TERM
+fresh_database="$(mktemp "${TMPDIR:-/tmp}/scopeproof-migrations-fresh.XXXXXX")"
+trap 'rm -f "$database" "$fresh_database"' EXIT HUP INT TERM
 
 for migration in \
   drizzle/0000_curvy_risque.sql \
@@ -58,14 +59,15 @@ for migration in \
   drizzle/0024_big_chamber.sql \
   drizzle/0025_pink_malice.sql \
   drizzle/0026_omniscient_scarlet_witch.sql \
-  drizzle/0027_lonely_guardian.sql
+  drizzle/0027_lonely_guardian.sql \
+  drizzle/0028_native_reconciliation_cursor.sql
 do
   test -f "$migration"
   sqlite3 "$database" ".read $migration"
 done
 
 test "$(sqlite3 "$database" 'PRAGMA integrity_check;')" = "ok"
-test "$(sqlite3 "$database" "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('assessments','audit_batch_guards','audit_checkpoint_delivery_attempts','audit_checkpoint_delivery_retry_state','audit_checkpoints','control_catalogs','evidence_artifacts','evidence_occurrences','evidence_review_events','findings','finding_events','key_rotation_attempts','retention_hold_release_requests','sbom_jobs');")" = "14"
+test "$(sqlite3 "$database" "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('assessments','audit_batch_guards','audit_checkpoint_delivery_attempts','audit_checkpoint_delivery_retry_state','audit_checkpoints','control_catalogs','evidence_artifacts','evidence_occurrences','evidence_review_events','findings','finding_events','key_rotation_attempts','native_provenance_reconciliation_queue','native_provenance_reconciliation_state','retention_hold_release_requests','sbom_jobs');")" = "16"
 test "$(sqlite3 "$database" "SELECT COUNT(*) FROM capture_devices WHERE id = 'dev_upgrade' AND token_issued_at IS NOT NULL AND token_expires_at > token_issued_at;")" = "1"
 test "$(sqlite3 "$database" "SELECT COUNT(*) FROM capture_devices WHERE id = 'dev_upgrade' AND chain_sequence = 0 AND chain_event_hash = 'GENESIS' AND provenance_key_id IS NULL;")" = "1"
 test "$(sqlite3 "$database" "SELECT COUNT(*) FROM evidence_artifacts WHERE id IN ('ev_upgrade_a','ev_upgrade_b') AND status = 'needs_review';")" = "2"
@@ -83,6 +85,28 @@ test "$(sqlite3 "$database" "SELECT COUNT(*) FROM pragma_table_info('assessments
 test "$(sqlite3 "$database" "SELECT COUNT(*) FROM pragma_table_info('key_rotation_attempts') WHERE name IN ('resource_type','resource_id','attempt_count','status','next_attempt_at','last_error_code','first_failed_at','last_attempt_at','last_attempt_id','resolved_at');")" = "10"
 test "$(sqlite3 "$database" "SELECT COUNT(*) FROM pragma_table_info('audit_checkpoint_delivery_retry_state') WHERE name IN ('checkpoint_id','checkpoint_sha256','status','attempt_count','next_attempt_at','lease_id','lease_expires_at','endpoint_origin','last_attempt_id','last_attempt_at','last_failure_code','delivered_attempt_id','created_at','updated_at');")" = "14"
 test "$(sqlite3 "$database" "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name IN ('audit_checkpoint_delivery_retry_state_checkpoint_binding','audit_checkpoint_delivery_retry_state_identity_immutable','audit_checkpoint_delivery_retry_state_delivered_terminal','audit_checkpoint_delivery_retry_state_no_delete','audit_checkpoint_delivery_attempts_require_active_claim','audit_checkpoint_delivery_attempts_complete_claim');")" = "6"
+test "$(sqlite3 "$database" "SELECT COUNT(*) FROM native_provenance_reconciliation_state WHERE id = 'native_provenance' AND revision = 0 AND pending_cursor_expires_epoch IS NULL AND pending_cursor_device_id IS NULL AND orphan_cursor_due_epoch IS NULL AND orphan_cursor_artifact_id IS NULL;")" = "1"
+test "$(sqlite3 "$database" "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name IN ('idx_capture_devices_pending_reconciliation_cursor','idx_native_reconciliation_queue_due');")" = "2"
+test "$(sqlite3 "$database" "SELECT COUNT(*) FROM native_provenance_reconciliation_queue;")" = "0"
+test "$(sqlite3 "$database" "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name IN ('native_provenance_reconciliation_state_identity_immutable','native_provenance_reconciliation_state_revision_cas','native_provenance_reconciliation_state_no_delete');")" = "3"
+if sqlite3 "$database" "UPDATE native_provenance_reconciliation_state SET revision = 2 WHERE id = 'native_provenance';" 2>/dev/null; then
+  echo "Native reconciliation cursor skipped its revision CAS." >&2
+  exit 1
+fi
+if sqlite3 "$database" "UPDATE native_provenance_reconciliation_state SET revision = 1, pending_cursor_expires_epoch = 1 WHERE id = 'native_provenance';" 2>/dev/null; then
+  echo "Native reconciliation cursor accepted a partial keyset." >&2
+  exit 1
+fi
+sqlite3 "$database" "UPDATE native_provenance_reconciliation_state SET revision = 1, pending_cursor_expires_epoch = 1, pending_cursor_device_id = 'poison-safe' WHERE id = 'native_provenance';"
+test "$(sqlite3 "$database" "SELECT COUNT(*) FROM native_provenance_reconciliation_state WHERE id = 'native_provenance' AND revision = 1 AND pending_cursor_expires_epoch = 1 AND pending_cursor_device_id = 'poison-safe';")" = "1"
+if sqlite3 "$database" "INSERT INTO native_provenance_reconciliation_queue (artifact_id, due_at) VALUES ('invalid-due', 'not-a-timestamp');" 2>/dev/null; then
+  echo "Native reconciliation queue accepted an invalid due time." >&2
+  exit 1
+fi
+if sqlite3 "$database" "DELETE FROM native_provenance_reconciliation_state WHERE id = 'native_provenance';" 2>/dev/null; then
+  echo "Native reconciliation cursor state was deletable." >&2
+  exit 1
+fi
 
 sqlite3 "$database" <<'SQL'
 INSERT INTO audit_checkpoints
@@ -169,4 +193,45 @@ if sqlite3 "$database" "INSERT INTO key_rotation_attempts (resource_type, resour
   echo "An unknown key-rotation error code bypassed its allowlist." >&2
   exit 1
 fi
-echo "Populated migration replay and integrity check passed."
+
+# A second empty-database replay catches migrations that accidentally depend on
+# upgrade fixtures or on rows created by an earlier application version. Keep
+# this explicit order identical to the populated path above.
+for migration in \
+  drizzle/0000_curvy_risque.sql \
+  drizzle/0001_sloppy_stark_industries.sql \
+  drizzle/0003_fine_wonder_man.sql \
+  drizzle/0003_cooing_rhino.sql \
+  drizzle/0004_cheerful_tombstone.sql \
+  drizzle/0005_nappy_alice.sql \
+  drizzle/0006_first_madelyne_pryor.sql \
+  drizzle/0007_greedy_nextwave.sql \
+  drizzle/0008_real_nebula.sql \
+  drizzle/0009_chubby_martin_li.sql \
+  drizzle/0010_tearful_goblin_queen.sql \
+  drizzle/0011_easy_vision.sql \
+  drizzle/0012_opposite_rachel_grey.sql \
+  drizzle/0013_light_toad_men.sql \
+  drizzle/0014_loving_plazm.sql \
+  drizzle/0015_flat_magus.sql \
+  drizzle/0016_loose_owl.sql \
+  drizzle/0017_demonic_firedrake.sql \
+  drizzle/0018_stale_freak.sql \
+  drizzle/0019_audited_cas_guard.sql \
+  drizzle/0020_native_device_chain.sql \
+  drizzle/0021_immutable_checkpoint_receipts.sql \
+  drizzle/0022_native_provenance_quarantine.sql \
+  drizzle/0023_independent_image_safety.sql \
+  drizzle/0024_big_chamber.sql \
+  drizzle/0025_pink_malice.sql \
+  drizzle/0026_omniscient_scarlet_witch.sql \
+  drizzle/0027_lonely_guardian.sql \
+  drizzle/0028_native_reconciliation_cursor.sql
+do
+  sqlite3 "$fresh_database" ".read $migration"
+done
+test "$(sqlite3 "$fresh_database" 'PRAGMA integrity_check;')" = "ok"
+test "$(sqlite3 "$fresh_database" "SELECT COUNT(*) FROM native_provenance_reconciliation_state WHERE id = 'native_provenance' AND revision = 0;")" = "1"
+test "$(sqlite3 "$fresh_database" "SELECT COUNT(*) FROM native_provenance_reconciliation_queue;")" = "0"
+
+echo "Fresh and populated migration replays and integrity checks passed."

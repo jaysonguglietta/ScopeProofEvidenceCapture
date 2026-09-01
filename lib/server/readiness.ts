@@ -1,5 +1,5 @@
 import { verifyAuditChain } from "./audit";
-import { validateBootstrapAdministratorAllowlist, validateTrustedApplicationOrigins } from "./identity-config";
+import { validateBootstrapAdministratorAllowlist, validateLegacyTenantBinding, validateTrustedApplicationOrigins } from "./identity-config";
 import { getLatestAuditCheckpoint, validateAuditCheckpointConfiguration, verifyLatestAuditCheckpoint } from "./checkpoints";
 import { validateConfiguredKeyMaterial, validatePackageSigningKeyPair } from "./crypto";
 import { getEnv } from "./env";
@@ -27,6 +27,13 @@ export async function productionReadiness(): Promise<{ ready: boolean; checkedAt
     checks.push({ id: "trusted_origins", status: "pass", summary: "Exactly one structurally safe application origin is configured.", details: { origins: [...origins] } });
   } catch (error) {
     checks.push({ id: "trusted_origins", status: "fail", summary: "The trusted application origin is missing or unsafe.", details: error instanceof Error ? error.message : String(error) });
+  }
+
+  try {
+    const binding = validateLegacyTenantBinding(env.LEGACY_TENANT_ID, env.LEGACY_WORKSPACE_ID);
+    checks.push({ id: "legacy_tenant_binding", status: "pass", summary: "The legacy native-ingest customer/workspace boundary is explicitly configured.", details: binding });
+  } catch (error) {
+    checks.push({ id: "legacy_tenant_binding", status: "fail", summary: "The legacy native-ingest customer/workspace boundary is missing or unsafe.", details: error instanceof Error ? error.message : String(error) });
   }
 
   try {

@@ -79,6 +79,78 @@ struct SensitiveDataScannerTests {
         #expect(!ReleaseVerifier.approvedBundleMetadata(identifier: "com.scopeproof.capture", version: "98.0.0", manifest: manifest))
     }
 
+    @Test("Re-verifies signed update expiry and the current rollback floor before commit")
+    func reverifiesSignedUpdateAtCommitTime() throws {
+        let privateKey = P256.Signing.PrivateKey()
+        let formatter = ISO8601DateFormatter()
+        let now = Date()
+        let origin = URL(string: "https://downloads.scopeproof.example")!
+        let manifest = ReleaseManifest(
+            schemaVersion: 1,
+            version: "99.1.0",
+            sequence: 42,
+            downloadUrl: URL(string: "https://downloads.scopeproof.example/macos/99.1.0/Scopeproof-Capture-99.1.0.zip")!,
+            sha256: String(repeating: "a", count: 64),
+            byteSize: 1_024,
+            publishedAt: formatter.string(from: now.addingTimeInterval(-60)),
+            expiresAt: formatter.string(from: now.addingTimeInterval(120)),
+            minimumSystemVersion: "14.0",
+            teamIdentifier: "ABCDE12345",
+            designatedRequirement: "identifier \"com.scopeproof.capture\" and anchor apple generic",
+            keyId: "release-2026",
+            notes: "Security update"
+        )
+        let envelope = ReleaseEnvelope(
+            manifest: manifest,
+            signatureDERBase64: try privateKey.signature(for: manifest.signingPayload).derRepresentation.base64EncodedString()
+        )
+        let trusted = TrustedUpdateKey(
+            keyId: manifest.keyId,
+            publicKeyX963Base64: privateKey.publicKey.x963Representation.base64EncodedString(),
+            notBefore: now.addingTimeInterval(-3_600),
+            notAfter: now.addingTimeInterval(3_600)
+        )
+        let candidate = try ReleaseVerifier.verifiedCandidate(
+            envelope,
+            keys: [trusted],
+            expectedTeamIdentifier: manifest.teamIdentifier,
+            expectedDesignatedRequirement: manifest.designatedRequirement,
+            expectedDownloadOrigin: origin,
+            installedVersion: "1.10.0",
+            previousRelease: nil,
+            now: now
+        )
+
+        #expect(throws: UpdateFailure.self) {
+            try ReleaseVerifier.reverify(
+                candidate,
+                keys: [trusted],
+                expectedTeamIdentifier: manifest.teamIdentifier,
+                expectedDesignatedRequirement: manifest.designatedRequirement,
+                expectedDownloadOrigin: origin,
+                installedVersion: "1.10.0",
+                previousRelease: nil,
+                now: now.addingTimeInterval(121)
+            )
+        }
+        #expect(throws: UpdateFailure.self) {
+            try ReleaseVerifier.reverify(
+                candidate,
+                keys: [trusted],
+                expectedTeamIdentifier: manifest.teamIdentifier,
+                expectedDesignatedRequirement: manifest.designatedRequirement,
+                expectedDownloadOrigin: origin,
+                installedVersion: "1.10.0",
+                previousRelease: VerifiedUpdateRelease(
+                    sequence: 43,
+                    version: "99.2.0",
+                    sha256: String(repeating: "b", count: 64)
+                ),
+                now: now.addingTimeInterval(30)
+            )
+        }
+    }
+
     @Test("Adds a full-width header above captured pixels")
     @MainActor
     func addsTimestampHeaderWithoutCoveringEvidence() throws {

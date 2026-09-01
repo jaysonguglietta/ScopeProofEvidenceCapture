@@ -5,6 +5,7 @@
     "@aws-cdk/aws-route53-targets:userPoolDomainNameMethodWithoutCustomResource": true,
     "rootDomain": "",
     "branchName": "main",
+    "maintenanceLifecycleMode": "backfill",
     "deploymentEnvironment": "",
     "createHostedZone": false,
     "recovery": {

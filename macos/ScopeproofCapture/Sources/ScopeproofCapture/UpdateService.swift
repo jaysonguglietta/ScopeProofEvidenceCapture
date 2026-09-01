@@ -29,6 +29,12 @@ struct ReleaseEnvelope: Codable, Sendable {
     let signatureDERBase64: String
 }
 
+struct VerifiedUpdateCandidate: Sendable {
+    fileprivate let envelope: ReleaseEnvelope
+
+    var manifest: ReleaseManifest { envelope.manifest }
+}
+
 struct TrustedUpdateKey: Sendable {
     let keyId: String
     let publicKeyX963Base64: String
@@ -131,6 +137,33 @@ enum ReleaseVerifier {
         return manifest
     }
 
+    static func verifiedCandidate(_ envelope: ReleaseEnvelope, keys: [TrustedUpdateKey], expectedTeamIdentifier: String, expectedDesignatedRequirement: String, expectedDownloadOrigin: URL, installedVersion: String, previousRelease: VerifiedUpdateRelease?, now: Date = Date()) throws -> VerifiedUpdateCandidate {
+        _ = try verify(
+            envelope,
+            keys: keys,
+            expectedTeamIdentifier: expectedTeamIdentifier,
+            expectedDesignatedRequirement: expectedDesignatedRequirement,
+            expectedDownloadOrigin: expectedDownloadOrigin,
+            installedVersion: installedVersion,
+            previousRelease: previousRelease,
+            now: now
+        )
+        return VerifiedUpdateCandidate(envelope: envelope)
+    }
+
+    static func reverify(_ candidate: VerifiedUpdateCandidate, keys: [TrustedUpdateKey], expectedTeamIdentifier: String, expectedDesignatedRequirement: String, expectedDownloadOrigin: URL, installedVersion: String, previousRelease: VerifiedUpdateRelease?, now: Date = Date()) throws -> ReleaseManifest {
+        try verify(
+            candidate.envelope,
+            keys: keys,
+            expectedTeamIdentifier: expectedTeamIdentifier,
+            expectedDesignatedRequirement: expectedDesignatedRequirement,
+            expectedDownloadOrigin: expectedDownloadOrigin,
+            installedVersion: installedVersion,
+            previousRelease: previousRelease,
+            now: now
+        )
+    }
+
     static func compareVersions(_ left: String, _ right: String) -> ComparisonResult {
         let a = left.split(separator: ".").prefix(3).map { Int($0.split(separator: "-")[0]) ?? 0 }
         let b = right.split(separator: ".").prefix(3).map { Int($0.split(separator: "-")[0]) ?? 0 }
@@ -141,6 +174,108 @@ enum ReleaseVerifier {
     private static func currentSystemVersion() -> String {
         let value = ProcessInfo.processInfo.operatingSystemVersion
         return "\(value.majorVersion).\(value.minorVersion).\(value.patchVersion)"
+    }
+}
+
+enum VerifiedUpdateArtifactStore {
+    static func stage(downloadedArchive: URL, in directory: URL) throws -> URL {
+        let staged = directory.appendingPathComponent(".scopeproof-update-\(UUID().uuidString).pending")
+        do {
+            try FileManager.default.copyItem(at: downloadedArchive, to: staged)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: staged.path)
+            return staged
+        } catch {
+            try? FileManager.default.removeItem(at: staged)
+            throw error
+        }
+    }
+
+    static func commit(
+        stagedArchive: URL,
+        destination: URL,
+        expectedByteSize: Int,
+        expectedSHA256: String,
+        persistRollbackFloor: () throws -> Void
+    ) throws {
+        guard stagedArchive.deletingLastPathComponent().standardizedFileURL == destination.deletingLastPathComponent().standardizedFileURL else {
+            throw UpdateFailure.invalidArtifact("The verified update was not staged on its destination volume.")
+        }
+        defer { try? FileManager.default.removeItem(at: stagedArchive) }
+        try validateExactArchive(at: stagedArchive, expectedByteSize: expectedByteSize, expectedSHA256: expectedSHA256)
+
+        // The rollback floor is the trust decision. Persist it only after a complete
+        // same-volume candidate exists, and before the candidate becomes visible at
+        // its stable path. POSIX rename then replaces any prior file atomically.
+        try persistRollbackFloor()
+        let renameResult = stagedArchive.path.withCString { source in
+            destination.path.withCString { target in Darwin.rename(source, target) }
+        }
+        guard renameResult == 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+        }
+        do {
+            try validateExactArchive(at: destination, expectedByteSize: expectedByteSize, expectedSHA256: expectedSHA256)
+        } catch {
+            try? FileManager.default.removeItem(at: destination)
+            throw error
+        }
+    }
+
+    static func validateExactArchive(at archive: URL, expectedByteSize: Int, expectedSHA256: String) throws {
+        guard expectedByteSize > 0, expectedByteSize <= 500 * 1_024 * 1_024,
+              expectedSHA256.count == 64,
+              expectedSHA256.unicodeScalars.allSatisfy({ (48...57).contains($0.value) || (97...102).contains($0.value) }) else {
+            throw UpdateFailure.invalidArtifact("The signed update size or digest is invalid.")
+        }
+        let descriptor = Darwin.open(archive.path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        guard descriptor >= 0 else {
+            throw UpdateFailure.invalidArtifact("The staged update archive is unavailable or unsafe.")
+        }
+        defer { Darwin.close(descriptor) }
+
+        var before = stat()
+        guard Darwin.fstat(descriptor, &before) == 0,
+              before.st_mode & S_IFMT == S_IFREG,
+              before.st_nlink == 1,
+              before.st_size == expectedByteSize else {
+            throw UpdateFailure.invalidArtifact("The staged update archive type or byte size changed.")
+        }
+        var hasher = SHA256()
+        var total = 0
+        var buffer = [UInt8](repeating: 0, count: 64 * 1_024)
+        while true {
+            let count = Darwin.read(descriptor, &buffer, buffer.count)
+            if count == 0 { break }
+            if count < 0 {
+                if errno == EINTR { continue }
+                throw UpdateFailure.invalidArtifact("The staged update archive could not be read safely.")
+            }
+            total += count
+            guard total <= expectedByteSize else {
+                throw UpdateFailure.invalidArtifact("The staged update archive byte size changed.")
+            }
+            hasher.update(data: Data(buffer[0..<count]))
+        }
+        var after = stat()
+        var pathState = stat()
+        guard Darwin.fstat(descriptor, &after) == 0,
+              Darwin.lstat(archive.path, &pathState) == 0,
+              before.st_dev == after.st_dev, before.st_ino == after.st_ino,
+              before.st_size == after.st_size,
+              before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec,
+              before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec,
+              before.st_ctimespec.tv_sec == after.st_ctimespec.tv_sec,
+              before.st_ctimespec.tv_nsec == after.st_ctimespec.tv_nsec,
+              after.st_dev == pathState.st_dev, after.st_ino == pathState.st_ino,
+              pathState.st_mode & S_IFMT == S_IFREG,
+              pathState.st_nlink == 1,
+              total == expectedByteSize else {
+            throw UpdateFailure.invalidArtifact("The staged update archive changed while it was being verified.")
+        }
+        let digest = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        guard digest == expectedSHA256 else {
+            throw UpdateFailure.invalidArtifact("The staged update archive SHA-256 does not match the signed manifest.")
+        }
     }
 }
 
@@ -784,7 +919,7 @@ actor UpdateService {
     private var appVersion: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.10.0" }
     private let commandRunner = UpdateProcessRunner()
 
-    func check(serverURL: URL?) async throws -> ReleaseManifest? {
+    func check(serverURL: URL?) async throws -> VerifiedUpdateCandidate? {
         guard let server = BackendTrust.normalizedOrigin(serverURL) else { throw UploadFailure.invalidServer }
         guard let token = KeychainStore.readToken(for: server), !token.isEmpty else { throw UploadFailure.notConfigured }
         var request = URLRequest(url: server.appendingPathComponent("api/native/releases/latest"))
@@ -795,25 +930,29 @@ actor UpdateService {
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode), data.count <= 32 * 1024,
               let envelope = try? JSONDecoder().decode(ReleaseEnvelope.self, from: data) else { throw UploadFailure.invalidResponse }
         guard let identity = ReleaseVerifier.configuredIdentity(), let downloadOrigin = ReleaseVerifier.configuredDownloadOrigin() else { throw UpdateFailure.invalidMetadata("the compiled update identity or download origin is not configured") }
-        let release = try ReleaseVerifier.verify(envelope, keys: ReleaseVerifier.trustedKeys(), expectedTeamIdentifier: identity.teamIdentifier, expectedDesignatedRequirement: identity.designatedRequirement, expectedDownloadOrigin: downloadOrigin, installedVersion: appVersion, previousRelease: KeychainStore.verifiedUpdateFloor())
-        return ReleaseVerifier.compareVersions(release.version, appVersion) == .orderedSame ? nil : release
+        let candidate = try ReleaseVerifier.verifiedCandidate(envelope, keys: ReleaseVerifier.trustedKeys(), expectedTeamIdentifier: identity.teamIdentifier, expectedDesignatedRequirement: identity.designatedRequirement, expectedDownloadOrigin: downloadOrigin, installedVersion: appVersion, previousRelease: KeychainStore.verifiedUpdateFloor())
+        return ReleaseVerifier.compareVersions(candidate.manifest.version, appVersion) == .orderedSame ? nil : candidate
     }
 
-    func downloadAndVerify(_ manifest: ReleaseManifest) async throws -> URL {
-        guard let downloadOrigin = ReleaseVerifier.configuredDownloadOrigin(),
-              ReleaseVerifier.approvedDownloadURL(manifest.downloadUrl, version: manifest.version, origin: downloadOrigin) else {
-            throw UpdateFailure.unapprovedDownload
-        }
+    func downloadAndVerify(_ candidate: VerifiedUpdateCandidate) async throws -> URL {
+        let manifest = try reverify(candidate)
+        guard let downloadOrigin = ReleaseVerifier.configuredDownloadOrigin() else { throw UpdateFailure.unapprovedDownload }
         let (download, _) = try await BackendHTTP.download(manifest.downloadUrl, approvedOrigins: [downloadOrigin.absoluteString], maximumBytes: manifest.byteSize)
         defer { try? FileManager.default.removeItem(at: download) }
-        let data = try Data(contentsOf: download, options: [.mappedIfSafe])
+        let updates = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true).appendingPathComponent("Scopeproof Capture/Verified Updates", isDirectory: true)
+        try FileManager.default.createDirectory(at: updates, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        let stagedArchive = try VerifiedUpdateArtifactStore.stage(downloadedArchive: download, in: updates)
+        defer { try? FileManager.default.removeItem(at: stagedArchive) }
+        let data = try Data(contentsOf: stagedArchive, options: [.mappedIfSafe])
         guard data.count == manifest.byteSize, SHA256.hash(data: data).map({ String(format: "%02x", $0) }).joined() == manifest.sha256 else { throw UpdateFailure.invalidArtifact("SHA-256 or byte size does not match the signed manifest.") }
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("scopeproof-update-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         defer { try? FileManager.default.removeItem(at: root) }
         let archiveMetadata = try UpdateArchiveValidator.validate(data)
         try UpdateArchiveValidator.requireAvailableExtractionCapacity(at: root, metadata: archiveMetadata)
-        _ = try await commandRunner.run("/usr/bin/ditto", ["-x", "-k", download.path, root.path])
+        try VerifiedUpdateArtifactStore.validateExactArchive(at: stagedArchive, expectedByteSize: manifest.byteSize, expectedSHA256: manifest.sha256)
+        _ = try await commandRunner.run("/usr/bin/ditto", ["-x", "-k", stagedArchive.path, root.path])
+        try VerifiedUpdateArtifactStore.validateExactArchive(at: stagedArchive, expectedByteSize: manifest.byteSize, expectedSHA256: manifest.sha256)
         let extracted = try UpdateArchiveValidator.validateExtractedTree(at: root)
         let apps = extracted.filter { $0.lastPathComponent == "Scopeproof Capture.app" }
         guard apps.count == 1 else { throw UpdateFailure.invalidArtifact("The archive must contain exactly one Scopeproof Capture.app.") }
@@ -829,14 +968,31 @@ actor UpdateService {
         guard signing.contains("TeamIdentifier=\(manifest.teamIdentifier)") else { throw UpdateFailure.invalidArtifact("Developer ID team does not match the signed manifest.") }
         _ = try await commandRunner.run("/usr/sbin/spctl", ["-a", "-t", "exec", "-vv", app.path], includeStandardError: true)
         _ = try await commandRunner.run("/usr/bin/xcrun", ["stapler", "validate", app.path], includeStandardError: true)
-        let updates = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true).appendingPathComponent("Scopeproof Capture/Verified Updates", isDirectory: true)
-        try FileManager.default.createDirectory(at: updates, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let destination = updates.appendingPathComponent("Scopeproof-Capture-\(manifest.version).zip")
-        if FileManager.default.fileExists(atPath: destination.path) { try FileManager.default.removeItem(at: destination) }
-        try FileManager.default.copyItem(at: download, to: destination)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
-        try KeychainStore.saveVerifiedUpdateRelease(VerifiedUpdateRelease(sequence: manifest.sequence, version: manifest.version, sha256: manifest.sha256))
+        try VerifiedUpdateArtifactStore.commit(stagedArchive: stagedArchive, destination: destination, expectedByteSize: manifest.byteSize, expectedSHA256: manifest.sha256) {
+            // Actor methods can interleave at every subprocess await. Recheck both
+            // signed expiry and the authoritative Keychain floor after all awaits,
+            // immediately before committing this release tuple.
+            let current = try reverify(candidate)
+            try KeychainStore.saveVerifiedUpdateRelease(VerifiedUpdateRelease(sequence: current.sequence, version: current.version, sha256: current.sha256))
+        }
         return destination
+    }
+
+    private func reverify(_ candidate: VerifiedUpdateCandidate) throws -> ReleaseManifest {
+        guard let identity = ReleaseVerifier.configuredIdentity(),
+              let downloadOrigin = ReleaseVerifier.configuredDownloadOrigin() else {
+            throw UpdateFailure.invalidMetadata("the compiled update identity or download origin is not configured")
+        }
+        return try ReleaseVerifier.reverify(
+            candidate,
+            keys: ReleaseVerifier.trustedKeys(),
+            expectedTeamIdentifier: identity.teamIdentifier,
+            expectedDesignatedRequirement: identity.designatedRequirement,
+            expectedDownloadOrigin: downloadOrigin,
+            installedVersion: appVersion,
+            previousRelease: KeychainStore.verifiedUpdateFloor()
+        )
     }
 
 }

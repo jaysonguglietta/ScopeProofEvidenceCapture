@@ -11,6 +11,21 @@ export interface TenantDefinition {
   readonly dlpPolicyVersion?: string;
 }
 
+export type MaintenanceLifecycleMode = "backfill" | "enabled";
+
+/**
+ * Existing control tables must migrate legacy lifecycle rows before the V2
+ * maintenance schedule can run. The safe default is therefore backfill-only;
+ * enabling the schedule is an explicit, reviewed second deployment.
+ */
+export function validateMaintenanceLifecycleMode(value: unknown): MaintenanceLifecycleMode {
+  const mode = String(value ?? "backfill").trim().toLowerCase();
+  if (mode !== "backfill" && mode !== "enabled") {
+    throw new Error("maintenanceLifecycleMode must be backfill or enabled.");
+  }
+  return mode;
+}
+
 export interface TenantDatabaseIdentifiers {
   readonly auditSignerUsername: string;
   readonly controlUsername: string;
