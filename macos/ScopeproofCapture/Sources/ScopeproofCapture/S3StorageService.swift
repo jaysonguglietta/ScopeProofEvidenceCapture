@@ -71,6 +71,7 @@ enum S3StorageFailure: LocalizedError, Equatable {
     case notConfigured
     case verificationRequired
     case destinationBindingMismatch
+    case invalidTenantBinding
     case invalidBucket
     case invalidRegion
     case invalidPrefix
@@ -122,6 +123,7 @@ enum S3StorageFailure: LocalizedError, Equatable {
         case .notConfigured: return "Configure an S3 bucket and AWS credentials before using S3 storage."
         case .verificationRequired: return "Verify the S3 destination with Save & Verify or complete Create & Harden Bucket before uploading evidence."
         case .destinationBindingMismatch: return "The S3 destination no longer matches the Keychain-protected verified configuration. Run Save & Verify again."
+        case .invalidTenantBinding: return "Enter a valid lowercase customer and workspace identifier before configuring S3 storage."
         case .invalidBucket: return "Enter a valid S3 bucket name containing 3–63 lowercase letters, numbers, periods, or hyphens."
         case .invalidRegion: return "Enter an AWS region such as us-east-1 or us-gov-west-1."
         case .invalidPrefix: return "The S3 prefix must be a relative path no longer than 240 characters and cannot contain traversal or empty path segments."
@@ -203,7 +205,7 @@ actor S3StorageService: S3CallerIdentityVerifying {
         let endpoint = try Self.endpoint(settings: cleanSettings, objectKey: nil)
         var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false)
         var queryItems = [URLQueryItem(name: "list-type", value: "2"), URLQueryItem(name: "max-keys", value: "0")]
-        if !cleanSettings.prefix.isEmpty { queryItems.append(URLQueryItem(name: "prefix", value: "\(cleanSettings.prefix)/")) }
+        queryItems.append(URLQueryItem(name: "prefix", value: "\(cleanSettings.tenantScopedPrefix)/"))
         components?.queryItems = queryItems
         guard let url = components?.url else { throw S3StorageFailure.invalidResponse }
         let request = try Self.signedRequest(
@@ -316,7 +318,11 @@ actor S3StorageService: S3CallerIdentityVerifying {
         catch { throw S3StorageFailure.invalidEvidence }
         let image = artifact.imageData
         let manifestData = artifact.manifestData
-        guard artifact.manifest.controlID == capture.context.controlID else { throw S3StorageFailure.invalidEvidence }
+        guard artifact.manifest.controlID == capture.context.controlID,
+              artifact.manifest.tenantBinding == cleanSettings.tenantBinding,
+              capture.context.resolvedTenantBinding == cleanSettings.tenantBinding else {
+            throw S3StorageFailure.invalidEvidence
+        }
 
         let base = Self.objectBase(settings: cleanSettings, context: capture.context, evidenceID: capture.evidenceID)
         let imageKey = "\(base)/\(capture.imageURL.lastPathComponent)"
@@ -378,7 +384,7 @@ actor S3StorageService: S3CallerIdentityVerifying {
             guard let http = response as? HTTPURLResponse, Self.isExpectedResponse(http, requestURL: url) else { throw S3StorageFailure.invalidResponse }
             guard http.statusCode == 200 else { throw S3StorageFailure.listRejected(http.statusCode) }
             guard data.count <= Self.maximumListResponseBytes else { throw S3StorageFailure.listResponseTooLarge }
-            let page = try Self.parseObjectVersionList(data, requiredPrefix: cleanSettings.prefix)
+            let page = try Self.parseObjectVersionList(data, requiredPrefix: cleanSettings.tenantScopedPrefix)
             guard scannedObjectCount + page.objects.count <= Self.maximumBrowsableObjects else { throw S3StorageFailure.tooManyObjects }
             scannedObjectCount += page.objects.count
             objects.append(contentsOf: page.objects.filter { !$0.key.hasSuffix("/") })
@@ -404,7 +410,7 @@ actor S3StorageService: S3CallerIdentityVerifying {
         guard cleanSettings.downloadsAllowed else { throw S3StorageFailure.downloadRejected(403) }
         guard binding.matches(cleanSettings) else { throw S3StorageFailure.destinationBindingMismatch }
         let cleanCredentials = try Self.validatedCredentials(credentials, for: cleanSettings)
-        let requiredPrefix = cleanSettings.prefix.isEmpty ? "" : "\(cleanSettings.prefix)/"
+        let requiredPrefix = "\(cleanSettings.tenantScopedPrefix)/"
         guard destinationURL.isFileURL, !destinationURL.lastPathComponent.isEmpty else { throw S3StorageFailure.invalidDownloadDestination }
         guard Self.isSafeObjectKey(object.key), object.key.hasPrefix(requiredPrefix) else { throw S3StorageFailure.objectOutsidePrefix }
         guard object.size >= 0, object.size <= Self.maximumDownloadBytes else { throw S3StorageFailure.downloadTooLarge }
@@ -481,6 +487,67 @@ actor S3StorageService: S3CallerIdentityVerifying {
             requestID: Self.safeResponseHeader(http.value(forHTTPHeaderField: "x-amz-request-id"), maximum: 256),
             contentValidated: true
         )
+    }
+
+    func verifyRemoteDurableCopy(
+        for entry: CaptureHistoryEntry, settings: S3StorageSettings,
+        credentials: S3Credentials, binding: S3VerifiedDestination,
+        now: Date = Date()
+    ) async throws -> Bool {
+        guard CaptureHistory.hasDurableLockedCopy(for: entry, now: now) else { return false }
+        let cleanSettings = try Self.validatedSettings(settings)
+        guard cleanSettings.securityProfile == .production,
+              cleanSettings.retentionMode == .compliance,
+              binding.matches(cleanSettings) else { return false }
+        let cleanCredentials = try Self.validatedCredentials(credentials, for: cleanSettings)
+        let root = entry.evidenceRoot ?? entry.manifestURL.deletingLastPathComponent()
+        let receiptData = try ValidatedEvidenceArtifact.readBoundedRegularFile(
+            at: entry.s3ReceiptURL, within: root,
+            maximumBytes: ValidatedEvidenceArtifact.maximumSidecarBytes
+        )
+        let receipt = try JSONDecoder().decode(S3UploadReceipt.self, from: receiptData)
+        guard receipt.schemaVersion == 3, receipt.bucket == cleanSettings.bucket,
+              receipt.region == cleanSettings.region, receipt.awsAccountID == binding.accountID,
+              receipt.encryption == cleanSettings.encryptionMode.rawValue,
+              receipt.kmsKeyARN == cleanSettings.kmsKeyARN,
+              receipt.retentionMode == S3RetentionMode.compliance.rawValue,
+              let retainUntil = receipt.retainUntilByObjectKey else { return false }
+        let requiredPrefix = "\(cleanSettings.tenantScopedPrefix)/"
+        for key in receipt.objectKeys {
+            guard key.hasPrefix(requiredPrefix), let versionID = receipt.versionIDs[key],
+                  let checksum = receipt.s3ChecksumsSHA256[key],
+                  let eTag = receipt.etags[key],
+                  let retainedDate = retainUntil[key].flatMap(Self.parseISO8601),
+                  retainedDate > now else { return false }
+            let url = try Self.endpoint(settings: cleanSettings, objectKey: key, versionID: versionID)
+            let request = try Self.signedRequest(
+                method: "HEAD", url: url, region: cleanSettings.region, body: Data(), contentType: nil,
+                credentials: cleanCredentials, date: now, requireEncryption: false,
+                ifMatch: eTag, expectedBucketOwner: binding.accountID,
+                extraHeaders: ["x-amz-checksum-mode": "ENABLED"]
+            )
+            let (_, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse,
+                  Self.isExpectedResponse(http, requestURL: url), http.statusCode == 200,
+                  Self.safeResponseHeader(http.value(forHTTPHeaderField: "x-amz-version-id"), maximum: 1_024) == versionID,
+                  http.value(forHTTPHeaderField: "x-amz-checksum-sha256") == checksum,
+                  Self.safeResponseHeader(http.value(forHTTPHeaderField: "x-amz-server-side-encryption"), maximum: 32) == cleanSettings.encryptionMode.rawValue,
+                  (!cleanSettings.encryptionMode.needsKMSKey
+                    || http.value(forHTTPHeaderField: "x-amz-server-side-encryption-aws-kms-key-id") == cleanSettings.kmsKeyARN) else {
+                return false
+            }
+            let expected = S3ObjectRetentionExpectation(
+                mode: receipt.retentionMode,
+                retainUntil: retainUntil[key] ?? "",
+                retainUntilDate: retainedDate, headers: [:]
+            )
+            try await verifyObjectRetention(
+                objectKey: key, versionID: versionID, expected: expected,
+                settings: cleanSettings, credentials: cleanCredentials,
+                expectedOwner: binding.accountID
+            )
+        }
+        return true
     }
 
     private func put(
@@ -698,6 +765,7 @@ actor S3StorageService: S3CallerIdentityVerifying {
 
     private nonisolated static func validatedSettings(_ settings: S3StorageSettings) throws -> S3StorageSettings {
         try S3StorageSettings.validated(
+            tenantID: settings.tenantID, workspaceID: settings.workspaceID,
             bucket: settings.bucket, region: settings.region, prefix: settings.prefix,
             autoUpload: settings.autoUpload, uploadsAllowed: settings.uploadsAllowed,
             securityProfile: settings.securityProfile, encryptionMode: settings.encryptionMode,
@@ -716,8 +784,12 @@ actor S3StorageService: S3CallerIdentityVerifying {
     ) throws -> S3Credentials {
         let clean = try S3Credentials.validated(
             accessKeyID: credentials.accessKeyID, secretAccessKey: credentials.secretAccessKey,
-            sessionToken: credentials.sessionToken, expiresAt: credentials.expiresAt
+            sessionToken: credentials.sessionToken, expiresAt: credentials.expiresAt,
+            tenantID: credentials.tenantID, workspaceID: credentials.workspaceID
         )
+        guard clean.tenantBinding == settings.tenantBinding else {
+            throw S3StorageFailure.credentialIdentityMismatch
+        }
         if clean.isExpired { throw S3StorageFailure.expiredCredentials }
         if settings.securityProfile == .production && (!clean.isTemporary || clean.expiresAt == nil) {
             throw S3StorageFailure.temporaryCredentialsRequired
@@ -760,7 +832,10 @@ actor S3StorageService: S3CallerIdentityVerifying {
         let title = context.resolvedControlTitle.isEmpty ? context.controlID : "\(context.controlID) - \(context.resolvedControlTitle)"
         let control = safeObjectComponent(title)
         let period = safeObjectComponent(context.assessmentPeriod)
-        return [settings.prefix, control, period, safeObjectComponent(evidenceID)].filter { !$0.isEmpty }.joined(separator: "/")
+        return [
+            settings.tenantScopedPrefix,
+            control, period, safeObjectComponent(evidenceID),
+        ].filter { !$0.isEmpty }.joined(separator: "/")
     }
 
     nonisolated static func endpoint(settings: S3StorageSettings, objectKey: String?, versionID: String? = nil) throws -> URL {
@@ -865,7 +940,7 @@ actor S3StorageService: S3CallerIdentityVerifying {
             URLQueryItem(name: "list-type", value: "2"),
             URLQueryItem(name: "max-keys", value: String(maximumKeys)),
         ]
-        if !settings.prefix.isEmpty { queryItems.append(URLQueryItem(name: "prefix", value: "\(settings.prefix)/")) }
+        queryItems.append(URLQueryItem(name: "prefix", value: "\(settings.tenantScopedPrefix)/"))
         if let continuationToken { queryItems.append(URLQueryItem(name: "continuation-token", value: continuationToken)) }
         components?.queryItems = queryItems
         guard let url = components?.url else { throw S3StorageFailure.invalidResponse }
@@ -886,7 +961,7 @@ actor S3StorageService: S3CallerIdentityVerifying {
             URLQueryItem(name: "versions", value: ""),
             URLQueryItem(name: "max-keys", value: String(maximumKeys)),
         ]
-        if !settings.prefix.isEmpty { queryItems.append(URLQueryItem(name: "prefix", value: "\(settings.prefix)/")) }
+        queryItems.append(URLQueryItem(name: "prefix", value: "\(settings.tenantScopedPrefix)/"))
         if let keyMarker, let versionIDMarker {
             queryItems.append(URLQueryItem(name: "key-marker", value: keyMarker))
             queryItems.append(URLQueryItem(name: "version-id-marker", value: versionIDMarker))

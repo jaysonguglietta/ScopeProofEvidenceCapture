@@ -9,6 +9,10 @@ const controlGrantsPath = new URL("../infra/aws/database/004_evidence_control_ro
 const legalApiGrantsPath = new URL("../infra/aws/database/005_legal_hold_api_role.sql", import.meta.url);
 const readGrantsPath = new URL("../infra/aws/database/007_evidence_read_role.sql", import.meta.url);
 const apiAuditSignerGrantsPath = new URL("../infra/aws/database/008_api_audit_signer_role.sql", import.meta.url);
+const evidenceAccessPath = new URL("../infra/aws/database/006_evidence_access_api.sql", import.meta.url);
+const runtimeHardeningPath = new URL("../infra/aws/database/009_runtime_hardening.sql", import.meta.url);
+const rejectionReconcilerPath = new URL("../infra/aws/cdk/runtime/reconcile-rejected-evidence/index.mjs", import.meta.url);
+const tenantStackPath = new URL("../infra/aws/cdk/lib/tenant-stack.ts", import.meta.url);
 
 function tableBody(sql: string, table: string): string {
   const match = sql.match(new RegExp(`CREATE TABLE scopeproof\\.${table} \\(([\\s\\S]*?)\\n\\);`));
@@ -118,6 +122,46 @@ test("upload and immutable-evidence constraints fail closed", async () => {
   assert.match(sql, /device_proof := p_metadata -> 'scopeproofDeviceProof'/);
   assert.match(sql, /device_sequence <= device_last_upload_sequence/);
   assert.match(sql, /SET last_upload_sequence = device_sequence/);
+});
+
+test("rejected evidence reconciliation recovers a DynamoDB-first partial commit after 24 hours", async () => {
+  const [sql, reconciler, tenantStack] = await Promise.all([
+    readFile(runtimeHardeningPath, "utf8"),
+    readFile(rejectionReconcilerPath, "utf8"),
+    readFile(tenantStackPath, "utf8"),
+  ]);
+  const reconcile = functionBody(sql, "reconcile_rejected_evidence");
+  const existingReceiptLookup = reconcile.indexOf("SELECT * INTO existing FROM scopeproof.rejected_ingest_receipts");
+  const exactReplayReturn = reconcile.indexOf("RETURN QUERY SELECT existing.id, false");
+  const recoveryAgeGate = reconcile.indexOf("p_rejected_at < clock_timestamp() - interval '14 days'");
+
+  assert.ok(existingReceiptLookup >= 0 && exactReplayReturn > existingReceiptLookup);
+  assert.ok(
+    recoveryAgeGate > exactReplayReturn,
+    "an exact durable receipt replay must be resolved before applying the new-commit age gate",
+  );
+  assert.match(reconcile, /p_canonical_receipt::jsonb IS DISTINCT FROM p_rejection_facts/);
+  assert.match(reconcile, /scopeproof-ingest-rejection-v1/);
+  assert.match(reconcile, /\(p_rejection_facts ->> 'rejectedAt'\)::timestamptz IS DISTINCT FROM p_rejected_at/);
+  assert.match(reconcile, /existing\.rejected_at IS DISTINCT FROM p_rejected_at/);
+  assert.doesNotMatch(reconcile, /interval '24 hours'/);
+  assert.match(reconciler, /const rejectedAt = intent\.rejectionReceipt\?\.rejectedAt \?\? new Date\(\)\.toISOString\(\)/);
+  assert.match(reconciler, /assertSameReceipt\(intent\.rejectionReceipt/);
+  assert.match(tenantStack, /"IngestDeadLetterQueue"[\s\S]*?retentionPeriod: Duration\.days\(14\)/);
+  assert.match(
+    tenantStack,
+    /"RejectedEvidenceQueue"[\s\S]*?deadLetterQueue: \{ maxReceiveCount: 5, queue: this\.ingestDeadLetterQueue \}/,
+  );
+
+  const recoveryDays = Number(
+    reconcile.match(/p_rejected_at < clock_timestamp\(\) - interval '(\d+) days'/)?.[1],
+  );
+  const partialCommitReplayDelayMilliseconds = 25 * 60 * 60 * 1_000;
+  assert.ok(partialCommitReplayDelayMilliseconds > 24 * 60 * 60 * 1_000);
+  assert.ok(
+    partialCommitReplayDelayMilliseconds < recoveryDays * 24 * 60 * 60 * 1_000,
+    "a 25-hour durable partial-commit replay must remain within the database recovery window",
+  );
 });
 
 test("public API audit events are actor-bound, idempotent, and immutable", async () => {
@@ -369,6 +413,25 @@ test("evidence-read database role has only membership and exact evidence read pr
     "record_api_audit_event",
     "resolve_active_membership",
   ]);
+});
+
+test("auditor evidence reads are DB-enforced as approved and currently retained", async () => {
+  const [baseline, hardening] = await Promise.all([
+    readFile(evidenceAccessPath, "utf8"),
+    readFile(runtimeHardeningPath, "utf8"),
+  ]);
+  for (const name of ["list_accessible_evidence", "read_accessible_evidence"]) {
+    const body = functionBody(baseline, name);
+    assert.match(body, /PERFORM scopeproof\.assert_actor_permission\(p_requested_by, 'evidence:read'\)/);
+    assert.match(body, /artifact\.retain_until IS NOT NULL/);
+  }
+  assert.match(hardening, /CREATE OR REPLACE FUNCTION scopeproof\.evidence_reader_role/);
+  assert.match(hardening, /new_authorize CONSTANT text := ' {2}actor_role := scopeproof\.evidence_reader_role\(p_requested_by\);'/);
+  assert.match(hardening, /actor_role <> ''auditor''/);
+  assert.match(hardening, /artifact\.status = 'APPROVED'/);
+  assert.match(hardening, /artifact\.retain_until > clock_timestamp\(\)/);
+  assert.match(hardening, /unexpected evidence-read function lineage/);
+  assert.match(hardening, /REVOKE ALL ON FUNCTION scopeproof\.evidence_reader_role/);
 });
 
 test("evidence-control database role can only reconcile approved legal holds and append receipts", async () => {

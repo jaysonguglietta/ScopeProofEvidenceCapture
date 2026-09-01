@@ -34,6 +34,20 @@ export const securityInvariants = sqliteTable("security_invariants", {
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
 });
 
+export const controlCatalogs = sqliteTable("control_catalogs", {
+  id: text("id").primaryKey(),
+  framework: text("framework").notNull(),
+  version: text("version").notNull(),
+  title: text("title").notNull(),
+  controlsJson: text("controls_json").notNull(),
+  digestSha256: text("digest_sha256").notNull(),
+  status: text("status", { enum: ["active", "retired"] }).notNull().default("active"),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [
+  uniqueIndex("idx_control_catalog_framework_version").on(table.framework, table.version),
+  uniqueIndex("idx_control_catalog_digest").on(table.digestSha256),
+]);
+
 export const assessments = sqliteTable("assessments", {
   id: text("id").primaryKey(),
   name: text("name").notNull(),
@@ -42,6 +56,8 @@ export const assessments = sqliteTable("assessments", {
   periodEnd: text("period_end").notNull(),
   systemsJson: text("systems_json").notNull().default("[]"),
   controlsJson: text("controls_json").notNull().default("[]"),
+  catalogId: text("catalog_id"),
+  scopeMode: text("scope_mode", { enum: ["explicit"] }).notNull().default("explicit"),
   ownerId: text("owner_id").notNull(),
   status: text("status", { enum: ["draft", "active", "closed"] }).notNull().default("draft"),
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
@@ -199,7 +215,7 @@ export const evidenceArtifacts = sqliteTable("evidence_artifacts", {
   encryptionKeyId: text("encryption_key_id").notNull().default("legacy-v1"),
   capturedAt: text("captured_at").notNull(),
   expiresAt: text("expires_at").notNull(),
-  status: text("status", { enum: ["needs_review", "approved", "expiring", "rejected", "expired", "purged"] }).notNull().default("needs_review"),
+  status: text("status", { enum: ["needs_review", "approved", "expiring", "rejected", "returned", "superseded", "expired", "purged"] }).notNull().default("needs_review"),
   redactionCount: integer("redaction_count").notNull().default(0),
   manualRedactions: integer("manual_redactions").notNull().default(0),
   redactionSummaryJson: text("redaction_summary_json").notNull().default("[]"),
@@ -267,17 +283,68 @@ export const evidenceOccurrences = sqliteTable("evidence_occurrences", {
   receivedAt: text("received_at").notNull(),
   createdBy: text("created_by").notNull(),
   expiresAt: text("expires_at").notNull(),
-  status: text("status", { enum: ["needs_review", "approved", "rejected", "expired"] }).notNull().default("needs_review"),
+  status: text("status", { enum: ["needs_review", "approved", "rejected", "returned", "superseded", "expired"] }).notNull().default("needs_review"),
   coverageStatus: text("coverage_status", { enum: ["complete", "partial", "not_applicable"] }).notNull().default("not_applicable"),
   coverageJson: text("coverage_json").notNull().default("{}"),
   approvedBy: text("approved_by"),
   approvedAt: text("approved_at"),
+  lastReviewEventId: text("last_review_event_id"),
   provenanceJson: text("provenance_json").notNull().default("{}"),
 }, (table) => [
   uniqueIndex("idx_evidence_occurrences_job_artifact").on(table.jobId, table.artifactId),
   index("idx_evidence_occurrences_artifact_received").on(table.artifactId, table.receivedAt),
   index("idx_evidence_occurrences_device_captured").on(table.deviceId, table.capturedAt),
 ]);
+
+export const evidenceReviewEvents = sqliteTable("evidence_review_events", {
+  id: text("id").primaryKey(),
+  evidenceId: text("evidence_id").notNull(),
+  occurrenceId: text("occurrence_id").notNull(),
+  action: text("action", { enum: ["approved", "rejected", "returned", "reopened", "superseded"] }).notNull(),
+  previousStatus: text("previous_status").notNull(),
+  resultingStatus: text("resulting_status").notNull(),
+  rationale: text("rationale").notNull(),
+  expectedSha256: text("expected_sha256").notNull(),
+  replacementEvidenceId: text("replacement_evidence_id"),
+  actorId: text("actor_id").notNull(),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [
+  index("idx_review_events_evidence_created").on(table.evidenceId, table.createdAt),
+  index("idx_review_events_actor_created").on(table.actorId, table.createdAt),
+]);
+
+export const findings = sqliteTable("findings", {
+  id: text("id").primaryKey(),
+  assessmentId: text("assessment_id").notNull(),
+  controlId: text("control_id"),
+  evidenceId: text("evidence_id"),
+  jobId: text("job_id"),
+  title: text("title").notNull(),
+  description: text("description").notNull(),
+  severity: text("severity", { enum: ["critical", "high", "medium", "low"] }).notNull(),
+  status: text("status", { enum: ["open", "in_progress", "accepted", "resolved", "closed"] }).notNull().default("open"),
+  ownerId: text("owner_id"),
+  dueAt: text("due_at"),
+  resolution: text("resolution"),
+  createdBy: text("created_by").notNull(),
+  resolvedBy: text("resolved_by"),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  resolvedAt: text("resolved_at"),
+}, (table) => [
+  index("idx_findings_assessment_status_created").on(table.assessmentId, table.status, table.createdAt),
+  index("idx_findings_owner_status").on(table.ownerId, table.status),
+  index("idx_findings_evidence").on(table.evidenceId),
+]);
+
+export const findingEvents = sqliteTable("finding_events", {
+  id: text("id").primaryKey(),
+  findingId: text("finding_id").notNull(),
+  action: text("action").notNull(),
+  actorId: text("actor_id").notNull(),
+  detailsJson: text("details_json").notNull().default("{}"),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [index("idx_finding_events_finding_created").on(table.findingId, table.createdAt)]);
 
 export const retentionHolds = sqliteTable("retention_holds", {
   evidenceId: text("evidence_id").primaryKey(),
@@ -287,6 +354,27 @@ export const retentionHolds = sqliteTable("retention_holds", {
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
   updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
 }, (table) => [index("idx_retention_holds_expiry").on(table.expiresAt)]);
+
+export const retentionHoldReleaseRequests = sqliteTable("retention_hold_release_requests", {
+  id: text("id").primaryKey(),
+  evidenceId: text("evidence_id").notNull(),
+  requestedBy: text("requested_by").notNull(),
+  reason: text("reason").notNull(),
+  requestDigest: text("request_digest").notNull(),
+  holdOwnerId: text("hold_owner_id").notNull(),
+  holdReason: text("hold_reason").notNull(),
+  holdExpiresAt: text("hold_expires_at").notNull(),
+  status: text("status", { enum: ["pending", "approved", "cancelled", "expired"] }).notNull().default("pending"),
+  requestedAt: text("requested_at").notNull(),
+  expiresAt: text("expires_at").notNull(),
+  approvedBy: text("approved_by"),
+  approvedAt: text("approved_at"),
+  releasedAt: text("released_at"),
+}, (table) => [
+  uniqueIndex("idx_hold_release_pending_evidence").on(table.evidenceId).where(sql`${table.status} = 'pending'`),
+  uniqueIndex("idx_hold_release_digest").on(table.requestDigest),
+  index("idx_hold_release_status_expiry").on(table.status, table.expiresAt),
+]);
 
 export const rateLimitBuckets = sqliteTable("rate_limit_buckets", {
   keyHash: text("key_hash").primaryKey(),

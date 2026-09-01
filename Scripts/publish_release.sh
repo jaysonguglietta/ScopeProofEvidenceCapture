@@ -172,6 +172,12 @@ mounted=false
 publication_dir="${SCOPEPROOF_PUBLICATION_OUTPUT_DIR:-$project_root/DerivedData/Publication}"
 [[ "$publication_dir" = /* ]] || publication_dir="$project_root/$publication_dir"
 mkdir -p "$publication_dir"
+[[ -d "$publication_dir" && ! -L "$publication_dir" ]] || { echo "Publication output directory must be a real directory, not a symlink." >&2; exit 1; }
+[[ "$(/usr/bin/stat -f '%u' "$publication_dir")" == "$(/usr/bin/id -u)" ]] || { echo "Publication output directory must be owned by the publishing user." >&2; exit 1; }
+publication_mode="$(/usr/bin/stat -f '%Lp' "$publication_dir")"
+publication_group_digit="${publication_mode[-2]}"
+publication_world_digit="${publication_mode[-1]}"
+[[ "$publication_group_digit" != [2367] && "$publication_world_digit" != [2367] ]] || { echo "Publication output directory must not be group- or world-writable." >&2; exit 1; }
 envelope="$publication_dir/$stem.release-envelope.json"
 [[ ! -e "$envelope" ]] || { echo "Refusing to overwrite publication envelope: $envelope" >&2; exit 1; }
 SCOPEPROOF_UPDATE_PRIVATE_KEY="$private_key" \

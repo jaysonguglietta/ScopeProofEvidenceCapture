@@ -60,10 +60,19 @@ struct CaptureManifest: Codable, Sendable {
     let reviewerNote: String?
     let jiraIssueKey: String?
     let jiraIssueURL: String?
+    var tenantID: String? = nil
+    var workspaceID: String? = nil
     let chainPreviousHash: String
     let chainEventHash: String
     let chainSequence: Int?
     var provenance: LocalProvenanceSignature?
+}
+
+extension CaptureManifest {
+    var tenantBinding: TenantWorkspaceBinding? {
+        guard let tenantID, let workspaceID else { return nil }
+        return TenantWorkspaceBinding.validated(tenantID: tenantID, workspaceID: workspaceID)
+    }
 }
 
 struct BrowserWindow: Sendable {
@@ -148,7 +157,9 @@ final class CaptureService {
     }
 
     var outputDirectory: URL {
-        CaptureHistory.defaultEvidenceRoot(homeDirectory: fileManager.homeDirectoryForCurrentUser)
+        preferences.tenantBinding.scopedEvidenceRoot(
+            base: CaptureHistory.defaultEvidenceRoot(homeDirectory: fileManager.homeDirectoryForCurrentUser)
+        )
     }
 
     var hasScreenRecordingPermission: Bool { CGPreflightScreenCaptureAccess() }
@@ -461,6 +472,12 @@ final class CaptureService {
     }
 
     private func finalizeCapture(original: CGImage, menuBar: CGImage?, sourceURL: URL?, browser: String, windowTitle: String, method: String, context: CaptureContext, captureDate: Date, liveMenuBarCaptured: Bool = false) throws -> CaptureResult {
+        guard let tenantBinding = context.resolvedTenantBinding,
+              tenantBinding == preferences.tenantBinding else {
+            throw CaptureFailure.provenanceFailed(
+                "The capture belongs to a different customer workspace than the active local workspace."
+            )
+        }
         let initialScan = try requiredSafetyScan(original)
         let menuBarScan = try menuBar.map { try requiredSafetyScan($0) }
         let includesLiveMenuBar = liveMenuBarCaptured || menuBarScan != nil
@@ -483,14 +500,26 @@ final class CaptureService {
         let imageURL = evidenceDirectory.appendingPathComponent(baseName).appendingPathExtension("png")
         let manifestURL = evidenceDirectory.appendingPathComponent(baseName).appendingPathExtension("json")
         let lifecycleURL = EvidenceLifecycleStore.url(for: manifestURL)
+        var commitJournal = LocalCaptureCommitJournal(
+            schemaVersion: LocalCaptureCommitJournal.currentSchemaVersion,
+            evidenceID: evidenceID, tenantID: tenantBinding.tenantID,
+            workspaceID: tenantBinding.workspaceID,
+            evidenceRootPath: outputDirectory.standardizedFileURL.path,
+            imagePath: imageURL.standardizedFileURL.path,
+            manifestPath: manifestURL.standardizedFileURL.path,
+            lifecyclePath: lifecycleURL.standardizedFileURL.path,
+            startedAt: capturedAt
+        )
         var captureCommitted = false
         defer {
             if !captureCommitted {
                 for url in [imageURL, manifestURL, lifecycleURL] where fileManager.fileExists(atPath: url.path) {
                     try? fileManager.removeItem(at: url)
                 }
+                KeychainStore.clearCaptureCommitJournal(evidenceID: evidenceID)
             }
         }
+        try KeychainStore.beginCaptureCommitJournal(commitJournal)
         let localTimestamp = localFormatter.string(from: now)
         let menuBarTimestamp = menuBarFormatter.string(from: now)
         let menuBarTimeZone = TimeZone.current.abbreviation().map {
@@ -498,7 +527,7 @@ final class CaptureService {
         } ?? TimeZone.current.identifier
         let recordedSourceURL = EvidenceSourceURL.sanitized(sourceURL?.absoluteString ?? context.sourceURL)
         let sourceLabel = recordedSourceURL?.absoluteString ?? "NOT PROVIDED"
-        let safeWindowTitle = windowTitle.count > 220 ? "\(windowTitle.prefix(219))…" : windowTitle
+        let safeWindowTitle = Self.singleLine(windowTitle, maximum: 220)
         let controlLabel = context.resolvedControlTitle.isEmpty ? context.controlID : "\(context.controlID) — \(context.resolvedControlTitle)"
         let ownerLabel = context.resolvedEvidenceOwner.isEmpty ? "UNASSIGNED" : context.resolvedEvidenceOwner
         let jiraLabel = jiraIssueKey.isEmpty ? "" : "  •  JIRA \(jiraIssueKey)"
@@ -522,7 +551,7 @@ final class CaptureService {
         try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: imageURL.path)
         let dimensions = (width: review.image.width, height: review.image.height)
         let existingAnchor: LocalCaptureChainAnchor?
-        do { existingAnchor = try KeychainStore.captureChainAnchor() }
+        do { existingAnchor = try KeychainStore.captureChainAnchor(binding: tenantBinding) }
         catch { throw CaptureFailure.provenanceFailed(error.localizedDescription) }
         // Schema 7 begins a signed, device-anchored epoch. An unsigned legacy
         // preference cannot be promoted into that chain's root of trust.
@@ -532,7 +561,7 @@ final class CaptureService {
         let safetyStatus = automaticRedactions + review.manualRedactions > 0 ? "redacted" : "passed"
         let mappings = ComplianceCatalog.mappings(frameworkName: framework.name, controlID: context.controlID)
         var manifest = CaptureManifest(
-            schemaVersion: 7, evidenceID: evidenceID, capturedAt: capturedAt, localTimestamp: localTimestamp, timezone: TimeZone.current.identifier,
+            schemaVersion: 8, evidenceID: evidenceID, capturedAt: capturedAt, localTimestamp: localTimestamp, timezone: TimeZone.current.identifier,
             sourceURL: recordedSourceURL?.absoluteString, sourceHost: recordedSourceURL?.host, browser: browser, windowTitle: windowTitle, screenshotFilename: imageURL.lastPathComponent,
             sha256: digest, pixelWidth: dimensions.width, pixelHeight: dimensions.height, captureMethod: method,
             timestampAuthority: includesLiveMenuBar
@@ -546,6 +575,7 @@ final class CaptureService {
             catalogVersion: framework.version ?? ComplianceCatalog.catalogVersion, evidenceOwner: context.resolvedEvidenceOwner, tags: context.resolvedTags,
             expectedEvidence: context.expectedEvidence, mappedControls: mappings, manualRedactions: review.manualRedactions, reviewerNote: review.reviewerNote,
             jiraIssueKey: jiraIssueKey.isEmpty ? nil : jiraIssueKey, jiraIssueURL: preferences.jiraHandoff.issueURL(for: jiraIssueKey)?.absoluteString,
+            tenantID: tenantBinding.tenantID, workspaceID: tenantBinding.workspaceID,
             chainPreviousHash: previousHash, chainEventHash: eventHash,
             chainSequence: chainSequence, provenance: nil
         )
@@ -565,6 +595,11 @@ final class CaptureService {
         guard let signingKeyID = manifest.provenance?.keyID else {
             throw CaptureFailure.provenanceFailed("The capture signing identity was unavailable.")
         }
+        commitJournal.chainPreviousHash = previousHash
+        commitJournal.chainSequence = chainSequence
+        commitJournal.chainEventHash = eventHash
+        commitJournal.signingKeyID = signingKeyID
+        try KeychainStore.updateCaptureCommitJournal(commitJournal)
         let prospectiveAnchor = LocalCaptureChainAnchor(
             schemaVersion: LocalCaptureChainAnchor.currentSchemaVersion,
             sequence: chainSequence, eventHash: eventHash,
@@ -582,14 +617,25 @@ final class CaptureService {
         do {
             _ = try KeychainStore.advanceCaptureChain(
                 previousHash: previousHash, sequence: chainSequence, eventHash: eventHash,
-                signingKeyID: signingKeyID, now: now
+                signingKeyID: signingKeyID, binding: tenantBinding, now: now
             )
         } catch {
             throw CaptureFailure.provenanceFailed(error.localizedDescription)
         }
         preferences.chainHead = eventHash
         captureCommitted = true
+        KeychainStore.clearCaptureCommitJournal(evidenceID: evidenceID)
         return CaptureResult(imageURL: imageURL, manifestURL: manifestURL, evidenceID: evidenceID, context: context, capturedAt: capturedAt, safetyStatus: safetyStatus, findings: automaticFindings, sha256: digest, chainPreviousHash: previousHash, chainEventHash: eventHash)
+    }
+
+    private static func singleLine(_ value: String, maximum: Int) -> String {
+        let normalized = value.unicodeScalars.map { scalar -> Character in
+            Character(scalar.value < 0x20 || scalar.value == 0x7f ? " " : String(scalar))
+        }
+        let collapsed = String(normalized)
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+        return collapsed.count > maximum ? "\(collapsed.prefix(maximum - 1))…" : collapsed
     }
 
     func stampedImage(source: CGImage, stamp: String) throws -> CGImage {

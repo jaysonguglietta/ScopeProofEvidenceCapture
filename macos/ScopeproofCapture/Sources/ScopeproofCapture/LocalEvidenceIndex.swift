@@ -56,8 +56,11 @@ final class LocalEvidenceIndex: @unchecked Sendable {
     private let lock = NSLock()
     private var database: OpaquePointer?
     private let auditKey: SymmetricKey
+    private let auditSigningKeyID: String
+    private let auditTrustScope: String
+    private let anchorAuditToKeychain: Bool
 
-    init(databaseURL: URL, auditKeyData: Data) throws {
+    init(databaseURL: URL, auditKeyData: Data, anchorAuditToKeychain: Bool = false) throws {
         try FileManager.default.createDirectory(
             at: databaseURL.deletingLastPathComponent(),
             withIntermediateDirectories: true,
@@ -72,6 +75,9 @@ final class LocalEvidenceIndex: @unchecked Sendable {
         }
         database = handle
         auditKey = SymmetricKey(data: auditKeyData)
+        auditSigningKeyID = SHA256.hash(data: auditKeyData).map { String(format: "%02x", $0) }.joined()
+        auditTrustScope = databaseURL.standardizedFileURL.path
+        self.anchorAuditToKeychain = anchorAuditToKeychain
         sqlite3_busy_timeout(handle, 2_500)
         do {
             try execute("PRAGMA journal_mode = WAL")
@@ -222,9 +228,25 @@ final class LocalEvidenceIndex: @unchecked Sendable {
             let payload = [previousHash, occurredAt, action, resourceID, detailsJSON].map { "\($0.utf8.count):\($0)" }.joined(separator: "|")
             let eventHash = SHA256.hash(data: Data(payload.utf8)).map { String(format: "%02x", $0) }.joined()
             let signature = Data(HMAC<SHA256>.authenticationCode(for: Data(eventHash.utf8), using: auditKey)).base64EncodedString()
-            try withStatementUnlocked("INSERT INTO local_audit_events (occurred_at, action, resource_id, details_json, previous_hash, event_hash, signature) VALUES (?, ?, ?, ?, ?, ?, ?)") { statement in
-                try bind([.text(occurredAt), .text(action), .text(resourceID), .text(detailsJSON), .text(previousHash), .text(eventHash), .text(signature)], to: statement)
-                guard sqlite3_step(statement) == SQLITE_DONE else { throw databaseErrorUnlocked() }
+            let nextSequence: Int = try withStatementUnlocked("SELECT count(*) + 1 FROM local_audit_events") { statement in
+                guard sqlite3_step(statement) == SQLITE_ROW else { throw databaseErrorUnlocked() }
+                return Int(sqlite3_column_int64(statement, 0))
+            }
+            let advance = anchorAuditToKeychain ? try KeychainStore.prepareLocalTrustAdvance(
+                domain: .audit, scope: auditTrustScope, previousHash: previousHash,
+                sequence: nextSequence, eventHash: eventHash, signingKeyID: auditSigningKeyID
+            ) : nil
+            do {
+                try withStatementUnlocked("INSERT INTO local_audit_events (occurred_at, action, resource_id, details_json, previous_hash, event_hash, signature) VALUES (?, ?, ?, ?, ?, ?, ?)") { statement in
+                    try bind([.text(occurredAt), .text(action), .text(resourceID), .text(detailsJSON), .text(previousHash), .text(eventHash), .text(signature)], to: statement)
+                    guard sqlite3_step(statement) == SQLITE_DONE else { throw databaseErrorUnlocked() }
+                }
+            } catch {
+                if let advance { KeychainStore.cancelLocalTrustAdvance(advance, scope: auditTrustScope) }
+                throw error
+            }
+            if let advance {
+                try KeychainStore.commitLocalTrustAdvance(advance, scope: auditTrustScope)
             }
         }
     }
@@ -285,6 +307,8 @@ final class LocalEvidenceIndex: @unchecked Sendable {
     }
 
     private func verifyAuditChainUnlocked() throws {
+        var finalSequence = 0
+        var finalHash = "GENESIS"
         try withStatementUnlocked("SELECT sequence, occurred_at, action, resource_id, details_json, previous_hash, event_hash, signature FROM local_audit_events ORDER BY sequence") { statement in
             var expectedSequence: Int64 = 1
             var previousHash = "GENESIS"
@@ -306,8 +330,31 @@ final class LocalEvidenceIndex: @unchecked Sendable {
                 }
                 expectedSequence += 1
                 previousHash = eventHash
+                finalSequence = Int(sequence)
+                finalHash = eventHash
             }
         }
+        guard anchorAuditToKeychain else { return }
+        if finalSequence == 0 {
+            guard try KeychainStore.localTrustHead(domain: .audit, scope: auditTrustScope) == nil,
+                  try KeychainStore.pendingLocalTrustAdvance(domain: .audit, scope: auditTrustScope) == nil else {
+                throw LocalEvidenceIndexFailure.database("The Keychain audit head exists but the local audit database is empty.")
+            }
+            return
+        }
+        if try KeychainStore.recoverLocalTrustAdvance(
+            domain: .audit, scope: auditTrustScope, sequence: finalSequence,
+            eventHash: finalHash, signingKeyID: auditSigningKeyID
+        ) { return }
+        if try KeychainStore.localTrustHead(domain: .audit, scope: auditTrustScope) == nil,
+           try KeychainStore.pendingLocalTrustAdvance(domain: .audit, scope: auditTrustScope) == nil {
+            try KeychainStore.adoptLocalTrustHeadForMigration(
+                domain: .audit, scope: auditTrustScope, sequence: finalSequence,
+                eventHash: finalHash, signingKeyID: auditSigningKeyID
+            )
+            return
+        }
+        throw LocalEvidenceIndexFailure.database("The local audit database is behind or diverges from its Keychain rollback head.")
     }
 
     private func constantTimeEqual(_ left: String, _ right: String) -> Bool {

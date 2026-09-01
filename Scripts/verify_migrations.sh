@@ -54,21 +54,26 @@ for migration in \
   drizzle/0020_native_device_chain.sql \
   drizzle/0021_immutable_checkpoint_receipts.sql \
   drizzle/0022_native_provenance_quarantine.sql \
-  drizzle/0023_independent_image_safety.sql
+  drizzle/0023_independent_image_safety.sql \
+  drizzle/0024_big_chamber.sql
 do
   test -f "$migration"
   sqlite3 "$database" ".read $migration"
 done
 
 test "$(sqlite3 "$database" 'PRAGMA integrity_check;')" = "ok"
-test "$(sqlite3 "$database" "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('assessments','audit_batch_guards','audit_checkpoints','evidence_artifacts','evidence_occurrences','sbom_jobs');")" = "6"
+test "$(sqlite3 "$database" "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN ('assessments','audit_batch_guards','audit_checkpoints','control_catalogs','evidence_artifacts','evidence_occurrences','evidence_review_events','findings','finding_events','retention_hold_release_requests','sbom_jobs');")" = "11"
 test "$(sqlite3 "$database" "SELECT COUNT(*) FROM capture_devices WHERE id = 'dev_upgrade' AND token_issued_at IS NOT NULL AND token_expires_at > token_issued_at;")" = "1"
 test "$(sqlite3 "$database" "SELECT COUNT(*) FROM capture_devices WHERE id = 'dev_upgrade' AND chain_sequence = 0 AND chain_event_hash = 'GENESIS' AND provenance_key_id IS NULL;")" = "1"
 test "$(sqlite3 "$database" "SELECT COUNT(*) FROM evidence_artifacts WHERE id IN ('ev_upgrade_a','ev_upgrade_b') AND status = 'needs_review';")" = "2"
 test "$(sqlite3 "$database" "SELECT COUNT(*) FROM evidence_occurrences WHERE artifact_id IN ('ev_upgrade_a','ev_upgrade_b');")" = "2"
+test "$(sqlite3 "$database" "SELECT COUNT(*) FROM pragma_table_info('evidence_occurrences') WHERE name = 'last_review_event_id';")" = "1"
+test "$(sqlite3 "$database" "SELECT COUNT(*) FROM pragma_table_info('retention_hold_release_requests') WHERE name IN ('hold_owner_id','hold_reason','hold_expires_at') AND \"notnull\" = 1;")" = "3"
 test "$(sqlite3 "$database" "SELECT COUNT(*) FROM audit_batch_guards;")" = "0"
 test "$(sqlite3 "$database" "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name IN ('audit_checkpoints_no_update','audit_checkpoints_no_delete');")" = "2"
 test "$(sqlite3 "$database" "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name IN ('native_evidence_manifests_no_update','native_evidence_manifests_no_delete');")" = "2"
 test "$(sqlite3 "$database" "SELECT COUNT(*) FROM pragma_table_info('native_evidence_manifests') WHERE name IN ('chain_sequence','chain_event_hash','provenance_key_id');")" = "3"
 test "$(sqlite3 "$database" "SELECT COUNT(*) FROM pragma_table_info('evidence_artifacts') WHERE name IN ('server_safety_scan_sha256','server_safety_scan_policy','server_safety_scan_completed_at','server_safety_scanner_origin','server_safety_receipt_sha256');")" = "5"
+test "$(sqlite3 "$database" "SELECT COUNT(*) FROM control_catalogs WHERE id = 'pci-dss-4.0.1-scopeproof-operations-v1' AND digest_sha256 = 'dd51b71a3ccbc0ddbcdb12a519ee8c1d5b9f6728323b3b621cbc165aa5c50abd';")" = "1"
+test "$(sqlite3 "$database" "SELECT COUNT(*) FROM pragma_table_info('assessments') WHERE name IN ('catalog_id','scope_mode');")" = "2"
 echo "Populated migration replay and integrity check passed."

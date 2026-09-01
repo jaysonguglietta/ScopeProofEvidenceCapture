@@ -28,10 +28,13 @@ final class S3ObjectBrowserController: NSObject, NSTableViewDataSource, NSTableV
         self.credentialProvider = credentialProvider
     }
 
-    func show(settings: S3StorageSettings) {
-        guard settings.canUpload, settings.downloadsAllowed, S3CredentialProvider.hasConfiguredSource(settings),
+    func show(settings: S3StorageSettings, activeBinding: TenantWorkspaceBinding) {
+        guard settings.isBound(to: activeBinding), settings.canUpload, settings.downloadsAllowed,
+              S3CredentialProvider.hasConfiguredSource(settings),
               let binding = KeychainStore.readS3VerifiedDestination(), binding.matches(settings) else {
-            presentStandaloneError(settings.isConfigured ? S3StorageFailure.verificationRequired : S3StorageFailure.notConfigured)
+            presentStandaloneError(
+                settings.isConfigured ? S3StorageFailure.destinationBindingMismatch : S3StorageFailure.notConfigured
+            )
             return
         }
         self.settings = settings
@@ -360,7 +363,16 @@ final class S3ObjectBrowserController: NSObject, NSTableViewDataSource, NSTableV
         presentError(error)
     }
 
+    func invalidateForWorkspaceChange() {
+        resetBrowserState()
+        window?.close()
+    }
+
     func windowWillClose(_ notification: Notification) {
+        resetBrowserState()
+    }
+
+    private func resetBrowserState() {
         operationGeneration += 1
         listTask?.cancel()
         downloadTask?.cancel()
@@ -370,6 +382,7 @@ final class S3ObjectBrowserController: NSObject, NSTableViewDataSource, NSTableV
         visibleObjects = []
         lastDownloadURL = nil
         binding = nil
+        settings = .defaults
         tableView.reloadData()
         updateSelectionState()
     }

@@ -169,6 +169,13 @@
       "when": 1787927976353,
       "tag": "0023_independent_image_safety",
       "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "6",
+      "when": 1788275780586,
+      "tag": "0024_big_chamber",
+      "breakpoints": true
     }
   ]
 }

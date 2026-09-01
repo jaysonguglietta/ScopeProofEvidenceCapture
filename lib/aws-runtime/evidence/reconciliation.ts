@@ -41,6 +41,10 @@ export interface PromotionFacts {
   readonly contentType: EvidenceMimeType;
   readonly copyAttemptId: string;
   readonly copyFence: number;
+  readonly dlpPolicyVersion: string;
+  readonly dlpReceiptSha256: string;
+  readonly dlpScannedAt: string;
+  readonly dlpScannerRequestId: string;
   readonly kmsKeyArn: string;
   readonly objectLockMode: ReconciliationObjectLockMode;
   readonly promotionAttemptId: string;
@@ -201,12 +205,22 @@ function normalizeFacts(input: PromotionReconciliationRequest, maximumBytes: num
   }
   const promotedAt = canonicalInstant(input.promotedAt, "Promotion time");
   const uploadedAt = canonicalInstant(input.uploadedAt, "Source upload time");
+  const dlpScannedAt = canonicalInstant(input.dlpScannedAt, "DLP scan time");
   const retainUntil = canonicalInstant(input.retainUntil, "Retention time");
   if (Date.parse(promotedAt) < Date.parse(uploadedAt)) {
     throw new TenantSecurityError("UPLOAD_MISMATCH", "Promotion time predates the exact source upload.", 409);
   }
   if (Date.parse(retainUntil) <= Date.parse(promotedAt)) {
     throw new TenantSecurityError("RETENTION_VIOLATION", "Promotion requires future S3 Object Lock retention.", 409);
+  }
+  if (Date.parse(dlpScannedAt) < Date.parse(uploadedAt) || Date.parse(dlpScannedAt) > Date.parse(promotedAt)) {
+    throw new TenantSecurityError("UPLOAD_MISMATCH", "DLP scan is not bound to the promotion interval.", 409);
+  }
+  const dlpPolicyVersion = assertBoundedText(input.dlpPolicyVersion, "DLP policy version", 3, 64);
+  const dlpScannerRequestId = assertBoundedText(input.dlpScannerRequestId, "DLP scanner request id", 8, 128);
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$/.test(dlpPolicyVersion) ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(dlpScannerRequestId)) {
+    throw new TenantSecurityError("UPLOAD_MISMATCH", "DLP receipt identity is invalid.", 409);
   }
   if (!(["GOVERNANCE", "COMPLIANCE"] as const).includes(input.objectLockMode)) {
     throw new TenantSecurityError("RETENTION_VIOLATION", "Promotion Object Lock mode is invalid.", 409);
@@ -240,6 +254,10 @@ function normalizeFacts(input: PromotionReconciliationRequest, maximumBytes: num
     contentType,
     copyAttemptId,
     copyFence: input.copyFence,
+    dlpPolicyVersion,
+    dlpReceiptSha256: asSha256(input.dlpReceiptSha256),
+    dlpScannedAt,
+    dlpScannerRequestId,
     kmsKeyArn: asKmsKeyArn(input.kmsKeyArn),
     objectLockMode: input.objectLockMode,
     promotionAttemptId,

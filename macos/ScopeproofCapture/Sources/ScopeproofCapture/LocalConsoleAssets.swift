@@ -74,7 +74,7 @@ enum LocalConsoleAssets {
               <article class="help-card"><span>3</span><h3>Browse every location</h3><p>The library combines local screenshots with the app's verified S3 prefix, labels where each artifact exists, and groups evidence by control or assessment period.</p></article>
               <article class="help-card"><span>4</span><h3>Package for auditors</h3><p>Export approved evidence from the menu-bar app. Scopeproof verifies hashes and lifecycle history before creating the signed assessor ZIP.</p></article>
             </div>
-            <section class="panel help-panel"><h2>Security boundaries</h2><ul><li>The console listens only on 127.0.0.1 and uses a new high-entropy browser session whenever Scopeproof launches.</li><li>State-changing requests require the session cookie and a same-origin browser request.</li><li>Filesystem paths, S3 object keys, and AWS credentials are never accepted from or exposed to the browser.</li><li>Local previews are served only after path containment, PNG signature, and SHA-256 manifest checks. S3-only screenshots are opened through the native validated download workflow.</li><li>The SQLite database is a disposable search index. Original PNG, manifest, lifecycle, and receipt files remain authoritative.</li></ul></section>
+            <section class="panel help-panel"><h2>Security boundaries</h2><ul><li>The console listens only on 127.0.0.1 and uses a new high-entropy browser session whenever Scopeproof launches.</li><li>API requests require an in-memory bearer exchanged from a one-time URL fragment; no localhost cookie is created.</li><li>Filesystem paths, S3 object keys, and AWS credentials are never accepted from or exposed to the browser.</li><li>Local previews are served only after path containment, PNG signature, and SHA-256 manifest checks. S3-only screenshots are opened through the native validated download workflow.</li><li>The SQLite database is a disposable search index. Original PNG, manifest, lifecycle, and receipt files remain authoritative.</li></ul></section>
           </section>
         </main>
       </div>
@@ -86,7 +86,7 @@ enum LocalConsoleAssets {
           <div class="form-grid">
             <label><span>Status</span><select id="review-state" required><option>Draft</option><option>In Review</option><option>Approved</option><option>Rejected</option><option>Superseded</option></select></label>
             <label><span>Owner</span><input id="review-owner" maxlength="160"></label>
-            <label><span>Reviewer</span><input id="reviewer" maxlength="160" required></label>
+            <div><span>Reviewer</span><p class="muted">The authenticated macOS user will be recorded after Touch ID or device-password confirmation.</p></div>
             <label><span>Tags</span><input id="review-tags" maxlength="500" placeholder="identity, quarterly, production"></label>
           </div>
           <label><span>Review rationale</span><textarea id="review-notes" maxlength="4000" rows="5" placeholder="Explain what was reviewed, what the artifact proves, and any limitations."></textarea><small>Approval, rejection, and supersession require at least 20 characters.</small></label>
@@ -105,14 +105,42 @@ enum LocalConsoleAssets {
 
     static let javascript = #"""
     (() => {
-      const state = { status: null, allEvidence: [], evidence: [], library: null, current: null };
+      const state = { status: null, allEvidence: [], evidence: [], library: null, current: null, bearer: null };
       const $ = (id) => document.getElementById(id);
       const request = async (url, options = {}) => {
-        const response = await fetch(url, { credentials: 'same-origin', cache: 'no-store', ...options });
+        if (!state.bearer) throw new Error('The local console session is unavailable. Reopen it from Scopeproof.');
+        const headers = new Headers(options.headers || {});
+        headers.set('Authorization', `Bearer ${state.bearer}`);
+        const response = await fetch(url, { credentials: 'omit', cache: 'no-store', ...options, headers });
         const payload = await response.json().catch(() => ({}));
         if (!response.ok) throw new Error(payload.error || `Request failed (${response.status})`);
         return payload;
       };
+      const protectedImage = async (image, url) => {
+        if (!state.bearer) throw new Error('The local console session is unavailable.');
+        const response = await fetch(url, { credentials: 'omit', cache: 'no-store', headers: { Authorization: `Bearer ${state.bearer}` } });
+        if (!response.ok) throw new Error(`Preview failed (${response.status})`);
+        const objectURL = URL.createObjectURL(await response.blob());
+        const release = () => URL.revokeObjectURL(objectURL);
+        image.addEventListener('load', release, { once: true });
+        image.addEventListener('error', release, { once: true });
+        image.src = objectURL;
+      };
+
+      async function establishSession() {
+        const fragment = new URLSearchParams(window.location.hash.slice(1));
+        const nonce = fragment.get('token');
+        history.replaceState(null, '', window.location.pathname);
+        if (!nonce || !/^[A-Za-z0-9_-]{8,256}$/.test(nonce)) throw new Error('Open the console again from the Scopeproof menu.');
+        const response = await fetch('/api/session', {
+          method: 'POST', credentials: 'omit', cache: 'no-store',
+          headers: { Authorization: `Scopeproof-Launch ${nonce}`, 'Content-Type': 'application/json' },
+          body: '{}'
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok || !payload.token) throw new Error(payload.error || 'The one-time console session could not be established.');
+        state.bearer = payload.token;
+      }
       const showNotice = (message, isError = false) => {
         const notice = $('notice'); notice.textContent = message; notice.classList.remove('hidden', 'error');
         if (isError) notice.classList.add('error');
@@ -159,11 +187,11 @@ enum LocalConsoleAssets {
       function evidenceCard(item) {
         const card = node('article','evidence-card');
         let image;
-        if(item.localAvailable){ image=node('img'); image.loading='lazy'; image.alt=`Screenshot preview for ${item.title}`; image.src=`/api/evidence/${encodeURIComponent(item.evidenceID)}/image`; }
+        if(item.localAvailable){ image=node('img'); image.loading='lazy'; image.alt=`Screenshot preview for ${item.title}`; protectedImage(image,`/api/evidence/${encodeURIComponent(item.evidenceID)}/image`).catch(()=>{image.alt='Preview unavailable';}); }
         else {
           image=node('div','s3-placeholder'); const icon=node('span','', '☁');
           image.append(icon,node('strong','', 'Stored in S3'),node('small','',item.s3PreviewAvailable?'Load this screenshot only when needed':'Validated S3 previews are disabled in the app configuration'));
-          if(item.s3PreviewAvailable){ const load=node('button','preview-button','Load secure preview'); load.type='button'; load.addEventListener('click',()=>{ load.disabled=true;load.textContent='Loading…';const preview=node('img');preview.alt=`S3 screenshot preview for ${item.title}`;preview.addEventListener('load',()=>image.replaceWith(preview),{once:true});preview.addEventListener('error',()=>{load.disabled=false;load.textContent='Try preview again';showNotice('The S3 preview could not be loaded. Verify the AWS session and download permissions.',true);},{once:true});preview.src=`/api/evidence/${encodeURIComponent(item.evidenceID)}/s3-image`; }); image.append(load); }
+          if(item.s3PreviewAvailable){ const load=node('button','preview-button','Load secure preview'); load.type='button'; load.addEventListener('click',()=>{ load.disabled=true;load.textContent='Loading…';const preview=node('img');preview.alt=`S3 screenshot preview for ${item.title}`;preview.addEventListener('load',()=>image.replaceWith(preview),{once:true});protectedImage(preview,`/api/evidence/${encodeURIComponent(item.evidenceID)}/s3-image`).catch(()=>{load.disabled=false;load.textContent='Try preview again';showNotice('The S3 preview could not be loaded. Verify the AWS session and download permissions.',true);}); }); image.append(load); }
         }
         const body=node('div','card-body'); const kicker=node('div','card-kicker');
         const badges=node('div','card-badges'); badges.append(node('span',`pill ${pillClass(item.reviewStatus)}`,item.reviewStatus),node('span',`pill storage-pill ${item.storageLocation==='S3'?'s3':item.storageLocation==='Local + S3'?'both':''}`,item.storageLocation));
@@ -189,7 +217,7 @@ enum LocalConsoleAssets {
         items.forEach((item)=>{ const key=grouping==='control'?`${item.controlID}${item.controlTitle?` — ${item.controlTitle}`:''}`:grouping==='assessmentPeriod'?(item.assessmentPeriod||'No assessment period'):grouping==='framework'?item.complianceArea:'All screenshots'; if(!groups.has(key))groups.set(key,[]); groups.get(key).push(item); });
         const sections=[...groups.entries()].map(([label,records])=>{ const section=node('section','evidence-group'); const heading=node('div','group-heading'); heading.append(node('h3','',label),node('small','',`${records.length} ${records.length===1?'screenshot':'screenshots'}`)); const grid=node('div','evidence-grid'); grid.append(...records.map(evidenceCard)); section.append(heading,grid); return section; });
         $('evidence-grid').replaceChildren(...sections); $('empty-state').classList.toggle('hidden',items.length>0);
-        const recent=state.allEvidence.slice(0,5).map((item)=>{ const row=node('div','recent-row'); let image;if(item.localAvailable){image=node('img');image.alt='';image.src=`/api/evidence/${encodeURIComponent(item.evidenceID)}/image`;}else{image=node('div','recent-thumb','S3');} const copy=node('div'); copy.append(node('strong','',item.title),node('small','',`${item.controlID} · ${item.storageLocation} · ${formatTimestamp(item.localTimestamp)}`)); row.append(image,copy,node('span',`pill ${pillClass(item.reviewStatus)}`,item.reviewStatus)); return row; });
+        const recent=state.allEvidence.slice(0,5).map((item)=>{ const row=node('div','recent-row'); let image;if(item.localAvailable){image=node('img');image.alt='';protectedImage(image,`/api/evidence/${encodeURIComponent(item.evidenceID)}/image`).catch(()=>{});}else{image=node('div','recent-thumb','S3');} const copy=node('div'); copy.append(node('strong','',item.title),node('small','',`${item.controlID} · ${item.storageLocation} · ${formatTimestamp(item.localTimestamp)}`)); row.append(image,copy,node('span',`pill ${pillClass(item.reviewStatus)}`,item.reviewStatus)); return row; });
         $('recent-evidence').replaceChildren(...recent);
         if (!recent.length) { const empty=node('p','empty-inline', 'No screenshots are available locally or in the configured S3 prefix.'); $('recent-evidence').replaceChildren(empty); }
       }
@@ -218,11 +246,11 @@ enum LocalConsoleAssets {
       function populateOptions(id, values, label) { const select=$(id), current=select.value; select.replaceChildren(new Option(label,''),...values.map((value)=>new Option(value,value))); select.value=current; }
       async function performAction(url, body, success) { try { await request(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})}); showNotice(success); } catch(error){ showNotice(error.message,true); } }
       function openS3Browser(){ performAction('/api/actions/open-s3-browser',{},'S3 browser opened in Scopeproof.'); }
-      function openReview(item) { state.current=item; $('review-evidence-id').value=item.evidenceID; $('review-title').textContent=`Review ${item.evidenceID}`; $('review-state').value=item.reviewStatus; $('review-owner').value=item.owner; $('reviewer').value=item.reviewer || state.status.localUser; $('review-tags').value=item.tags.join(', '); $('review-notes').value=item.reviewNotes; $('review-dialog').showModal(); }
+      function openReview(item) { state.current=item; $('review-evidence-id').value=item.evidenceID; $('review-title').textContent=`Review ${item.evidenceID}`; $('review-state').value=item.reviewStatus; $('review-owner').value=item.owner; $('review-tags').value=item.tags.join(', '); $('review-notes').value=item.reviewNotes; $('review-dialog').showModal(); }
       async function saveReview(event) {
         event.preventDefault(); const status=$('review-state').value, notes=$('review-notes').value.trim();
         if (['Approved','Rejected','Superseded'].includes(status) && notes.length<20) { showNotice('Enter at least 20 characters explaining this decision.',true); return; }
-        try { await request(`/api/evidence/${encodeURIComponent($('review-evidence-id').value)}/review`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status,owner:$('review-owner').value,reviewer:$('reviewer').value,notes,tags:$('review-tags').value.split(',').map((value)=>value.trim()).filter(Boolean)})}); $('review-dialog').close(); await refresh(); showNotice('Lifecycle event saved and indexed.'); } catch(error){ showNotice(error.message,true); }
+        try { await request(`/api/evidence/${encodeURIComponent($('review-evidence-id').value)}/review`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({status,owner:$('review-owner').value,notes,tags:$('review-tags').value.split(',').map((value)=>value.trim()).filter(Boolean)})}); $('review-dialog').close(); await refresh(); showNotice('Authenticated lifecycle event saved and indexed.'); } catch(error){ showNotice(error.message,true); }
       }
       async function refresh(){ const status=await request('/api/status'); renderStatus(status); await loadEvidence(); }
       function capture(){ performAction('/api/actions/capture',{},'Capture dialog opened in Scopeproof.'); }
@@ -236,7 +264,7 @@ enum LocalConsoleAssets {
       $('open-folder').addEventListener('click',()=>performAction('/api/actions/open-folder',{},'Evidence folder opened.'));
       $('capture').addEventListener('click',capture); $('empty-capture').addEventListener('click',capture); $('review-form').addEventListener('submit',saveReview);
       $('review-close').addEventListener('click',()=>$('review-dialog').close()); $('review-cancel').addEventListener('click',()=>$('review-dialog').close());
-      refresh().catch((error)=>showNotice(error.message,true));
+      establishSession().then(refresh).catch((error)=>showNotice(error.message,true));
     })();
     """#
 }

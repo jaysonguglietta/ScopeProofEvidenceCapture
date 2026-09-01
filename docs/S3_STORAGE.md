@@ -1,13 +1,13 @@
 # AWS S3 evidence storage
 
-Scopeproof Capture can copy each locally verified screenshot and immutable JSON manifest to a private, versioned S3 evidence prefix. Production compliance mode adds temporary-credential enforcement, a verified customer-managed KMS encryption key, mandatory COMPLIANCE Object Lock retention, ownership controls, bucket-posture verification, exact version receipts, optional Deep Archive and replication, and auditable downloads.
+Scopeproof Capture can copy each locally verified screenshot and immutable JSON manifest to a private, versioned, tenant/workspace-scoped S3 evidence prefix. Production compliance mode adds temporary-credential enforcement, a verified customer-managed KMS encryption key, mandatory COMPLIANCE Object Lock retention, ownership controls, bucket-posture verification, exact-version receipts plus live durability revalidation, optional Deep Archive and replication, and auditable downloads.
 
 ## Recommended production workflow
 
-1. Install AWS CLI v2 from AWS and configure a named IAM Identity Center profile with `aws configure sso`. Do not place access keys in that profile.
+1. In **Capture & Jira Settings…**, select the exact tenant/workspace first. Then install AWS CLI v2 from AWS and configure a named IAM Identity Center profile with `aws configure sso`. Do not place access keys in that profile.
 2. Choose **Scopeproof shield → AWS S3 Storage…**, select **IAM Identity Center profile**, and enter the exact profile name. Select **Identity Center + assumed role** instead when the daily S3 policy belongs to a separate least-privilege role; enter its exact ARN and optional external ID.
 3. Select **Sign in with IAM Identity Center before verification** when the cached SSO session is absent or expired. Scopeproof opens the AWS browser flow through the reviewed AWS CLI v2 executable, then obtains an expiring credential set without displaying or persisting it.
-4. Select **Production compliance** and enter a same-account bucket, region, nonempty evidence prefix, customer-managed KMS key ARN, and retention. The app fixes Object Lock to **Compliance** in this profile. Governance appears only as an explicitly non-production Compatible S3 setting, does not satisfy the production verifier, and can be bypassed or shortened by a sufficiently privileged identity. Leave **Archive after days** at `0` for the supplied native bucket template; a nonzero value requires an independently reviewed exact lifecycle configuration. Select FIPS endpoints when policy requires them.
+4. Select **Production compliance** and enter a same-account bucket, region, nonempty base evidence prefix, customer-managed KMS key ARN, and retention. Scopeproof adds `tenants/<tenant>/workspaces/<workspace>` and binds the resulting destination to the active identity. The app fixes Object Lock to **Compliance** in this profile. Governance appears only as an explicitly non-production Compatible S3 setting, does not satisfy the production verifier, and can be bypassed or shortened by a sufficiently privileged identity. Leave **Archive after days** at `0` for the supplied native bucket template; a nonzero value requires an independently reviewed exact lifecycle configuration. Select FIPS endpoints when policy requires them.
 5. Leave downloads disabled for an upload-only role. Enable them only for operators who need the version-aware S3 browser.
 6. For an existing bucket, choose **Save & Verify**. Scopeproof verifies the caller identity and expected bucket owner, then calls `kms:DescribeKey` on the exact ARN and requires the same partition, Region, and owner account plus `KeyManager=CUSTOMER`, `KeyUsage=ENCRYPT_DECRYPT`, `KeySpec=SYMMETRIC_DEFAULT`, `Enabled=true`, and `KeyState=Enabled`. It also verifies prefix access, Block Public Access, versioning, BucketOwnerEnforced ownership, bucket encryption, an enabled S3 Bucket Key for SSE-KMS, COMPLIANCE Object Lock/retention, the exact deletion-deny policy, and any requested lifecycle or replication configuration.
 7. For a new production bucket, deploy the reviewed `infra/aws/cloudformation/native-capture-evidence-bucket.yaml` stack through an approved infrastructure change. Give both native templates only the KMS UUID or `mrk-…` key ID; they derive the ARN from the stack partition/Region and exact owner account. Paste the resulting `KmsKeyArn` output into the app. Use **Create & Harden Bucket** only with a separately reviewed, short-lived setup role; none of the supplied daily access templates grants bucket administration. Read the irreversible Object Lock warning before either path.
@@ -63,7 +63,9 @@ protection: WhenUnlockedThisDeviceOnly
 
 For either IAM Identity Center option, AWS CLI v2 obtains temporary credentials. Scopeproof parses them through bounded formats, copies them into an in-memory refresh cache, and never writes them to Keychain, preferences, evidence, receipts, logs, or browser storage. The AWS CLI maintains its own SSO token cache outside Scopeproof under the signed-in macOS account; protect that account with FileVault, screen lock, and endpoint controls, and use your IdP session policy to bound lifetime and revoke access.
 
-After verification, the AWS account, principal ARN or assumed-role scope, exact destination/settings digest, verification time, verified bucket posture, and verified KMS key metadata are stored in a separate `WhenUnlockedThisDeviceOnly` Keychain item. Changing the authentication method, profile, role, external ID, destination, or other security-sensitive setting invalidates that binding and disables uploads until re-verification. A refreshed session must match the saved account and role scope. Bindings created by earlier app schemas do not satisfy the current verifier and must be refreshed.
+After verification, the AWS account, principal ARN or assumed-role scope, tenant/workspace, exact destination/settings digest, verification time, verified bucket posture, and verified KMS key metadata are stored in a separate `WhenUnlockedThisDeviceOnly` Keychain item. Changing the tenant, workspace, authentication method, profile, role, external ID, destination, or other security-sensitive setting invalidates that binding and disables uploads until re-verification. A refreshed session must match the saved account, role scope, tenant, and workspace. Bindings created by earlier app schemas do not satisfy the current verifier and must be refreshed.
+
+Switching tenant/workspace is an explicit S3 disconnect boundary. Scopeproof cancels in-flight setup and retry work, closes and clears the S3 browser, removes its manual credential and verified-destination Keychain items, invalidates its in-memory AWS session, and replaces the saved S3 configuration with an empty configuration bound to the new identity. Existing local and S3 evidence is not deleted. Configure and verify the destination again after every customer/workspace switch; the app will not display the prior bucket or prefix through the new Local Console.
 
 Bucket, region, prefix, KMS ARN, retention, FIPS, lifecycle, replication, download, automatic-upload, authentication method, profile name, and role ARN are configuration and remain in macOS preferences. An external ID is an authorization binding rather than a password, but treat the saved value as restricted configuration. Credentials are never written to preferences, manifests, receipts, logs, environment files, Git, or the CloudTrail template. **Disconnect** deletes Scopeproof's S3 Keychain items, in-memory credentials, and preferences; it does not delete evidence, sign out of IAM Identity Center, or delete the AWS CLI's independently managed SSO cache. Run `aws sso logout` separately when workstation AWS access must end; that command signs out cached IAM Identity Center sessions used by the AWS CLI account.
 
@@ -71,11 +73,11 @@ Bucket, region, prefix, KMS ARN, retention, FIPS, lifecycle, replication, downlo
 
 The Local Console automatically selects its inventory source from the running app configuration:
 
-- without an S3 destination, it scans the current `~/Documents/Scopeproof Evidence` root plus the bounded legacy Pictures root;
+- without an S3 destination, it scans only the active tenant/workspace root under `~/Documents/Scopeproof Evidence` plus an applicable bounded legacy Pictures root;
 - with configured but unverified S3 settings, it continues to show local evidence and reports that verification is required; and
 - with current credentials, `s3:ListBucketVersions`, and a matching verified destination, it adds paired current PNG/manifest objects beneath that exact prefix. A local artifact is labeled `Local + S3` only when its local upload receipt binds the exact S3 keys, versions, ETags, and checksums; inventory-only objects are labeled `S3` with unverified provenance.
 
-The inventory accepts only the generated `<control>/<assessment-period>/<evidence-id>/<file>.png` plus same-basename `.json` manifest layout, and it never resurrects an older version when the current object is deleted. It groups immutable S3 versions by object key and displays one current screenshot card plus the version count. A matching evidence ID or filename is not proof of identity: joining to a local artifact additionally requires the exact schema-2 local `.s3.json` receipt, destination account/settings, key, version, ETag, S3 checksum, and local manifest digest to agree. If two different object keys claim the same evidence ID, the console omits that ambiguous ID instead of guessing. The browser API receives normalized display metadata, not an S3 object key, version ID, ETag, filesystem path, access key, secret, or session token. S3-only records remain explicitly lifecycle-invalid and provenance-unverified until a trusted receipt exists.
+The inventory accepts only the generated `tenants/<tenant>/workspaces/<workspace>/<control>/<assessment-period>/<evidence-id>/<file>.png` plus same-basename `.json` manifest layout, and it never resurrects an older version when the current object is deleted. It groups immutable S3 versions by object key and displays one current screenshot card plus the version count. A matching evidence ID or filename is not proof of identity: joining to a local artifact additionally requires the exact local `.s3.json` receipt, tenant/workspace, destination account/settings, key, version, ETag, S3 checksum, and local manifest digest to agree. If two different object keys claim the same evidence ID, the console omits that ambiguous ID instead of guessing. The browser API receives normalized display metadata, not an S3 object key, version ID, ETag, filesystem path, access key, secret, or session token. S3-only records remain explicitly lifecycle-invalid and provenance-unverified until a trusted receipt exists.
 
 S3 listing is limited to 5,000 object versions and cached in memory for 60 seconds. **Refresh** forces a new list. A list failure is fail-open only for local availability: local evidence remains visible and the console reports the S3 recovery steps, but it never invents S3 state.
 
@@ -87,11 +89,12 @@ Objects use sanitized control-oriented keys:
 
 ```text
 <prefix>/
-  <control-id>-<control-title>/
-    <assessment-period>/
-      <evidence-id>/
-        <timestamped-evidence>.png
-        <timestamped-evidence>.json
+  tenants/<tenant>/workspaces/<workspace>/
+    <control-id>-<control-title>/
+      <assessment-period>/
+        <evidence-id>/
+          <timestamped-evidence>.png
+          <timestamped-evidence>.json
 ```
 
 User input cannot supply traversal segments, backslashes, a host, or an absolute object path. Production mode requires a nonempty prefix so IAM and CloudTrail can be narrowly scoped.
@@ -102,6 +105,8 @@ Every PUT includes a base64 SHA-256 checksum and the selected encryption headers
 - bucket, region, security profile, encryption, KMS key, retention mode, and retention days;
 - exact object keys, version IDs, ETags, S3 SHA-256 checksums, and S3 request IDs; and
 - local screenshot and manifest SHA-256 digests.
+
+The receipt is not sufficient by itself to authorize local expiry cleanup. Before treating S3 as the durable copy, Scopeproof uses current credentials bound to the same tenant/workspace and performs live exact-version `HEAD` plus Object Lock retention reads for every receipt object. The response must repeat the exact version, ETag, S3 checksum, expected-owner boundary, encryption mode/KMS key, and a future COMPLIANCE retention date. Any unavailable call, stale credential, missing/replaced version, checksum change, retention change, or identity mismatch preserves the local files.
 
 The receipt contains no AWS credential. A retry creates a new protected version at the deterministic key and records that exact version.
 
@@ -401,7 +406,8 @@ Test at least annually:
 3. exercise KMS-key recovery and rotation procedures;
 4. confirm Object Lock prevents prohibited deletion;
 5. confirm CloudTrail and SNS detect a controlled policy-change test; and
-6. restore from the replication destination when replication is enabled.
+6. restore from the replication destination when replication is enabled; and
+7. attempt local expiry with a stale receipt, missing version, wrong checksum, expired session, changed KMS key, and released/shortened retention; every case must fail closed and preserve the local artifact.
 
 Deep Archive affects retrieval time and cost. A lifecycle transition does not change Object Lock retention. Configure deletion/expiration separately through reviewed records-management infrastructure; Scopeproof intentionally does not create an automatic deletion policy.
 
@@ -419,6 +425,7 @@ Deep Archive affects retrieval time and cost. A lifecycle transition does not ch
 | KMS mismatch | Select the exact same-region customer-managed key and correct its IAM/key policies. |
 | KMS access denied | Confirm the identity policy and key policy both name the exact key, account, S3 regional service, and Bucket Key encryption context; then verify the bucket default encryption matches the app. |
 | Object Lock mismatch | Confirm mode and minimum retention. Enabling Object Lock is irreversible. |
+| Local expiry cannot verify the durable copy | Refresh temporary credentials for the same tenant/workspace, re-verify the destination, and inspect each exact receipt version's ETag, checksum, KMS key, and COMPLIANCE retention. Do not delete the local copy manually to bypass the failed check. |
 | Bucket policy, lifecycle, or replication mismatch | Apply the complete exact five-statement policy from the native bucket template; do not merge extra bucket-policy statements. Configure lifecycle/replication through reviewed IaC. Scopeproof verifies but does not overwrite these controls on an existing bucket. |
 | Browser cannot list versions | Add prefix-scoped `s3:ListBucketVersions`. |
 | Exact version download rejected | Add `s3:GetObjectVersion` and `kms:Decrypt`, then refresh the version list. |

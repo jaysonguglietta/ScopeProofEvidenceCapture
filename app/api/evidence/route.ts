@@ -4,7 +4,19 @@ import { enforceRateLimit, requireBoundedContentLength } from "../../../lib/serv
 import { SAFE_MANUAL_EVIDENCE_TYPES } from "../../../lib/server/evidence-response";
 
 export async function GET(request: Request) {
-  try { const user = await requireApiUser(request); await enforceRateLimit(request, user.id, "evidence:list", 120, 60); return Response.json({ evidence: await listEvidence() }); }
+  try {
+    const user = await requireApiUser(request);
+    await enforceRateLimit(request, user.id, "evidence:list", 120, 60);
+    const query = new URL(request.url).searchParams;
+    return Response.json(await listEvidence({
+      assessmentId: query.get("assessmentId") || undefined,
+      cursor: query.get("cursor") || undefined,
+      limit: query.get("limit") || undefined,
+      status: query.get("status") || undefined,
+      type: query.get("type") || undefined,
+      query: query.get("q") || undefined,
+    }), { headers: { "cache-control": "private, no-store" } });
+  }
   catch (error) { return jsonError(error); }
 }
 

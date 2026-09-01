@@ -119,6 +119,10 @@ function recoveryFoundation() {
   });
   const tenantDefinition = validateTenant({
     displayName: "Acme Corporation",
+    dlpPolicyVersion: "scopeproof-dlp-v1",
+    dlpScannerEndpoint: "https://scanner.security.example.com/v1/exact-version",
+    dlpScannerSecretArn: "arn:aws:secretsmanager:us-east-1:111111111111:secret:scopeproof/acme/dlp-token-AbCdEf",
+    dlpScannerSecretKmsKeyArn: "arn:aws:kms:us-east-1:111111111111:key/33333333-3333-4333-8333-333333333333",
     id: acmeTenantId,
     retentionDays: 365,
     retentionMode: "COMPLIANCE",
@@ -262,12 +266,12 @@ test("production tenant retention and Lambda concurrency budgets fail closed", (
   assert.equal(validateTenantDeploymentSecurity(governance, "stage"), governance);
   assert.equal(
     Object.values(validateTenantLambdaConcurrencyBudget(defaultTenantLambdaConcurrencyBudget, "prod")).reduce((sum, value) => sum + value, 0),
-    21,
+    23,
   );
   assert.throws(() => validateTenantLambdaConcurrencyBudget({
     ...defaultTenantLambdaConcurrencyBudget,
     tenantApi: 6,
-  }, "prod"), /exceeds the 21 prod budget/);
+  }, "prod"), /exceeds the 23 prod budget/);
   assert.throws(() => validateTenantLambdaConcurrencyBudget({
     ...defaultTenantLambdaConcurrencyBudget,
     tenantApi: 0,
@@ -841,14 +845,14 @@ test("tenant stack is isolated, immutable, and remains provisioning", () => {
   ]) {
     assert.match(workflowJson, new RegExp(state));
   }
-  template.resourceCountIs("AWS::Lambda::Function", 8);
+  template.resourceCountIs("AWS::Lambda::Function", 10);
   assert.equal(
     Object.values(synthesized.Resources).filter(
       (resource) =>
         resource.Type === "AWS::Lambda::Function" &&
         JSON.stringify(resource).includes('"Architectures":["arm64"]'),
     ).length,
-    7,
+    9,
   );
   template.hasResourceProperties("AWS::IAM::Role", {
     Path: "/scopeproof/api/",
@@ -907,7 +911,7 @@ test("tenant stack is isolated, immutable, and remains provisioning", () => {
   assert.match(apiRolePolicyJson, /DOMAIN#api-acme\.evidence\.example\.com/);
   assert.match(apiRolePolicyJson, /sts:AssumeRole/);
   assert.doesNotMatch(apiRolePolicyJson, /rds-data:|secretsmanager:GetSecretValue|s3:PutObject|kms:Decrypt/);
-  template.resourceCountIs("AWS::SQS::Queue", 3);
+  template.resourceCountIs("AWS::SQS::Queue", 4);
   template.hasResourceProperties("AWS::Lambda::Function", {
     Environment: {
       Variables: Match.objectLike({
@@ -1079,8 +1083,8 @@ test("runtime assets enforce exact provisioning and single-writer promotion cont
   assert.match(provisioner, /fieldNumber\(functions\[0\]\) !== controlRoleAllowedFunctions\.length/);
   assert.match(provisioner, /p\.proname IN \('current_tenant_id', 'resolve_active_membership', 'reserve_exact_version_legal_hold', 'approve_exact_version_legal_hold', 'record_api_audit_event'\)/);
   assert.match(provisioner, /fieldNumber\(functions\[0\]\) !== 5/);
-  assert.match(provisioner, /p\.proname IN \('claim_promotion_fence', 'current_tenant_id', 'read_promoted_evidence_receipt', 'reconcile_promoted_evidence'\)/);
-  assert.match(provisioner, /fieldNumber\(functions\[0\]\) !== 4/);
+  assert.match(provisioner, /p\.proname IN \('claim_promotion_fence', 'current_tenant_id', 'read_promoted_evidence_receipt', 'reconcile_promoted_evidence', 'reconcile_rejected_evidence'\)/);
+  assert.match(provisioner, /fieldNumber\(functions\[0\]\) !== 5/);
   assert.doesNotMatch(provisioner, /stableToken\(executionId/);
   assert.doesNotMatch(provisioner, /quoteLiteral\(password\)/);
 

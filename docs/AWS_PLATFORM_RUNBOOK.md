@@ -1,6 +1,6 @@
 # Scopeproof AWS platform operator runbook
 
-> **Pre-deployment status — 2026-08-27:** this repository contains an AWS CDK foundation and security-domain code, but no AWS resources have been deployed or validated by this project work. The current browser/API application is still the legacy Cloudflare/Sites, D1, and R2 single-tenant runtime. It is not the AWS multi-tenant service described here. Do not direct a second customer hostname to the legacy runtime.
+> **Pre-deployment status — 2026-09-01:** this repository contains an AWS CDK foundation and security-domain code, but no AWS resources have been deployed or validated by this project work. The current browser/API application is still the legacy Cloudflare/Sites, D1, and R2 single-tenant runtime. It is not the AWS multi-tenant service described here. Do not direct a second customer hostname to the legacy runtime. The current source adds production-required exact-version DLP, KMS-signed DLP receipts, cross-store reconciliation, schema version 3 forward hardening, and an execution-bound `CUSTOMER_ENABLED` activation approval; none is live-cloud evidence.
 >
 > **Production stop:** do not onboard a customer or serve traffic from the AWS hostname. The repository now implements the database boundary; a composed per-tenant API for `/health`, `/v1/me`, `/v1/upload-intents`, `/v1/evidence/search`, `/v1/evidence-download-intents`, and two-person legal-hold request/approval; strict JWT/scope/membership authorization; retry-safe upload reconciliation; a durable bounded KMS-signed public-API audit drain; KMS receipts; a scheduled exact-version legal-hold reconciliation/expiry worker; global-table/S3/Aurora recovery; a protected signing/notarization workflow; and advanced CodeQL with a manual Swift build. None is deployed or validated in a live AWS/PostgreSQL/Apple environment, and no artifact has been submitted to Apple. The Amplify customer UI still has no source connection or application release, no hosted Mac OAuth/session UI or legal-hold UI/operational drill exists, and most product routes are not migrated. A successful infrastructure deployment or database execution is not customer-service activation.
 
@@ -8,11 +8,48 @@ This is the start-to-finish operator procedure for the selected [AWS CDK foundat
 
 Keep these lifecycle stages distinct:
 
+### 2026-09-01 provisioner and promotion update
+
+The current source packages migrations `001`–`009` and reports tenant database
+schema version `3`. Migration `009_runtime_hardening.sql` is the forward-only
+upgrade for already provisioned version-2 databases; it adds exact-version DLP
+fact validation, immutable rejected-ingest receipts/reconciliation, and
+auditor-approved-only evidence reads. Never obtain those changes by editing or
+re-running historical `001`/`006` files. The attested bundle now covers all nine
+SQL files and the corresponding live catalog definitions.
+
+The activation task now requires a strongly consistent `CUSTOMER_ENABLED`
+record bound to the exact tenant and Step Functions execution before it can
+publish DNS or mark the tenant `ACTIVE`. Create that approval only after the
+launch evidence is attached; a prior execution's item is invalid. `ACTIVE`
+therefore proves database checks plus that exact approval, but it still does not
+prove that the UI/API artifact, DLP service, identities, recovery, or tenant
+isolation passed live tests.
+
+For every production tenant, provide all four DLP context fields together:
+`dlpScannerEndpoint`, `dlpScannerSecretArn`,
+`dlpScannerSecretKmsKeyArn`, and `dlpPolicyVersion`. Promotion is disabled
+unless the clean HTTPS scanner returns a strict `CLEAN` decision for the exact
+quarantine version and the canonical receipt is signed/verified with tenant
+KMS. Retain live clean/rejected/replay/tamper and DynamoDB/PostgreSQL
+reconciliation evidence before activation. This subsection supersedes older
+schema-version-2, eight-file, and infrastructure-only activation wording later
+in this runbook. No AWS resource was deployed by these source changes.
+
+Rejected-ingest recovery is bound to the durable queue contract. An exact
+DynamoDB-first receipt can replay idempotently even after 24 hours; when Aurora
+has no receipt yet, the authenticated relational transition is accepted only
+within the 14-day ingest DLQ horizon. Never edit `rejectedAt` to force a replay.
+For an older message, preserve the queue/DynamoDB evidence, investigate the
+outage and authoritative revisions, and use a reviewed repair procedure. Before
+activation, test Aurora unavailability followed by a 25-hour redrive and prove
+that an exact replay converges while any changed fact is rejected.
+
 | Stage | What it proves | What it does not prove |
 | --- | --- | --- |
 | Local tests and `cdk synth` | Source contracts compile and CloudFormation can be generated | No AWS resource exists; no IAM, service, network, or engine behavior was exercised |
 | `cdk diff` and approved stack deployment | Reviewed infrastructure resources exist in the target account | The tenant database is not provisioned and no customer application is running |
-| Tenant state-machine execution | Migrations `001`-`008`, identity seed, six split execute-only application grants, ownership/RLS invariants, a wrong-tenant write denial, and DNS-last publication passed for that tenant | `ACTIVE` is infrastructure/database readiness only; it does not release an application, create users/memberships, expose uploads/legal holds, or authorize customer service |
+| Tenant state-machine execution | Migrations `001`-`009`, schema version 3, identity seed, six split execute-only application grants, ownership/RLS/integrity invariants, a wrong-tenant write denial, and an execution-bound `CUSTOMER_ENABLED` approval passed before DNS-last publication | It proves only the exact execution and approval represented by those records; it does not release an application artifact, create users/memberships, or prove live upload/DLP/recovery behavior |
 | Runtime integration and activation record | Hosted authentication, membership, adapters, upload issuer/promotion, monitoring, restore, and isolation tests passed | Nothing beyond the signed scope/environment of that activation record |
 
 ## 1. Product and operating brief
@@ -33,7 +70,7 @@ Keep these lifecycle stages distinct:
 | Shared AWS foundation | Route 53, Amplify resources, WAF, Cognito, DynamoDB, Aurora/Data API, SQS, SES, budgets, release S3/CloudFront | Synthesizable only; no deployment was performed |
 | Tenant data plane | Separate per-tenant Cognito web/native clients and custom scopes; regional API custom domain; an API Gateway mock `/health`; separated upload, evidence-read, legal-hold-API, ingest, evidence-control-worker, and API-audit-signer IAM identities; evidence/secret/signing KMS keys; quarantine/evidence buckets; GuardDuty; promotion Lambda; and database provisioning | Source/template-tested only; identity, upload, metadata-search, exact-version-download, and legal-hold request/approval routes are composed in source, but no route or stack is deployed |
 | Audit and recovery infrastructure | Durable public-API outbox plus bounded KMS signer/hash-chain append, multi-region CloudTrail, exact tenant S3 data events, locked audit bucket, KMS receipt adapters, DynamoDB global table, same-account cross-region S3 live replication plus Batch backfill/exact verification, Aurora AWS Backup/Vault Lock, and selected alarms | Not deployed; no live audit-drain/poison-row drill, backfill execution, replica validation, restore, cutover, or RPO/RTO evidence exists |
-| AWS runtime code | Strict Cognito/JWKS, exact-host/Dynamo, app-client and OAuth-scope checks, active-membership/RBAC, RDS Data, composed upload/search/exact-download routes, Dynamo/Aurora reconciliation, KMS receipts, authenticated two-person legal-hold routes, and a scheduled exact-version worker | Production-shaped code with adversarial tests; remaining product/UI routes are not composed and no live AWS integration test has run |
+| AWS runtime code | Strict Cognito/JWKS, exact-host/Dynamo, API Gateway and Lambda app-client/OAuth-scope checks, active-membership/RBAC, RDS Data, composed upload/search/exact-download routes, exact-version DLP with durable KMS-signed receipts, Dynamo/Aurora/S3 reconciliation, immutable rejected-ingest receipts, KMS promotion receipts, authenticated two-person legal-hold routes, and a scheduled exact-version worker | Production-shaped code with adversarial tests; remaining product/UI routes are not composed and no live AWS integration test has run |
 | Browser/API runtime | Legacy Cloudflare/Sites application | Single tenant; must not serve multiple customers |
 | macOS hosted auth | PKCE and Keychain primitives under `HostedOAuth.swift` and `HostedTokenStore.swift` | Not integrated with app UI, callback handling, token exchange, or device enrollment |
 

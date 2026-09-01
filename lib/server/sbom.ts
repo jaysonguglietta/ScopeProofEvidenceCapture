@@ -6,6 +6,7 @@ import { getAssessment } from "./assessments";
 import { getEnv } from "./env";
 import { storeEvidence } from "./evidence";
 import { isValidGitHubOwner, isValidGitRef, isValidRepositoryName, SbomError, validateOneTimeGitHubToken } from "./sbom-input";
+import { decodePageCursor, pageLimit, pageMeta, type PageMeta } from "./pagination";
 
 export { parseGitHubRepositoryUrl, SbomError, validateOneTimeGitHubToken } from "./sbom-input";
 
@@ -262,12 +263,12 @@ export async function queueSbom(input: { assessmentId: string; owner?: string; r
   const credentialMode = input.credentialMode === "one_time" ? "one_time" : "managed";
   if (!/^asm_[a-f0-9]{32}$/.test(input.assessmentId) || !isValidGitHubOwner(owner) || !isValidRepositoryName(repository) || !isValidGitRef(ref) || !["cyclonedx_json", "spdx_json"].includes(input.format)) throw new SbomError("Assessment, repository, ref, and SBOM format are required.", "INVALID_REQUEST");
   const assessment = await getAssessment(input.assessmentId);
-  if (!assessment || assessment.status !== "active") throw new SbomError("SBOM generation requires an active assessment.", "ASSESSMENT_NOT_ACTIVE", false, 409);
+  if (!assessment || assessment.status !== "active" || assessment.scope_mode !== "explicit" || !assessment.catalog_id) throw new SbomError("SBOM generation requires an active assessment with an explicit, versioned scope.", "ASSESSMENT_NOT_ACTIVE", false, 409);
   const controls = assessment.controls as string[];
-  if (controls.length && !controls.includes("6.3.2")) throw new SbomError("The assessment does not include PCI DSS control 6.3.2.", "OUT_OF_SCOPE", false, 422);
+  if (!controls.length || !controls.includes("6.3.2")) throw new SbomError("The assessment does not include PCI DSS control 6.3.2.", "OUT_OF_SCOPE", false, 422);
   const fullName = `${owner}/${repository}`;
   const systems = assessment.systems as string[];
-  if (systems.length && !systems.some((value) => [fullName, owner, "github"].includes(value.toLowerCase() === "github" ? "github" : value))) throw new SbomError(`Repository ${fullName} is outside the assessment system scope. Add ${fullName}, ${owner}, or GitHub to a new assessment scope.`, "OUT_OF_SCOPE", false, 422);
+  if (!systems.length || !systems.some((value) => [fullName, owner, "github"].includes(value.toLowerCase() === "github" ? "github" : value))) throw new SbomError(`Repository ${fullName} is outside the assessment system scope. Add ${fullName}, ${owner}, or GitHub to a new assessment scope.`, "OUT_OF_SCOPE", false, 422);
   const id = randomId("sbom");
   await executeAuditedBatch(actor, "sbom.queued", "sbom_job", id, { assessmentId: input.assessmentId, repository: fullName, requestedRef: ref, format: input.format, credentialMode }, [
     env.DB.prepare("INSERT INTO sbom_jobs (id, requested_by, assessment_id, repository_owner, repository_name, repository_full_name, requested_ref, format, max_attempts) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(id, actor.id, input.assessmentId, owner, repository, fullName, ref, input.format, credentialMode === "one_time" ? 1 : 3),
@@ -344,11 +345,35 @@ export async function listSbomJobs(assessmentId?: string): Promise<Array<Record<
   return (await Promise.all(ids.map((row) => getSbomJob(row.id)))).filter((row): row is Record<string, unknown> => Boolean(row));
 }
 
+export async function listSbomJobsPage(input: { assessmentId?: string; cursor?: string; limit?: string }): Promise<{ jobs: Array<Record<string, unknown>>; page: PageMeta; summary: Record<string, number> }> {
+  const assessmentId = String(input.assessmentId || "");
+  if (assessmentId && !/^asm_[a-f0-9]{32}$/u.test(assessmentId)) throw new SbomError("Assessment identifier is invalid.", "INVALID_ASSESSMENT", false, 400);
+  const limit = pageLimit(input.limit, 50, 100);
+  const cursor = decodePageCursor(input.cursor, /^sbom_[a-f0-9]{32}$/u);
+  const conditions: string[] = [];
+  const bindings: unknown[] = [];
+  if (assessmentId) { conditions.push("assessment_id = ?"); bindings.push(assessmentId); }
+  if (cursor) { conditions.push("(created_at < ? OR (created_at = ? AND id < ?))"); bindings.push(cursor.sortValue, cursor.sortValue, cursor.id); }
+  const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+  const baseWhere = assessmentId ? "WHERE assessment_id = ?" : "";
+  const baseBindings = assessmentId ? [assessmentId] : [];
+  const total = await getEnv().DB.prepare(`SELECT COUNT(*) AS total FROM sbom_jobs ${baseWhere}`).bind(...baseBindings).first<{ total: number }>();
+  const ids = (await getEnv().DB.prepare(`SELECT id, created_at FROM sbom_jobs ${where} ORDER BY created_at DESC, id DESC LIMIT ?`).bind(...bindings, limit + 1).all<{ id: string; created_at: string }>()).results;
+  const jobs = (await Promise.all(ids.map((row) => getSbomJob(row.id)))).filter((row): row is Record<string, unknown> => Boolean(row));
+  const paged = pageMeta(jobs, limit, Number(total?.total || 0), "created_at", "id");
+  const summary = await getEnv().DB.prepare(`SELECT COUNT(*) AS total,
+      SUM(CASE WHEN status IN ('queued','running','retrying') THEN 1 ELSE 0 END) AS active,
+      SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed,
+      SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
+    FROM sbom_jobs ${baseWhere}`).bind(...baseBindings).first<Record<string, number>>();
+  return { jobs: paged.items, page: paged.page, summary: Object.fromEntries(Object.entries(summary || {}).map(([key, value]) => [key, Number(value || 0)])) };
+}
+
 export async function processDueSbomWork(now = new Date()): Promise<void> {
   const env = getEnv();
   const exhausted = (await env.DB.prepare("SELECT id, requested_by FROM sbom_jobs WHERE status = 'running' AND lease_expires_at < ? AND attempt >= max_attempts ORDER BY lease_expires_at LIMIT 3").bind(now.toISOString()).all<{ id: string; requested_by: string }>()).results;
   for (const job of exhausted) await executeAuditedBatch(sbomSystemActor, "sbom.failed", "sbom_job", job.id, { code: "LEASE_EXPIRED", retryAt: null, requestedBy: job.requested_by }, [env.DB.prepare("UPDATE sbom_jobs SET status = 'failed', error_code = 'LEASE_EXPIRED', error_message = 'The SBOM job ended before completion and no retry attempt remains. Start a new job.', completed_at = ?, lease_id = NULL, lease_expires_at = NULL WHERE id = ? AND status = 'running' AND lease_expires_at < ? AND attempt >= max_attempts").bind(now.toISOString(), job.id, now.toISOString())], { sql: "EXISTS (SELECT 1 FROM sbom_jobs WHERE id = ? AND status = 'failed' AND error_code = 'LEASE_EXPIRED')", bindings: [job.id] });
-  const jobs = (await env.DB.prepare("SELECT id, requested_by FROM sbom_jobs WHERE (status = 'retrying' AND next_attempt_at <= ? AND attempt < max_attempts) OR (status = 'running' AND lease_expires_at < ? AND attempt < max_attempts) ORDER BY next_attempt_at LIMIT 3").bind(now.toISOString(), now.toISOString()).all<{ id: string; requested_by: string }>()).results;
+  const jobs = (await env.DB.prepare("SELECT id, requested_by FROM sbom_jobs WHERE status = 'queued' OR (status = 'retrying' AND next_attempt_at <= ? AND attempt < max_attempts) OR (status = 'running' AND lease_expires_at < ? AND attempt < max_attempts) ORDER BY created_at, id LIMIT 3").bind(now.toISOString(), now.toISOString()).all<{ id: string; requested_by: string }>()).results;
   for (const job of jobs) {
     const user = await loadActiveUser(job.requested_by);
     if (user) await processSbom(job.id, user);

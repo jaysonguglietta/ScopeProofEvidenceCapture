@@ -6,6 +6,40 @@ import { getEnv } from "./env";
 import { readEvidenceBytes } from "./evidence";
 import { csvCell } from "./csv";
 
+export type PackagePreflight = {
+  ready: boolean;
+  assessmentId: string;
+  total: number;
+  eligible: number;
+  excluded: number;
+  blockers: Array<{ code: string; count: number; message: string }>;
+};
+
+export async function preflightAssessorPackage(assessmentId: string): Promise<PackagePreflight> {
+  if (!/^asm_[a-f0-9]{32}$/u.test(assessmentId)) throw new Response(JSON.stringify({ error: "A valid assessment is required." }), { status: 400, headers: { "content-type": "application/json" } });
+  const assessment = await getEnv().DB.prepare("SELECT status FROM assessments WHERE id = ?").bind(assessmentId).first<{ status: string }>();
+  if (!assessment) throw new Response(JSON.stringify({ error: "Assessment not found." }), { status: 404, headers: { "content-type": "application/json" } });
+  const now = new Date().toISOString();
+  const counts = await getEnv().DB.prepare(`SELECT COUNT(*) AS total,
+      SUM(CASE WHEN e.status = 'approved' AND e.expires_at > ? AND e.coverage_status != 'partial'
+        AND (e.type != 'screenshot' OR (e.server_safety_scan_sha256 = e.sha256 AND e.server_safety_scan_policy IS NOT NULL AND e.server_safety_scan_completed_at IS NOT NULL AND e.server_safety_scanner_origin IS NOT NULL AND e.server_safety_receipt_sha256 IS NOT NULL))
+        AND (e.device_id IS NULL OR EXISTS (SELECT 1 FROM native_evidence_manifests n JOIN capture_devices d ON d.id = n.device_id WHERE n.artifact_id = e.id AND n.device_id = e.device_id AND n.image_sha256 = e.sha256 AND n.manifest_sha256 = e.manifest_sha256 AND n.chain_sequence IS NOT NULL AND n.chain_sequence > 0 AND n.chain_event_hash = e.chain_event_hash AND n.provenance_key_id IS NOT NULL AND d.provenance_key_id = n.provenance_key_id AND d.chain_sequence >= n.chain_sequence)) THEN 1 ELSE 0 END) AS eligible,
+      SUM(CASE WHEN e.coverage_status = 'partial' AND e.expires_at > ? AND e.status NOT IN ('rejected','returned','superseded','expired','purged') THEN 1 ELSE 0 END) AS partial,
+      SUM(CASE WHEN e.type = 'screenshot' AND e.status = 'approved' AND e.expires_at > ? AND NOT (e.server_safety_scan_sha256 = e.sha256 AND e.server_safety_scan_policy IS NOT NULL AND e.server_safety_scan_completed_at IS NOT NULL AND e.server_safety_scanner_origin IS NOT NULL AND e.server_safety_receipt_sha256 IS NOT NULL) THEN 1 ELSE 0 END) AS pending_safety,
+      SUM(CASE WHEN e.device_id IS NOT NULL AND e.status = 'approved' AND e.expires_at > ? AND NOT EXISTS (SELECT 1 FROM native_evidence_manifests n JOIN capture_devices d ON d.id = n.device_id WHERE n.artifact_id = e.id AND n.device_id = e.device_id AND n.image_sha256 = e.sha256 AND n.manifest_sha256 = e.manifest_sha256 AND n.chain_sequence IS NOT NULL AND n.chain_sequence > 0 AND n.chain_event_hash = e.chain_event_hash AND n.provenance_key_id IS NOT NULL AND d.provenance_key_id = n.provenance_key_id AND d.chain_sequence >= n.chain_sequence) THEN 1 ELSE 0 END) AS pending_native
+    FROM evidence_artifacts e WHERE e.assessment_id = ?`).bind(now, now, now, now, assessmentId).first<Record<string, number>>();
+  const total = Number(counts?.total || 0);
+  const eligible = Number(counts?.eligible || 0);
+  const blockers: PackagePreflight["blockers"] = [];
+  if (assessment.status === "draft") blockers.push({ code: "ASSESSMENT_DRAFT", count: 1, message: "Activate or close the assessment before export." });
+  if (!eligible) blockers.push({ code: "NO_ELIGIBLE_EVIDENCE", count: 0, message: "No approved, current, complete evidence is eligible." });
+  if (eligible > 100) blockers.push({ code: "PACKAGE_LIMIT", count: eligible, message: "The package limit is 100 artifacts; split scope explicitly." });
+  if (Number(counts?.partial || 0)) blockers.push({ code: "PARTIAL_COVERAGE", count: Number(counts?.partial || 0), message: "Recollect partial-coverage evidence." });
+  if (Number(counts?.pending_safety || 0)) blockers.push({ code: "SAFETY_PENDING", count: Number(counts?.pending_safety || 0), message: "Complete independent screenshot safety verification." });
+  if (Number(counts?.pending_native || 0)) blockers.push({ code: "PROVENANCE_PENDING", count: Number(counts?.pending_native || 0), message: "Finalize native device provenance." });
+  return { ready: blockers.length === 0, assessmentId, total, eligible, excluded: total - eligible, blockers };
+}
+
 function safeName(value: string): string {
   return value.toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "evidence";
 }

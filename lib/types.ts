@@ -1,5 +1,5 @@
 export type EvidenceType = "Screenshot" | "Code" | "Configuration" | "Report";
-export type EvidenceStatus = "Approved" | "Needs review" | "Expiring" | "Expired" | "Failed";
+export type EvidenceStatus = "Approved" | "Needs review" | "Expiring" | "Expired" | "Rejected" | "Returned" | "Superseded";
 export type ControlStatus = "Covered" | "Partial" | "Gap";
 
 export interface Evidence {

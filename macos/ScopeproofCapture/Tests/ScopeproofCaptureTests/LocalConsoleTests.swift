@@ -35,13 +35,30 @@ struct LocalConsoleTests {
     func shipsCSPCompatibleAssets() {
         #expect(LocalConsoleAssets.html.contains("src=\"/assets/app.js\""))
         #expect(!LocalConsoleAssets.html.contains("<script>"))
-        #expect(LocalConsoleAssets.javascript.contains("credentials: 'same-origin'"))
+        #expect(LocalConsoleAssets.javascript.contains("credentials: 'omit'"))
+        #expect(LocalConsoleAssets.javascript.contains("Scopeproof-Launch"))
+        #expect(LocalConsoleAssets.javascript.contains("Authorization"))
+        #expect(!LocalConsoleAssets.javascript.contains("scopeproof_local="))
+        #expect(!LocalConsoleAssets.html.contains("id=\"reviewer\""))
         #expect(LocalConsoleAssets.html.contains("Private to this Mac"))
         #expect(LocalConsoleAssets.html.contains("storage-location"))
         #expect(LocalConsoleAssets.html.contains("assessment-period"))
         #expect(LocalConsoleAssets.html.contains("group-by"))
         #expect(LocalConsoleAssets.javascript.contains("/api/library"))
         #expect(!LocalConsoleAssets.javascript.localizedCaseInsensitiveContains("secretAccessKey"))
+    }
+
+    @Test("Canonicalizes tenant/workspace IDs and isolates filesystem roots")
+    func isolatesTenantWorkspaceRoots() throws {
+        let binding = try #require(TenantWorkspaceBinding.validated(
+            tenantID: " Customer-A ", workspaceID: "Audit_2026"
+        ))
+        #expect(binding == TenantWorkspaceBinding(tenantID: "customer-a", workspaceID: "audit_2026"))
+        let base = URL(fileURLWithPath: "/Users/tester/Documents/Scopeproof Evidence", isDirectory: true)
+        #expect(binding.scopedEvidenceRoot(base: base).path ==
+            "/Users/tester/Documents/Scopeproof Evidence/tenants/customer-a/workspaces/audit_2026")
+        #expect(TenantWorkspaceBinding.validated(tenantID: "../customer-b", workspaceID: "default") == nil)
+        #expect(TenantWorkspaceBinding.validated(tenantID: "customer-a", workspaceID: "../other") == nil)
     }
 
     @Test("Uses one-time launch nonces and rotates bounded browser sessions")

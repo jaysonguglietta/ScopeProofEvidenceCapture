@@ -16,6 +16,7 @@ import {
   PutObjectCommand,
   S3Client,
 } from "@aws-sdk/client-s3";
+import { GetSecretValueCommand, SecretsManagerClient } from "@aws-sdk/client-secrets-manager";
 import {
   buildAuthoritativePromotionReceiptItem,
   parseAuthoritativePromotionReceiptItem,
@@ -24,6 +25,7 @@ import {
 } from "./promotion-receipt.mjs";
 import { buildPromotionRecoveryChangeItem } from "../reconcile-recovery/change-ledger.mjs";
 import { derivePromotionRetention } from "./retention-contract.mjs";
+import { buildExactVersionDlpRequest, parseExactVersionDlpResponse } from "./dlp-contract.mjs";
 import {
   buildPromotionCopyAttemptItem,
   createOrAdoptImmutableDestination,
@@ -40,6 +42,10 @@ const required = [
   "CONTROL_TABLE_NAME",
   "DATABASE_CLUSTER_ARN",
   "DATABASE_NAME",
+  "DLP_MODE",
+  "DLP_POLICY_VERSION",
+  "DLP_SCANNER_ENDPOINT",
+  "DLP_SCANNER_SECRET_ARN",
   "EVIDENCE_BUCKET_NAME",
   "EVIDENCE_KEY_ARN",
   "INGEST_BUCKET_NAME",
@@ -61,6 +67,10 @@ const config = Object.freeze({
   controlTable: process.env.CONTROL_TABLE_NAME,
   databaseClusterArn: process.env.DATABASE_CLUSTER_ARN,
   databaseName: process.env.DATABASE_NAME,
+  dlpMode: process.env.DLP_MODE,
+  dlpPolicyVersion: process.env.DLP_POLICY_VERSION,
+  dlpScannerEndpoint: process.env.DLP_SCANNER_ENDPOINT,
+  dlpScannerSecretArn: process.env.DLP_SCANNER_SECRET_ARN,
   evidenceBucket: process.env.EVIDENCE_BUCKET_NAME,
   evidenceKeyArn: process.env.EVIDENCE_KEY_ARN,
   ingestBucket: process.env.INGEST_BUCKET_NAME,
@@ -99,6 +109,18 @@ if (!Number.isInteger(config.retentionDays) || config.retentionDays < 1 || confi
 if (!new Set(["GOVERNANCE", "COMPLIANCE"]).has(config.retentionMode)) {
   throw new Error("Invalid Object Lock retention mode.");
 }
+if (!new Set(["DISABLED", "ENFORCED"]).has(config.dlpMode)) throw new Error("Invalid exact-version DLP mode.");
+if (config.dlpMode === "ENFORCED") {
+  let endpoint;
+  try { endpoint = new URL(config.dlpScannerEndpoint); } catch { throw new Error("Invalid DLP scanner endpoint."); }
+  if (endpoint.protocol !== "https:" || endpoint.username || endpoint.password || endpoint.search || endpoint.hash ||
+      endpoint.port || endpoint.pathname === "/" || !/^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$/.test(config.dlpPolicyVersion) ||
+      !secretArnPattern.test(config.dlpScannerSecretArn)) {
+    throw new Error("Unsafe exact-version DLP configuration.");
+  }
+} else if (config.dlpPolicyVersion !== "DISABLED" || config.dlpScannerEndpoint !== "DISABLED" || config.dlpScannerSecretArn !== "DISABLED") {
+  throw new Error("Disabled DLP configuration must use the exact fail-closed sentinel.");
+}
 
 const mimeExtensions = new Map([
   ["application/json", "json"],
@@ -109,9 +131,11 @@ const mimeExtensions = new Map([
   ["text/plain", "txt"],
 ]);
 const scanReconciliationGraceMilliseconds = 7 * 24 * 60 * 60 * 1_000;
+const dlpSigningAlgorithm = "RSASSA_PSS_SHA_256";
 const dynamo = new DynamoDBClient({});
 const kms = new KMSClient({});
 const rds = new RDSDataClient({});
+const secrets = new SecretsManagerClient({});
 // Conditional PutObject is deliberately single-attempt. An ambiguous network
 // result is recovered by exact-key HeadObject; SDK-level replay is unnecessary.
 const s3 = new S3Client({ maxAttempts: 1 });
@@ -201,6 +225,19 @@ async function promoteRecord(record) {
   if (!tags.TagSet?.some((tag) => tag.Key === "GuardDutyMalwareScanStatus" && tag.Value === "NO_THREATS_FOUND")) {
     throw new Error("GuardDuty's clean-scan object tag is absent.");
   }
+  const dlp = await ensureExactVersionDlp(intentKey, intent, {
+    bucket,
+    byteSize: intent.expectedSize,
+    contentType: intent.contentType,
+    key,
+    sha256: intent.expectedSha256,
+    tenantId: config.tenantId,
+    uploadedAt,
+    versionId,
+  });
+  if (dlp.decision !== "CLEAN") {
+    throw new Error("The exact quarantine object was blocked by the independent server DLP policy.");
+  }
 
   const receiptHash = digestHex(`${config.tenantId}\0${intentId}\0${versionId}`);
   const receiptKey = {
@@ -222,6 +259,7 @@ async function promoteRecord(record) {
       committedReceipt.facts.evidenceVersionId,
       new Date(committedReceipt.facts.retainUntil),
       committedReceipt.facts.uploadedAt,
+      dlpFromFacts(committedReceipt.facts),
       committedReceipt.facts.copyAttemptId,
       committedReceipt.facts.copyFence,
     );
@@ -322,6 +360,7 @@ async function promoteRecord(record) {
     undefined,
     retainUntil,
     uploadedAt,
+    dlp,
   );
   if (destination) await ensureTrackedCopyOutcome(destination, receiptHash);
   let currentAttemptPermitted = false;
@@ -373,6 +412,10 @@ async function promoteRecord(record) {
           "source-version": versionId,
           "tenant-id": config.tenantId,
           "uploaded-at": uploadedAt,
+          "dlp-policy": dlp.policyVersion,
+          "dlp-receipt-sha256": dlp.receiptDigest,
+          "dlp-scanned-at": dlp.scannedAt,
+          "dlp-scanner-request-id": dlp.scannerRequestId,
         },
         ObjectLockMode: config.retentionMode,
         ObjectLockRetainUntilDate: retainUntil,
@@ -381,6 +424,7 @@ async function promoteRecord(record) {
         SSEKMSEncryptionContext: encryptionContext,
         Tagging: new URLSearchParams({
           "malware-status": "NO_THREATS_FOUND",
+          "dlp-status": "CLEAN",
           "tenant-id": config.tenantId,
         }).toString(),
       })),
@@ -395,6 +439,7 @@ async function promoteRecord(record) {
         undefined,
         retainUntil,
         uploadedAt,
+        dlp,
       ),
     });
     const put = write.result;
@@ -425,6 +470,7 @@ async function promoteRecord(record) {
         put.VersionId,
         retainUntil,
         uploadedAt,
+        dlp,
         lease.attemptId,
         lease.fence,
       );
@@ -472,6 +518,7 @@ async function promoteRecord(record) {
     retainUntil,
     uploadedAt,
     versionId,
+    dlp,
   });
   const databaseReconciliation = await reconcilePromotionDatabase(promotionFacts, intent, reconciliationLease);
   const completionTime = new Date().toISOString();
@@ -508,6 +555,14 @@ function parseIntent(item, expectedIntentId, expectedControlId, expectedKey) {
     finalKey: item.finalKey?.S,
     id: item.id?.S,
     issuedAt: item.issuedAt?.S,
+    dlpCanonicalReceipt: item.dlpReceipt?.M?.canonicalReceipt?.S,
+    dlpPolicyVersion: item.dlpReceipt?.M?.policyVersion?.S,
+    dlpReceiptDigest: item.dlpReceipt?.M?.receiptDigest?.S,
+    dlpScannedAt: item.dlpReceipt?.M?.scannedAt?.S,
+    dlpScannerRequestId: item.dlpReceipt?.M?.scannerRequestId?.S,
+    dlpSignature: item.dlpReceipt?.M?.signature?.S,
+    dlpSigningAlgorithm: item.dlpReceipt?.M?.signingAlgorithm?.S,
+    dlpSigningKeyArn: item.dlpReceipt?.M?.signingKeyArn?.S,
     nonceDigest: item.nonceDigest?.S,
     promotionReceipt: {
       byteSize: item.promotionReceipt?.M?.byteSize?.N === undefined
@@ -675,19 +730,6 @@ async function verifyCompletedPromotion(intent, intentId, sourceVersionId) {
   ) {
     throw new Error("The completed promotion receipt is absent or inconsistent.");
   }
-  const destination = await findCompletedCopy(
-    intent.finalKey,
-    sourceVersionId,
-    intent.expectedSha256,
-    intent.promotionReceipt.finalVersionId,
-    new Date(intent.promotionReceipt.retainUntil),
-    intent.promotionReceipt.uploadedAt,
-    intent.promotionReceipt.copyAttemptId,
-    intent.promotionReceipt.copyFence,
-  );
-  if (destination?.versionId !== intent.promotionReceipt.finalVersionId) {
-    throw new Error("The recorded immutable evidence version failed revalidation.");
-  }
   const reconciliation = await readCommittedPromotionReceipt(intent, {
     uploadedAt: intent.promotionReceipt.uploadedAt,
     versionId: sourceVersionId,
@@ -700,6 +742,20 @@ async function verifyCompletedPromotion(intent, intentId, sourceVersionId) {
     reconciliation.idempotencyDigest !== intent.promotionReceipt.databaseIdempotencyDigest
   ) {
     throw new Error("The completed promotion database revisions are inconsistent.");
+  }
+  const destination = await findCompletedCopy(
+    intent.finalKey,
+    sourceVersionId,
+    intent.expectedSha256,
+    intent.promotionReceipt.finalVersionId,
+    new Date(intent.promotionReceipt.retainUntil),
+    intent.promotionReceipt.uploadedAt,
+    dlpFromFacts(reconciliation.facts),
+    intent.promotionReceipt.copyAttemptId,
+    intent.promotionReceipt.copyFence,
+  );
+  if (destination?.versionId !== intent.promotionReceipt.finalVersionId) {
+    throw new Error("The recorded immutable evidence version failed revalidation.");
   }
   await verifyAuthoritativeRecoveryReceipt(receiptHash, reconciliation);
 }
@@ -1229,6 +1285,7 @@ async function findCompletedCopy(
   exactVersionId,
   expectedRetainUntil,
   expectedUploadedAt,
+  expectedDlp,
   expectedPromotionAttemptId,
   expectedPromotionFence,
 ) {
@@ -1248,6 +1305,10 @@ async function findCompletedCopy(
       destination.Metadata?.["source-version"] !== sourceVersionId ||
       destination.Metadata?.sha256 !== expectedSha256 ||
       destination.Metadata?.["uploaded-at"] !== expectedUploadedAt ||
+      destination.Metadata?.["dlp-policy"] !== expectedDlp.policyVersion ||
+      destination.Metadata?.["dlp-receipt-sha256"] !== expectedDlp.receiptDigest ||
+      destination.Metadata?.["dlp-scanned-at"] !== expectedDlp.scannedAt ||
+      destination.Metadata?.["dlp-scanner-request-id"] !== expectedDlp.scannerRequestId ||
       (expectedPromotionAttemptId !== undefined &&
         destination.Metadata?.["promotion-attempt-id"] !== expectedPromotionAttemptId) ||
       (expectedPromotionFence !== undefined &&
@@ -1306,7 +1367,215 @@ function buildPromotionFacts(input) {
     uploadedAt: input.uploadedAt,
     promotedAt: input.nowIso,
     providerRequestId: input.providerRequestId,
+    dlpPolicyVersion: input.dlp.policyVersion,
+    dlpReceiptSha256: input.dlp.receiptDigest,
+    dlpScannedAt: input.dlp.scannedAt,
+    dlpScannerRequestId: input.dlp.scannerRequestId,
   });
+}
+
+function dlpFromFacts(facts) {
+  const result = {
+    policyVersion: facts?.dlpPolicyVersion,
+    receiptDigest: facts?.dlpReceiptSha256,
+    scannedAt: facts?.dlpScannedAt,
+    scannerRequestId: facts?.dlpScannerRequestId,
+  };
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$/.test(String(result.policyVersion ?? "")) ||
+      !/^[a-f0-9]{64}$/.test(String(result.receiptDigest ?? "")) || !validInstant(result.scannedAt) ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(String(result.scannerRequestId ?? ""))) {
+    throw new Error("The signed promotion receipt lacks valid exact-version DLP facts.");
+  }
+  return Object.freeze(result);
+}
+
+let dlpTokenCache;
+
+async function ensureExactVersionDlp(intentKey, intent, source) {
+  if (config.dlpMode !== "ENFORCED") {
+    throw new Error("Exact-version server DLP is not configured; immutable promotion is disabled.");
+  }
+  const request = buildExactVersionDlpRequest({ ...source, policyVersion: config.dlpPolicyVersion });
+  if (!validInstant(source.uploadedAt)) throw new Error("The DLP source upload time is invalid.");
+  if (intent.dlpCanonicalReceipt) {
+    const persisted = await parsePersistedDlp(intent, request);
+    assertDlpAfterUpload(persisted, source.uploadedAt);
+    return persisted;
+  }
+  const scanned = await callExactVersionDlp(request);
+  assertDlpAfterUpload(scanned, source.uploadedAt);
+  const signed = await signDlpReceipt(scanned);
+  const receipt = {
+    M: {
+      canonicalReceipt: { S: scanned.canonicalReceipt },
+      policyVersion: { S: scanned.policyVersion },
+      receiptDigest: { S: scanned.receiptDigest },
+      scannedAt: { S: scanned.scannedAt },
+      scannerRequestId: { S: scanned.scannerRequestId },
+      signature: { S: signed.signature },
+      signingAlgorithm: { S: signed.signingAlgorithm },
+      signingKeyArn: { S: signed.signingKeyArn },
+    },
+  };
+  try {
+    await dynamo.send(new TransactWriteItemsCommand({
+      ClientRequestToken: token(`${intent.id}\0${scanned.receiptDigest}`, "dlp"),
+      TransactItems: [{
+        Update: {
+          ConditionExpression: "attribute_not_exists(dlpReceipt) AND #status IN (:issued, :quarantined, :validated) AND quarantineKey = :key AND expectedSha256 = :sha256 AND expectedSize = :size AND contentType = :contentType",
+          ExpressionAttributeNames: { "#status": "status" },
+          ExpressionAttributeValues: {
+            ":contentType": { S: intent.contentType },
+            ":issued": { S: "issued" },
+            ":key": { S: intent.quarantineKey },
+            ":quarantined": { S: "quarantined" },
+            ":receipt": receipt,
+            ":sha256": { S: intent.expectedSha256 },
+            ":size": { N: String(intent.expectedSize) },
+            ":validated": { S: "validated" },
+          },
+          Key: intentKey,
+          TableName: config.controlTable,
+          UpdateExpression: "SET dlpReceipt = :receipt",
+        },
+      }],
+    }));
+    return scanned;
+  } catch (error) {
+    if (error?.name !== "TransactionCanceledException") throw error;
+    const existing = await dynamo.send(new GetItemCommand({ ConsistentRead: true, Key: intentKey, TableName: config.controlTable }));
+    const reparsed = parseIntent(existing.Item, intent.id, intent.controlId, intent.quarantineKey);
+    const persisted = await parsePersistedDlp(reparsed, request);
+    assertDlpAfterUpload(persisted, source.uploadedAt);
+    return persisted;
+  }
+}
+
+function assertDlpAfterUpload(receipt, uploadedAt) {
+  if (Date.parse(receipt.scannedAt) < Date.parse(uploadedAt)) {
+    throw new Error("The exact-version DLP receipt predates the source upload.");
+  }
+}
+
+async function parsePersistedDlp(intent, request) {
+  if (typeof intent.dlpCanonicalReceipt !== "string" || intent.dlpCanonicalReceipt.length > 16_384) {
+    throw new Error("The durable DLP receipt is malformed.");
+  }
+  let payload;
+  try { payload = JSON.parse(intent.dlpCanonicalReceipt); } catch { throw new Error("The durable DLP receipt is malformed."); }
+  // A receipt persisted for this exact immutable quarantine version is safe to
+  // reuse after a Lambda retry. Keep rejecting future timestamps, but do not
+  // impose the network-response freshness window on a durable receipt.
+  const parsed = parseExactVersionDlpResponse(payload, request, new Date(), {
+    maximumAgeMilliseconds: null,
+  });
+  if (parsed.canonicalReceipt !== intent.dlpCanonicalReceipt || parsed.receiptDigest !== intent.dlpReceiptDigest ||
+      parsed.policyVersion !== intent.dlpPolicyVersion || parsed.scannedAt !== intent.dlpScannedAt ||
+      parsed.scannerRequestId !== intent.dlpScannerRequestId) {
+    throw new Error("The durable DLP receipt failed canonical verification.");
+  }
+  const signature = canonicalRsa3072Signature(intent.dlpSignature, "DLP receipt signature");
+  if (intent.dlpSigningKeyArn !== config.auditSigningKeyArn || intent.dlpSigningAlgorithm !== dlpSigningAlgorithm) {
+    throw new Error("The durable DLP receipt has an invalid signing identity.");
+  }
+  const verification = await kms.send(new VerifyCommand({
+    KeyId: config.auditSigningKeyArn,
+    Message: Buffer.from(parsed.receiptDigest, "hex"),
+    MessageType: "DIGEST",
+    Signature: signature,
+    SigningAlgorithm: dlpSigningAlgorithm,
+  }));
+  if (verification?.KeyId !== config.auditSigningKeyArn ||
+      verification?.SigningAlgorithm !== dlpSigningAlgorithm || verification?.SignatureValid !== true) {
+    throw new Error("The durable DLP receipt signature did not verify.");
+  }
+  return parsed;
+}
+
+async function signDlpReceipt(scanned) {
+  const result = await kms.send(new SignCommand({
+    KeyId: config.auditSigningKeyArn,
+    Message: Buffer.from(scanned.receiptDigest, "hex"),
+    MessageType: "DIGEST",
+    SigningAlgorithm: dlpSigningAlgorithm,
+  }));
+  if (result?.KeyId !== config.auditSigningKeyArn || result?.SigningAlgorithm !== dlpSigningAlgorithm ||
+      !(result?.Signature instanceof Uint8Array) || result.Signature.byteLength !== 384) {
+    throw new Error("KMS did not return a valid DLP receipt signature.");
+  }
+  return Object.freeze({
+    signature: Buffer.from(result.Signature).toString("base64"),
+    signingAlgorithm: dlpSigningAlgorithm,
+    signingKeyArn: config.auditSigningKeyArn,
+  });
+}
+
+async function callExactVersionDlp(request) {
+  const tokenValue = await loadDlpToken();
+  const response = await fetch(config.dlpScannerEndpoint, {
+    body: stableJson(request),
+    headers: {
+      accept: "application/json",
+      authorization: `Bearer ${tokenValue}`,
+      "content-type": "application/json",
+    },
+    method: "POST",
+    redirect: "error",
+    signal: AbortSignal.timeout(45_000),
+  });
+  if (!response.ok || response.headers.get("content-type")?.split(";", 1)[0].trim().toLowerCase() !== "application/json") {
+    throw new Error("The exact-version DLP scanner did not return a successful JSON response.");
+  }
+  const declared = Number(response.headers.get("content-length") ?? "0");
+  if (declared > 65_536) throw new Error("The exact-version DLP response is too large.");
+  const bytes = await readBoundedResponseBody(response, 65_536);
+  if (bytes.byteLength < 2 || bytes.byteLength > 65_536) throw new Error("The exact-version DLP response is invalid or too large.");
+  let payload;
+  try { payload = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); }
+  catch { throw new Error("The exact-version DLP response is not valid UTF-8 JSON."); }
+  return parseExactVersionDlpResponse(payload, request);
+}
+
+async function loadDlpToken() {
+  if (dlpTokenCache?.expiresAt > Date.now()) return dlpTokenCache.value;
+  const response = await secrets.send(new GetSecretValueCommand({
+    SecretId: config.dlpScannerSecretArn,
+    VersionStage: "AWSCURRENT",
+  }));
+  const value = response?.SecretString;
+  if (typeof value !== "string" || !/^[A-Za-z0-9._~-]{32,512}$/.test(value) ||
+      !response.VersionStages?.includes("AWSCURRENT") || !/^[A-Za-z0-9-]{8,128}$/.test(String(response.VersionId ?? ""))) {
+    throw new Error("The DLP scanner token secret is missing or unsafe.");
+  }
+  dlpTokenCache = Object.freeze({ expiresAt: Date.now() + 5 * 60_000, value });
+  return value;
+}
+
+async function readBoundedResponseBody(response, maximumBytes) {
+  if (!response.body) throw new Error("The exact-version DLP response has no body.");
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!(value instanceof Uint8Array)) throw new Error("The exact-version DLP response stream is invalid.");
+      total += value.byteLength;
+      if (total > maximumBytes) throw new Error("The exact-version DLP response is too large.");
+      chunks.push(value);
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => undefined);
+    throw error;
+  }
+  const result = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return result;
 }
 
 async function claimPromotionFenceDatabase(intent, lease) {
@@ -1792,6 +2061,18 @@ function validInstant(value) {
   if (typeof value !== "string") return false;
   const parsed = new Date(value);
   return Number.isFinite(parsed.getTime()) && value === parsed.toISOString();
+}
+
+function canonicalRsa3072Signature(value, label) {
+  if (typeof value !== "string" ||
+      !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
+    throw new Error(`${label} is not canonical base64.`);
+  }
+  const signature = Buffer.from(value, "base64");
+  if (signature.byteLength !== 384 || signature.toString("base64") !== value) {
+    throw new Error(`${label} is not a canonical RSA-3072 signature.`);
+  }
+  return signature;
 }
 
 function normalizeEtag(value) {

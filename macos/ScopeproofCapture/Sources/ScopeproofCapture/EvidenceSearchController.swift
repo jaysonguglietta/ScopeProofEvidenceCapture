@@ -250,7 +250,11 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
         switch identifier {
         case "preview":
             let imageView = NSImageView(frame: NSRect(x: 4, y: 4, width: 54, height: 44))
-            imageView.image = NSImage(contentsOf: entry.imageURL)
+            if let artifact = try? ValidatedEvidenceArtifact.loadForLegacyBrowsing(
+                entry, requireLifecycle: false
+            ) {
+                imageView.image = NSImage(data: artifact.imageData)
+            }
             imageView.imageScaling = .scaleProportionallyUpOrDown
             imageView.setAccessibilityLabel("Preview of \(manifest.title)")
             return imageView
@@ -332,9 +336,16 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
         jiraUploadButton.isEnabled = false
         Task {
             do {
-                let connection = try await jiraCloudService.connection(serverURL: serverURL)
+                guard let binding = entry.manifest.tenantBinding else {
+                    throw JiraCloudFailure.notConnected
+                }
+                let connection = try await jiraCloudService.connection(
+                    serverURL: serverURL, binding: binding
+                )
                 guard connection.connected else { throw JiraCloudFailure.rejected("Jira Cloud is not connected for this Scopeproof account. Open Scopeproof web → Connections and authorize it first.") }
-                let issue = try await jiraCloudService.issue(issueKey, serverURL: serverURL)
+                let issue = try await jiraCloudService.issue(
+                    issueKey, serverURL: serverURL, binding: binding
+                )
                 let confirmation = NSAlert()
                 confirmation.alertStyle = .warning
                 confirmation.messageText = "Upload approved evidence to \(issue.key)?"
@@ -359,11 +370,11 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
         let alert = NSAlert(); alert.messageText = "Review \(entry.manifest.evidenceID)"; alert.informativeText = "The original capture manifest remains immutable. This decision is written to a separate hash-chained lifecycle record included in assessor exports."; alert.addButton(withTitle: "Save Review"); alert.addButton(withTitle: "Cancel")
         let status = NSPopUpButton(); status.addItems(withTitles: EvidenceReviewStatus.allCases.map(\.rawValue)); status.selectItem(withTitle: current.status.rawValue)
         let owner = NSTextField(string: current.owner)
-        let reviewer = NSTextField(string: current.reviewer.isEmpty ? NSFullUserName() : current.reviewer)
+        let reviewer = NSTextField(labelWithString: "Authenticated macOS user (verified when saved)")
         let tags = NSTextField(string: current.tags.joined(separator: ", "))
         let notes = NSTextField(string: current.reviewNotes)
         let supersedes = NSTextField(string: current.supersedesEvidenceID ?? "")
-        owner.placeholderString = "Control owner"; reviewer.placeholderString = "Reviewer name"; tags.placeholderString = "identity, quarterly"; notes.placeholderString = "Approval rationale, caveat, or rejection reason"; supersedes.placeholderString = "Optional older evidence ID"
+        owner.placeholderString = "Control owner"; tags.placeholderString = "identity, quarterly"; notes.placeholderString = "Approval rationale, caveat, or rejection reason"; supersedes.placeholderString = "Optional older evidence ID"
         for field in [owner, reviewer, tags, notes, supersedes] { field.frame.size.width = 420 }
         let grid = NSGridView(views: [[caption("Status"), status], [caption("Owner"), owner], [caption("Reviewer"), reviewer], [caption("Tags"), tags], [caption("Review notes"), notes], [caption("Supersedes"), supersedes]])
         grid.rowSpacing = 10; grid.columnSpacing = 12; grid.column(at: 0).xPlacement = .trailing; grid.column(at: 1).xPlacement = .fill; alert.accessoryView = grid
@@ -371,12 +382,23 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
         if [.approved, .rejected, .superseded].contains(selectedStatus) && notes.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let error = NSAlert(); error.alertStyle = .warning; error.messageText = "Add a review note"; error.informativeText = "Approval, rejection, and supersession decisions require a short rationale for the assessor trail."; error.runModal(); return
         }
-        do {
-            _ = try EvidenceLifecycleStore.update(entry: entry, status: selectedStatus, owner: owner.stringValue, reviewer: reviewer.stringValue, notes: notes.stringValue, tags: tags.stringValue.split(separator: ",").map(String.init), supersedesEvidenceID: supersedes.stringValue)
-            if let evidenceRoot { allEntries = CaptureHistory.entries(in: evidenceRoot) }
-            applyFilters()
-        } catch {
-            let failure = NSAlert(); failure.alertStyle = .warning; failure.messageText = "Review could not be saved"; failure.informativeText = error.localizedDescription; failure.runModal()
+        Task { @MainActor in
+            do {
+                let identity = try await LocalReviewerAuthorizer.authorize(
+                    reason: "Authenticate to save the \(selectedStatus.rawValue) decision for \(entry.manifest.evidenceID)"
+                )
+                _ = try EvidenceLifecycleStore.update(
+                    entry: entry, status: selectedStatus, owner: owner.stringValue,
+                    reviewer: "", notes: notes.stringValue,
+                    tags: tags.stringValue.split(separator: ",").map(String.init),
+                    supersedesEvidenceID: supersedes.stringValue,
+                    reviewerIdentity: identity
+                )
+                if let evidenceRoot { allEntries = CaptureHistory.entries(in: evidenceRoot) }
+                applyFilters()
+            } catch {
+                let failure = NSAlert(); failure.alertStyle = .warning; failure.messageText = "Review could not be saved"; failure.informativeText = error.localizedDescription; failure.runModal()
+            }
         }
     }
 
@@ -415,13 +437,21 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
         guard reason.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).count >= 10 else {
             let error = NSAlert(); error.alertStyle = .warning; error.messageText = "Add a specific hold reason"; error.informativeText = "Enter at least 10 characters identifying the matter or release authorization."; error.runModal(); return
         }
-        do {
-            _ = try LocalEvidenceHoldStore.set(entry: entry, active: active, reason: reason.stringValue)
-            if let evidenceRoot { allEntries = CaptureHistory.entries(in: evidenceRoot) }
-            applyFilters()
-            statusLabel.stringValue = active ? "Legal hold placed on \(entry.manifest.evidenceID)." : "Legal hold released for \(entry.manifest.evidenceID)."
-        } catch {
-            let failure = NSAlert(); failure.alertStyle = .critical; failure.messageText = "Legal hold could not be changed"; failure.informativeText = error.localizedDescription; failure.runModal()
+        Task { @MainActor in
+            do {
+                let identity = try await LocalReviewerAuthorizer.authorize(
+                    reason: "Authenticate to \(active ? "place" : "release") the legal hold for \(entry.manifest.evidenceID)"
+                )
+                _ = try LocalEvidenceHoldStore.set(
+                    entry: entry, active: active, reason: reason.stringValue,
+                    reviewerIdentity: identity
+                )
+                if let evidenceRoot { allEntries = CaptureHistory.entries(in: evidenceRoot) }
+                applyFilters()
+                statusLabel.stringValue = active ? "Legal hold placed on \(entry.manifest.evidenceID)." : "Legal hold released for \(entry.manifest.evidenceID)."
+            } catch {
+                let failure = NSAlert(); failure.alertStyle = .critical; failure.messageText = "Legal hold could not be changed"; failure.informativeText = error.localizedDescription; failure.runModal()
+            }
         }
     }
 

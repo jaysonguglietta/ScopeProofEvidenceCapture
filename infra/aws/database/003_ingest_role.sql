@@ -48,6 +48,10 @@ BEGIN
     'GRANT EXECUTE ON FUNCTION scopeproof.read_promoted_evidence_receipt(scopeproof.resource_identifier) TO %I',
     ingest_role
   );
+  EXECUTE format(
+    'GRANT EXECUTE ON FUNCTION scopeproof.reconcile_rejected_evidence(scopeproof.resource_identifier, scopeproof.resource_identifier, scopeproof.resource_identifier, text, text, text, integer, integer, jsonb, text, text, timestamptz) TO %I',
+    ingest_role
+  );
 
   EXECUTE format('ALTER ROLE %I SET search_path = pg_catalog, scopeproof', ingest_role);
   EXECUTE format('ALTER ROLE %I SET row_security = on', ingest_role);

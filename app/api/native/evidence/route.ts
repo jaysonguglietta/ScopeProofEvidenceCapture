@@ -56,10 +56,13 @@ export async function POST(request: Request) {
     }
     const capturedAt = manifest.capturedAt;
     const localFindings = manifest.redactionFindings;
-    const candidateAssessments = (await getEnv().DB.prepare("SELECT id, framework, systems_json, controls_json FROM assessments WHERE status = 'active' ORDER BY period_end DESC LIMIT 20").all<{ id: string; framework: string; systems_json: string; controls_json: string }>()).results.filter((assessment) => {
-      const systems = JSON.parse(assessment.systems_json || "[]") as string[]; const controls = JSON.parse(assessment.controls_json || "[]") as string[];
-      return assessment.framework === complianceArea && (!systems.length || systems.includes(system)) && (!controls.length || controls.includes(controlId));
-    });
+    const candidateAssessments = (await getEnv().DB.prepare(`SELECT id FROM assessments
+      WHERE status = 'active' AND framework = ? AND scope_mode = 'explicit' AND catalog_id IS NOT NULL
+        AND json_valid(systems_json) AND json_valid(controls_json)
+        AND json_array_length(systems_json) > 0 AND json_array_length(controls_json) > 0
+        AND EXISTS (SELECT 1 FROM json_each(assessments.systems_json) WHERE value = ?)
+        AND EXISTS (SELECT 1 FROM json_each(assessments.controls_json) WHERE value = ?)
+      ORDER BY period_end DESC, id DESC LIMIT 2`).bind(complianceArea, system, controlId).all<{ id: string }>()).results;
     if (candidateAssessments.length !== 1) return Response.json({ error: candidateAssessments.length ? "Capture matches multiple active assessments; close or narrow the overlapping scopes." : "Capture does not match an active assessment scope." }, { status: 409 });
     let serverSafetyScan: Awaited<ReturnType<typeof scanExactEvidencePixels>>;
     try { serverSafetyScan = await scanExactEvidencePixels(image, getEnv()); }

@@ -1,6 +1,50 @@
 # Changelog
 
-## Unreleased — 1.9.0 (build 23)
+## Unreleased — 1.10.0 (build 24)
+
+### 2026-09-01 security and product hardening
+
+#### Hosted product
+
+- Added a reviewed, digest-verified control-catalog model and explicit assessment scope. Active assessments now require at least one named system, one catalog, and one selected catalog control; evidence, collection jobs, and SBOMs fail closed when the assessment binding is absent or mismatched. The built-in PCI DSS 4.0.1 Scopeproof operations catalog is explicitly limited and is not presented as the complete standard.
+- Added durable evidence-review events with optimistic-concurrency winner binding and self-review separation.
+- Replaced page-derived finding cards with persisted findings and finding events. Findings can bind an assessment, control, evidence occurrence, collection job, owner, severity, and due date. Reviewers maintain ordinary finding state; only compliance leads and administrators can accept or close a finding, and every disposition is audited.
+- Added bounded opaque-cursor pagination and database aggregates for assessments, evidence, collection runs, SBOMs, findings, and package history. Dashboard/control totals no longer depend on the current visible page.
+- Added package preflight and race revalidation. Export fails closed for no eligible evidence, partial coverage, pending independent screenshot safety, pending native provenance, or a selection above the 100-artifact non-truncation limit.
+- Made managed collector and SBOM requests durable asynchronous jobs returning `202`; one-time-token SBOMs remain request-bound and cannot be replayed after the credential is cleared.
+- Added a digest-bound two-administrator hosted retention-hold release. A different administrator must approve the exact immutable hold facts within 24 hours, and replacing the hold cancels the pending request.
+- Added focus trapping/restoration and keyboard-safe dialog behavior to the hosted console.
+- Added D1 migration `0024_big_chamber.sql` for control catalogs, explicit scope, review events, findings/finding events, optimistic review tokens, and hold-release requests.
+
+#### AWS runtime and infrastructure source
+
+- Added route-specific Cognito OAuth scopes at API Gateway as an outer authorization layer while retaining strict JWT, tenant-host, app-client, active-membership, and role enforcement in each Lambda.
+- Made exact-version DLP mandatory for production tenant synthesis. The promoter submits the immutable quarantine bucket, key, version, SHA-256, size, content type, tenant, and policy version to one clean HTTPS scanner endpoint; a bounded strict response must bind the same facts and return `CLEAN`.
+- Added durable canonical DLP receipts signed and verified with the tenant RSA KMS audit key. Replays must use the same exact object version and receipt digest; altered, stale, future, malformed, rejected, or unsigned decisions fail closed.
+- Bound DLP facts into the KMS-signed promotion receipt, destination S3 metadata, DynamoDB state, and PostgreSQL reconciliation. Recovery verifies checksum, version, encryption, retention, audit, and DLP facts instead of trusting one store to repair another silently.
+- Made rejected-evidence reconciliation durable across a DynamoDB-first partial commit and delayed SQS/DLQ redrive. An exact stored receipt replays before freshness enforcement; a genuinely new relational recovery accepts the configured 14-day durable retry horizon while retaining canonical digest, tenant, intent, revision, and future-skew checks.
+- Added KMS/Secrets Manager least-privilege wiring for the DLP token secret and its customer-managed encryption key.
+- Added tests for exact-version DLP contracts, OAuth scope wiring, signed promotion facts, and DynamoDB/PostgreSQL reconciliation. These are source/template tests only; this change did not deploy or mutate AWS resources.
+
+#### Scopeproof Capture for macOS
+
+- Added validated tenant/workspace identity. New evidence roots, manifests, device tokens, S3 credentials/settings, S3 object prefixes, capture-chain heads, lifecycle rollback anchors, and local legal-hold anchors are bound to the same identity. Switching identity invalidates the previous Local Console session and rejects mismatched hosted or S3 credentials.
+- Replaced the localhost cookie session with a one-time URL-fragment nonce exchanged for an in-memory bearer. The fragment is cleared after exchange, no localhost authentication cookie is created, and every protected API/image request carries the bearer explicitly.
+- Added macOS local-user authentication for trust-bearing lifecycle and local legal-hold changes. Current events record the authenticated subject, method, and time.
+- Added separate capture, lifecycle, and legal-hold signing/rollback domains with tenant/workspace-scoped Keychain heads, two-phase pending advances, and recovery of interrupted anchor commits.
+- Made local legal holds fail closed when a signed marker is deleted, moved, or left behind during an interrupted trust-head update. Hold rollback scope now uses immutable tenant, workspace, evidence ID, and artifact digest values; legacy signed markers are adopted into that scope before they are trusted.
+- Made a tenant/workspace switch cancel in-flight S3 setup and browsing, close the old S3 browser, clear manual credentials and the verified destination, reset configuration to the new identity, and invalidate the old Local Console even across suspended requests. The new identity must configure and verify its own S3 destination.
+- Added a Keychain-backed tenant-bound capture-commit journal. Startup either validates and commits a complete image/manifest/lifecycle transaction or removes a partial transaction; conflicting or rollback state fails closed.
+- Centralized trust-bearing file reads through bounded, contained, regular-file validation and rejects symbolic links, hard links, oversized sidecars, unsafe roots, and digest mismatches. Legacy unsigned artifacts remain browsing-only.
+- Hardened local expiry cleanup. A `.s3.json` receipt is no longer sufficient: Scopeproof performs live exact-version S3 `HEAD` and Object Lock retention checks for every receipt object and verifies tenant prefix, account, version, ETag, checksum, SSE-KMS/DSSE-KMS settings, KMS key, and future COMPLIANCE retention before relying on S3 as a durable copy.
+
+#### Documentation and deployment state
+
+- Added [Security and product remediation status — 2026-09-01](docs/SECURITY_REMEDIATION_2026-09-01.md) with the source-control matrix, operator workflows, production prerequisites, validation commands, and explicit deployment boundary.
+- Updated hosted, AWS, S3, native, operator, assessor, installation, architecture, security, deployment, operations, and development documentation for the new behavior.
+- No AWS resources, DNS records, live tenant databases, or customer environments were deployed or changed. No public DMG was published or Apple-notarized by this source update; the public release remains the version named on the GitHub Releases page until a separate release workflow succeeds.
+
+### Earlier 1.10.0 source hardening
 
 - Removed the hardcoded native hosted-service destination. The checked-in `ScopeproofHostedAPIOrigins` allowlist is empty; production release identity configuration now requires one exact pathless `SCOPEPROOF_HOSTED_API_ORIGIN`, while ordinary source builds remain local-only for remote hosted synchronization.
 - Removed the AWS CDK placeholder-domain fallback. `rootDomain` is empty by default, and synthesis now requires an explicit domain plus exactly one Route 53 choice: an existing `hostedZoneId` or the reviewed `createHostedZone=true` opt-in.
@@ -10,8 +54,8 @@
 
 > **Not published:** these changes postdate
 > `v1.8.1-development-preview.1` (`8cd2d5c`) and are not present in that public
-> DMG. As of 2026-08-28 this working branch is not merged into the public default
-> branch. Version `1.9.0` and build `23` are allocated in source, but no 1.9.0
+> DMG. As of 2026-09-01 this working branch is not merged into the public default
+> branch. Version `1.10.0` and build `24` are allocated in source, but no 1.10.0
 > artifact exists; an independently verified new release is required before
 > these entries can be described as downloadable behavior.
 
@@ -44,6 +88,19 @@
 - Expanded the native Local Console into a unified local/S3 screenshot library with storage badges, search, framework/control/assessment-period/status/storage filters, control/period/framework grouping, S3 version counts, and resilient local-only fallback. Local/S3 joins now require an exact schema-2 upload receipt; S3-only pairs remain visibly provenance-unverified, and on-demand previews validate the paired exact-version manifest plus PNG digest without exposing credentials, object keys, or filesystem paths to browser code.
 - Changed the default local evidence root from `~/Pictures/Scopeproof Evidence` to `~/Documents/Scopeproof Evidence`. Existing Pictures-based captures remain discoverable without an automatic file move; only signed schema-7 artifacts remain eligible for trust-bearing review, upload, retention/legal-hold, package, and Jira workflows, while unsigned schema-6 and older artifacts are browsing-only and must be recaptured.
 
+### Earlier production evidence correctness and operations
+
+The entries in this older rollout section describe behavior when each feature was introduced. The current security contract above supersedes legacy schema-6 upload and optional timestamp/checkpoint behavior without rewriting those historical facts.
+
+- Added active-tab URL detection to **Capture Frontmost Browser Window** for Safari, Chrome, Edge, and Arc. The sanitized address is prefilled for operator confirmation; unsupported browsers or denied macOS Automation access fail safely to an empty manual field instead of reusing a prior capture URL.
+- Added operator-guided **Capture Scrolling Evidence…** for browser evidence that spans two or more viewports. Scopeproof keeps every section in memory, inserts numbered continuation dividers, applies one evidence/URL banner, and runs the complete OCR, redaction, review, exact-PNG scan, manifest, indexing, and upload workflow on the combined artifact.
+- Added editable Page URL classification with persisted provenance narrowed to the lowercase HTTP(S) origin; user information, path, query, and fragment are removed before the value reaches the screenshot, manifest, index, or log.
+- Added one-time repository SBOM generation from an exact GitHub URL and short-lived read-only token entered in the SBOM menu. The token is masked, cleared on submission, used only for the active request, excluded from persistence/logs/audit details, and never available to automatic retries.
+- Added the auditor-facing repository SBOM workspace, assessment-scoped PCI DSS 6.3.2 evidence, immutable commit resolution, independent approval, prior-inventory comparison, audited downloads, bounded parsing, and least-privilege GitHub guidance without cloning or executing repository code.
+- Replaced demo-derived compliance state with fail-closed assessment records, complete/partial collector coverage provenance, and non-truncating exports.
+- Added versioned evidence/export/audit/Jira key references, signed audit checkpoints, migration replay, native CI, immutable Action references, SBOM/provenance artifacts, CODEOWNERS, and dependency automation.
+- Added key-management, backup/recovery, monitoring, incident-response, launch-authorization, and production macOS release procedures.
+
 ## 1.8.1 — 2026-08-25
 
 ### Added
@@ -62,25 +119,6 @@
 ### Fixed
 
 - Replaced the clipped Capture & Jira Settings alert with compact **Capture & Local** and **Jira** tabs so every field and checkbox remains visible on smaller displays.
-
-## Unreleased — production evidence correctness and operations
-
-The entries in this older rollout section describe behavior when each feature was introduced. The current **Unreleased** security contract above supersedes legacy schema-6 upload and optional timestamp/checkpoint behavior without rewriting those historical facts.
-
-- Added active-tab URL detection to **Capture Frontmost Browser Window** for Safari, Chrome, Edge, and Arc. The sanitized address is prefilled for operator confirmation; unsupported browsers or denied macOS Automation access fail safely to an empty manual field instead of reusing a prior capture URL.
-- Added operator-guided **Capture Scrolling Evidence…** for browser evidence that spans two or more viewports. Scopeproof keeps every section in memory, inserts numbered continuation dividers, applies one evidence/URL banner, and runs the complete OCR, redaction, review, exact-PNG scan, manifest, indexing, and upload workflow on the combined artifact.
-- Added an editable Page URL to capture classification. Security hardening subsequently narrowed persisted evidence provenance to the lowercase HTTP(S) origin; user information, path, query, and fragment are removed before the value reaches the screenshot, manifest, index, or log.
-- Added one-time repository SBOM generation from an exact GitHub URL and short-lived read-only token entered in the SBOM menu. The token is masked, cleared on submission, used only for the active request, excluded from persistence/logs/audit details, and never available to automatic retries.
-- Added an auditor-facing repository SBOM workspace that generates CycloneDX 1.6 or SPDX 2.3 JSON from supported GitHub lockfiles at an immutable commit without cloning or executing repository code.
-- Added assessment-scoped PCI DSS 6.3.2 evidence, independent approval, assessor-package inclusion, prior-inventory comparison, audited downloads, bounded parsing, retryable jobs, and least-privilege GitHub configuration guidance.
-- Replaced demo-derived compliance state with fail-closed, assessment-scoped authoritative records.
-- Added complete/partial collector coverage provenance and non-truncating assessment exports.
-- Added versioned evidence, export, audit, Jira-token, and Jira-receipt key references with bounded audited rotation.
-- Added signed audit-chain checkpoints, optional independent delivery, production readiness checks, and HMAC-authenticated monitoring health.
-- Added migration replay, native macOS CI, immutable GitHub Action references, SBOM/provenance artifacts, CODEOWNERS, and dependency automation.
-- Added key-management, backup/recovery, monitoring, incident-response, launch-authorization, and production macOS release procedures.
-
-All notable Scopeproof changes are recorded here. Dates use the repository’s release timezone.
 
 ## 1.8.0 — 2026-08-20
 

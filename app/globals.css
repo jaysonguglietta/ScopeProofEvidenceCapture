@@ -158,6 +158,10 @@ main { min-height: 100vh; margin-left: 244px; }
 .status-needs-review, .status-partial, .status-expiring, .status-action-needed { color: #a36817; background: #fff5e5; }
 .status-failed, .status-gap { color: #b64a4a; background: #fff0f0; }
 .status-running, .status-queued, .status-retrying { color: #315fe9; background: #edf2ff; }
+.status-open, .status-critical { color: #b64a4a; background: #fff0f0; }
+.status-in-progress, .status-accepted { color: #a36817; background: #fff5e5; }
+.status-resolved { color: #315fe9; background: #edf2ff; }
+.status-closed { color: #28795f; background: #eaf7f2; }
 .status-not-configured { color: #6e7989; background: #eef1f5; }
 
 .recent-panel { overflow: hidden; }
@@ -260,6 +264,9 @@ select { height: 35px; padding: 0 30px 0 10px; }
 .info-callout > span, .privacy-note > span { width: 19px; height: 19px; display: grid; place-items: center; border-radius: 50%; background: #dfe8fb; color: #4062b7; font-size: 9px; font-weight: 750; }
 .info-callout strong { display: block; font-size: 10px; }
 .info-callout p, .privacy-note p { margin: 3px 0 0; color: var(--muted); font-size: 9.5px; }
+.pagination-callout { margin: 0 0 14px; align-items: center; }
+.pagination-callout > div { flex: 1; }
+.pagination-callout > .button { flex: 0 0 auto; }
 .finding-stats { margin-bottom: 14px; display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
 .finding-stats article { position: relative; padding: 16px 17px; border: 1px solid var(--line); border-radius: 9px; background: white; }
 .finding-stats article > strong { display: block; font-size: 20px; }
@@ -269,16 +276,28 @@ select { height: 35px; padding: 0 30px 0 10px; }
 .severity-dot.medium { background: #dd9432; box-shadow: 0 0 0 4px #fff7e8; }
 .severity-dot.low { background: #5b83df; box-shadow: 0 0 0 4px #edf2ff; }
 .finding-list { overflow: hidden; }
-.finding-row { min-height: 73px; padding: 0 20px; display: grid; grid-template-columns: 72px minmax(280px, 2fr) 1fr .7fr 110px; align-items: center; gap: 16px; border-bottom: 1px solid #edf0f3; }
-.finding-row:last-child { border: 0; }
+.finding-record { border-bottom: 1px solid #edf0f3; }
+.finding-record:last-child { border-bottom: 0; }
+.finding-row { min-height: 73px; padding: 0 20px; display: grid; grid-template-columns: 72px minmax(280px, 2fr) 1fr .7fr 150px; align-items: center; gap: 16px; }
 .finding-row > div:nth-child(2) strong { display: block; color: #35435a; font-size: 10.5px; }
 .finding-row p { margin: 4px 0 0; color: #8e99a8; font-size: 8.5px; }
 .finding-row > div:nth-child(3) small, .finding-row > div:nth-child(4) small { display: block; margin-bottom: 4px; color: #929cac; font-size: 8px; }
 .finding-row > div:nth-child(3) span, .finding-row > div:nth-child(4) span { font-size: 9.5px; }
 .severity-flag { width: max-content; padding: 4px 7px; border-radius: 5px; font-size: 8px; font-weight: 750; text-transform: uppercase; }
+.severity-flag.critical { color: #8f2f3b; background: #fce6e9; }
 .severity-flag.high { color: #b64747; background: #fff0f0; }
 .severity-flag.medium { color: #a16516; background: #fff5e6; }
 .severity-flag.low { color: #4367bd; background: #edf2ff; }
+.finding-status-action { display: flex; align-items: center; justify-content: space-between; gap: 7px; }
+.finding-status-action .button { min-height: 29px; padding: 0 9px; }
+.finding-description { padding: 0 20px 13px 108px; color: #687589; }
+.finding-description p { margin: 0; font-size: 9.5px; line-height: 1.5; }
+.finding-description small { display: block; margin-top: 7px; font-size: 8.5px; }
+.finding-update { padding: 13px 20px; display: grid; grid-template-columns: 160px minmax(260px, 1fr) auto; align-items: end; gap: 12px; border-top: 1px solid #edf0f3; background: #f9fafc; }
+.finding-update .button { margin-bottom: 1px; }
+.package-blockers { margin: 12px 0; padding: 12px 14px; border: 1px solid #efd9aa; border-radius: 8px; background: #fffaf0; color: #76541d; font-size: 9.5px; }
+.package-blockers > strong { display: block; }
+.package-blockers ul { margin: 7px 0 0; padding-left: 18px; line-height: 1.55; }
 
 .connection-alert { border-color: #f0c9c9; background: #fff6f6; }
 .connection-alert > span { background: #ffe1e1; color: #b84a4a; }
@@ -538,6 +557,9 @@ select { height: 35px; padding: 0 30px 0 10px; }
   .evidence-row { grid-template-columns: 1fr 1fr; }
   .finding-row { grid-template-columns: 65px minmax(190px, 2fr) 1fr 100px; }
   .finding-row > div:nth-child(4) { display: none; }
+  .finding-status-action { flex-direction: column; align-items: flex-start; }
+  .finding-update { grid-template-columns: 150px minmax(220px, 1fr); }
+  .finding-update > .button { grid-column: 2; justify-self: end; }
   .settings-layout { grid-template-columns: 1fr; }
   .settings-layout > nav { display: flex; overflow-x: auto; }
   .settings-layout > nav button { white-space: nowrap; }
@@ -600,6 +622,11 @@ select { height: 35px; padding: 0 30px 0 10px; }
   .finding-stats { grid-template-columns: 1fr 1fr; }
   .finding-list { overflow-x: auto; }
   .finding-row { min-width: 650px; }
+  .finding-description { min-width: 650px; padding-left: 20px; }
+  .finding-update { min-width: 650px; }
+  .pagination-callout { align-items: flex-start; flex-wrap: wrap; }
+  .pagination-callout > div { min-width: calc(100% - 35px); }
+  .pagination-callout > .button { margin-left: 29px; }
   .form-grid { grid-template-columns: 1fr; }
   .field.full { grid-column: 1; }
   .source-select { grid-template-columns: 1fr; }

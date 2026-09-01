@@ -143,7 +143,7 @@ enum ReleaseVerifier {
 }
 
 actor UpdateService {
-    private var appVersion: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.9.0" }
+    private var appVersion: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.10.0" }
 
     func check(serverURL: URL?) async throws -> ReleaseManifest? {
         guard let server = BackendTrust.normalizedOrigin(serverURL) else { throw UploadFailure.invalidServer }

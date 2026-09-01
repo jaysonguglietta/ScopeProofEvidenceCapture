@@ -4,6 +4,11 @@ export interface TenantDefinition {
   readonly displayName: string;
   readonly retentionDays?: number;
   readonly retentionMode?: "GOVERNANCE" | "COMPLIANCE";
+  /** Independent HTTPS scanner. Promotion fails closed when it is absent. */
+  readonly dlpScannerEndpoint?: string;
+  readonly dlpScannerSecretArn?: string;
+  readonly dlpScannerSecretKmsKeyArn?: string;
+  readonly dlpPolicyVersion?: string;
 }
 
 export interface TenantDatabaseIdentifiers {
@@ -24,6 +29,8 @@ export interface TenantLambdaConcurrencyBudget {
   readonly legalHoldApi: number;
   readonly legalHoldWorker: number;
   readonly evidencePromoter: number;
+  readonly rejectedEvidenceReconciler: number;
+  readonly uploadProjectionRepairer: number;
   readonly tenantProvisioner: number;
 }
 
@@ -34,6 +41,8 @@ export const defaultTenantLambdaConcurrencyBudget: TenantLambdaConcurrencyBudget
   legalHoldApi: 2,
   legalHoldWorker: 1,
   evidencePromoter: 2,
+  rejectedEvidenceReconciler: 1,
+  uploadProjectionRepairer: 1,
   tenantProvisioner: 5,
 });
 
@@ -58,7 +67,7 @@ export function validateTenantLambdaConcurrencyBudget(
     }
   }
   const total = entries.reduce((sum, [, amount]) => sum + amount, 0);
-  const maximum = environment === "prod" ? 21 : 50;
+  const maximum = environment === "prod" ? 23 : 50;
   if (total > maximum) {
     throw new Error(`Tenant Lambda reserved concurrency ${total} exceeds the ${maximum} ${environment} budget.`);
   }
@@ -71,6 +80,9 @@ export function validateTenantDeploymentSecurity(
 ): TenantDefinition {
   if (environment === "prod" && tenant.retentionMode !== "COMPLIANCE") {
     throw new Error(`Production tenant ${tenant.id} requires COMPLIANCE evidence retention.`);
+  }
+  if (environment === "prod" && (!tenant.dlpScannerEndpoint || !tenant.dlpScannerSecretArn || !tenant.dlpScannerSecretKmsKeyArn || !tenant.dlpPolicyVersion)) {
+    throw new Error(`Production tenant ${tenant.id} requires an exact server DLP endpoint, KMS-encrypted token secret, and policy version.`);
   }
   return tenant;
 }
@@ -151,6 +163,10 @@ export function validateTenant(value: unknown): TenantDefinition {
   const displayName = String(candidate.displayName ?? "").trim();
   const retentionDays = Number(candidate.retentionDays ?? 365);
   const retentionMode = String(candidate.retentionMode ?? "GOVERNANCE").toUpperCase();
+  const dlpScannerEndpoint = optionalHttpsEndpoint(candidate.dlpScannerEndpoint, "DLP scanner endpoint");
+  const dlpScannerSecretArn = optionalRegionalArn(candidate.dlpScannerSecretArn, "secretsmanager", "DLP scanner token secret");
+  const dlpScannerSecretKmsKeyArn = optionalRegionalArn(candidate.dlpScannerSecretKmsKeyArn, "kms", "DLP scanner token KMS key", "key/");
+  const dlpPolicyVersion = optionalPolicyVersion(candidate.dlpPolicyVersion);
 
   if (!/^ten_[a-f0-9]{32}$/.test(id)) {
     throw new Error(`Tenant id ${id || "<empty>"} must match ten_ followed by 32 lowercase hexadecimal characters.`);
@@ -167,6 +183,10 @@ export function validateTenant(value: unknown): TenantDefinition {
   if (retentionMode !== "GOVERNANCE" && retentionMode !== "COMPLIANCE") {
     throw new Error(`Tenant ${id} retentionMode must be GOVERNANCE or COMPLIANCE.`);
   }
+  const dlpFields = [dlpScannerEndpoint, dlpScannerSecretArn, dlpScannerSecretKmsKeyArn, dlpPolicyVersion].filter(Boolean).length;
+  if (dlpFields > 0 && dlpFields < 4) {
+    throw new Error(`Tenant ${id} must configure all server DLP fields together.`);
+  }
 
   return {
     id,
@@ -174,7 +194,44 @@ export function validateTenant(value: unknown): TenantDefinition {
     displayName,
     retentionDays,
     retentionMode,
+    ...(dlpScannerEndpoint ? { dlpScannerEndpoint, dlpScannerSecretArn, dlpScannerSecretKmsKeyArn, dlpPolicyVersion } : {}),
   };
+}
+
+function optionalHttpsEndpoint(value: unknown, label: string): string | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  const raw = String(value);
+  if (raw !== raw.trim() || raw.length > 500 || /\p{Cc}/u.test(raw)) throw new Error(`${label} is invalid.`);
+  let parsed: URL;
+  try { parsed = new URL(raw); } catch { throw new Error(`${label} is invalid.`); }
+  if (parsed.protocol !== "https:" || parsed.username || parsed.password || parsed.search || parsed.hash ||
+      parsed.port || parsed.pathname === "/" || parsed.hostname === "localhost" ||
+      /^(?:127\.|10\.|169\.254\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.)/.test(parsed.hostname)) {
+    throw new Error(`${label} must be a public, clean HTTPS URL with an explicit path.`);
+  }
+  return parsed.toString();
+}
+
+function optionalRegionalArn(
+  value: unknown,
+  service: "kms" | "secretsmanager",
+  label: string,
+  resourcePrefix = "",
+): string | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  const arn = String(value);
+  const escapedPrefix = resourcePrefix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  if (arn !== arn.trim() || !new RegExp(`^arn:aws:${service}:[a-z]{2}-[a-z]+-[0-9]:[0-9]{12}:${escapedPrefix}[A-Za-z0-9/_+=.@:-]{1,512}$`).test(arn)) {
+    throw new Error(`${label} ARN is invalid.`);
+  }
+  return arn;
+}
+
+function optionalPolicyVersion(value: unknown): string | undefined {
+  if (value === undefined || value === null || value === "") return undefined;
+  const policy = String(value);
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$/.test(policy)) throw new Error("DLP policy version is invalid.");
+  return policy;
 }
 
 export function parseTenants(value: unknown): TenantDefinition[] {

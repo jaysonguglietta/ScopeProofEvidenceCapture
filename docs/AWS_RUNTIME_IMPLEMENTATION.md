@@ -20,9 +20,13 @@ true before customer evidence is trusted:
 3. The upload capability binds one tenant, control, evidence identifier,
    checksum, byte length, media type, KMS context, key, object path, and short
    expiry using temporary STS credentials and SigV4.
-4. GuardDuty scanned the exact quarantine object version, S3 returned an exact
-   immutable destination version with the required retention, and PostgreSQL
-   atomically committed both lifecycle revisions and a KMS-signed receipt.
+4. The independent DLP service returned a strict `CLEAN` decision for the exact
+   immutable quarantine bucket/key/version/digest/size/content type; Scopeproof
+   durably KMS-signed those canonical DLP facts; S3 returned an exact immutable
+   destination version with the required retention; and DynamoDB/PostgreSQL
+   reconciled the same DLP, promotion, audit, and storage facts. GuardDuty event
+   processing remains an additional AWS detection/trigger boundary, not a
+   substitute for the exact-version DLP contract.
 
 Hostnames select a tenant candidate. They never authorize access. Cognito groups,
 email domains, editable claims, and client-provided tenant identifiers are not
@@ -44,6 +48,7 @@ authorization inputs.
 | `RdsDataEvidenceAccessRepository` | Lists and resolves downloadable evidence through tenant-scoped execute-only procedures | Tenant PostgreSQL database |
 | `HostedEvidenceAccessService` | Issues HMAC-protected tenant-bound cursors and 60-second exact-version GET capabilities | Aurora metadata plus S3 SigV4 |
 | GuardDuty promotion Lambda | Verifies the exact scanned version, performs one conditional Object-Locked destination write, and reconciles state | S3, DynamoDB, and PostgreSQL |
+| Exact-version DLP client | Sends one immutable quarantine coordinate set to a clean HTTPS scanner endpoint, validates a strict bounded response, and stores a canonical KMS-signed receipt before promotion | External scanner, Secrets Manager, tenant KMS audit key, DynamoDB |
 | `RdsDataSignedAuditReceiptStore` | Verifies and appends one KMS-signed event into the tenant hash chain | Tenant PostgreSQL database |
 | API audit outbox/signer | Durably records successful public API facts, leases a bounded batch, signs each canonical event with tenant KMS, atomically appends it to the hash chain, and retries/dead-letters poison rows | Tenant PostgreSQL, dedicated Lambda/database login, KMS, EventBridge, DLQ, CloudWatch |
 | Exact-version legal-hold service | Separately commits requester-only `REQUESTED`, distinct-admin `APPROVED`, durable worker-only `APPLYING`, and exact-readback `APPLIED` state for one exact S3 `VersionId` | PostgreSQL plus S3 Object Lock |
@@ -52,6 +57,15 @@ authorization inputs.
 The AWS SDK is kept behind small facades. Tests can therefore exercise command
 construction, exact parameters, malformed AWS responses, transaction rollback,
 and replay behavior without credentials or network access.
+
+Production tenant synthesis requires `dlpScannerEndpoint`,
+`dlpScannerSecretArn`, `dlpScannerSecretKmsKeyArn`, and `dlpPolicyVersion`
+together. The scanner URL must be clean HTTPS, the bearer secret must use the
+declared regional customer-managed KMS key, and the response must bind the exact
+tenant, bucket, key, `VersionId`, SHA-256, size, content type, and policy. A
+missing scanner, rejection, extra response field, stale/future time, mismatch,
+or failed KMS verification disables promotion. See the
+[2026-09-01 remediation status](SECURITY_REMEDIATION_2026-09-01.md).
 
 ## Configure authentication
 
@@ -306,6 +320,18 @@ attempt adopts the winner's durable attempt/version and reconciles under its
 newer fence. A partial S3 result is rediscovered by exact metadata, a partial
 database result is rejected, and randomized RSA-PSS retry signatures do not
 create duplicate logical receipts.
+
+Threat, unsupported, access-denied, and failed scan outcomes use a separate
+immutable rejection receipt. If DynamoDB persisted that canonical receipt but
+Aurora was unavailable, an exact replay first compares every stored fact,
+including `rejectedAt`, and returns the existing relational receipt before
+freshness enforcement. If the relational receipt is still missing, migration
+`009_runtime_hardening.sql` accepts the authenticated transition for at most 14
+days, matching the configured ingest DLQ retention. The ordinary future-skew,
+tenant, upload-intent, evidence, version, revision, canonical JSON, and SHA-256
+checks still apply. A changed replay or recovery after that durable window fails
+closed and requires an operator-investigated repair rather than timestamp
+replacement.
 
 ## KMS-signed audit receipts
 

@@ -12,6 +12,14 @@ struct S3StorageTests {
         #expect(settings.autoUpload)
         #expect(S3StorageSettings.defaults.archiveAfterDays == 0)
         #expect(S3StorageSettings.defaults.retentionMode == .compliance)
+        let customerBinding = try #require(TenantWorkspaceBinding.validated(
+            tenantID: "customer-a", workspaceID: "audit-2026"
+        ))
+        let disconnected = S3StorageSettings.empty(for: customerBinding)
+        #expect(disconnected.tenantBinding == customerBinding)
+        #expect(!disconnected.isConfigured)
+        #expect(disconnected.isBound(to: customerBinding))
+        #expect(!disconnected.isBound(to: .localDefault))
         #expect(S3RetentionMode.governance.displayName.contains("non-production"))
         #expect(throws: S3StorageFailure.self) { try S3StorageSettings.validated(bucket: "../../bucket", region: "us-east-1", prefix: "evidence", autoUpload: false) }
         #expect(throws: S3StorageFailure.self) { try S3StorageSettings.validated(bucket: "company-evidence", region: "https://attacker.example", prefix: "evidence", autoUpload: false) }
@@ -140,11 +148,19 @@ struct S3StorageTests {
 
     @Test("Builds control-oriented object keys without traversal")
     func buildsSafeControlObjectKeys() {
-        let settings = S3StorageSettings(bucket: "company-evidence", region: "us-east-1", prefix: "scopeproof", autoUpload: false)
-        let context = CaptureContext(sessionID: "session", sessionName: "Q3", controlID: "../../8.3.1", title: "MFA", system: "Okta", environment: "Production", assessmentPeriod: "../2026 Q3", description: "", complianceArea: "PCI DSS 4.0.1", controlTitle: "Strong authentication / MFA", customFileName: "MFA")
+        let settings = S3StorageSettings(
+            tenantID: "customer-a", workspaceID: "audit-2026",
+            bucket: "company-evidence", region: "us-east-1", prefix: "scopeproof", autoUpload: false
+        )
+        let context = CaptureContext(sessionID: "session", sessionName: "Q3", controlID: "../../8.3.1", title: "MFA", system: "Okta", environment: "Production", assessmentPeriod: "../2026 Q3", description: "", complianceArea: "PCI DSS 4.0.1", controlTitle: "Strong authentication / MFA", customFileName: "MFA", tenantID: "customer-a", workspaceID: "audit-2026")
         let base = S3StorageService.objectBase(settings: settings, context: context, evidenceID: "EV-123")
-        #expect(base == "scopeproof/8.3.1-Strong-authentication-MFA/2026-Q3/EV-123")
+        #expect(base == "scopeproof/tenants/customer-a/workspaces/audit-2026/8.3.1-Strong-authentication-MFA/2026-Q3/EV-123")
         #expect(!base.contains(".."))
+
+        let listURL = try? S3StorageService.listObjectVersionsEndpoint(
+            settings: settings, maximumKeys: 100, keyMarker: nil, versionIDMarker: nil
+        )
+        #expect(listURL?.query?.contains("prefix=scopeproof/tenants/customer-a/workspaces/audit-2026/") == true)
     }
 
     @Test("Uses fixed AWS hosts and signs encrypted PUT requests")

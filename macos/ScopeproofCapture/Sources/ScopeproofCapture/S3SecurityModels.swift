@@ -115,6 +115,8 @@ enum S3RetentionMode: String, Codable, CaseIterable, Sendable {
 }
 
 struct S3StorageSettings: Codable, Equatable, Sendable {
+    var tenantID: String
+    var workspaceID: String
     var bucket: String
     var region: String
     var prefix: String
@@ -134,6 +136,8 @@ struct S3StorageSettings: Codable, Equatable, Sendable {
     var authentication: S3AuthenticationConfiguration
 
     static let defaults = S3StorageSettings(
+        tenantID: TenantWorkspaceBinding.localDefault.tenantID,
+        workspaceID: TenantWorkspaceBinding.localDefault.workspaceID,
         bucket: "", region: "us-east-1", prefix: "scopeproof-evidence", autoUpload: false,
         uploadsAllowed: false, securityProfile: .production, encryptionMode: .sseKMS,
         kmsKeyARN: "", retentionMode: .compliance, retentionDays: 365,
@@ -142,11 +146,25 @@ struct S3StorageSettings: Codable, Equatable, Sendable {
         authentication: .manual
     )
 
+    static func empty(for binding: TenantWorkspaceBinding) -> S3StorageSettings {
+        var settings = defaults
+        settings.tenantID = binding.tenantID
+        settings.workspaceID = binding.workspaceID
+        return settings
+    }
+
     var isConfigured: Bool { !bucket.isEmpty && !region.isEmpty }
     var canUpload: Bool { isConfigured && uploadsAllowed }
     var replicationEnabled: Bool { !replicationDestinationBucketARN.isEmpty }
+    var tenantScopedPrefix: String {
+        [prefix, "tenants", tenantID, "workspaces", workspaceID]
+            .filter { !$0.isEmpty }
+            .joined(separator: "/")
+    }
 
     init(
+        tenantID: String = TenantWorkspaceBinding.localDefault.tenantID,
+        workspaceID: String = TenantWorkspaceBinding.localDefault.workspaceID,
         bucket: String, region: String, prefix: String, autoUpload: Bool,
         uploadsAllowed: Bool = false, securityProfile: S3SecurityProfile = .compatible,
         encryptionMode: S3EncryptionMode = .sseS3, kmsKeyARN: String = "",
@@ -155,6 +173,8 @@ struct S3StorageSettings: Codable, Equatable, Sendable {
         replicationDestinationBucketARN: String = "", replicationRoleARN: String = "",
         replicationKMSKeyARN: String = "", authentication: S3AuthenticationConfiguration = .manual
     ) {
+        self.tenantID = tenantID
+        self.workspaceID = workspaceID
         self.bucket = bucket
         self.region = region
         self.prefix = prefix
@@ -175,6 +195,7 @@ struct S3StorageSettings: Codable, Equatable, Sendable {
     }
 
     private enum CodingKeys: String, CodingKey {
+        case tenantID, workspaceID
         case bucket, region, prefix, autoUpload, uploadsAllowed, securityProfile, encryptionMode, kmsKeyARN
         case retentionMode, retentionDays, archiveAfterDays, downloadsAllowed, useFIPSEndpoint
         case replicationDestinationBucketARN, replicationRoleARN, replicationKMSKeyARN
@@ -183,6 +204,10 @@ struct S3StorageSettings: Codable, Equatable, Sendable {
 
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
+        tenantID = try values.decodeIfPresent(String.self, forKey: .tenantID)
+            ?? TenantWorkspaceBinding.localDefault.tenantID
+        workspaceID = try values.decodeIfPresent(String.self, forKey: .workspaceID)
+            ?? TenantWorkspaceBinding.localDefault.workspaceID
         bucket = try values.decode(String.self, forKey: .bucket)
         region = try values.decode(String.self, forKey: .region)
         prefix = try values.decode(String.self, forKey: .prefix)
@@ -203,6 +228,8 @@ struct S3StorageSettings: Codable, Equatable, Sendable {
     }
 
     static func validated(
+        tenantID: String = TenantWorkspaceBinding.localDefault.tenantID,
+        workspaceID: String = TenantWorkspaceBinding.localDefault.workspaceID,
         bucket: String, region: String, prefix: String, autoUpload: Bool, uploadsAllowed: Bool = false,
         securityProfile: S3SecurityProfile = .compatible, encryptionMode: S3EncryptionMode = .sseS3,
         kmsKeyARN: String = "", retentionMode: S3RetentionMode = .compliance, retentionDays: Int = 365,
@@ -210,6 +237,9 @@ struct S3StorageSettings: Codable, Equatable, Sendable {
         replicationDestinationBucketARN: String = "", replicationRoleARN: String = "",
         replicationKMSKeyARN: String = "", authentication: S3AuthenticationConfiguration = .manual
     ) throws -> S3StorageSettings {
+        guard let binding = TenantWorkspaceBinding.validated(
+            tenantID: tenantID, workspaceID: workspaceID
+        ) else { throw S3StorageFailure.invalidTenantBinding }
         let cleanBucket = bucket.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let cleanRegion = region.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         var cleanPrefix = prefix.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -268,6 +298,7 @@ struct S3StorageSettings: Codable, Equatable, Sendable {
         }
 
         return S3StorageSettings(
+            tenantID: binding.tenantID, workspaceID: binding.workspaceID,
             bucket: cleanBucket, region: cleanRegion, prefix: cleanPrefix, autoUpload: autoUpload,
             uploadsAllowed: uploadsAllowed, securityProfile: securityProfile, encryptionMode: encryptionMode,
             kmsKeyARN: cleanKMS, retentionMode: retentionMode, retentionDays: retentionDays,
@@ -293,12 +324,20 @@ struct S3StorageSettings: Codable, Equatable, Sendable {
 
     var securityBindingDigest: String {
         let fields = [
-            bucket, region, prefix, securityProfile.rawValue, encryptionMode.rawValue, kmsKeyARN,
+            tenantID, workspaceID, bucket, region, prefix, securityProfile.rawValue, encryptionMode.rawValue, kmsKeyARN,
             retentionMode.rawValue, String(retentionDays), String(archiveAfterDays), String(downloadsAllowed),
             String(useFIPSEndpoint), replicationDestinationBucketARN, replicationRoleARN, replicationKMSKeyARN,
             authentication.method.rawValue, authentication.profileName, authentication.roleARN, authentication.externalID,
         ]
         return SHA256.hash(data: Data(fields.joined(separator: "\u{1f}").utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    var tenantBinding: TenantWorkspaceBinding? {
+        TenantWorkspaceBinding.validated(tenantID: tenantID, workspaceID: workspaceID)
+    }
+
+    func isBound(to binding: TenantWorkspaceBinding) -> Bool {
+        tenantBinding == binding
     }
 }
 
@@ -307,18 +346,32 @@ struct S3Credentials: Codable, Equatable, Sendable {
     var secretAccessKey: String
     var sessionToken: String
     var expiresAt: Date?
+    var tenantID: String
+    var workspaceID: String
 
-    init(accessKeyID: String, secretAccessKey: String, sessionToken: String, expiresAt: Date? = nil) {
+    init(
+        accessKeyID: String, secretAccessKey: String, sessionToken: String,
+        expiresAt: Date? = nil,
+        tenantID: String = TenantWorkspaceBinding.localDefault.tenantID,
+        workspaceID: String = TenantWorkspaceBinding.localDefault.workspaceID
+    ) {
         self.accessKeyID = accessKeyID
         self.secretAccessKey = secretAccessKey
         self.sessionToken = sessionToken
         self.expiresAt = expiresAt
+        self.tenantID = tenantID
+        self.workspaceID = workspaceID
     }
 
     var isTemporary: Bool { !sessionToken.isEmpty }
     var isExpired: Bool { expiresAt.map { $0 <= Date().addingTimeInterval(300) } ?? false }
 
-    static func validated(accessKeyID: String, secretAccessKey: String, sessionToken: String, expiresAt: Date? = nil) throws -> S3Credentials {
+    static func validated(
+        accessKeyID: String, secretAccessKey: String, sessionToken: String,
+        expiresAt: Date? = nil,
+        tenantID: String = TenantWorkspaceBinding.localDefault.tenantID,
+        workspaceID: String = TenantWorkspaceBinding.localDefault.workspaceID
+    ) throws -> S3Credentials {
         let access = accessKeyID.trimmingCharacters(in: .whitespacesAndNewlines)
         let secret = secretAccessKey.trimmingCharacters(in: .whitespacesAndNewlines)
         let session = sessionToken.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -329,7 +382,18 @@ struct S3Credentials: Codable, Equatable, Sendable {
         guard session.count <= 4_096,
               session.unicodeScalars.allSatisfy({ $0.value >= 0x21 && $0.value <= 0x7e }) else { throw S3StorageFailure.invalidCredentials }
         if let expiresAt, expiresAt <= Date().addingTimeInterval(300) { throw S3StorageFailure.expiredCredentials }
-        return S3Credentials(accessKeyID: access, secretAccessKey: secret, sessionToken: session, expiresAt: expiresAt)
+        guard let binding = TenantWorkspaceBinding.validated(
+            tenantID: tenantID, workspaceID: workspaceID
+        ) else { throw S3StorageFailure.invalidTenantBinding }
+        return S3Credentials(
+            accessKeyID: access, secretAccessKey: secret, sessionToken: session,
+            expiresAt: expiresAt, tenantID: binding.tenantID, workspaceID: binding.workspaceID
+        )
+    }
+
+
+    var tenantBinding: TenantWorkspaceBinding? {
+        TenantWorkspaceBinding.validated(tenantID: tenantID, workspaceID: workspaceID)
     }
 }
 

@@ -111,9 +111,11 @@ enum CaptureHistory {
         }
     }
 
+    @MainActor
     static func removeExpired(
-        in directory: URL, retentionDays: Int, now: Date = Date()
-    ) throws -> LocalRetentionReport {
+        in directory: URL, retentionDays: Int, now: Date = Date(),
+        remoteDurabilityVerifier: (CaptureHistoryEntry) async throws -> Bool
+    ) async throws -> LocalRetentionReport {
         let cutoff = now.addingTimeInterval(-Double(retentionDays) * 86_400)
         var report = LocalRetentionReport()
         for entry in entries(in: directory) {
@@ -126,6 +128,10 @@ enum CaptureHistory {
                 break
             }
             guard hasDurableLockedCopy(for: entry, now: now) else {
+                report.skippedWithoutDurableCopy += 1
+                continue
+            }
+            guard try await remoteDurabilityVerifier(entry) else {
                 report.skippedWithoutDurableCopy += 1
                 continue
             }
@@ -198,7 +204,11 @@ enum CaptureHistory {
 
     static func captureChainIntegrity(_ entries: [CaptureHistoryEntry]) -> Bool {
         let anchor: LocalCaptureChainAnchor?
-        do { anchor = try KeychainStore.captureChainAnchor() }
+        let binding = entries.first?.manifest.tenantBinding ?? .localDefault
+        guard entries.allSatisfy({ ($0.manifest.tenantBinding ?? .localDefault) == binding }) else {
+            return false
+        }
+        do { anchor = try KeychainStore.captureChainAnchor(binding: binding) }
         catch { return false }
         return captureChainIntegrity(entries, anchor: anchor)
     }
@@ -210,7 +220,7 @@ enum CaptureHistory {
         // signed epoch backwards from the Keychain anchor without sorting away
         // duplicated, missing, or reordered sequence claims.
         let signed = entries.compactMap { entry -> CaptureManifest? in
-            entry.manifest.schemaVersion == 7 ? entry.manifest : nil
+            entry.manifest.schemaVersion >= 7 ? entry.manifest : nil
         }
         guard let anchor else { return signed.isEmpty }
         guard anchor.schemaVersion == LocalCaptureChainAnchor.currentSchemaVersion,

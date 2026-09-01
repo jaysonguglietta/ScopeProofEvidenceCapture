@@ -7,6 +7,7 @@ export const PROMOTION_SIGNING_ALGORITHM = "RSASSA_PSS_SHA_256";
 const exactFactKeys = [
   "byteSize", "contentType", "controlId", "copyAttemptId", "copyFence", "evidenceBucket", "evidenceId", "evidenceKey",
   "evidenceVersionId", "kmsKeyArn", "objectLockMode", "promotedAt", "providerRequestId",
+  "dlpPolicyVersion", "dlpReceiptSha256", "dlpScannedAt", "dlpScannerRequestId",
   "promotionAttemptId", "promotionFence", "quarantineBucket", "quarantineKey", "quarantineVersionId", "retainUntil", "schemaVersion",
   "sha256", "tenantId", "uploadedAt", "uploadIntentId",
 ].sort();
@@ -271,6 +272,10 @@ function assertPromotionInvariants(facts, expected) {
     objectLockMode: expected.objectLockMode,
     promotionAttemptId: expected.promotionAttemptId,
     promotionFence: expected.promotionFence,
+    dlpPolicyVersion: expected.dlpPolicyVersion,
+    dlpReceiptSha256: expected.dlpReceiptSha256,
+    dlpScannedAt: expected.dlpScannedAt,
+    dlpScannerRequestId: expected.dlpScannerRequestId,
     retainUntil: expected.retainUntil === undefined
       ? undefined
       : canonicalInstant(expected.retainUntil, "Expected retention time"),
@@ -291,6 +296,13 @@ function assertPromotionInvariants(facts, expected) {
     !Number.isSafeInteger(facts.copyFence) || facts.copyFence < 1 ||
     !/^pat_[a-f0-9]{32}$/.test(String(facts.promotionAttemptId ?? "")) ||
     !Number.isSafeInteger(facts.promotionFence) || facts.promotionFence < facts.copyFence ||
+    !/^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$/.test(String(facts.dlpPolicyVersion ?? "")) ||
+    !/^[a-f0-9]{64}$/.test(String(facts.dlpReceiptSha256 ?? "")) ||
+    !/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(String(facts.dlpScannerRequestId ?? "")) ||
+    Date.parse(canonicalInstant(facts.dlpScannedAt, "Committed DLP scan time")) >
+      Date.parse(canonicalInstant(facts.promotedAt, "Committed promotion time")) ||
+    Date.parse(canonicalInstant(facts.dlpScannedAt, "Committed DLP scan time")) <
+      Date.parse(canonicalInstant(facts.uploadedAt, "Committed source upload time")) ||
     (expected.minimumRetainUntil !== undefined &&
       Date.parse(retainUntil) < Date.parse(canonicalInstant(expected.minimumRetainUntil, "Minimum retention time"))) ||
     Date.parse(canonicalInstant(facts.promotedAt, "Committed promotion time")) <

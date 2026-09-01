@@ -41,7 +41,7 @@ export async function queueCollection(collectorId: string, actor: AuthenticatedU
   const env = getEnv();
   const collector = await env.DB.prepare("SELECT id FROM collectors WHERE id = ? AND enabled = 1").bind(collectorId).first();
   if (!collector) throw new Error("Collector is unavailable or disabled.");
-  if (assessmentId && !(await env.DB.prepare("SELECT 1 FROM assessments WHERE id = ? AND status = 'active'").bind(assessmentId).first())) throw new Response(JSON.stringify({ error: "Collections require an active assessment." }), { status: 409, headers: { "content-type": "application/json" } });
+  if (assessmentId && !(await env.DB.prepare("SELECT 1 FROM assessments WHERE id = ? AND status = 'active' AND scope_mode = 'explicit' AND catalog_id IS NOT NULL AND json_array_length(systems_json) > 0 AND json_array_length(controls_json) > 0").bind(assessmentId).first())) throw new Response(JSON.stringify({ error: "Collections require an active assessment with an explicit, non-empty, versioned scope." }), { status: 409, headers: { "content-type": "application/json" } });
   const id = randomId("job");
   await executeAuditedBatch(actor, "collection.queued", "collection_job", id, { collectorId, triggerType }, [
     env.DB.prepare("INSERT INTO collection_jobs (id, collector_id, requested_by, trigger_type, assessment_id) VALUES (?, ?, ?, ?, ?)").bind(id, collectorId, actor.id, triggerType, assessmentId || null),
@@ -101,7 +101,7 @@ export async function processJob(jobId: string, actor?: AuthenticatedUser): Prom
     for (const artifact of collection.artifacts) {
       const ownsLease = await env.DB.prepare("SELECT 1 FROM collection_jobs WHERE id = ? AND status = 'running' AND lease_id = ? AND lease_expires_at > ?").bind(jobId, leaseId, new Date().toISOString()).first();
       if (!ownsLease) throw new CollectorError("Collection lease expired before evidence persistence.", "LEASE_LOST", true);
-      const result = await storeEvidence({ ...artifact, createdBy: runActor, collectorId: String(collector.id), jobId, assessmentId: job.assessment_id ? String(job.assessment_id) : undefined, coverageStatus: collection.coverage.complete ? "complete" : "partial", coverage: collection.coverage });
+      const result = await storeEvidence({ ...artifact, createdBy: runActor, collectorId: String(collector.id), jobId, assessmentId: String(job.assessment_id || ""), coverageStatus: collection.coverage.complete ? "complete" : "partial", coverage: collection.coverage });
       if (!result.deduplicated) stored += 1;
     }
     const completed = new Date().toISOString();
@@ -128,7 +128,7 @@ export async function processDueWork(now = new Date()): Promise<void> {
   const env = getEnv();
   await purgeExpiredEvidence(now, systemActor);
   await purgeRateLimitBuckets(Math.floor(now.getTime() / 1_000));
-  const dueRetries = (await env.DB.prepare("SELECT id FROM collection_jobs WHERE (status = 'retrying' AND next_attempt_at <= ?) OR (status = 'running' AND lease_expires_at < ?) ORDER BY next_attempt_at LIMIT 10").bind(now.toISOString(), now.toISOString()).all<{ id: string }>()).results;
+  const dueRetries = (await env.DB.prepare("SELECT id FROM collection_jobs WHERE status = 'queued' OR (status = 'retrying' AND next_attempt_at <= ?) OR (status = 'running' AND lease_expires_at < ?) ORDER BY created_at, id LIMIT 10").bind(now.toISOString(), now.toISOString()).all<{ id: string }>()).results;
   for (const job of dueRetries) await processJob(job.id);
   await processDueSbomWork(now);
   const collectors = (await env.DB.prepare("SELECT id, schedule_cron, last_run_at FROM collectors WHERE enabled = 1 AND schedule_cron IS NOT NULL").all<{ id: string; schedule_cron: string; last_run_at: string | null }>()).results;

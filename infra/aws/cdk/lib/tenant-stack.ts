@@ -1039,6 +1039,31 @@ export class TenantStack extends Stack {
       allowTestInvoke: false,
       proxy: true,
     });
+    // API Gateway rejects missing, expired, wrong-pool, and under-scoped access
+    // tokens before they can consume Lambda capacity. Every Lambda continues to
+    // verify the JWT, token_use, client_id, tenant membership, and role itself;
+    // this is an independent outer boundary, not a replacement for application
+    // authorization.
+    const cognitoAuthorizer = new apigateway.CognitoUserPoolsAuthorizer(this, "TenantCognitoAuthorizer", {
+      cognitoUserPools: [shared.userPool],
+      identitySource: "method.request.header.Authorization",
+      resultsCacheTtl: Duration.seconds(0),
+    });
+    const readAuthorization: apigateway.MethodOptions = {
+      authorizationType: apigateway.AuthorizationType.COGNITO,
+      authorizer: cognitoAuthorizer,
+      authorizationScopes: ["scopeproof/evidence.read"],
+    };
+    const collectAuthorization: apigateway.MethodOptions = {
+      authorizationType: apigateway.AuthorizationType.COGNITO,
+      authorizer: cognitoAuthorizer,
+      authorizationScopes: ["scopeproof/evidence.collect"],
+    };
+    const retentionAuthorization: apigateway.MethodOptions = {
+      authorizationType: apigateway.AuthorizationType.COGNITO,
+      authorizer: cognitoAuthorizer,
+      authorizationScopes: ["scopeproof/retention.manage"],
+    };
     const health = api.root.addResource("health");
     // Keep unauthenticated liveness entirely inside API Gateway. It must not
     // cold-start a role that can assume the authenticated upload boundary.
@@ -1071,9 +1096,9 @@ export class TenantStack extends Stack {
     });
     const version = api.root.addResource("v1");
     const me = version.addResource("me");
-    me.addMethod("GET", integration);
+    me.addMethod("GET", integration, readAuthorization);
     const collector = version.addResource("collector");
-    collector.addResource("me").addMethod("GET", integration);
+    collector.addResource("me").addMethod("GET", integration, collectAuthorization);
     const uploadIntents = version.addResource("upload-intents");
     const uploadModel = api.addModel("UploadIntentRequestModel", {
       contentType: "application/json",
@@ -1137,6 +1162,7 @@ export class TenantStack extends Stack {
       },
     });
     uploadIntents.addMethod("POST", integration, {
+      ...collectAuthorization,
       requestModels: { "application/json": uploadModel },
       requestValidator: new apigateway.RequestValidator(this, "UploadIntentRequestValidator", {
         restApi: api,
@@ -1162,6 +1188,7 @@ export class TenantStack extends Stack {
       },
     });
     evidenceSearch.addMethod("POST", evidenceReadIntegration, {
+      ...readAuthorization,
       requestModels: { "application/json": evidenceSearchModel },
       requestValidator: new apigateway.RequestValidator(this, "EvidenceSearchRequestValidator", {
         restApi: api,
@@ -1186,6 +1213,7 @@ export class TenantStack extends Stack {
       },
     });
     evidenceDownloadIntents.addMethod("POST", evidenceReadIntegration, {
+      ...readAuthorization,
       requestModels: { "application/json": evidenceDownloadModel },
       requestValidator: new apigateway.RequestValidator(this, "EvidenceDownloadIntentRequestValidator", {
         restApi: api,
@@ -1225,6 +1253,7 @@ export class TenantStack extends Stack {
       },
     });
     legalHoldRequests.addMethod("POST", legalHoldIntegration, {
+      ...retentionAuthorization,
       requestModels: { "application/json": legalHoldRequestModel },
       requestValidator: new apigateway.RequestValidator(this, "LegalHoldRequestValidator", {
         restApi: api,
@@ -1250,6 +1279,7 @@ export class TenantStack extends Stack {
       },
     });
     legalHoldApprovals.addMethod("POST", legalHoldIntegration, {
+      ...retentionAuthorization,
       requestModels: { "application/json": legalHoldApprovalModel },
       requestValidator: new apigateway.RequestValidator(this, "LegalHoldApprovalValidator", {
         restApi: api,
@@ -1327,7 +1357,7 @@ export class TenantStack extends Stack {
             const databaseOutput = `${outputDir}/database`;
             return [
               `mkdir -p "${databaseOutput}"`,
-              ...["001_tenant_schema.sql", "002_runtime_role.sql", "003_ingest_role.sql", "004_evidence_control_role.sql", "005_legal_hold_api_role.sql", "006_evidence_access_api.sql", "007_evidence_read_role.sql", "008_api_audit_signer_role.sql"].map(
+              ...["001_tenant_schema.sql", "002_runtime_role.sql", "003_ingest_role.sql", "004_evidence_control_role.sql", "005_legal_hold_api_role.sql", "006_evidence_access_api.sql", "007_evidence_read_role.sql", "008_api_audit_signer_role.sql", "009_runtime_hardening.sql"].map(
                 (name) => `cp -p "${inputDir}/../database/${name}" "${databaseOutput}/${name}"`,
               ),
             ];
@@ -1351,6 +1381,7 @@ export class TenantStack extends Stack {
         AWS_REGION_EXPECTED: this.region,
         CANONICAL_HOSTNAME: hostname,
         CONTROL_TABLE_NAME: shared.controlTable.tableName,
+        CUSTOMER_ACTIVATION_TABLE_NAME: shared.customerActivationTable.tableName,
         DATABASE_CLUSTER_ARN: shared.databaseCluster.clusterArn,
         DATABASE_NAME: databaseIdentifier,
         DATABASE_OWNER: databaseOwner,
@@ -1398,6 +1429,14 @@ export class TenantStack extends Stack {
         resources: [shared.controlTable.tableArn],
       }),
     );
+    provisioner.addToRolePolicy(new iam.PolicyStatement({
+      actions: ["dynamodb:GetItem"],
+      conditions: {
+        "ForAllValues:StringEquals": { "dynamodb:LeadingKeys": [`TENANT#${tenant.id}`] },
+        Null: { "dynamodb:LeadingKeys": "false" },
+      },
+      resources: [shared.customerActivationTable.tableArn],
+    }));
     provisioner.addToRolePolicy(
       new iam.PolicyStatement({
         actions: [
@@ -1515,6 +1554,12 @@ export class TenantStack extends Stack {
       "verify",
     );
     const activateTenant = tenantProvisioningTask(this, "ActivateTenant", provisioner, "activate");
+    activateTenant.addRetry({
+      backoffRate: 1,
+      errors: ["CustomerActivationRequired"],
+      interval: Duration.minutes(5),
+      maxAttempts: 288,
+    });
     for (const task of [initializeDatabase, verifyDatabase, activateTenant]) {
       task.addCatch(markFailed, { resultPath: "$.failure" });
     }
@@ -1532,7 +1577,7 @@ export class TenantStack extends Stack {
         level: sfn.LogLevel.ALL,
       },
       stateMachineType: sfn.StateMachineType.STANDARD,
-      timeout: Duration.minutes(15),
+      timeout: Duration.hours(25),
       tracingEnabled: true,
     });
 
@@ -1625,6 +1670,13 @@ export class TenantStack extends Stack {
       retentionPeriod: Duration.days(4),
       visibilityTimeout: Duration.minutes(6),
     });
+    const rejectedEvidenceQueue = new sqs.Queue(this, "RejectedEvidenceQueue", {
+      deadLetterQueue: { maxReceiveCount: 5, queue: this.ingestDeadLetterQueue },
+      enforceSSL: true,
+      encryption: sqs.QueueEncryption.SQS_MANAGED,
+      retentionPeriod: Duration.days(4),
+      visibilityTimeout: Duration.minutes(6),
+    });
     const cleanScanRule = new events.Rule(this, "CleanMalwareScanResult", {
       description: `Queues only successful NO_THREATS_FOUND scans for ${tenant.id}`,
       enabled: true,
@@ -1652,9 +1704,140 @@ export class TenantStack extends Stack {
         detailType: ["GuardDuty Malware Protection Object Scan Result"],
         source: ["aws.guardduty"],
       },
-      targets: [new eventTargets.SnsTopic(shared.operationsTopic)],
+      targets: [
+        new eventTargets.SnsTopic(shared.operationsTopic),
+        new eventTargets.SqsQueue(rejectedEvidenceQueue),
+      ],
     });
     rejectedScanRule.node.addDependency(malwareProtectionPlan);
+
+    const rejectionLogGroup = new logs.LogGroup(this, "RejectedEvidenceReconcilerLogs", {
+      encryptionKey: tenantKey,
+      removalPolicy: RemovalPolicy.RETAIN,
+      retention: logs.RetentionDays.ONE_YEAR,
+    });
+    const rejectionReconciler = new lambdaNodejs.NodejsFunction(this, "RejectedEvidenceReconciler", {
+      architecture: lambda.Architecture.ARM_64,
+      bundling: {
+        externalModules: [],
+        format: lambdaNodejs.OutputFormat.ESM,
+        minify: true,
+        sourceMap: false,
+        target: "node22",
+      },
+      depsLockFilePath: path.join(__dirname, "..", "pnpm-lock.yaml"),
+      description: `Fences and durably reconciles rejected GuardDuty object versions for ${tenant.id}`,
+      entry: path.join(__dirname, "..", "runtime", "reconcile-rejected-evidence", "index.mjs"),
+      environment: {
+        AWS_ACCOUNT_ID_EXPECTED: this.account,
+        AWS_REGION_EXPECTED: this.region,
+        CONTROL_TABLE_NAME: shared.controlTable.tableName,
+        DATABASE_CLUSTER_ARN: shared.databaseCluster.clusterArn,
+        DATABASE_NAME: databaseIdentifier,
+        INGEST_BUCKET_NAME: ingestBucket.bucketName,
+        INGEST_DATABASE_SECRET_ARN: ingestDatabaseSecret.secretArn,
+        MALWARE_PROTECTION_PLAN_ARN: malwareProtectionPlan.attrArn,
+        TENANT_ID: tenant.id,
+      },
+      handler: "handler",
+      logGroup: rejectionLogGroup,
+      memorySize: 256,
+      projectRoot: path.join(__dirname, ".."),
+      reservedConcurrentExecutions: concurrency.rejectedEvidenceReconciler,
+      runtime: lambda.Runtime.NODEJS_22_X,
+      timeout: Duration.minutes(5),
+      tracing: lambda.Tracing.ACTIVE,
+    });
+    rejectionReconciler.addEventSource(new lambdaEventSources.SqsEventSource(rejectedEvidenceQueue, {
+      batchSize: 5,
+      maxBatchingWindow: Duration.seconds(30),
+      reportBatchItemFailures: true,
+    }));
+    rejectionReconciler.addToRolePolicy(new iam.PolicyStatement({
+      actions: ["dynamodb:GetItem", "dynamodb:TransactWriteItems"],
+      conditions: {
+        Null: { "dynamodb:LeadingKeys": "false" },
+        "ForAllValues:StringEquals": { "dynamodb:LeadingKeys": [`TENANT#${tenant.id}`] },
+      },
+      resources: [shared.controlTable.tableArn],
+    }));
+    rejectionReconciler.addToRolePolicy(new iam.PolicyStatement({
+      actions: ["s3:GetObjectTagging", "s3:GetObjectVersionTagging"],
+      resources: [ingestBucket.arnForObjects(`tenants/${tenant.id}/controls/*/quarantine/*`)],
+    }));
+    rejectionReconciler.addToRolePolicy(new iam.PolicyStatement({
+      actions: [
+        "rds-data:BeginTransaction", "rds-data:CommitTransaction",
+        "rds-data:ExecuteStatement", "rds-data:RollbackTransaction",
+      ],
+      resources: [shared.databaseCluster.clusterArn, ingestDatabaseSecret.secretArn],
+    }));
+    ingestDatabaseSecret.grantRead(rejectionReconciler);
+
+    const projectionRepairLogGroup = new logs.LogGroup(this, "UploadProjectionRepairerLogs", {
+      encryptionKey: tenantKey,
+      removalPolicy: RemovalPolicy.RETAIN,
+      retention: logs.RetentionDays.ONE_YEAR,
+    });
+    const projectionRepairer = new lambdaNodejs.NodejsFunction(this, "UploadProjectionRepairer", {
+      architecture: lambda.Architecture.ARM_64,
+      bundling: {
+        externalModules: [],
+        format: lambdaNodejs.OutputFormat.ESM,
+        minify: true,
+        sourceMap: false,
+        target: "node22",
+      },
+      depsLockFilePath: path.join(__dirname, "..", "pnpm-lock.yaml"),
+      description: `Repairs exact Dynamo-to-Aurora upload projections for ${tenant.id}`,
+      entry: path.join(__dirname, "..", "runtime", "repair-upload-projections", "index.ts"),
+      environment: {
+        CONTROL_TABLE_NAME: shared.controlTable.tableName,
+        DATABASE_CLUSTER_ARN: shared.databaseCluster.clusterArn,
+        DATABASE_NAME: databaseIdentifier,
+        DATABASE_SECRET_ARN: databaseSecret.secretArn,
+        TENANT_ID: tenant.id,
+      },
+      handler: "handler",
+      logGroup: projectionRepairLogGroup,
+      memorySize: 256,
+      projectRoot: path.join(__dirname, ".."),
+      reservedConcurrentExecutions: concurrency.uploadProjectionRepairer,
+      runtime: lambda.Runtime.NODEJS_22_X,
+      timeout: Duration.minutes(5),
+      tracing: lambda.Tracing.ACTIVE,
+    });
+    projectionRepairer.addToRolePolicy(new iam.PolicyStatement({
+      actions: ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:UpdateItem"],
+      conditions: {
+        Null: { "dynamodb:LeadingKeys": "false" },
+        "ForAllValues:StringEquals": { "dynamodb:LeadingKeys": [`TENANT#${tenant.id}`] },
+      },
+      resources: [shared.controlTable.tableArn],
+    }));
+    projectionRepairer.addToRolePolicy(new iam.PolicyStatement({
+      actions: [
+        "rds-data:BeginTransaction", "rds-data:CommitTransaction",
+        "rds-data:ExecuteStatement", "rds-data:RollbackTransaction",
+      ],
+      resources: [shared.databaseCluster.clusterArn, databaseSecret.secretArn],
+    }));
+    databaseSecret.grantRead(projectionRepairer);
+    new events.Rule(this, "UploadProjectionRepairSchedule", {
+      description: `Periodically repairs cross-service upload projections for ${tenant.id}`,
+      enabled: true,
+      schedule: events.Schedule.rate(Duration.minutes(5)),
+      targets: [new eventTargets.LambdaFunction(projectionRepairer, {
+        deadLetterQueue: this.ingestDeadLetterQueue,
+        event: events.RuleTargetInput.fromObject({
+          schemaVersion: 1,
+          tenantId: tenant.id,
+          type: "scopeproof.upload_projection.repair",
+        }),
+        maxEventAge: Duration.hours(2),
+        retryAttempts: 6,
+      })],
+    });
 
     const promoterLogGroup = new logs.LogGroup(this, "EvidencePromoterLogs", {
       encryptionKey: tenantKey,
@@ -1682,6 +1865,10 @@ export class TenantStack extends Stack {
         AUDIT_SIGNING_KEY_ARN: auditSigningKey.keyArn,
         DATABASE_CLUSTER_ARN: shared.databaseCluster.clusterArn,
         DATABASE_NAME: databaseIdentifier,
+        DLP_MODE: tenant.dlpScannerEndpoint ? "ENFORCED" : "DISABLED",
+        DLP_POLICY_VERSION: tenant.dlpPolicyVersion ?? "DISABLED",
+        DLP_SCANNER_ENDPOINT: tenant.dlpScannerEndpoint ?? "DISABLED",
+        DLP_SCANNER_SECRET_ARN: tenant.dlpScannerSecretArn ?? "DISABLED",
         INGEST_DATABASE_SECRET_ARN: ingestDatabaseSecret.secretArn,
         INGEST_BUCKET_NAME: ingestBucket.bucketName,
         MALWARE_PROTECTION_PLAN_ARN: malwareProtectionPlan.attrArn,
@@ -1769,6 +1956,22 @@ export class TenantStack extends Stack {
       resources: [shared.databaseCluster.clusterArn, ingestDatabaseSecret.secretArn],
     }));
     ingestDatabaseSecret.grantRead(promoter);
+    if (tenant.dlpScannerSecretArn) {
+      promoter.addToRolePolicy(new iam.PolicyStatement({
+        actions: ["secretsmanager:GetSecretValue"],
+        resources: [tenant.dlpScannerSecretArn],
+      }));
+      promoter.addToRolePolicy(new iam.PolicyStatement({
+        actions: ["kms:Decrypt"],
+        conditions: {
+          StringEquals: {
+            "kms:EncryptionContext:SecretARN": tenant.dlpScannerSecretArn,
+            "kms:ViaService": `secretsmanager.${this.region}.amazonaws.com`,
+          },
+        },
+        resources: [tenant.dlpScannerSecretKmsKeyArn!],
+      }));
+    }
     promoter.addToRolePolicy(new iam.PolicyStatement({
       actions: ["kms:Sign", "kms:Verify"],
       resources: [auditSigningKey.keyArn],

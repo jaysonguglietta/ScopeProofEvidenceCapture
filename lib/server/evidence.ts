@@ -5,6 +5,7 @@ import { getEnv } from "./env";
 import { getAssessment } from "./assessments";
 import { evidenceSafetyReceiptSha256 } from "./image-safety";
 import { redactJson, redactText, type RedactionFinding } from "./redaction";
+import { decodePageCursor, pageLimit, pageMeta, type PageMeta } from "./pagination";
 
 export type ArtifactType = "screenshot" | "code" | "configuration" | "report";
 export interface EvidenceInput {
@@ -44,7 +45,7 @@ export interface EvidenceInput {
   safetyScanPolicy?: string;
   safetyScanCompletedAt?: string;
   serverSafetyScan?: { digest: string; policy: string; completedAt: string; scannerOrigin: string; receiptSha256: string };
-  assessmentId?: string;
+  assessmentId: string;
   coverageStatus?: "complete" | "partial" | "not_applicable";
   coverage?: Record<string, unknown>;
 }
@@ -109,14 +110,14 @@ function occurrenceInsert(input: EvidenceInput, occurrenceId: string, artifactId
 
 export async function storeEvidence(input: EvidenceInput): Promise<StoreEvidenceResult> {
   const env = getEnv();
-  if (input.assessmentId) {
-    const assessment = await getAssessment(input.assessmentId);
-    if (!assessment || assessment.status === "closed") throw new Response(JSON.stringify({ error: "Evidence must target an open assessment." }), { status: 409, headers: { "content-type": "application/json" } });
-    const systems = assessment.systems as string[];
-    const controls = assessment.controls as string[];
-    if (String(assessment.framework) !== (input.framework || "PCI DSS 4.0.1") || (systems.length && !systems.includes(input.system)) || (controls.length && !controls.includes(input.controlId))) {
-      throw new Response(JSON.stringify({ error: "Evidence falls outside the selected assessment scope." }), { status: 422, headers: { "content-type": "application/json" } });
-    }
+  if (!/^asm_[a-f0-9]{32}$/u.test(input.assessmentId)) throw new Response(JSON.stringify({ error: "Evidence requires an explicit assessment." }), { status: 400, headers: { "content-type": "application/json" } });
+  const assessment = await getAssessment(input.assessmentId);
+  if (!assessment || assessment.status === "closed") throw new Response(JSON.stringify({ error: "Evidence must target an open assessment." }), { status: 409, headers: { "content-type": "application/json" } });
+  const systems = assessment.systems as string[];
+  const controls = assessment.controls as string[];
+  if (assessment.scope_mode !== "explicit" || !assessment.catalog_id || !systems.length || !controls.length) throw new Response(JSON.stringify({ error: "Evidence cannot target an assessment without an explicit, non-empty, versioned scope." }), { status: 409, headers: { "content-type": "application/json" } });
+  if (String(assessment.framework) !== (input.framework || "PCI DSS 4.0.1") || !systems.includes(input.system) || !controls.includes(input.controlId)) {
+    throw new Response(JSON.stringify({ error: "Evidence falls outside the selected assessment scope." }), { status: 422, headers: { "content-type": "application/json" } });
   }
   const id = randomId("ev");
   let bytes = input.bytes;
@@ -254,24 +255,30 @@ export async function storeEvidence(input: EvidenceInput): Promise<StoreEvidence
   return { id, deduplicated: false, occurrenceId, occurrenceRecorded: true, redactionCount, sha256: digest };
 }
 
-export async function listEvidence(limit = 100): Promise<Array<Record<string, unknown>>> {
-  const rows = (await getEnv().DB.prepare(`SELECT id, control_id, framework, catalog_version, title, description, type, source, system, environment, assessment_period, evidence_owner, tags_json, expected_evidence, mapped_controls_json, jira_issue_key, jira_issue_url, manual_redactions, collector_id, job_id, session_id, device_id, content_type, byte_size, sha256, captured_at, expires_at,
-      CASE WHEN status != 'purged' AND expires_at <= ? THEN 'expired' ELSE status END AS status,
-      redaction_count, redaction_summary_json, manifest_sha256, chain_previous_hash, chain_event_hash, timestamp_authority, safety_scan_sha256, safety_scan_policy, safety_scan_completed_at,
-      server_safety_scan_sha256, server_safety_scan_policy, server_safety_scan_completed_at, server_safety_scanner_origin, server_safety_receipt_sha256,
-      created_by, created_at, approved_by, approved_at, assessment_id, coverage_status, coverage_json,
-      CASE WHEN device_id IS NULL THEN 'not_applicable' WHEN EXISTS (
-        SELECT 1 FROM native_evidence_manifests n JOIN capture_devices d ON d.id = n.device_id
-        WHERE n.artifact_id = evidence_artifacts.id AND n.device_id = evidence_artifacts.device_id
-          AND n.image_sha256 = evidence_artifacts.sha256 AND n.manifest_sha256 = evidence_artifacts.manifest_sha256
-          AND n.chain_sequence IS NOT NULL AND n.chain_sequence > 0 AND n.chain_event_hash = evidence_artifacts.chain_event_hash
-          AND n.provenance_key_id IS NOT NULL AND d.provenance_key_id = n.provenance_key_id AND d.chain_sequence >= n.chain_sequence
-      ) THEN 'verified' ELSE 'pending' END AS native_provenance_status,
-      (SELECT expires_at FROM retention_holds WHERE evidence_id = evidence_artifacts.id AND expires_at > ?) AS retention_hold_expires_at,
-      (SELECT COUNT(*) FROM evidence_occurrences WHERE artifact_id = evidence_artifacts.id) AS occurrence_count,
-      (SELECT MAX(received_at) FROM evidence_occurrences WHERE artifact_id = evidence_artifacts.id) AS last_observed_at
-    FROM evidence_artifacts ORDER BY captured_at DESC LIMIT ?`).bind(new Date().toISOString(), new Date().toISOString(), Math.min(Math.max(limit, 1), 250)).all<Record<string, unknown>>()).results;
-  return Promise.all(rows.map(async (row: Record<string, unknown>) => {
+export type EvidenceListInput = {
+  assessmentId?: string;
+  cursor?: string;
+  limit?: string;
+  status?: string;
+  type?: string;
+  query?: string;
+};
+
+export type EvidenceSummary = {
+  total: number;
+  approved: number;
+  needsReview: number;
+  rejected: number;
+  returned: number;
+  superseded: number;
+  expired: number;
+  openFindings: number;
+  controls: Array<{ controlId: string; total: number; approved: number; needsReview: number; partialCoverage: number }>;
+};
+
+async function evidenceRowsForPage(sql: string, bindings: unknown[]): Promise<Array<Record<string, unknown>>> {
+  const rows = (await getEnv().DB.prepare(sql).bind(...bindings).all<Record<string, unknown>>()).results;
+  return Promise.all(rows.map(async (row) => {
     let serverSafetyStatus: "verified" | "pending" | "not_applicable" = "not_applicable";
     if (row.type === "screenshot") {
       const receiptFields = {
@@ -279,11 +286,104 @@ export async function listEvidence(limit = 100): Promise<Array<Record<string, un
         completedAt: String(row.server_safety_scan_completed_at || ""), scannerOrigin: String(row.server_safety_scanner_origin || ""),
       };
       const receiptDigest = String(row.server_safety_receipt_sha256 || "");
-      serverSafetyStatus = receiptFields.digest === row.sha256 && /^[a-f0-9]{64}$/.test(receiptDigest)
+      serverSafetyStatus = receiptFields.digest === row.sha256 && /^[a-f0-9]{64}$/u.test(receiptDigest)
         && await evidenceSafetyReceiptSha256(receiptFields) === receiptDigest ? "verified" : "pending";
     }
-    return { ...row, server_safety_status: serverSafetyStatus, redaction_summary: JSON.parse(String(row.redaction_summary_json || "[]")), tags: JSON.parse(String(row.tags_json || "[]")), mapped_controls: JSON.parse(String(row.mapped_controls_json || "[]")), coverage: JSON.parse(String(row.coverage_json || "{}")), redaction_summary_json: undefined, tags_json: undefined, mapped_controls_json: undefined, coverage_json: undefined };
+    return {
+      ...row,
+      server_safety_status: serverSafetyStatus,
+      redaction_summary: JSON.parse(String(row.redaction_summary_json || "[]")),
+      tags: JSON.parse(String(row.tags_json || "[]")),
+      mapped_controls: JSON.parse(String(row.mapped_controls_json || "[]")),
+      coverage: JSON.parse(String(row.coverage_json || "{}")),
+      redaction_summary_json: undefined,
+      tags_json: undefined,
+      mapped_controls_json: undefined,
+      coverage_json: undefined,
+    };
   }));
+}
+
+export async function listEvidence(input: EvidenceListInput = {}): Promise<{ evidence: Array<Record<string, unknown>>; page: PageMeta; summary: EvidenceSummary }> {
+  const limit = pageLimit(input.limit, 50, 100);
+  const cursor = decodePageCursor(input.cursor, /^ev_[a-f0-9]{32}$/u);
+  const assessmentId = String(input.assessmentId || "");
+  if (assessmentId && !/^asm_[a-f0-9]{32}$/u.test(assessmentId)) throw new Response(JSON.stringify({ error: "Assessment identifier is invalid." }), { status: 400, headers: { "content-type": "application/json" } });
+  const statuses = new Set(["needs_review", "approved", "expiring", "rejected", "returned", "superseded", "expired"]);
+  if (input.status && !statuses.has(input.status)) throw new Response(JSON.stringify({ error: "Evidence status filter is invalid." }), { status: 400, headers: { "content-type": "application/json" } });
+  const types = new Set(["screenshot", "code", "configuration", "report"]);
+  if (input.type && !types.has(input.type)) throw new Response(JSON.stringify({ error: "Evidence type filter is invalid." }), { status: 400, headers: { "content-type": "application/json" } });
+  const query = String(input.query || "").trim();
+  if (query.length > 200) throw new Response(JSON.stringify({ error: "Evidence search is limited to 200 characters." }), { status: 400, headers: { "content-type": "application/json" } });
+  const now = new Date().toISOString();
+  const baseConditions: string[] = [];
+  const baseBindings: unknown[] = [];
+  if (assessmentId) { baseConditions.push("e.assessment_id = ?"); baseBindings.push(assessmentId); }
+  const conditions = [...baseConditions];
+  const bindings = [...baseBindings];
+  if (input.status === "expired") {
+    conditions.push("(e.status = 'expired' OR (e.status != 'purged' AND e.expires_at <= ?))");
+    bindings.push(now);
+  } else if (input.status) {
+    conditions.push("e.status = ? AND e.expires_at > ?");
+    bindings.push(input.status, now);
+  }
+  if (input.type) { conditions.push("e.type = ?"); bindings.push(input.type); }
+  if (query) {
+    const escaped = `%${query.replace(/[\\%_]/gu, (character) => `\\${character}`)}%`;
+    conditions.push("(e.title LIKE ? ESCAPE '\\' OR e.control_id LIKE ? ESCAPE '\\' OR e.source LIKE ? ESCAPE '\\' OR e.system LIKE ? ESCAPE '\\' OR e.jira_issue_key LIKE ? ESCAPE '\\')");
+    bindings.push(escaped, escaped, escaped, escaped, escaped);
+  }
+  if (cursor) { conditions.push("(e.captured_at < ? OR (e.captured_at = ? AND e.id < ?))"); bindings.push(cursor.sortValue, cursor.sortValue, cursor.id); }
+  const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+  const countConditions = conditions.filter((condition) => !condition.startsWith("(e.captured_at <"));
+  const countBindings = cursor ? bindings.slice(0, -3) : bindings;
+  const countWhere = countConditions.length ? `WHERE ${countConditions.join(" AND ")}` : "";
+  const totalRow = await getEnv().DB.prepare(`SELECT COUNT(*) AS total FROM evidence_artifacts e ${countWhere}`).bind(...countBindings).first<{ total: number }>();
+  const rows = await evidenceRowsForPage(`SELECT e.id, e.control_id, e.framework, e.catalog_version, e.title, e.description, e.type, e.source, e.system, e.environment, e.assessment_period, e.evidence_owner, e.tags_json, e.expected_evidence, e.mapped_controls_json, e.jira_issue_key, e.jira_issue_url, e.manual_redactions, e.collector_id, e.job_id, e.session_id, e.device_id, e.content_type, e.byte_size, e.sha256, e.captured_at, e.expires_at,
+      CASE WHEN e.status != 'purged' AND e.expires_at <= ? THEN 'expired' ELSE e.status END AS status,
+      e.redaction_count, e.redaction_summary_json, e.manifest_sha256, e.chain_previous_hash, e.chain_event_hash, e.timestamp_authority, e.safety_scan_sha256, e.safety_scan_policy, e.safety_scan_completed_at,
+      e.server_safety_scan_sha256, e.server_safety_scan_policy, e.server_safety_scan_completed_at, e.server_safety_scanner_origin, e.server_safety_receipt_sha256,
+      e.created_by, e.created_at, e.approved_by, e.approved_at, e.assessment_id, e.coverage_status, e.coverage_json,
+      CASE WHEN e.device_id IS NULL THEN 'not_applicable' WHEN EXISTS (
+        SELECT 1 FROM native_evidence_manifests n JOIN capture_devices d ON d.id = n.device_id
+        WHERE n.artifact_id = e.id AND n.device_id = e.device_id AND n.image_sha256 = e.sha256 AND n.manifest_sha256 = e.manifest_sha256
+          AND n.chain_sequence IS NOT NULL AND n.chain_sequence > 0 AND n.chain_event_hash = e.chain_event_hash
+          AND n.provenance_key_id IS NOT NULL AND d.provenance_key_id = n.provenance_key_id AND d.chain_sequence >= n.chain_sequence
+      ) THEN 'verified' ELSE 'pending' END AS native_provenance_status,
+      (SELECT expires_at FROM retention_holds WHERE evidence_id = e.id AND expires_at > ?) AS retention_hold_expires_at,
+      (SELECT id FROM retention_hold_release_requests WHERE evidence_id = e.id AND status = 'pending' AND expires_at > ? LIMIT 1) AS retention_release_request_id,
+      (SELECT requested_by FROM retention_hold_release_requests WHERE evidence_id = e.id AND status = 'pending' AND expires_at > ? LIMIT 1) AS retention_release_requested_by,
+      (SELECT COUNT(*) FROM evidence_occurrences WHERE artifact_id = e.id) AS occurrence_count,
+      (SELECT MAX(received_at) FROM evidence_occurrences WHERE artifact_id = e.id) AS last_observed_at
+    FROM evidence_artifacts e ${where} ORDER BY e.captured_at DESC, e.id DESC LIMIT ?`, [now, now, now, now, ...bindings, limit + 1]);
+  const paged = pageMeta(rows, limit, Number(totalRow?.total || 0), "captured_at", "id");
+  const baseWhere = baseConditions.length ? `WHERE ${baseConditions.join(" AND ")}` : "";
+  const aggregate = await getEnv().DB.prepare(`SELECT COUNT(*) AS total,
+      SUM(CASE WHEN status = 'approved' AND expires_at > ? THEN 1 ELSE 0 END) AS approved,
+      SUM(CASE WHEN status = 'needs_review' AND expires_at > ? THEN 1 ELSE 0 END) AS needs_review,
+      SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected,
+      SUM(CASE WHEN status = 'returned' THEN 1 ELSE 0 END) AS returned,
+      SUM(CASE WHEN status = 'superseded' THEN 1 ELSE 0 END) AS superseded,
+      SUM(CASE WHEN status = 'expired' OR expires_at <= ? THEN 1 ELSE 0 END) AS expired
+    FROM evidence_artifacts e ${baseWhere}`).bind(now, now, now, ...baseBindings).first<Record<string, number>>();
+  const controlRows = (await getEnv().DB.prepare(`SELECT e.control_id,
+      COUNT(*) AS total,
+      SUM(CASE WHEN e.status = 'approved' AND e.expires_at > ? THEN 1 ELSE 0 END) AS approved,
+      SUM(CASE WHEN e.status = 'needs_review' AND e.expires_at > ? THEN 1 ELSE 0 END) AS needs_review,
+      SUM(CASE WHEN e.coverage_status = 'partial' AND e.expires_at > ? THEN 1 ELSE 0 END) AS partial_coverage
+    FROM evidence_artifacts e ${baseWhere} GROUP BY e.control_id ORDER BY e.control_id`).bind(now, now, now, ...baseBindings).all<Record<string, unknown>>()).results;
+  const findingRow = assessmentId ? await getEnv().DB.prepare("SELECT COUNT(*) AS total FROM findings WHERE assessment_id = ? AND status IN ('open','in_progress')").bind(assessmentId).first<{ total: number }>() : { total: 0 };
+  return {
+    evidence: paged.items,
+    page: paged.page,
+    summary: {
+      total: Number(aggregate?.total || 0), approved: Number(aggregate?.approved || 0), needsReview: Number(aggregate?.needs_review || 0),
+      rejected: Number(aggregate?.rejected || 0), returned: Number(aggregate?.returned || 0), superseded: Number(aggregate?.superseded || 0), expired: Number(aggregate?.expired || 0),
+      openFindings: Number(findingRow?.total || 0),
+      controls: controlRows.map((row) => ({ controlId: String(row.control_id), total: Number(row.total || 0), approved: Number(row.approved || 0), needsReview: Number(row.needs_review || 0), partialCoverage: Number(row.partial_coverage || 0) })),
+    },
+  };
 }
 
 export async function readEvidenceBytes(id: string, actor?: AuthenticatedUser): Promise<{ bytes: Uint8Array; row: Record<string, unknown> } | null> {
@@ -361,8 +461,9 @@ export async function approveEvidence(id: string, actor: AuthenticatedUser, revi
   if (artifact.sha256 !== expectedSha256) throw new Response(JSON.stringify({ error: "The reviewed artifact digest changed. Reload and inspect the evidence again." }), { status: 409, headers: { "content-type": "application/json" } });
   if (artifact.coverage_status === "partial") throw new Response(JSON.stringify({ error: "Partial collector evidence cannot be approved as complete. Resolve the coverage gap and recollect it." }), { status: 409, headers: { "content-type": "application/json" } });
   const approvedAt = new Date().toISOString();
-  const [result] = await executeAuditedBatch(actor, "evidence.approved", "evidence", id, { artifactSha256: expectedSha256, occurrenceId: artifact.occurrence_id, rationale }, [
-    getEnv().DB.prepare(`UPDATE evidence_occurrences SET status = 'approved', approved_by = ?, approved_at = ?
+  const reviewEventId = randomId("rev");
+  const [result] = await executeAuditedBatch(actor, "evidence.approved", "evidence", id, { artifactSha256: expectedSha256, occurrenceId: artifact.occurrence_id, rationale, reviewEventId }, [
+    getEnv().DB.prepare(`UPDATE evidence_occurrences SET status = 'approved', approved_by = ?, approved_at = ?, last_review_event_id = ?
       WHERE id = ? AND artifact_id = ? AND created_by != ? AND status = 'needs_review' AND expires_at > ?
         AND id = (SELECT latest.id FROM evidence_occurrences latest WHERE latest.artifact_id = ? ORDER BY latest.received_at DESC, latest.id DESC LIMIT 1)
         AND EXISTS (SELECT 1 FROM evidence_artifacts e WHERE e.id = ? AND e.sha256 = ?
@@ -376,8 +477,73 @@ export async function approveEvidence(id: string, actor: AuthenticatedUser, revi
             AND n.chain_sequence IS NOT NULL AND n.chain_sequence > 0 AND n.chain_event_hash = e.chain_event_hash
             AND n.provenance_key_id IS NOT NULL AND d.provenance_key_id = n.provenance_key_id AND d.chain_sequence >= n.chain_sequence
         )))`)
-      .bind(actor.id, approvedAt, artifact.occurrence_id, id, actor.id, approvedAt, id, id, expectedSha256),
-  ], { sql: "EXISTS (SELECT 1 FROM evidence_artifacts WHERE id = ? AND approved_by = ? AND approved_at = ?) AND EXISTS (SELECT 1 FROM evidence_occurrences WHERE id = ? AND approved_by = ? AND approved_at = ?)", bindings: [id, actor.id, approvedAt, artifact.occurrence_id, actor.id, approvedAt] });
+      .bind(actor.id, approvedAt, reviewEventId, artifact.occurrence_id, id, actor.id, approvedAt, id, id, expectedSha256),
+    getEnv().DB.prepare(`INSERT INTO evidence_review_events
+      (id, evidence_id, occurrence_id, action, previous_status, resulting_status, rationale, expected_sha256, actor_id, created_at)
+      SELECT ?, ?, ?, 'approved', ?, 'approved', ?, ?, ?, ?
+      WHERE EXISTS (SELECT 1 FROM evidence_occurrences WHERE id = ? AND status = 'approved' AND approved_by = ? AND approved_at = ? AND last_review_event_id = ?)`)
+      .bind(reviewEventId, id, artifact.occurrence_id, artifact.occurrence_status, rationale, expectedSha256, actor.id, approvedAt, artifact.occurrence_id, actor.id, approvedAt, reviewEventId),
+  ], { sql: "EXISTS (SELECT 1 FROM evidence_artifacts WHERE id = ? AND approved_by = ? AND approved_at = ?) AND EXISTS (SELECT 1 FROM evidence_review_events WHERE id = ? AND actor_id = ?)", bindings: [id, actor.id, approvedAt, reviewEventId, actor.id] });
   if (!result.meta.changes) return false;
   return true;
+}
+
+export type EvidenceReviewAction = "reject" | "return" | "reopen" | "supersede";
+
+const reviewTransitions: Record<EvidenceReviewAction, { from: string[]; to: string }> = {
+  reject: { from: ["needs_review"], to: "rejected" },
+  return: { from: ["needs_review"], to: "returned" },
+  reopen: { from: ["rejected", "returned"], to: "needs_review" },
+  supersede: { from: ["approved"], to: "superseded" },
+};
+
+export async function transitionEvidenceReview(id: string, actor: AuthenticatedUser, review: { action: EvidenceReviewAction; expectedSha256: string; rationale: string; replacementEvidenceId?: string }): Promise<{ changed: boolean; status: string; reviewEventId: string }> {
+  const expectedSha256 = review.expectedSha256.trim().toLowerCase();
+  const rationale = review.rationale.trim();
+  if (!/^[a-f0-9]{64}$/u.test(expectedSha256) || rationale.length < 20 || rationale.length > 1_000) throw new Response(JSON.stringify({ error: "Review requires the full artifact digest and a 20–1,000 character rationale." }), { status: 400, headers: { "content-type": "application/json" } });
+  const transition = reviewTransitions[review.action];
+  if (!transition) throw new Response(JSON.stringify({ error: "Review action is invalid." }), { status: 400, headers: { "content-type": "application/json" } });
+  const artifact = await getEnv().DB.prepare(`SELECT e.id, e.sha256, e.status, e.assessment_id, e.control_id,
+      o.id AS occurrence_id, o.created_by, o.status AS occurrence_status, o.expires_at
+    FROM evidence_artifacts e JOIN evidence_occurrences o ON o.artifact_id = e.id
+    WHERE e.id = ? AND o.id = (SELECT latest.id FROM evidence_occurrences latest WHERE latest.artifact_id = e.id ORDER BY latest.received_at DESC, latest.id DESC LIMIT 1)`)
+    .bind(id).first<{ id: string; sha256: string; status: string; assessment_id: string | null; control_id: string; occurrence_id: string; created_by: string; occurrence_status: string; expires_at: string }>();
+  if (!artifact) throw new Response(JSON.stringify({ error: "Evidence not found." }), { status: 404, headers: { "content-type": "application/json" } });
+  if (artifact.sha256 !== expectedSha256) throw new Response(JSON.stringify({ error: "The reviewed artifact digest changed. Reload and inspect it again." }), { status: 409, headers: { "content-type": "application/json" } });
+  if (new Date(artifact.expires_at).getTime() <= Date.now()) throw new Response(JSON.stringify({ error: "Expired evidence cannot change review state." }), { status: 410, headers: { "content-type": "application/json" } });
+  if (artifact.created_by === actor.id) throw new Response(JSON.stringify({ error: "Collectors and uploaders cannot review their own evidence." }), { status: 403, headers: { "content-type": "application/json" } });
+  if (!transition.from.includes(artifact.occurrence_status)) throw new Response(JSON.stringify({ error: `Evidence cannot transition from ${artifact.occurrence_status} using ${review.action}.` }), { status: 409, headers: { "content-type": "application/json" } });
+  let replacementId: string | null = null;
+  if (review.action === "supersede") {
+    replacementId = String(review.replacementEvidenceId || "");
+    if (!/^ev_[a-f0-9]{32}$/u.test(replacementId) || replacementId === id) throw new Response(JSON.stringify({ error: "Superseding approved evidence requires a different approved replacement evidence identifier." }), { status: 400, headers: { "content-type": "application/json" } });
+    const replacement = await getEnv().DB.prepare("SELECT 1 FROM evidence_artifacts WHERE id = ? AND assessment_id IS ? AND control_id = ? AND status = 'approved' AND expires_at > ?")
+      .bind(replacementId, artifact.assessment_id, artifact.control_id, new Date().toISOString()).first();
+    if (!replacement) throw new Response(JSON.stringify({ error: "The replacement must be approved, current, and mapped to the same assessment and control." }), { status: 422, headers: { "content-type": "application/json" } });
+  }
+  const reviewEventId = randomId("rev");
+  const reviewedAt = new Date().toISOString();
+  const actionName = review.action === "return" ? "returned" : review.action === "reopen" ? "reopened" : review.action === "supersede" ? "superseded" : "rejected";
+  const approvedBy = transition.to === "approved" ? actor.id : null;
+  const approvedAt = transition.to === "approved" ? reviewedAt : null;
+  const [result] = await executeAuditedBatch(actor, `evidence.${actionName}`, "evidence", id, { artifactSha256: expectedSha256, occurrenceId: artifact.occurrence_id, rationale, reviewEventId, replacementEvidenceId: replacementId }, [
+    getEnv().DB.prepare(`UPDATE evidence_occurrences SET status = ?, approved_by = ?, approved_at = ?, last_review_event_id = ?
+      WHERE id = ? AND artifact_id = ? AND status = ? AND created_by != ? AND expires_at > ?
+        AND id = (SELECT latest.id FROM evidence_occurrences latest WHERE latest.artifact_id = ? ORDER BY latest.received_at DESC, latest.id DESC LIMIT 1)`)
+      .bind(transition.to, approvedBy, approvedAt, reviewEventId, artifact.occurrence_id, id, artifact.occurrence_status, actor.id, reviewedAt, id),
+    getEnv().DB.prepare(`INSERT INTO evidence_review_events
+      (id, evidence_id, occurrence_id, action, previous_status, resulting_status, rationale, expected_sha256, replacement_evidence_id, actor_id, created_at)
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+      WHERE EXISTS (SELECT 1 FROM evidence_occurrences WHERE id = ? AND status = ? AND last_review_event_id = ?)`)
+      .bind(reviewEventId, id, artifact.occurrence_id, actionName, artifact.occurrence_status, transition.to, rationale, expectedSha256, replacementId, actor.id, reviewedAt, artifact.occurrence_id, transition.to, reviewEventId),
+  ], { sql: "EXISTS (SELECT 1 FROM evidence_review_events WHERE id = ? AND evidence_id = ? AND resulting_status = ?)", bindings: [reviewEventId, id, transition.to] });
+  return { changed: Boolean(result.meta.changes), status: transition.to, reviewEventId };
+}
+
+export async function listEvidenceReviewEvents(id: string): Promise<Array<Record<string, unknown>>> {
+  if (!/^ev_[a-f0-9]{32}$/u.test(id)) return [];
+  return (await getEnv().DB.prepare(`SELECT r.id, r.evidence_id, r.occurrence_id, r.action, r.previous_status, r.resulting_status, r.rationale,
+      r.expected_sha256, r.replacement_evidence_id, r.actor_id, u.email AS actor_email, r.created_at
+    FROM evidence_review_events r LEFT JOIN users u ON u.id = r.actor_id
+    WHERE r.evidence_id = ? ORDER BY r.created_at DESC, r.id DESC LIMIT 250`).bind(id).all<Record<string, unknown>>()).results;
 }

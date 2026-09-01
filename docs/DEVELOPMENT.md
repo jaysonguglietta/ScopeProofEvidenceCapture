@@ -110,7 +110,7 @@ Hosted one-time credential changes must preserve exact `github.com` URL parsing,
 
 ## Native release
 
-The current working tree reports bundle version/build `1.9.0`/`23`. It is
+The current working tree reports bundle version/build `1.10.0`/`24`. It is
 **Unreleased**, postdates the public `v1.8.1-development-preview.1` artifact at
 `8cd2d5c`, and has no corresponding DMG. Do not rebuild or publish these changes
 under the 1.8.1 release identity. Before the next public artifact, re-verify the

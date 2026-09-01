@@ -1,5 +1,6 @@
 import {
   DynamoDBClient,
+  GetItemCommand,
   TransactWriteItemsCommand,
 } from "@aws-sdk/client-dynamodb";
 import { Buffer } from "node:buffer";
@@ -19,6 +20,7 @@ import {
   Route53Client,
 } from "@aws-sdk/client-route-53";
 import { transactionToken } from "./idempotency.mjs";
+import { validateCustomerActivationApproval } from "./customer-activation.mjs";
 
 const required = [
   "ADMIN_SECRET_ARN",
@@ -30,6 +32,7 @@ const required = [
   "AWS_REGION_EXPECTED",
   "CANONICAL_HOSTNAME",
   "CONTROL_TABLE_NAME",
+  "CUSTOMER_ACTIVATION_TABLE_NAME",
   "CONTROL_DATABASE_SECRET_ARN",
   "CONTROL_DATABASE_USERNAME",
   "DATABASE_CLUSTER_ARN",
@@ -70,6 +73,7 @@ const config = Object.freeze({
   canonicalHostname: process.env.CANONICAL_HOSTNAME,
   clusterArn: process.env.DATABASE_CLUSTER_ARN,
   controlTable: process.env.CONTROL_TABLE_NAME,
+  customerActivationTable: process.env.CUSTOMER_ACTIVATION_TABLE_NAME,
   controlDatabaseSecretArn: process.env.CONTROL_DATABASE_SECRET_ARN,
   controlDatabaseUsername: process.env.CONTROL_DATABASE_USERNAME,
   databaseName: process.env.DATABASE_NAME,
@@ -181,14 +185,22 @@ const legalApiRoleSql = readFileSync("/var/task/database/005_legal_hold_api_role
 const evidenceAccessSql = readFileSync("/var/task/database/006_evidence_access_api.sql", "utf8");
 const evidenceReadRoleSql = readFileSync("/var/task/database/007_evidence_read_role.sql", "utf8");
 const apiAuditSignerRoleSql = readFileSync("/var/task/database/008_api_audit_signer_role.sql", "utf8");
+const runtimeHardeningSql = readFileSync("/var/task/database/009_runtime_hardening.sql", "utf8");
 const tenantSchemaSha256 = createHash("sha256").update(tenantSchemaSql).digest("hex");
 const tenantSchemaMarker = `scopeproof:001:sha256:${tenantSchemaSha256}`;
+const interimTenantSchemaMarker = "scopeproof:001:sha256:eed23f5927199da62de29ba378e32817872a789abafcf6443bf1209048a58868";
 const ownerMigrationsSha256 = createHash("sha256")
   .update(tenantSchemaSql)
   .update("\0")
   .update(evidenceAccessSql)
+  .update("\0")
+  .update(runtimeHardeningSql)
   .digest("hex");
-const evidenceAccessMarker = `scopeproof:owner:v2:sha256:${ownerMigrationsSha256}`;
+const evidenceAccessMarker = `scopeproof:owner:v3:sha256:${ownerMigrationsSha256}`;
+const legacyEvidenceAccessMarkers = new Set([
+  "scopeproof:owner:v2:sha256:f4fa825f06c9bc3577887c93b349d55634baf98bf4720d5128de13b88f2317e9",
+  "scopeproof:owner:v2:sha256:a58e051643aa023cb03442532ab9b0549e280a3044903aef0bab3e0c0afc32e8",
+]);
 const databaseBundleSha256 = createHash("sha256")
   .update(tenantSchemaSql)
   .update("\0")
@@ -205,8 +217,17 @@ const databaseBundleSha256 = createHash("sha256")
   .update(evidenceReadRoleSql)
   .update("\0")
   .update(apiAuditSignerRoleSql)
+  .update("\0")
+  .update(runtimeHardeningSql)
   .digest("hex");
-const databaseBundleMarkerPrefix = `scopeproof:bundle:v3:sha256:${databaseBundleSha256}:catalog-sha256:`;
+const databaseBundleMarkerPrefix = `scopeproof:bundle:v4:sha256:${databaseBundleSha256}:catalog-sha256:`;
+// Exact digest of the reviewed v3 bundle. This is intentionally a constant:
+// accepting an arbitrary old `scopeproof:bundle:v3` marker would turn the
+// forward migration into a schema-attestation bypass.
+const legacyDatabaseBundleMarkerPrefixes = [
+  "scopeproof:bundle:v3:sha256:4aad4deac0cdd140a1a5d8ead7fb593465a45cf8e39ec8247b92861c7cd732af:catalog-sha256:",
+  "scopeproof:bundle:v3:sha256:62521079526831bcd6807b66b1913911ebdd139db11b1f95cbaf0fe5127c941d:catalog-sha256:",
+];
 
 function databaseBundleMarker(catalogSha256) {
   if (!/^[a-f0-9]{64}$/.test(catalogSha256)) throw new Error("Database catalog digest is invalid.");
@@ -218,6 +239,12 @@ function isCurrentDatabaseBundleMarker(value) {
     value.startsWith(databaseBundleMarkerPrefix) &&
     /^[a-f0-9]{64}$/.test(value.slice(databaseBundleMarkerPrefix.length));
 }
+
+function isLegacyDatabaseBundleMarker(value) {
+  return typeof value === "string" && legacyDatabaseBundleMarkerPrefixes.some((prefix) =>
+    value.startsWith(prefix) && /^[a-f0-9]{64}$/.test(value.slice(prefix.length))
+  );
+}
 const isolatedTables = Object.freeze([
   "assessments",
   "audit_events",
@@ -228,6 +255,7 @@ const isolatedTables = Object.freeze([
   "evidence_artifacts",
   "export_receipts",
   "ingest_receipts",
+  "rejected_ingest_receipts",
   "integrations",
   "jobs",
   "memberships",
@@ -258,6 +286,7 @@ const baselineFunctions = Object.freeze([
   "create_upload_intent",
   "current_tenant_id",
   "expire_stale_exact_version_legal_hold_requests",
+  "evidence_reader_role",
   "list_pending_exact_version_legal_holds",
   "list_unaudited_applied_legal_holds",
   "list_unaudited_expired_legal_holds",
@@ -274,6 +303,8 @@ const baselineFunctions = Object.freeze([
   "requeue_dead_lettered_api_audit_event",
   "resolve_active_membership",
   "reconcile_promoted_evidence",
+  "reconcile_rejected_evidence",
+  "reject_rejected_ingest_receipt_mutation",
   "reserve_exact_version_legal_hold",
 ]);
 const controlRoleAllowedFunctions = Object.freeze([
@@ -344,7 +375,7 @@ export async function handler(event) {
         throw namedError("InvalidAction", "Unsupported provisioning action.");
     }
   } catch (error) {
-    if (error?.name === "LeaseRejected" || error?.name === "InvalidAction") throw error;
+    if (error?.name === "LeaseRejected" || error?.name === "InvalidAction" || error?.name === "CustomerActivationRequired") throw error;
     const safe = new Error(`Tenant provisioning action ${action || "unknown"} failed.`);
     safe.name = "TenantProvisioningError";
     throw safe;
@@ -355,6 +386,7 @@ async function activateTenant(executionId) {
   // Activation is deliberately self-verifying: a caller cannot skip the
   // preceding Step Functions verification task and publish a tenant hostname.
   await verifyDatabase(["PROVISIONING", "ACTIVE"]);
+  await requireCustomerActivation(executionId);
   await publishTenantDns();
   await setDatabaseTenantStatus("ACTIVE", ["PROVISIONING", "ACTIVE"]);
   try {
@@ -362,6 +394,25 @@ async function activateTenant(executionId) {
   } catch (error) {
     await restoreDatabaseProvisioningStatus();
     throw error;
+  }
+}
+
+async function requireCustomerActivation(executionId) {
+  const response = await dynamo.send(new GetItemCommand({
+    ConsistentRead: true,
+    Key: {
+      PK: { S: `TENANT#${config.tenantId}` },
+      SK: { S: "CUSTOMER_ENABLED" },
+    },
+    TableName: config.customerActivationTable,
+  }));
+  const valid = validateCustomerActivationApproval(response.Item, {
+    executionId,
+    nowMilliseconds: Date.now(),
+    tenantId: config.tenantId,
+  });
+  if (!valid) {
+    throw namedError("CustomerActivationRequired", "A current, execution-bound CUSTOMER_ENABLED approval is required.");
   }
 }
 
@@ -698,6 +749,7 @@ async function initializeDatabase() {
     await executeAdmin("scopeproof_admin", `GRANT CONNECT ON DATABASE ${database} TO ${apiAuditRole}`);
 
     let evidenceAccessMigrationApplied = false;
+    let runtimeHardeningMigrationApplied = false;
     let installedMigrationMarker;
     const migrationState = await executeAdmin(
       config.databaseName,
@@ -723,30 +775,47 @@ async function initializeDatabase() {
       // versioned forward migration with its own reviewed compatibility path.
       const baseline = await executeAdmin(
         config.databaseName,
-        "SELECT count(*) FILTER (WHERE version = 1)::bigint, min(name) FILTER (WHERE version = 1), max(name) FILTER (WHERE version = 1), count(*) FILTER (WHERE version NOT IN (1, 2))::bigint, count(*) FILTER (WHERE version = 2 AND name = 'evidence_access_api')::bigint, obj_description('scopeproof.schema_migrations'::regclass, 'pg_class') FROM scopeproof.schema_migrations",
+        "SELECT count(*) FILTER (WHERE version = 1)::bigint, min(name) FILTER (WHERE version = 1), max(name) FILTER (WHERE version = 1), count(*) FILTER (WHERE version NOT IN (1, 2, 3))::bigint, count(*) FILTER (WHERE version = 2 AND name = 'evidence_access_api')::bigint, count(*) FILTER (WHERE version = 3 AND name = 'runtime_hardening')::bigint, obj_description('scopeproof.schema_migrations'::regclass, 'pg_class') FROM scopeproof.schema_migrations",
       );
       const row = baseline.records?.[0] ?? [];
       const evidenceAccessCount = fieldNumber(row[4]);
-      installedMigrationMarker = fieldString(row[5]);
+      const runtimeHardeningCount = fieldNumber(row[5]);
+      installedMigrationMarker = fieldString(row[6]);
       if (
         fieldNumber(row[0]) !== 1 ||
         fieldString(row[1]) !== "tenant_security_baseline" ||
         fieldString(row[2]) !== "tenant_security_baseline" ||
         fieldNumber(row[3]) !== 0 ||
         ![0, 1].includes(evidenceAccessCount) ||
-        (evidenceAccessCount === 0 && installedMigrationMarker !== tenantSchemaMarker) ||
-        (evidenceAccessCount === 1 &&
+        ![0, 1].includes(runtimeHardeningCount) ||
+        runtimeHardeningCount > evidenceAccessCount ||
+        (evidenceAccessCount === 0 && installedMigrationMarker !== tenantSchemaMarker && installedMigrationMarker !== interimTenantSchemaMarker) ||
+        (evidenceAccessCount === 1 && runtimeHardeningCount === 0 &&
           installedMigrationMarker !== evidenceAccessMarker &&
+          !legacyEvidenceAccessMarkers.has(installedMigrationMarker) &&
+          !isLegacyDatabaseBundleMarker(installedMigrationMarker) &&
+          !isCurrentDatabaseBundleMarker(installedMigrationMarker)) ||
+        (runtimeHardeningCount === 1 && installedMigrationMarker !== evidenceAccessMarker &&
           !isCurrentDatabaseBundleMarker(installedMigrationMarker))
       ) {
         throw new Error("Tenant schema is not the exact packaged baseline; a reviewed forward migration is required.");
       }
       evidenceAccessMigrationApplied = evidenceAccessCount === 1;
+      runtimeHardeningMigrationApplied = runtimeHardeningCount === 1;
     }
 
     if (!evidenceAccessMigrationApplied) {
       await applyMigration(
         evidenceAccessSql,
+        config.adminSecretArn,
+        config.databaseOwner,
+        evidenceAccessMarker,
+      );
+      installedMigrationMarker = evidenceAccessMarker;
+    }
+    if (!runtimeHardeningMigrationApplied) {
+      await applyMigration(
+        runtimeHardeningSql,
         config.adminSecretArn,
         config.databaseOwner,
         evidenceAccessMarker,
@@ -830,7 +899,7 @@ async function initializeDatabase() {
     }
     await applyMigration(renderedApiAuditSignerGrant, config.adminSecretArn);
     const expectedInstalledMarker = databaseBundleMarker(await databaseCatalogSha256());
-    if (installedMigrationMarker === evidenceAccessMarker) {
+    if (installedMigrationMarker === evidenceAccessMarker || isLegacyDatabaseBundleMarker(installedMigrationMarker)) {
       await executeAdmin(
         config.databaseName,
         `COMMENT ON TABLE scopeproof.schema_migrations IS ${quoteLiteral(expectedInstalledMarker)}`,
@@ -889,7 +958,7 @@ async function verifyDatabase(allowedIdentityStatuses = ["PROVISIONING"]) {
       sql: "SELECT rolcanlogin, rolinherit, rolsuper, rolcreaterole, rolcreatedb, rolreplication, rolbypassrls FROM pg_catalog.pg_roles WHERE rolname = current_user",
     },
     {
-      sql: "SELECT count(*)::bigint, min(version), max(version), count(*) FILTER (WHERE version = 1 AND name = 'tenant_security_baseline')::bigint, count(*) FILTER (WHERE version = 2 AND name = 'evidence_access_api')::bigint, obj_description('scopeproof.schema_migrations'::regclass, 'pg_class') FROM scopeproof.schema_migrations",
+      sql: "SELECT count(*)::bigint, min(version), max(version), count(*) FILTER (WHERE version = 1 AND name = 'tenant_security_baseline')::bigint, count(*) FILTER (WHERE version = 2 AND name = 'evidence_access_api')::bigint, count(*) FILTER (WHERE version = 3 AND name = 'runtime_hardening')::bigint, obj_description('scopeproof.schema_migrations'::regclass, 'pg_class') FROM scopeproof.schema_migrations",
     },
     {
       sql: [
@@ -918,6 +987,7 @@ async function verifyDatabase(allowedIdentityStatuses = ["PROVISIONING"]) {
         "SELECT count(*) FILTER (WHERE (",
         "(t.tgname = 'protect_immutable_fields' AND c.relname IN ('jobs', 'upload_intents', 'evidence_artifacts', 'retention_holds', 'legal_hold_operations', 'support_access_grants') AND p.proname = 'protect_immutable_security_fields')",
         "OR (t.tgname = 'protect_api_audit_outbox' AND c.relname = 'api_audit_outbox' AND p.proname = 'protect_immutable_security_fields')",
+        "OR (t.tgname = 'protect_rejected_ingest_receipt' AND c.relname = 'rejected_ingest_receipts' AND p.proname = 'reject_rejected_ingest_receipt_mutation')",
         "OR (t.tgname = 'append_audit_chain' AND c.relname = 'audit_events' AND p.proname = 'advance_audit_head')))::bigint, count(*)::bigint",
         "FROM pg_catalog.pg_trigger t",
         "JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid",
@@ -1001,18 +1071,19 @@ async function verifyDatabase(allowedIdentityStatuses = ["PROVISIONING"]) {
     role.length !== 7 ||
     role[0]?.booleanValue !== true ||
     role.slice(1).some((field) => field?.booleanValue !== false) ||
-    fieldNumber(migration[0]) !== 2 ||
+    fieldNumber(migration[0]) !== 3 ||
     fieldNumber(migration[1]) !== 1 ||
-    fieldNumber(migration[2]) !== 2 ||
+    fieldNumber(migration[2]) !== 3 ||
     fieldNumber(migration[3]) !== 1 ||
     fieldNumber(migration[4]) !== 1 ||
-    fieldString(migration[5]) !== expectedInstalledMarker ||
+    fieldNumber(migration[5]) !== 1 ||
+    fieldString(migration[6]) !== expectedInstalledMarker ||
     tableOwners.length !== 3 ||
     tableOwners.some((field) => fieldNumber(field) !== baselineTables.length) ||
     rls.length !== 6 ||
     rls.some((field) => fieldNumber(field) !== isolatedTables.length) ||
-    fieldNumber(securityTriggers[0]) !== 8 ||
-    fieldNumber(securityTriggers[1]) !== 25 ||
+    fieldNumber(securityTriggers[0]) !== 9 ||
+    fieldNumber(securityTriggers[1]) !== 27 ||
     functionOwners.length !== 3 ||
     functionOwners.some((field) => fieldNumber(field) !== baselineFunctions.length) ||
     fieldNumber(domainOwners[0]) !== 2 ||
@@ -1156,7 +1227,7 @@ async function verifyIngestRole() {
     {
       sql: [
         "SELECT count(*) FILTER (WHERE has_function_privilege(current_user, p.oid, 'EXECUTE'))::bigint,",
-        "count(*) FILTER (WHERE p.proname IN ('claim_promotion_fence', 'current_tenant_id', 'read_promoted_evidence_receipt', 'reconcile_promoted_evidence') AND has_function_privilege(current_user, p.oid, 'EXECUTE'))::bigint",
+        "count(*) FILTER (WHERE p.proname IN ('claim_promotion_fence', 'current_tenant_id', 'read_promoted_evidence_receipt', 'reconcile_promoted_evidence', 'reconcile_rejected_evidence') AND has_function_privilege(current_user, p.oid, 'EXECUTE'))::bigint",
         "FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace",
         "WHERE n.nspname = 'scopeproof'",
       ].join(" "),
@@ -1184,8 +1255,8 @@ async function verifyIngestRole() {
     role.length !== 7 ||
     role[0]?.booleanValue !== true ||
     role.slice(1).some((field) => field?.booleanValue !== false) ||
-    fieldNumber(functions[0]) !== 4 ||
-    fieldNumber(functions[1]) !== 4 ||
+    fieldNumber(functions[0]) !== 5 ||
+    fieldNumber(functions[1]) !== 5 ||
     fieldNumber(tables[0]) !== 0
   ) {
     throw new Error("Tenant ingest role is not an execute-only reconciliation identity.");

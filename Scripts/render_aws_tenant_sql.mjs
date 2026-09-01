@@ -84,9 +84,10 @@ export function validateTenantSqlOptions(candidate) {
 
 export async function renderTenantSql(candidate) {
   const options = validateTenantSqlOptions(candidate);
-  const [schema, evidenceAccess, grants, ingestGrants, controlGrants, legalApiGrants, readGrants] = await Promise.all([
+  const [schema, evidenceAccess, runtimeHardening, grants, ingestGrants, controlGrants, legalApiGrants, readGrants] = await Promise.all([
     readFile(new URL("001_tenant_schema.sql", migrationDirectory), "utf8"),
     readFile(new URL("006_evidence_access_api.sql", migrationDirectory), "utf8"),
+    readFile(new URL("009_runtime_hardening.sql", migrationDirectory), "utf8"),
     readFile(new URL("002_runtime_role.sql", migrationDirectory), "utf8"),
     readFile(new URL("003_ingest_role.sql", migrationDirectory), "utf8"),
     readFile(new URL("004_evidence_control_role.sql", migrationDirectory), "utf8"),
@@ -114,7 +115,7 @@ export async function renderTenantSql(candidate) {
   if (renderedLegalApiGrants.includes("__SCOPEPROOF_LEGAL_API_ROLE__")) throw new Error("Legal-hold API role substitution did not complete.");
   const renderedReadGrants = readGrants.replaceAll("__SCOPEPROOF_EVIDENCE_READ_ROLE__", options.readRole);
   if (renderedReadGrants.includes("__SCOPEPROOF_EVIDENCE_READ_ROLE__")) throw new Error("Evidence-read role substitution did not complete.");
-  return `${schema.trim()}\n\n${seed}\n\n${evidenceAccess.trim()}\n\n${renderedGrants.trim()}\n\n${renderedIngestGrants.trim()}\n\n${renderedControlGrants.trim()}\n\n${renderedLegalApiGrants.trim()}\n\n${renderedReadGrants.trim()}\n`;
+  return `${schema.trim()}\n\n${seed}\n\n${evidenceAccess.trim()}\n\n${runtimeHardening.trim()}\n\n${renderedGrants.trim()}\n\n${renderedIngestGrants.trim()}\n\n${renderedControlGrants.trim()}\n\n${renderedLegalApiGrants.trim()}\n\n${renderedReadGrants.trim()}\n`;
 }
 
 function parseArguments(argv) {

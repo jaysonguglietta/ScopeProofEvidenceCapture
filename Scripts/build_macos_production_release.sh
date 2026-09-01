@@ -17,6 +17,8 @@ info_plist="$package_root/Resources/Info.plist"
 entitlements="$package_root/Resources/ScopeproofCapture.entitlements"
 output_root="${SCOPEPROOF_RELEASE_OUTPUT_DIR:-$project_root/DerivedData/Production}"
 [[ "$output_root" = /* ]] || output_root="$project_root/$output_root"
+prepared_archive="${SCOPEPROOF_RELEASE_PREPARED_ARCHIVE:-}"
+prepared_checksum="${SCOPEPROOF_RELEASE_PREPARED_CHECKSUM:-}"
 
 : "${SCOPEPROOF_CODESIGN_IDENTITY:?Developer ID Application identity is required}"
 : "${SCOPEPROOF_NOTARY_PROFILE:?Notarytool Keychain profile is required}"
@@ -48,12 +50,18 @@ if [[ -n "${SCOPEPROOF_NOTARY_KEYCHAIN:-}" ]]; then
   SCOPEPROOF_NOTARY_KEYCHAIN="${SCOPEPROOF_NOTARY_KEYCHAIN:A}"
 fi
 
-for required_command in swift codesign ditto hdiutil lipo node plutil shasum spctl xcrun; do
+for required_command in cmp codesign ditto hdiutil lipo node plutil shasum sort spctl unzip xcrun; do
   command -v "$required_command" >/dev/null || {
     echo "Required release command is unavailable: $required_command" >&2
     exit 1
   }
 done
+if [[ -z "$prepared_archive" ]]; then
+  command -v swift >/dev/null || { echo "Required release command is unavailable: swift" >&2; exit 1; }
+elif [[ -z "$prepared_checksum" ]]; then
+  echo "A checksum sidecar is required with a prepared release candidate." >&2
+  exit 1
+fi
 xcrun --find notarytool >/dev/null
 xcrun --find stapler >/dev/null
 plutil -lint "$info_plist" >/dev/null
@@ -107,18 +115,62 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 mkdir -p "$build_root/ModuleCache" "$app_root/Contents/MacOS" "$app_root/Contents/Resources" "$staging_root" "$mount_root" "$output_root"
-export CLANG_MODULE_CACHE_PATH="$build_root/ModuleCache"
-export SWIFTPM_MODULECACHE_OVERRIDE="$build_root/ModuleCache"
-(
-  cd "$package_root"
-  swift build -c release --arch arm64 --scratch-path "$build_root"
-)
-binary_path="$build_root/arm64-apple-macosx/release/ScopeproofCapture"
-if [[ ! -x "$binary_path" ]]; then binary_path="$build_root/release/ScopeproofCapture"; fi
+[[ -d "$output_root" && ! -L "$output_root" ]] || { echo "Release output directory must not be a symlink." >&2; exit 1; }
+
+if [[ -n "$prepared_archive" ]]; then
+  [[ -f "$prepared_archive" && ! -L "$prepared_archive" ]] || { echo "Prepared release archive must be a regular, non-symlink file." >&2; exit 1; }
+  [[ -f "$prepared_checksum" && ! -L "$prepared_checksum" ]] || { echo "Prepared release checksum must be a regular, non-symlink file." >&2; exit 1; }
+  prepared_snapshot="$release_temp/Scopeproof-Capture-prepared.zip"
+  checksum_snapshot="$release_temp/Scopeproof-Capture-prepared.zip.sha256"
+  /bin/cp -pP "$prepared_archive" "$prepared_snapshot"
+  /bin/cp -pP "$prepared_checksum" "$checksum_snapshot"
+  [[ -f "$prepared_snapshot" && ! -L "$prepared_snapshot" && -f "$checksum_snapshot" && ! -L "$checksum_snapshot" ]] || {
+    echo "Prepared release inputs changed type while being snapshotted." >&2
+    exit 1
+  }
+  expected_checksum="$(<"$checksum_snapshot")"
+  [[ "$expected_checksum" =~ '^([a-f0-9]{64})  Scopeproof-Capture-prepared\.zip$' ]] || {
+    echo "Prepared release checksum sidecar is malformed." >&2
+    exit 1
+  }
+  actual_checksum="$(shasum -a 256 "$prepared_snapshot" | /usr/bin/awk '{ print $1 }')"
+  [[ "$actual_checksum" == "${match[1]}" ]] || { echo "Prepared release checksum does not match." >&2; exit 1; }
+
+  actual_members="$(unzip -Z1 "$prepared_snapshot" | LC_ALL=C sort)"
+  expected_members=$'Info.plist\nScopeproofCapture\nScopeproofCapture.entitlements\nsource-commit.txt'
+  [[ "$actual_members" == "$expected_members" ]] || { echo "Prepared release archive contains missing, duplicate, or unexpected members." >&2; exit 1; }
+  prepared_root="$release_temp/prepared"
+  mkdir -p "$prepared_root"
+  unzip -qq "$prepared_snapshot" -d "$prepared_root"
+  for prepared_file in Info.plist ScopeproofCapture ScopeproofCapture.entitlements source-commit.txt; do
+    [[ -f "$prepared_root/$prepared_file" && ! -L "$prepared_root/$prepared_file" ]] || {
+      echo "Prepared release member is not a regular file: $prepared_file" >&2
+      exit 1
+    }
+  done
+  prepared_commit="$(<"$prepared_root/source-commit.txt")"
+  [[ "$prepared_commit" =~ '^[a-f0-9]{40}$' && "$prepared_commit" == "$(git -C "$project_root" rev-parse HEAD)" ]] || {
+    echo "Prepared release source commit does not match the checked-out signing source." >&2
+    exit 1
+  }
+  cmp -s "$prepared_root/Info.plist" "$info_plist" || { echo "Prepared Info.plist differs from the approved signing source." >&2; exit 1; }
+  cmp -s "$prepared_root/ScopeproofCapture.entitlements" "$entitlements" || { echo "Prepared entitlements differ from the approved signing source." >&2; exit 1; }
+  binary_path="$prepared_root/ScopeproofCapture"
+  chmod 0755 "$binary_path"
+else
+  export CLANG_MODULE_CACHE_PATH="$build_root/ModuleCache"
+  export SWIFTPM_MODULECACHE_OVERRIDE="$build_root/ModuleCache"
+  (
+    cd "$package_root"
+    swift build -c release --arch arm64 --scratch-path "$build_root"
+  )
+  binary_path="$build_root/arm64-apple-macosx/release/ScopeproofCapture"
+  if [[ ! -x "$binary_path" ]]; then binary_path="$build_root/release/ScopeproofCapture"; fi
+fi
 [[ -x "$binary_path" && ! -L "$binary_path" ]] || { echo "The arm64 release binary was not produced." >&2; exit 1; }
 [[ "$(lipo -archs "$binary_path")" == "arm64" ]] || { echo "The release binary is not arm64-only." >&2; exit 1; }
 if [[ -n "$(git -C "$project_root" status --porcelain --untracked-files=normal)" ]]; then
-  echo "The build modified the committed source tree; refusing to sign it." >&2
+  echo "The build or handoff validation modified the committed source tree; refusing to sign it." >&2
   exit 1
 fi
 

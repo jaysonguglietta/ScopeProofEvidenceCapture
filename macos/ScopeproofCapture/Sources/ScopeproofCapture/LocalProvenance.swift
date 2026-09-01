@@ -70,7 +70,7 @@ enum LocalProvenance {
         )
         return try sign(
             payload: payload, domain: lifecycleDomain,
-            privateKeyData: try privateKeyData ?? KeychainStore.localProvenancePrivateKey()
+            privateKeyData: try privateKeyData ?? KeychainStore.localLifecyclePrivateKey()
         )
     }
 
@@ -89,7 +89,7 @@ enum LocalProvenance {
         try sign(
             payload: canonicalJSON(hold, removingTopLevelKeys: ["provenance"]),
             domain: holdDomain,
-            privateKeyData: try privateKeyData ?? KeychainStore.localProvenancePrivateKey()
+            privateKeyData: try privateKeyData ?? KeychainStore.localHoldPrivateKey()
         )
     }
 
@@ -169,6 +169,9 @@ enum LocalProvenance {
             try container.encode(event.status, forKey: .status)
             try container.encode(event.owner, forKey: .owner)
             try container.encode(event.reviewer, forKey: .reviewer)
+            try container.encodeIfPresent(event.actorSubjectID, forKey: .actorSubjectID)
+            try container.encodeIfPresent(event.authenticationMethod, forKey: .authenticationMethod)
+            try container.encodeIfPresent(event.authenticatedAt, forKey: .authenticatedAt)
             try container.encode(event.reviewNotes, forKey: .reviewNotes)
             try container.encode(event.tags, forKey: .tags)
             try container.encodeIfPresent(event.supersedesEvidenceID, forKey: .supersedesEvidenceID)
@@ -182,6 +185,7 @@ enum LocalProvenance {
 
         private enum CodingKeys: String, CodingKey {
             case evidenceID, sequence, occurredAt, actor, action, status, owner, reviewer
+            case actorSubjectID, authenticationMethod, authenticatedAt
             case reviewNotes, tags, supersedesEvidenceID, artifactSha256, policyVersion
             case safetyScanPolicy, previousHash, eventHash, provenance
         }

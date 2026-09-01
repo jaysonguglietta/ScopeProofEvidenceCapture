@@ -494,7 +494,8 @@ actor S3CredentialProvider {
 
     nonisolated static func hasConfiguredSource(_ settings: S3StorageSettings) -> Bool {
         switch settings.authentication.method {
-        case .manualCredentials: return KeychainStore.readS3Credentials() != nil
+        case .manualCredentials:
+            return KeychainStore.readS3Credentials()?.tenantBinding == settings.tenantBinding
         case .identityCenterProfile, .identityCenterAssumeRole: return SystemS3AWSCLIExecutor().isAvailable()
         }
     }
@@ -525,6 +526,9 @@ actor S3CredentialProvider {
         switch settings.authentication.method {
         case .manualCredentials:
             guard let loaded = manualCredentialLoader() else { throw S3StorageFailure.invalidCredentials }
+            guard loaded.tenantBinding == settings.tenantBinding else {
+                throw S3StorageFailure.credentialIdentityMismatch
+            }
             let validated = try validatedCredentials(loaded, settings: settings)
             if let cached, cached.settingsDigest == settings.securityBindingDigest,
                cached.credentials == validated, !cached.credentials.isExpired {
@@ -674,7 +678,8 @@ actor S3CredentialProvider {
     private func validatedCredentials(_ credentials: S3Credentials, settings: S3StorageSettings) throws -> S3Credentials {
         let clean = try S3Credentials.validated(
             accessKeyID: credentials.accessKeyID, secretAccessKey: credentials.secretAccessKey,
-            sessionToken: credentials.sessionToken, expiresAt: credentials.expiresAt
+            sessionToken: credentials.sessionToken, expiresAt: credentials.expiresAt,
+            tenantID: settings.tenantID, workspaceID: settings.workspaceID
         )
         if clean.isExpired { throw S3StorageFailure.expiredCredentials }
         if settings.securityProfile == .production && (!clean.isTemporary || clean.expiresAt == nil) {

@@ -99,8 +99,8 @@ enum EvidenceLibraryBuilder {
                   let manifestKey = receipt.objectKeys.first(where: { lastPathComponent($0) == entry.manifestURL.lastPathComponent }),
                   imageKey != manifestKey,
                   parentKey(imageKey) == parentKey(manifestKey),
-                  isExpectedLayout(imageKey, evidenceID: artifact.manifest.evidenceID, prefix: settings.prefix),
-                  isExpectedLayout(manifestKey, evidenceID: artifact.manifest.evidenceID, prefix: settings.prefix),
+                  isExpectedLayout(imageKey, evidenceID: artifact.manifest.evidenceID, prefix: settings.tenantScopedPrefix),
+                  isExpectedLayout(manifestKey, evidenceID: artifact.manifest.evidenceID, prefix: settings.tenantScopedPrefix),
                   let imageVersion = receipt.versionIDs[imageKey], !imageVersion.isEmpty, imageVersion != "null",
                   let manifestVersion = receipt.versionIDs[manifestKey], !manifestVersion.isEmpty, manifestVersion != "null",
                   receipt.schemaVersion < 3 || settings.securityProfile != .production || (

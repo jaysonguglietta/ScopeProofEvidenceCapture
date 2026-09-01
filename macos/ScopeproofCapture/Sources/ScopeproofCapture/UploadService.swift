@@ -20,17 +20,20 @@ enum UploadFailure: LocalizedError {
 }
 
 actor UploadService {
-    private var appVersion: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.9.0" }
+    private var appVersion: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.10.0" }
 
     func upload(_ capture: CaptureResult, serverURL: URL?) async throws -> URL {
         guard let serverURL = BackendTrust.normalizedOrigin(serverURL) else { throw UploadFailure.invalidServer }
-        guard let token = KeychainStore.readToken(for: serverURL), !token.isEmpty else { throw UploadFailure.notConfigured }
+        guard let binding = capture.context.resolvedTenantBinding,
+              let token = KeychainStore.readToken(for: serverURL, binding: binding),
+              !token.isEmpty else { throw UploadFailure.notConfigured }
         let artifact: ValidatedEvidenceArtifact
         do { artifact = try ValidatedEvidenceArtifact.load(capture) }
         catch { throw UploadFailure.invalidEvidence }
         let image = artifact.imageData
         let manifest = artifact.manifestData
         let manifestModel = artifact.manifest
+        guard manifestModel.tenantBinding == binding else { throw UploadFailure.invalidEvidence }
         let boundary = "ScopeproofBoundary\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))"
         var request = URLRequest(url: serverURL.appendingPathComponent("api/native/evidence"))
         request.httpMethod = "POST"

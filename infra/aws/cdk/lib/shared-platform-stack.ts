@@ -51,6 +51,11 @@ export class SharedPlatformStack extends Stack {
   public readonly branchName: string;
   public readonly hostedZone: route53.IHostedZone;
   public readonly controlTable: dynamodb.TableV2;
+  /**
+   * Out-of-band, short-lived customer activation approvals. Application and
+   * provisioning code receive read-only access; no workload can self-approve.
+   */
+  public readonly customerActivationTable: dynamodb.TableV2;
   public readonly userPool: cognito.UserPool;
   public readonly oauthScopes: Readonly<{
     evidenceRead: cognito.OAuthScope;
@@ -123,6 +128,16 @@ export class SharedPlatformStack extends Stack {
       removalPolicy: RemovalPolicy.RETAIN,
       // Lifecycle records retain canonical ISO timestamps for CAS comparisons;
       // DynamoDB TTL requires a distinct numeric epoch-seconds attribute.
+      timeToLiveAttribute: "ttlEpochSeconds",
+    });
+    this.customerActivationTable = new dynamodb.TableV2(this, "CustomerActivationTable", {
+      billing: dynamodb.Billing.onDemand(),
+      deletionProtection: true,
+      encryption: dynamodb.TableEncryptionV2.dynamoOwnedKey(),
+      partitionKey: { name: "PK", type: dynamodb.AttributeType.STRING },
+      pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
+      removalPolicy: RemovalPolicy.RETAIN,
+      sortKey: { name: "SK", type: dynamodb.AttributeType.STRING },
       timeToLiveAttribute: "ttlEpochSeconds",
     });
 
@@ -723,6 +738,13 @@ export class SharedPlatformStack extends Stack {
     new CfnOutput(this, "CognitoUserPoolId", { value: this.userPool.userPoolId });
     new CfnOutput(this, "CognitoLoginDomain", { value: `https://auth.${this.rootDomain}` });
     new CfnOutput(this, "ControlPlaneTableName", { value: this.controlTable.tableName });
+    new CfnOutput(this, "CustomerActivationTableName", {
+      description: "Out-of-band CUSTOMER_ENABLED approvals; no application principal has write access",
+      value: this.customerActivationTable.tableName,
+    });
+    new CfnOutput(this, "CustomerActivationTableArn", {
+      value: this.customerActivationTable.tableArn,
+    });
     new CfnOutput(this, "DatabaseClusterArn", { value: this.databaseCluster.clusterArn });
     new CfnOutput(this, "JobsQueueUrl", { value: this.jobsQueue.queueUrl });
     new CfnOutput(this, "OperationsTopicArn", { value: this.operationsTopic.topicArn });

@@ -44,6 +44,7 @@ final class LocalConsoleServer {
     }
 
     private let evidenceRoot: URL
+    private let tenantBinding: TenantWorkspaceBinding
     private let preferences: CapturePreferences
     private let s3Service: S3StorageService
     private let credentialProvider: S3CredentialProvider
@@ -58,12 +59,14 @@ final class LocalConsoleServer {
     private var s3Cache: S3InventoryCache?
 
     init(
-        evidenceRoot: URL, preferences: CapturePreferences, s3Service: S3StorageService,
+        evidenceRoot: URL, tenantBinding: TenantWorkspaceBinding,
+        preferences: CapturePreferences, s3Service: S3StorageService,
         credentialProvider: S3CredentialProvider,
         requestCapture: @escaping @MainActor () -> Void,
         openS3Browser: @escaping @MainActor () -> Void
     ) {
         self.evidenceRoot = evidenceRoot.standardizedFileURL
+        self.tenantBinding = tenantBinding
         self.preferences = preferences
         self.s3Service = s3Service
         self.credentialProvider = credentialProvider
@@ -78,7 +81,11 @@ final class LocalConsoleServer {
         if !isRunning { try await start() }
         try syncIndex(action: "console.opened")
         let launchNonce = sessionState.beginOpen()
-        guard let port, let launchURL = URL(string: "http://127.0.0.1:\(port)/launch?token=\(launchNonce)") else { throw LocalConsoleFailure.startup("No local address was assigned.") }
+        // URL fragments are never sent in an HTTP request. The static bootstrap
+        // page exchanges this one-time nonce for an in-memory bearer, preventing
+        // another process listening on a different loopback port from receiving
+        // a host-wide browser cookie.
+        guard let port, let launchURL = URL(string: "http://127.0.0.1:\(port)/#token=\(launchNonce)") else { throw LocalConsoleFailure.startup("No local address was assigned.") }
         NSWorkspace.shared.open(launchURL)
     }
 
@@ -181,13 +188,28 @@ final class LocalConsoleServer {
     private func route(_ request: HTTPRequest) async -> HTTPResponse {
         do {
             guard ["127.0.0.1", "localhost"].contains(request.hostName), request.hostPort == port else { throw LocalConsoleFailure.forbidden }
-            if request.path == "/launch", request.method == "GET" {
-                guard let token = request.query["token"].flatMap({ sessionState.consumeLaunchNonce($0) }) else {
+            guard preferences.tenantBinding == tenantBinding else { throw LocalConsoleFailure.unauthorized }
+            switch (request.method, request.path) {
+            case ("GET", "/"):
+                return .data(status: 200, contentType: "text/html; charset=utf-8", body: Data(LocalConsoleAssets.html.utf8))
+            case ("GET", "/assets/app.css"):
+                return .data(status: 200, contentType: "text/css; charset=utf-8", body: Data(LocalConsoleAssets.css.utf8), cache: "private, max-age=3600")
+            case ("GET", "/assets/app.js"):
+                return .data(status: 200, contentType: "text/javascript; charset=utf-8", body: Data(LocalConsoleAssets.javascript.utf8), cache: "private, max-age=3600")
+            case ("POST", "/api/session"):
+                guard request.headers["origin"] == displayURL?.absoluteString.dropLast().description,
+                      request.headers["sec-fetch-site"] == "same-origin",
+                      request.headers["content-type"]?.lowercased().hasPrefix("application/json") == true,
+                      let nonce = request.authorization(scheme: "Scopeproof-Launch"),
+                      let bearer = sessionState.consumeLaunchNonce(nonce) else {
                     throw LocalConsoleFailure.unauthorized
                 }
-                return .redirect(location: "/", cookie: sessionCookie(token: token))
+                return .codable(LocalConsoleSessionResponse(token: bearer))
+            default:
+                break
             }
-            guard let cookie = request.cookies["scopeproof_local"], sessionState.authorize(cookie) else {
+            guard let bearer = request.authorization(scheme: "Bearer"),
+                  sessionState.authorize(bearer) else {
                 throw LocalConsoleFailure.unauthorized
             }
             if request.method != "GET" {
@@ -197,21 +219,17 @@ final class LocalConsoleServer {
             }
 
             switch (request.method, request.path) {
-            case ("GET", "/"):
-                return .data(status: 200, contentType: "text/html; charset=utf-8", body: Data(LocalConsoleAssets.html.utf8))
-            case ("GET", "/assets/app.css"):
-                return .data(status: 200, contentType: "text/css; charset=utf-8", body: Data(LocalConsoleAssets.css.utf8), cache: "private, max-age=3600")
-            case ("GET", "/assets/app.js"):
-                return .data(status: 200, contentType: "text/javascript; charset=utf-8", body: Data(LocalConsoleAssets.javascript.utf8), cache: "private, max-age=3600")
             case ("GET", "/api/status"):
                 let index = try evidenceIndex()
                 let entries = CaptureHistory.entries(in: evidenceRoot)
                 try index.sync(entries: entries)
                 let server = preferences.serverURL?.absoluteString ?? ""
-                let hosted = BackendTrust.normalizedOrigin(preferences.serverURL).flatMap(KeychainStore.readToken(for:)) != nil
+                let hosted = BackendTrust.normalizedOrigin(preferences.serverURL).flatMap {
+                    KeychainStore.readToken(for: $0, binding: preferences.tenantBinding)
+                } != nil
                 let auditValid = try index.verifyAuditChain()
                 let captureChainValid = CaptureHistory.captureChainIntegrity(entries)
-                let s3Settings = preferences.s3Storage
+                let s3Settings = activeS3Settings()
                 return .codable(Status(
                     localUser: NSFullUserName(), evidenceRoot: evidenceRoot.path,
                     indexState: auditValid && captureChainValid
@@ -219,9 +237,10 @@ final class LocalConsoleServer {
                         : "Audit or capture-chain rollback verification failed",
                     hostedConnected: hosted, hostedServer: server, autoUpload: preferences.autoUpload,
                     retentionDays: preferences.retentionDays, summary: try index.summary(),
-                    s3Configured: s3Settings.isConfigured, s3InventoryState: s3InventoryState(settings: s3Settings),
-                    s3Bucket: s3Settings.bucket, s3Prefix: s3Settings.prefix,
-                    s3DownloadsAllowed: s3Settings.downloadsAllowed
+                    s3Configured: s3Settings?.isConfigured == true,
+                    s3InventoryState: s3InventoryState(settings: s3Settings),
+                    s3Bucket: s3Settings?.bucket ?? "", s3Prefix: s3Settings?.prefix ?? "",
+                    s3DownloadsAllowed: s3Settings?.downloadsAllowed == true
                 ))
             case ("GET", "/api/library"):
                 return .codable(try await libraryPayload(forceS3Refresh: request.query["refreshS3"] == "1"))
@@ -242,7 +261,7 @@ final class LocalConsoleServer {
                 try evidenceIndex().recordAudit(action: "capture.requested", resourceID: "menu-bar-app")
                 return .json(status: 202, object: ["ok": true])
             case ("POST", "/api/actions/open-s3-browser"):
-                guard preferences.s3Storage.isConfigured else { throw S3StorageFailure.notConfigured }
+                guard activeS3Settings()?.isConfigured == true else { throw S3StorageFailure.notConfigured }
                 openS3Browser()
                 try evidenceIndex().recordAudit(action: "s3.browser.opened", resourceID: "configured-prefix")
                 return .json(status: 200, object: ["ok": true])
@@ -254,7 +273,7 @@ final class LocalConsoleServer {
                     return try await s3ImageResponse(evidenceID: evidenceID)
                 }
                 if request.method == "POST", let evidenceID = routeEvidenceID(request.path, suffix: "/review") {
-                    return try reviewResponse(evidenceID: evidenceID, request: request)
+                    return try await reviewResponse(evidenceID: evidenceID, request: request)
                 }
                 if request.method == "POST", request.path == "/api/actions/reveal" {
                     let body = try decode(ActionBody.self, request.body)
@@ -293,17 +312,19 @@ final class LocalConsoleServer {
             throw LocalConsoleFailure.notFound
         }
         let settings = preferences.s3Storage
-        guard settings == cache.settings, settings.downloadsAllowed,
+        let activeBinding = preferences.tenantBinding
+        guard settings.isBound(to: activeBinding), settings == cache.settings, settings.downloadsAllowed,
               let binding = KeychainStore.readS3VerifiedDestination(), binding.matches(settings) else {
             throw S3StorageFailure.verificationRequired
         }
         let credentials = try await credentialProvider.credentials(for: settings, binding: binding)
+        guard preferences.tenantBinding == activeBinding else { throw LocalConsoleFailure.unauthorized }
         let entries = CaptureHistory.entries(in: evidenceRoot)
         let receiptBindings = EvidenceLibraryBuilder.verifiedReceiptBindings(
             entries: entries, settings: settings, destination: binding
         )
         let screenshots = EvidenceLibraryBuilder.s3Screenshots(
-            objects: cache.objects, prefix: settings.prefix, receiptBindings: receiptBindings
+            objects: cache.objects, prefix: settings.tenantScopedPrefix, receiptBindings: receiptBindings
         )
         guard let screenshot = screenshots.first(where: { $0.evidenceID == evidenceID }),
               screenshot.size >= 0, screenshot.size <= 40 * 1024 * 1024 else {
@@ -333,6 +354,7 @@ final class LocalConsoleServer {
             screenshot.manifestObject, settings: settings, credentials: credentials,
             binding: binding, to: manifestURL
         )
+        guard preferences.tenantBinding == activeBinding else { throw LocalConsoleFailure.unauthorized }
         let manifestData = try ValidatedEvidenceArtifact.readBoundedRegularFile(
             at: manifestURL, within: previewDirectory,
             maximumBytes: ValidatedEvidenceArtifact.maximumManifestBytes
@@ -348,6 +370,7 @@ final class LocalConsoleServer {
             screenshot.object, settings: settings, credentials: credentials,
             binding: binding, to: previewURL
         )
+        guard preferences.tenantBinding == activeBinding else { throw LocalConsoleFailure.unauthorized }
         let data = try ValidatedEvidenceArtifact.readBoundedRegularFile(
             at: previewURL, within: previewDirectory,
             maximumBytes: ValidatedEvidenceArtifact.maximumImageBytes
@@ -367,6 +390,7 @@ final class LocalConsoleServer {
               }) ?? true else {
             throw S3StorageFailure.unsupportedDownloadedContent
         }
+        guard preferences.tenantBinding == activeBinding else { throw LocalConsoleFailure.unauthorized }
         return .data(status: 200, contentType: "image/png", body: artifact.imageData)
     }
 
@@ -375,7 +399,8 @@ final class LocalConsoleServer {
         let entries = CaptureHistory.entries(in: evidenceRoot)
         try index.sync(entries: entries)
         let local = try index.search(LocalEvidenceQuery(), limit: 5_000)
-        let settings = preferences.s3Storage
+        let activeBinding = preferences.tenantBinding
+        let settings = activeS3Settings() ?? .empty(for: activeBinding)
         var s3: [S3ScreenshotSummary] = []
         var state = s3InventoryState(settings: settings)
         var warning: String?
@@ -390,13 +415,17 @@ final class LocalConsoleServer {
                     objects = cache.objects
                 } else {
                     objects = try await s3Service.listObjects(settings: settings, credentials: credentials, binding: binding)
+                    guard preferences.tenantBinding == activeBinding else {
+                        s3Cache = nil
+                        throw LocalConsoleFailure.unauthorized
+                    }
                     s3Cache = S3InventoryCache(settings: settings, loadedAt: Date(), objects: objects)
                 }
                 let receiptBindings = EvidenceLibraryBuilder.verifiedReceiptBindings(
                     entries: entries, settings: settings, destination: binding
                 )
                 s3 = EvidenceLibraryBuilder.s3Screenshots(
-                    objects: objects, prefix: settings.prefix, receiptBindings: receiptBindings
+                    objects: objects, prefix: settings.tenantScopedPrefix, receiptBindings: receiptBindings
                 )
                 state = "Connected"
             } catch {
@@ -407,6 +436,10 @@ final class LocalConsoleServer {
             warning = "S3 is configured but not currently verified. Local evidence is shown; use S3 Evidence Storage in the menu-bar app to verify the destination."
         }
 
+        guard preferences.tenantBinding == activeBinding else {
+            s3Cache = nil
+            throw LocalConsoleFailure.unauthorized
+        }
         let evidence = EvidenceLibraryBuilder.merge(local: local, s3: s3, s3PreviewsAllowed: settings.downloadsAllowed)
         return EvidenceLibraryPayload(
             evidence: evidence,
@@ -425,26 +458,46 @@ final class LocalConsoleServer {
         )
     }
 
-    private func s3InventoryState(settings: S3StorageSettings) -> String {
-        guard settings.isConfigured else { return "Not configured" }
+    private func activeS3Settings() -> S3StorageSettings? {
+        let settings = preferences.s3Storage
+        return preferences.tenantBinding == tenantBinding && settings.isBound(to: tenantBinding) ? settings : nil
+    }
+
+    private func s3InventoryState(settings: S3StorageSettings?) -> String {
+        guard let settings, settings.isBound(to: preferences.tenantBinding), settings.isConfigured else {
+            return "Not configured"
+        }
         guard S3CredentialProvider.hasConfiguredSource(settings),
               KeychainStore.readS3VerifiedDestination()?.matches(settings) == true else { return "Verification required" }
         return "Ready"
     }
 
-    private func reviewResponse(evidenceID: String, request: HTTPRequest) throws -> HTTPResponse {
+    private func reviewResponse(evidenceID: String, request: HTTPRequest) async throws -> HTTPResponse {
         let body = try decode(ReviewBody.self, request.body)
         guard let status = EvidenceReviewStatus(rawValue: body.status) else { throw LocalConsoleFailure.invalidBody("Select a valid lifecycle status.") }
         let notes = body.notes.trimmingCharacters(in: .whitespacesAndNewlines)
         if [.approved, .rejected, .superseded].contains(status), notes.count < 20 { throw LocalConsoleFailure.invalidBody("Approval, rejection, and supersession require a rationale of at least 20 characters.") }
-        guard !body.reviewer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw LocalConsoleFailure.invalidBody("A reviewer is required.") }
         let entry = try entry(for: evidenceID)
         _ = try ValidatedEvidenceArtifact.load(entry, requireLifecycle: true)
         guard EvidenceLifecycleStore.verify(entry.lifecycle, artifactSha256: entry.manifest.sha256) else { throw EvidenceLifecycleFailure.integrityFailure }
-        _ = try EvidenceLifecycleStore.update(entry: entry, status: status, owner: body.owner, reviewer: body.reviewer, notes: notes, tags: body.tags)
+        let identity = try await LocalReviewerAuthorizer.authorize(
+            reason: "Authenticate to record a lifecycle decision for \(evidenceID)."
+        )
+        guard preferences.tenantBinding == tenantBinding else {
+            throw LocalConsoleFailure.unauthorized
+        }
+        _ = try EvidenceLifecycleStore.update(
+            entry: entry, status: status, owner: body.owner,
+            reviewer: identity.displayName, notes: notes, tags: body.tags,
+            reviewerIdentity: identity
+        )
         let index = try evidenceIndex()
         try index.sync(entries: CaptureHistory.entries(in: evidenceRoot))
-        try index.recordAudit(action: "evidence.reviewed", resourceID: evidenceID, details: ["status": status.rawValue, "reviewer": String(body.reviewer.prefix(160))])
+        try index.recordAudit(action: "evidence.reviewed", resourceID: evidenceID, details: [
+            "status": status.rawValue,
+            "reviewerSubject": identity.subjectID,
+            "authenticationMethod": identity.authenticationMethod
+        ])
         return .json(status: 200, object: ["ok": true])
     }
 
@@ -465,8 +518,18 @@ final class LocalConsoleServer {
         guard let supportRoot = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
             throw LocalConsoleFailure.startup("The Application Support folder is unavailable.")
         }
-        let support = supportRoot.appendingPathComponent("Scopeproof Capture", isDirectory: true)
-        let index = try LocalEvidenceIndex(databaseURL: support.appendingPathComponent("local-console.sqlite3"), auditKeyData: KeychainStore.localAuditKey())
+        let binding = preferences.tenantBinding
+        let support = supportRoot
+            .appendingPathComponent("Scopeproof Capture", isDirectory: true)
+            .appendingPathComponent("tenants", isDirectory: true)
+            .appendingPathComponent(binding.tenantID, isDirectory: true)
+            .appendingPathComponent("workspaces", isDirectory: true)
+            .appendingPathComponent(binding.workspaceID, isDirectory: true)
+        let index = try LocalEvidenceIndex(
+            databaseURL: support.appendingPathComponent("local-console.sqlite3"),
+            auditKeyData: KeychainStore.localAuditKey(binding: binding),
+            anchorAuditToKeychain: true
+        )
         storedIndex = index
         return index
     }
@@ -483,9 +546,6 @@ final class LocalConsoleServer {
         catch { throw LocalConsoleFailure.invalidBody("The request body is invalid.") }
     }
 
-    private func sessionCookie(token: String) -> String {
-        "scopeproof_local=\(token); Path=/; HttpOnly; SameSite=Strict; Max-Age=1800"
-    }
     private func sha256(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
 
     private func validatedPNGDimensions(_ data: Data, width: Int, height: Int) -> Bool {
@@ -651,7 +711,8 @@ private final class LocalConsoleConnectionLease: @unchecked Sendable {
 }
 
 private struct ActionBody: Decodable { let evidenceID: String }
-private struct ReviewBody: Decodable { let status: String; let owner: String; let reviewer: String; let notes: String; let tags: [String] }
+private struct LocalConsoleSessionResponse: Encodable { let token: String }
+private struct ReviewBody: Decodable { let status: String; let owner: String; let notes: String; let tags: [String] }
 private struct EvidencePayload: Encodable {
     struct Facets: Encodable { let frameworks: [String]; let controls: [String] }
     let evidence: [LocalEvidenceRecord]
@@ -707,6 +768,20 @@ private struct HTTPRequest {
         guard let host = headers["host"] else { return nil }
         if host.hasPrefix("[") { return host.split(separator: "]:").last.flatMap { UInt16($0) } }
         return host.split(separator: ":", maxSplits: 1).dropFirst().first.flatMap { UInt16($0) }
+    }
+
+    func authorization(scheme: String) -> String? {
+        guard let value = headers["authorization"], value.utf8.count <= 512 else { return nil }
+        let parts = value.split(separator: " ", maxSplits: 1, omittingEmptySubsequences: false)
+        guard parts.count == 2, parts[0].caseInsensitiveCompare(scheme) == .orderedSame else {
+            return nil
+        }
+        let token = String(parts[1])
+        guard (8...256).contains(token.utf8.count),
+              token.range(of: #"^[A-Za-z0-9_-]+$"#, options: .regularExpression) != nil else {
+            return nil
+        }
+        return token
     }
 
     static func parse(_ data: Data) -> HTTPRequest? {

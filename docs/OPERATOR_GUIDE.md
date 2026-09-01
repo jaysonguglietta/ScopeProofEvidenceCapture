@@ -4,7 +4,7 @@ This guide is for evidence collectors, control owners, and reviewers. It describ
 
 ## Install and open the local Mac app
 
-For a tagged-build evaluation on an Apple Silicon Mac, download the older [Scopeproof Capture 1.8.1 development preview](https://github.com/jaysonguglietta/ScopeProofEvidenceCapture/releases/tag/v1.8.1-development-preview.1), verify its adjacent SHA-256 file, open the DMG, and drag **Scopeproof Capture** to **Applications**. It was built from `8cd2d5c`, predates the current **Unreleased 1.9.0 (build 23)** native changes, is ad-hoc signed, and is not Apple-notarized. No 1.9.0 DMG exists. Use an exact reviewed source checkout to test current behavior until a new DMG is published; the current branch is not merged into the public default branch as of 2026-08-28.
+For a tagged-build evaluation on an Apple Silicon Mac, download the older [Scopeproof Capture 1.8.1 development preview](https://github.com/jaysonguglietta/ScopeProofEvidenceCapture/releases/tag/v1.8.1-development-preview.1), verify its adjacent SHA-256 file, open the DMG, and drag **Scopeproof Capture** to **Applications**. It was built from `8cd2d5c`, predates the current **Unreleased 1.10.0 (build 24)** native changes, is ad-hoc signed, and is not Apple-notarized. No 1.10.0 DMG exists. Use an exact reviewed source checkout to test current behavior until a new DMG is published; the public release remains 1.8.1 until a separate release workflow succeeds.
 
 Developers can instead build from the repository root:
 
@@ -16,7 +16,7 @@ The command builds Scopeproof Capture, installs it for the current user in `~/Ap
 
 Look for the Scopeproof shield in the menu bar. On the first capture, allow **Scopeproof Capture** under **System Settings → Privacy & Security → Screen & System Audio Recording**, then quit and reopen the app once.
 
-Scopeproof opens its **Local Console** in your browser at launch. This console runs only while the menu-bar app is running, listens only on the Mac loopback interface, and does not require a hosted account or device token. Its **Evidence library** automatically shows local screenshots and, when configured and verified, screenshot versions beneath the selected S3 prefix. Use storage/framework/control/period/status filters and group by control, assessment period, or framework. `Local`, `S3`, and `Local + S3` badges make the authoritative locations explicit. Choose **Open Local Console** from the shield menu if you close the browser tab.
+Scopeproof opens its **Local Console** in your browser at launch. This console runs only while the menu-bar app is running, listens only on the Mac loopback interface, and does not require a hosted account or device token. The launch address carries a one-time nonce after `#token=`; the page exchanges it for a separate short-lived in-memory bearer and clears the fragment. Scopeproof creates no localhost authentication cookie. Do not copy or share the launch address. Its **Evidence library** automatically shows only the active tenant/workspace's local screenshots and, when configured and verified, screenshot versions beneath the matching S3 prefix. Use storage/framework/control/period/status filters and group by control, assessment period, or framework. `Local`, `S3`, and `Local + S3` badges make the authoritative locations explicit. Choose **Open Local Console** from the shield menu if you close the browser tab.
 
 The Local Console is optional. To prevent it from starting automatically, open **Capture & Jira Settings…**, use the **Capture & Local** tab, clear **Open Local Console when Scopeproof launches**, save, then quit and reopen Scopeproof. The current random loopback port closes when the app quits; screenshot capture and the native evidence tools continue to work.
 
@@ -24,7 +24,7 @@ In local-only mode, the menu shows **Open GitHub Releases…** for development-p
 
 ### Local evidence versus hosted-trusted evidence
 
-The local app does not depend on the hosted OCR/DLP scanner or timestamp authority. You can continue to capture, redact, review, search, retain, and export locally when no hosted service is configured. New captures use a schema-7 manifest signed by a device-only P-256 key and anchored to the local capture chain.
+The local app does not depend on the hosted OCR/DLP scanner or timestamp authority. You can continue to capture, redact, review, search, retain, and export locally when no hosted service is configured. New captures use a current signed manifest bound to the selected tenant/workspace and its local capture-chain head. Lifecycle and local legal-hold changes use separate signing/rollback domains and require macOS local-user authentication.
 
 Uploading introduces independent server controls. The server verifies the schema-7 device signature and exact PNG/manifest digests, performs its own OCR/DLP scan of the exact PNG bytes, verifies a trusted RFC 3161 timestamp, and finalizes the artifact into the device's hosted chain. Local OCR is useful endpoint protection, but it is not a substitute for this independent hosted scan. The server evaluates recognized OCR text only in memory and retains no recognized text; it stores only digest-bound scanner policy, origin, completion time, and receipt metadata.
 
@@ -32,7 +32,7 @@ Until every hosted step succeeds, the item is unverified/quarantined and cannot 
 
 ## Before collecting evidence
 
-1. Confirm the system, environment, assessment period, framework, and control are in scope.
+1. Confirm the customer/tenant, workspace, system, environment, assessment period, framework, and control are in scope. For a non-default identity, set the lowercase tenant and workspace in **Capture & Jira Settings…** before enrollment, S3 verification, or capture. Switching identity stops the previous Local Console, rejects suspended requests, cancels and closes S3 activity, removes Scopeproof's S3 Keychain binding, and resets S3 configuration; enroll and verify credentials for the new identity.
 2. Confirm the source view shows the minimum information needed to prove the control.
 3. Remove unrelated customer, employee, authentication, or cardholder data from the view where possible.
 4. For Jira-linked work, confirm the destination issue and project are approved for the evidence classification.
@@ -59,7 +59,7 @@ Each saved item can contain:
 - `.review.json`: hash-chained lifecycle decisions and review notes.
 - `.receipt.json`: server evidence identity and signed timestamp receipt, when uploaded.
 
-New files are stored under `~/Documents/Scopeproof Evidence` and use current-account-only permissions. Evidence under `~/Pictures/Scopeproof Evidence` remains discoverable and is not moved automatically. A signed schema-7 artifact may use either supported root, but unsigned schema-6 and older evidence is visibly unverified and browsing-only; it cannot enter review, pending-upload, retention/legal-hold, assessor-package, or Jira workflows and must be recaptured. Before collection, confirm that iCloud Drive, enterprise file synchronization, backup, and DLP settings for Documents are approved for the evidence classification.
+New files are stored under `~/Documents/Scopeproof Evidence` and use current-account-only permissions. The default local identity writes directly under that root; another identity writes under `tenants/<tenant>/workspaces/<workspace>/`. Evidence under `~/Pictures/Scopeproof Evidence` remains discoverable and is not moved automatically. A current signed artifact may use a supported root, but unsigned or obsolete evidence is visibly unverified and browsing-only; it cannot enter review, pending-upload, retention/legal-hold, assessor-package, or Jira workflows and must be recaptured. A Keychain-backed commit journal makes an interrupted save recover as either a complete validated image/manifest/lifecycle set or a removed partial set. Before collection, confirm that iCloud Drive, enterprise file synchronization, backup, and DLP settings for Documents are approved for the evidence classification.
 
 The visible menu-bar clock is useful corroborating context, but it is controlled by the endpoint and does not independently prove time. For scrolling evidence, Scopeproof captures the menu-bar strip when you choose **Finish & review**, rather than when the first viewport was taken. A local artifact may rely on that corroborating context. Production hosted evidence additionally requires the verified RFC 3161 timestamp attestation included with its signed server receipt.
 
@@ -79,10 +79,10 @@ Scopeproof bounds section count and final image size. If the maximum is reached,
 1. Use **Evidence library** in the Local Console or choose **Search Evidence…** for the native review window.
 2. Filter by framework, control, system, date, lifecycle status, or keyword. Jira issue keys are searchable.
 3. Open the screenshot and confirm the control mapping, source, period, system, redactions, and visible timestamp banner.
-4. Choose **Review Status…** and assign the owner/reviewer, useful tags, a decision, and a rationale.
+4. Choose **Review Status…**, assign the owner, useful tags, a decision, and a rationale. Scopeproof displays the reviewer as the authenticated macOS user; it does not trust a typed reviewer name. Complete the local-user authentication prompt to save a trust-bearing decision.
 5. Use **Approved** only when the artifact is current, complete, correctly scoped, and safe to disclose. Use **Superseded** for replaced evidence and **Rejected** for unsuitable evidence.
 
-Approval, rejection, and supersession require a note. Lifecycle changes are written to the sidecar record; the original capture manifest is not rewritten.
+Approval, rejection, and supersession require a note. Lifecycle changes are written to a signed sidecar and advance a tenant/workspace/file-scoped Keychain rollback head; the original capture manifest is not rewritten. Placing or releasing a local legal hold requires the same macOS authentication but uses a separate signing key and an immutable tenant/workspace/evidence/digest rollback scope. Deleting or moving its sidecar cannot silently release the hold: missing or inconsistent marker/head state blocks retention. A local hold does not change an S3 Object Lock legal hold.
 
 ## Upload and retry
 
@@ -96,9 +96,20 @@ The current Sites runtime is for one organization only. An administrator opens *
 
 The **Settings → Audit log** view shows the newest 250 material actions and the current bounded integrity result. Treat a failed or pending chain/checkpoint result as a production stop: compare the D1 head with the independently retained checkpoint and trusted signing-key fingerprint before resuming collection or export.
 
+### Create scoped assessments and findings
+
+In the hosted console, create or edit an assessment before collecting:
+
+1. Select a reviewed versioned control catalog. The bundled **PCI DSS 4.0.1 · Scopeproof operations catalog** is intentionally a limited operations catalog, not the complete PCI DSS standard.
+2. Enter at least one explicit system and select at least one control from that exact catalog before changing the assessment to **Active**. Drafts may remain incomplete; active assessments may not.
+3. Confirm the period and owner. A scope reduction is a separately audited action. Collection, native upload, and SBOM generation fail if their framework, catalog version, system, or control falls outside the active scope.
+4. Use **Load more** where offered. Evidence, runs, SBOMs, findings, assessments, and package history are cursor-paged; totals and control counts are server aggregates across the full filtered set, not the number of visible cards.
+
+Use **Findings** for durable issues, not a local note on an evidence card. Bind each finding to the assessment and, when applicable, an in-scope control, evidence item, collection run, owner, severity, and due date. Reviewers can create and maintain ordinary finding work. Only a compliance lead or administrator can **Accept** risk or **Close** a finding, and that disposition requires a rationale. Closed is terminal; create a new finding for later recurrence.
+
 ### Store evidence in AWS S3
 
-Choose **AWS S3 Storage…** separately from hosted synchronization. For production, select a direct named **IAM Identity Center profile** or **Identity Center + assumed role**. Scopeproof can start AWS CLI v2 SSO login, keeps derived STS credentials only in memory, refreshes them before expiry, and rejects a refreshed account or role that no longer matches the verified binding. Manual STS entry remains available when SSO cannot be used. Enter a same-account bucket, nonempty prefix, customer-managed KMS key, and Object Lock mode/retention; SSE-KMS requires an enabled S3 Bucket Key. Use **Save & Verify** for an existing bucket. For a new production bucket, prefer the reviewed `native-capture-evidence-bucket.yaml` CloudFormation stack; use **Create & Harden Bucket** only with a separately reviewed short-lived setup role. The app stores the verified account, principal/role scope, destination, and posture in Keychain; any authentication or routing change disables uploads until verification. The native verifier requires the template's exact transport/encryption/deletion-deny bucket policy. None of the supplied daily access templates grants setup permissions.
+Choose **AWS S3 Storage…** separately from hosted synchronization. First verify the active tenant/workspace in **Capture & Jira Settings…**. For production, select a direct named **IAM Identity Center profile** or **Identity Center + assumed role**. Scopeproof can start AWS CLI v2 SSO login, keeps derived STS credentials only in memory, refreshes them before expiry, and rejects a refreshed account, role, tenant, or workspace that no longer matches the verified binding. Manual STS entry remains available when SSO cannot be used. Enter a same-account bucket, nonempty base prefix, customer-managed KMS key, and Object Lock mode/retention; SSE-KMS requires an enabled S3 Bucket Key. The app automatically adds `/tenants/<tenant>/workspaces/<workspace>` to that base prefix. Use **Save & Verify** for an existing bucket. For a new production bucket, prefer the reviewed `native-capture-evidence-bucket.yaml` CloudFormation stack; use **Create & Harden Bucket** only with a separately reviewed short-lived setup role. The app stores the verified account, principal/role scope, destination, tenant/workspace, and posture in Keychain; any identity, authentication, or routing change disables uploads until verification. The native verifier requires the template's exact transport/encryption/deletion-deny bucket policy. None of the supplied daily access templates grants setup permissions.
 
 The encryption selection must match the bucket: select **SSE-KMS** or **DSSE-KMS** when entering a KMS ARN; **SSE-S3** does not use that ARN. Production rejects long-lived credentials. Compatible S3 can use a dedicated no-console IAM user restricted to the exact bucket, prefix, regional S3 service, and KMS encryption context only as a migration exception. Do not use a personal or administrator key. The complete identity/KMS guidance and optional secretless-authentication CloudFormation templates are linked from [AWS S3 evidence storage](S3_STORAGE.md).
 
@@ -106,7 +117,7 @@ Enable browsing only for operators who need it. **Browse S3 Evidence…** loads 
 
 The Local Console uses the same verified prefix and role. Prefix-scoped `s3:ListBucketVersions` lets it list paired screenshot/manifest metadata and collapse immutable versions into one card. It labels a local artifact `Local + S3` only when the local upload receipt binds the exact S3 keys, versions, ETags, and checksums; an S3-only card remains visibly provenance-unverified and cannot be reviewed or treated as lifecycle-valid. For S3-only cards, **Load secure preview** first validates the paired exact-version manifest and then its PNG digest; this proves pair consistency, not trusted authorship. Previews are limited to 40 MiB, served only to the authenticated loopback page, and removed from temporary storage. If validated downloads are disabled but the list permission remains, metadata stays visible while preview/download controls are disabled. S3 failures leave the complete local library available with a recovery message.
 
-Enable automatic S3 upload to copy each newly saved, safety-scanned PNG and immutable manifest, or leave it off and choose **Upload Pending Evidence to S3** manually. A successful pair creates a local `.s3.json` receipt with exact versions, S3 checksums/request IDs, caller identity, encryption, and retention. Deploy and test the documented CloudTrail alerting template before production use.
+Enable automatic S3 upload to copy each newly saved, safety-scanned PNG and immutable manifest, or leave it off and choose **Upload Pending Evidence to S3** manually. A successful pair creates a local `.s3.json` receipt with exact versions, S3 checksums/request IDs, caller identity, tenant/workspace, encryption, and retention. That receipt is evidence of the completed upload but is not sufficient by itself for later deletion. If local expiry cleanup would rely on S3, Scopeproof uses the current matching temporary session to perform live exact-version `HEAD` and Object Lock retention checks for every receipt object; any version, ETag, checksum, KMS, account, prefix, or future COMPLIANCE-retention mismatch blocks cleanup. Deploy and test the documented CloudTrail alerting template before production use.
 
 ## Send approved evidence to Jira Cloud
 
@@ -149,7 +160,7 @@ For one-time hosted access, Scopeproof masks the token and clears the field at s
 
 ## Export for an assessor
 
-1. Complete lifecycle review first; only **Approved** evidence is eligible.
+1. Complete lifecycle review first; only **Approved** evidence is eligible. In the hosted console, review the package preflight and resolve every blocker: zero eligible evidence, partial coverage, pending independent screenshot safety, pending native provenance, or more than 100 eligible artifacts prevents export.
 2. Choose **Export Assessor Package…** and select the framework and assessment period.
 3. Name the package and identify the preparer.
 4. Transfer the resulting ZIP and its separate `.sha256.txt` file through an approved secure channel.
@@ -159,7 +170,7 @@ Detailed validation steps are in the [assessor guide](ASSESSOR_GUIDE.md). Jira-s
 
 ## Retention and disposal
 
-**Apply Local Retention…** moves expired local evidence to Trash; it does not delete hosted evidence. Confirm legal hold, assessment status, regulatory retention, contractual obligations, and organizational policy before disposing of evidence. Empty the Trash only when the deletion is authorized.
+**Apply Local Retention…** moves expired local evidence to Trash; it does not delete hosted or S3 evidence. Active or invalid local hold state blocks cleanup. When the policy permits cleanup only after a durable S3 copy, Scopeproof must successfully revalidate every exact remote version and its unexpired COMPLIANCE Object Lock retention live; a receipt or object name alone is never enough. Confirm legal hold, assessment status, regulatory retention, contractual obligations, and organizational policy before disposing of evidence. Empty the Trash only when the deletion is authorized.
 
 ## Troubleshooting
 
@@ -179,5 +190,6 @@ Detailed validation steps are in the [assessor guide](ASSESSOR_GUIDE.md). Jira-s
 | Native SBOM menu says generation is already running | Wait for the current one-time request to finish; the Mac intentionally allows only one repository scan at a time. |
 | Repository is missing from managed selection | Confirm it belongs to the configured organization, is within the managed token's repository selection, and is among the first 250 bounded inventory results. For a separately scoped repository, use one-time mode with an exact GitHub URL and an assessment system scope that includes the repository, owner, or `GitHub`. |
 | SBOM reports no supported components | Commit a supported lockfile with pinned versions, or request a reviewed parser addition for that ecosystem. |
-| Package export is unavailable | Approve at least one artifact in the selected framework/period and resolve any integrity failure. |
+| Package export is unavailable | Read the hosted preflight blockers. Approve at least one eligible artifact, recollect partial coverage, complete independent screenshot safety/native provenance, or split an explicit scope above 100 artifacts; then retry. |
+| Local expiry reports that no durable S3 copy is available | Refresh the matching tenant/workspace AWS session and verify the exact receipt versions, checksums, KMS key, and COMPLIANCE retention. Scopeproof intentionally preserves the local files when any live check is unavailable or mismatched. |
 | Evidence cannot be found | Search all frameworks and periods, or use **Open Evidence Folder**. |

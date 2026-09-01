@@ -9,6 +9,36 @@
 
 ## 1. Executive Summary
 
+### Remediation status addendum — 2026-09-01
+
+The current source adds route-specific API Gateway Cognito scopes while
+retaining Lambda JWT/tenant/membership/RBAC enforcement; makes exact-version
+DLP configuration mandatory for production tenants; KMS-signs and verifies the
+canonical DLP receipt; binds those facts into promotion, S3 metadata, DynamoDB,
+and PostgreSQL reconciliation; persists immutable rejected-ingest receipts;
+ships forward-only PostgreSQL migration `009_runtime_hardening.sql`; and blocks
+DNS activation without a current `CUSTOMER_ENABLED` approval bound to the exact
+provisioning execution.
+
+These controls materially narrow AWS-02, AWS-05, and AWS-06 and repair the
+source-enforceable rejection/upgrade/activation gaps found during integration
+review. They do not establish closure through live operation: scanner privacy,
+efficacy, region, retention, availability, KMS/IAM behavior, two-tenant denial,
+failure convergence, recovery, alarm delivery, and release notarization still
+require deployed staging evidence. No AWS resource was deployed by this work.
+Use [Security and product remediation status — 2026-09-01](SECURITY_REMEDIATION_2026-09-01.md)
+for the detailed source-control matrix and validation plan. The audit's Open
+Questions section is intentionally unchanged because those decisions were
+deferred by the owner.
+
+Final source review also corrected a rejection-availability edge: an exact
+DynamoDB-first rejection receipt now replays before the age gate, while a
+missing Aurora receipt can recover only within the configured 14-day ingest DLQ
+horizon. Canonical receipt digest, stored `rejectedAt`, tenant, intent, evidence,
+version, and optimistic-revision checks remain mandatory. The regression suite
+covers a 25-hour partial-commit replay; live Aurora outage and DLQ-redrive proof
+is still a production gate.
+
 The new foundation materially improves the security design. It establishes exact tenant hostnames, private per-tenant S3 quarantine and evidence buckets, customer-managed KMS encryption, S3 Object Lock, versioning, GuardDuty malware scanning, separate tenant PostgreSQL databases, forced row-level security, non-owner runtime roles, Cognito MFA, WAF controls, bounded jobs, immutable CloudTrail storage, and fail-closed TypeScript state-transition contracts. The evidence promoter is notably skeptical: it requires a strongly consistent upload intent, an exact opaque key and object version, a full-object SHA-256 checksum, an exact MIME type and size, a clean GuardDuty result and tag, the configured KMS key and encryption context, and an Object Lock retention receipt.
 
 At the original review baseline, those controls were foundations rather than a

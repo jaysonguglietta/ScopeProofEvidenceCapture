@@ -1,5 +1,5 @@
 import { jsonError, requireApiPermission, requireApiUser, requireSameOrigin } from "../../../../lib/server/auth";
-import { approveEvidence, readEvidenceBytes } from "../../../../lib/server/evidence";
+import { approveEvidence, readEvidenceBytes, transitionEvidenceReview, type EvidenceReviewAction } from "../../../../lib/server/evidence";
 import { enforceRateLimit, requireBoundedContentLength } from "../../../../lib/server/rate-limit";
 import { evidenceResponseHeaders } from "../../../../lib/server/evidence-response";
 import { appendAuditEvent } from "../../../../lib/server/audit";
@@ -32,9 +32,13 @@ export async function PATCH(request: Request, context: { params: Promise<{ id: s
     await enforceRateLimit(request, user.id, "evidence:approve", 60, 3_600);
     requireBoundedContentLength(request, 4 * 1024);
     const { id } = await context.params;
-    const body = await request.json() as { action?: string; expectedSha256?: string; rationale?: string; confirmedActualArtifact?: boolean };
-    if (body.action !== "approve" || body.confirmedActualArtifact !== true) return Response.json({ error: "Approval requires explicit confirmation that the actual artifact was reviewed." }, { status: 400 });
-    const changed = await approveEvidence(id, user, { expectedSha256: String(body.expectedSha256 || ""), rationale: String(body.rationale || "") });
-    return Response.json({ approved: changed });
+    const body = await request.json() as { action?: string; expectedSha256?: string; rationale?: string; replacementEvidenceId?: string; confirmedActualArtifact?: boolean };
+    if (body.confirmedActualArtifact !== true) return Response.json({ error: "A review transition requires explicit confirmation that the actual artifact was inspected." }, { status: 400 });
+    if (body.action === "approve") {
+      const changed = await approveEvidence(id, user, { expectedSha256: String(body.expectedSha256 || ""), rationale: String(body.rationale || "") });
+      return Response.json({ changed, status: "approved" });
+    }
+    if (!["reject", "return", "reopen", "supersede"].includes(String(body.action))) return Response.json({ error: "Review action must be approve, reject, return, reopen, or supersede." }, { status: 400 });
+    return Response.json(await transitionEvidenceReview(id, user, { action: body.action as EvidenceReviewAction, expectedSha256: String(body.expectedSha256 || ""), rationale: String(body.rationale || ""), replacementEvidenceId: body.replacementEvidenceId }));
   } catch (error) { return jsonError(error); }
 }

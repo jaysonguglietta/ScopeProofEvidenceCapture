@@ -13,6 +13,7 @@ const securityWorkflowPath = new URL("../.github/workflows/security.yml", import
 const trivyIgnorePath = new URL("../.trivyignore.yaml", import.meta.url);
 const dependabotPath = new URL("../.github/dependabot.yml", import.meta.url);
 const buildScriptPath = new URL("../Scripts/build_macos_production_release.sh", import.meta.url);
+const prepareScriptPath = new URL("../Scripts/prepare_macos_release_candidate.sh", import.meta.url);
 const publishScriptPath = new URL("../Scripts/publish_release.sh", import.meta.url);
 const entitlementValidatorPath = new URL("../Scripts/validate_macos_release_entitlements.mjs", import.meta.url);
 const releaseEntitlementsPath = new URL("../macos/ScopeproofCapture/Resources/ScopeproofCapture.entitlements", import.meta.url);
@@ -60,13 +61,25 @@ test("production release is manual, main-only, protected, and cleans credentials
   assert.match(workflow, /persist-credentials: false/);
   assert.match(workflow, /swift test --arch arm64/);
   assert.match(workflow, /security delete-keychain/);
+  assert.match(workflow, /prepare-release:/);
+  assert.match(workflow, /sign-notarize:\n\s+needs: prepare-release/);
+  assert.match(workflow, /attest-release:\n\s+needs: sign-notarize/);
+  assert.match(workflow, /actions\/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c/);
+  assert.match(workflow, /SCOPEPROOF_RELEASE_PREPARED_ARCHIVE/);
+  const signingJob = workflow.slice(workflow.indexOf("  sign-notarize:"), workflow.indexOf("  attest-release:"));
+  const attestationJob = workflow.slice(workflow.indexOf("  attest-release:"));
+  assert.doesNotMatch(signingJob, /swift (?:build|test)/);
+  assert.doesNotMatch(signingJob, /id-token:\s*write|attestations:\s*write/);
+  assert.doesNotMatch(attestationJob, /secrets\.|actions\/checkout/);
+  assert.match(attestationJob, /id-token: write/);
+  assert.match(attestationJob, /attestations: write/);
   assert.match(workflow, /uses: actions\/attest@1e69f48acb82d1966a394da916b4c1698aa569d6/);
   assert.match(workflow, /\.notary-receipt\.json/);
   assert.match(workflow, /\.sbom\.cdx\.json/);
   assert.match(workflow, /\.provenance\.intoto\.json/);
   assert.doesNotMatch(workflow, /actions\/attest-build-provenance@/);
   assert.ok(workflow.indexOf("Destroy temporary release credentials") < workflow.indexOf("Attest the signed release candidate"));
-  assert.ok(workflow.indexOf("Destroy temporary release credentials") < workflow.indexOf("Upload the signed release candidate"));
+  assert.ok(workflow.indexOf("Destroy temporary release credentials") < workflow.indexOf("Upload the signed candidate for isolated attestation"));
   assert.ok(workflow.indexOf("swift test --arch arm64") < workflow.indexOf("MACOS_DEVELOPER_ID_P12_BASE64"));
   assert.ok(workflow.indexOf("Require successful security workflows") < workflow.indexOf("MACOS_DEVELOPER_ID_P12_BASE64"));
   assertPinnedActions(workflow);
@@ -148,8 +161,9 @@ test("AWS pnpm lockfile produces a complete deterministic CycloneDX dependency g
 });
 
 test("production builder enforces hardened signing, notarization, stapling, and final assessment", async () => {
-  const [build, configure] = await Promise.all([
+  const [build, prepare, configure] = await Promise.all([
     readFile(buildScriptPath, "utf8"),
+    readFile(prepareScriptPath, "utf8"),
     readFile(notaryScriptPath, "utf8"),
   ]);
   assert.match(build, /--options runtime/);
@@ -162,9 +176,18 @@ test("production builder enforces hardened signing, notarization, stapling, and 
   assert.match(build, /ScopeproofUpdateDownloadOrigin/);
   assert.match(build, /validate_macos_update_keys\.mjs/);
   assert.match(build, /macos_release_evidence\.mjs" create/);
+  assert.match(build, /SCOPEPROOF_RELEASE_PREPARED_ARCHIVE/);
+  assert.match(build, /Prepared release archive contains missing, duplicate, or unexpected members/);
+  assert.match(build, /Prepared Info\.plist differs from the approved signing source/);
+  assert.match(build, /Prepared entitlements differ from the approved signing source/);
+  assert.match(prepare, /swift build -c release --arch arm64/);
+  assert.match(prepare, /SCOPEPROOF_RELEASE_EXPECTED_COMMIT/);
+  assert.match(prepare, /Scopeproof-Capture-prepared\.zip\.sha256/);
   assert.equal([...build.matchAll(/validate_macos_release_entitlements\.mjs/g)].length, 2);
   assert.match(configure, /notarytool store-credentials/);
   assert.match(configure, /Refusing to read an App Store Connect private key from the repository/);
+  assert.match(configure, /must not have additional hard links/);
+  assert.match(configure, /must not have extended ACLs/);
   assert.doesNotMatch(`${build}\n${configure}`, /--disable-sandbox/);
 });
 
@@ -298,6 +321,10 @@ test("update manifest signer accepts only the compiled immutable CloudFront rele
     await execFileAsync(process.execPath, [manifestScriptPath.pathname, artifact, output], { env: environment });
     const envelope = JSON.parse(await readFile(output, "utf8")) as { manifest: { downloadUrl: string } };
     assert.equal(envelope.manifest.downloadUrl, environment.SCOPEPROOF_RELEASE_URL);
+    await assert.rejects(
+      execFileAsync(process.execPath, [manifestScriptPath.pathname, artifact, output], { env: environment }),
+      /EEXIST/,
+    );
     await assert.rejects(
       execFileAsync(process.execPath, [manifestScriptPath.pathname, artifact, join(directory, "bad.json")], {
         env: { ...environment, SCOPEPROOF_RELEASE_URL: `https://github.com/example/releases/download/v${version}/Scopeproof-Capture-${version}.zip` },

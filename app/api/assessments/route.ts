@@ -1,12 +1,14 @@
 import { jsonError, requireApiPermission, requireApiUser, requireSameOrigin } from "../../../lib/server/auth";
-import { createAssessment, listAssessments, updateAssessment } from "../../../lib/server/assessments";
+import { createAssessment, listAssessments, listControlCatalogs, updateAssessment } from "../../../lib/server/assessments";
 import { enforceRateLimit, requireBoundedContentLength } from "../../../lib/server/rate-limit";
 
 export async function GET(request: Request) {
   try {
     const user = await requireApiUser(request);
     await enforceRateLimit(request, user.id, "assessment:list", 120, 60);
-    return Response.json({ assessments: await listAssessments() });
+    const query = new URL(request.url).searchParams;
+    const result = await listAssessments({ cursor: query.get("cursor") || undefined, limit: query.get("limit") || undefined, status: query.get("status") || undefined });
+    return Response.json({ ...result, catalogs: await listControlCatalogs() }, { headers: { "cache-control": "private, no-store" } });
   } catch (error) { return jsonError(error); }
 }
 

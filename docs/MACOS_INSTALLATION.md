@@ -18,15 +18,15 @@ The downloadable DMG does not require a repository checkout, Xcode, or Swift. Bu
 ## Install the development-preview DMG
 
 > **Older published build:** `v1.8.1-development-preview.1` was built from
-> commit `8cd2d5c`. It does not contain the current **Unreleased 1.9.0 (build 23)** native changes
+> commit `8cd2d5c`. It does not contain the current **Unreleased 1.10.0 (build 24)** native changes
 > described elsewhere in this guide, and the current working branch is not
-> merged into the public default branch as of 2026-08-28. Use this DMG only to
+> merged into the public default branch as of 2026-09-01. Use this DMG only to
 > evaluate the tagged build. It writes new captures under
 > `~/Pictures/Scopeproof Evidence` and uses manual AWS credential entry rather
 > than the current Documents-root and direct AWS CLI IAM Identity
 > Center/AssumeRole workflow. Build an exact reviewed current-source checkout for
 > current behavior until a new versioned DMG is independently verified and
-> published. Current source is version `1.9.0` build `23`; no 1.9.0 artifact
+> published. Current source is version `1.10.0` build `24`; no 1.10.0 artifact
 > exists.
 
 Open the [Scopeproof Capture 1.8.1 development-preview release](https://github.com/jaysonguglietta/ScopeProofEvidenceCapture/releases/tag/v1.8.1-development-preview.1) and download both:
@@ -61,7 +61,7 @@ equivalent to this working tree. Record the exact commit and require a clean
 
 The script builds a release executable into a fresh staging bundle, verifies its signature, bundle identifier, and macOS minimum, and only then publishes `DerivedData/Scopeproof Capture.app`. Installation likewise copies into a fresh staging directory on the destination volume, verifies it, stops the running Scopeproof process, and replaces `~/Applications/Scopeproof Capture.app` by same-volume rename. A failed replacement restores the prior complete app instead of merging new files over stale resources. Administrator access is not required. Do not keep both the DMG-installed and source-installed copies running; consistently open one installed path so macOS permissions remain associated with the intended bundle.
 
-Scopeproof appears as a shield in the menu bar and opens its Local Console in the default browser. The console is served by the running Mac app on a random `127.0.0.1` port and is not published to the LAN or internet. Its Evidence library shows local screenshots and, when the S3 destination is configured and verified, matching S3 screenshots with explicit storage badges and on-demand previews. If the tab is closed, choose **Open Local Console** from the shield menu or press `Command-Shift-L`.
+Scopeproof appears as a shield in the menu bar and opens its Local Console in the default browser. The console is served by the running Mac app on a random `127.0.0.1` port and is not published to the LAN or internet. A one-time nonce in the URL fragment is exchanged for a separate short-lived in-memory bearer and then cleared; no localhost authentication cookie is created. Do not copy or share that launch URL. Its Evidence library shows only the active tenant/workspace's local screenshots and, when the matching S3 destination is configured and verified, matching S3 screenshots with explicit storage badges and on-demand previews. If the tab is closed, choose **Open Local Console** from the shield menu or press `Command-Shift-L`.
 
 ## Grant capture permission
 
@@ -76,9 +76,9 @@ If Scopeproof is not listed, attempt one capture first so macOS can register the
 
 ## Confirm local-only settings
 
-Open **Capture & Jira Settings…** from the shield menu. Leave **Server URL** blank to prevent hosted synchronization. The Local Console, capture, search, review, Jira comment generation, and local assessor-package export continue to work even when no hosted OCR/DLP scanner or trusted timestamp authority exists. New captures still use a signed schema-7 manifest and the device's locally anchored P-256 provenance identity.
+Open **Capture & Jira Settings…** from the shield menu. Leave **Server URL** blank to prevent hosted synchronization. The Local Console, capture, search, review, Jira comment generation, and local assessor-package export continue to work even when no hosted OCR/DLP scanner or trusted timestamp authority exists. New captures use a signed current manifest and the selected tenant/workspace's locally anchored P-256 provenance identity. Trust-bearing lifecycle and local legal-hold actions require macOS local-user authentication and use independent signing/rollback domains.
 
-New evidence is stored under `~/Documents/Scopeproof Evidence/<framework>/<control>/`. Existing captures under `~/Pictures/Scopeproof Evidence` remain discoverable; Scopeproof does not move or delete them automatically. Storage location does not determine trust. A valid signed schema-7 capture can use the supported legacy root, but unsigned schema-6 and older artifacts are an explicit visibly unverified browsing/migration path and are blocked from approval, upload, legal-hold/retention assertions, package export, and Jira trust workflows. Recapture legacy evidence with the current app rather than editing its manifest or lifecycle record. The Local Console's SQLite search index lives in the current user's Application Support folder and can be rebuilt from the immutable evidence manifests and lifecycle sidecars.
+The default `local/default` identity stores evidence under `~/Documents/Scopeproof Evidence/<framework>/<control>/`. A named tenant/workspace stores it under `~/Documents/Scopeproof Evidence/tenants/<tenant>/workspaces/<workspace>/<framework>/<control>/`. Configure that identity before enrolling the Mac, verifying S3, or capturing; changing it invalidates the prior Local Console session and requires matching hosted/S3 credentials. Existing captures under `~/Pictures/Scopeproof Evidence` remain discoverable; Scopeproof does not move or delete them automatically. Storage location does not determine trust. A valid current signed capture can use a supported root, but unsigned or obsolete artifacts are an explicit visibly unverified browsing/migration path and are blocked from approval, upload, legal-hold/retention assertions, package export, and Jira trust workflows. Recapture legacy evidence with the current app rather than editing its manifest or lifecycle record. The Local Console's SQLite search index lives in the current user's Application Support folder and can be rebuilt from the immutable evidence manifests and lifecycle sidecars. A tenant-bound Keychain commit journal reconciles complete capture files with the monotonic capture head after an interrupted save.
 
 ## Optional hosted synchronization requirements
 
@@ -86,7 +86,7 @@ Hosted synchronization is not required for installation or local use. The checke
 
 A production server accepts the current signed schema-7 PNG/manifest pair only. It independently rescans the exact PNG through the OCR/DLP service configured by the legacy-named `BROWSER_OCR_ENDPOINT`, `BROWSER_OCR_TOKEN`, and `BROWSER_OCR_ALLOWED_HOSTS` settings, verifies a trusted RFC 3161 timestamp, and finalizes the exact artifact into the server-side device chain. Recognized OCR text is evaluated transiently and is not retained. Until the scan, timestamp, and final chain linkage succeed, the hosted item is quarantined and cannot be read, previewed, approved, packaged, exported, or sent to Jira.
 
-If scanner or timestamp verification is unavailable, the hosted upload fails closed while the local artifact remains usable. Retry the unchanged current pair after recovery. An unsigned legacy capture must be recaptured; an older hosted item missing the independent scan or final linkage must be re-uploaded/rescanned. Administrators must never grandfather either population with direct database updates. Server operators must apply migrations through `0023_independent_image_safety.sql` and confirm production readiness has no scanner or trusted-timestamp failures before enabling native uploads. No AWS deployment is performed by installing or building the Mac app.
+If scanner or timestamp verification is unavailable, the hosted upload fails closed while the local artifact remains usable. Retry the unchanged current pair after recovery. An unsigned legacy capture must be recaptured; an older hosted item missing the independent scan or final linkage must be re-uploaded/rescanned. Administrators must never grandfather either population with direct database updates. Server operators must apply migrations through `0024_big_chamber.sql` and confirm production readiness has no scanner or trusted-timestamp failures before enabling native uploads. No AWS deployment is performed by installing or building the Mac app.
 
 ## Update the DMG installation
 
@@ -107,6 +107,7 @@ The script quits a running Scopeproof process before replacing the application, 
 - `/Applications/Scopeproof Capture.app` exists for a DMG installation, or `~/Applications/Scopeproof Capture.app` exists for a source installation.
 - The shield is visible in the menu bar.
 - **Open Local Console** opens a browser page while Scopeproof is running.
+- The Local Console launch URL contains a fragment nonce only until bootstrap; browser developer tools show protected requests using an `Authorization: Bearer …` header and no Scopeproof localhost authentication cookie.
 - **Open Evidence Folder** opens `~/Documents/Scopeproof Evidence`.
 - **Generate Repository SBOM…** opens a masked one-time GitHub credential dialog and offers CycloneDX 1.6 or SPDX 2.3 JSON.
 - **AWS S3 Storage…** opens the authentication, security-profile, KMS/Object Lock, lifecycle/replication, and FIPS configuration. Identity Center credentials stay in memory; manual credentials use Keychain. Use **Save & Verify** for an existing bucket or **Create & Harden Bucket** after reviewing the irreversible retention warning.
@@ -123,7 +124,7 @@ The script quits a running Scopeproof process before replacing the application, 
 | Scopeproof is not in `/Applications` | The source installer intentionally uses the current user's `~/Applications` folder; the DMG installs into `/Applications`. |
 | Local Console does not open | Choose **Open Local Console**. If the session expired, quit and reopen Scopeproof. |
 | Settings fields or checkbox labels are clipped | Install build 20 or newer. **Capture & Jira Settings…** separates the bounded form into **Capture & Local** and **Jira** tabs. |
-| Browser reports unauthorized | Do not reuse an old loopback URL; reopen the console from the shield menu to establish a fresh per-launch session. |
+| Browser reports unauthorized | Do not reuse or share an old loopback URL; reopen the console from the shield menu to establish a fresh fragment nonce and in-memory bearer. Switching tenant/workspace intentionally invalidates the former session. |
 | Capture permission repeats | Confirm the enabled entry matches the installed copy you launch, remove obsolete copies, then fully quit and reopen Scopeproof. |
 | Evidence cannot be saved under Documents | Open **System Settings → Privacy & Security → Files & Folders**, allow Scopeproof Capture to access Documents, then quit and reopen the same installed copy. Confirm any iCloud Drive or enterprise sync policy is approved for compliance evidence. |
 | Menu says `Waiting for evidence review…` | Close the menu and use the review workspace Scopeproof placed above the browser. Save or discard it before starting another operation. |
@@ -131,6 +132,7 @@ The script quits a running Scopeproof process before replacing the application, 
 | Repository SBOM authentication fails | Create a fresh fine-grained token selected only for the repository with Metadata: read and Contents: read, then submit a new run. The app never retains or retries a one-time token. |
 | The app says SSE-S3 does not use a KMS key | Select SSE-KMS or DSSE-KMS when the bucket uses your customer-managed key, or clear the KMS ARN for an intentional SSE-S3 bucket. |
 | S3 verification or upload fails | Confirm the STS expiration, same-account bucket owner, posture-read permissions, KMS/Object Lock policy, exact prefix, and reported control failure; then re-verify before retrying. |
+| Local expiry cannot confirm a durable S3 copy | Use temporary credentials bound to the same tenant/workspace and re-verify the destination. Scopeproof requires live exact-version, ETag, checksum, KMS, and future COMPLIANCE-retention checks and intentionally preserves the local files if any check fails. |
 | Hosted upload reports scanner or timestamp unavailable | Keep using the local artifact, ask the service operator to restore the independent scanner/RFC 3161 boundary, then retry the unchanged schema-7 pair. The server intentionally stores nothing for this failed attempt. |
 | Hosted evidence is unverified or quarantined | Do not approve, export, package, download, or disclose it. Retry the original current upload to rescan/finalize it; recapture unsigned legacy evidence. Never manually change the trust fields. |
 

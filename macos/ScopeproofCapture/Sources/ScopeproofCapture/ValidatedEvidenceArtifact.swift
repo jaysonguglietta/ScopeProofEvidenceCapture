@@ -119,10 +119,13 @@ struct ValidatedEvidenceArtifact: Sendable {
             )
             guard let lifecycle = try? JSONDecoder().decode(EvidenceLifecycleRecord.self, from: lifecycleData),
                   lifecycle.evidenceID == artifact.manifest.evidenceID,
-                  lifecycle.schemaVersion == (artifact.manifest.schemaVersion >= 7 ? 3 : 2),
+                  lifecycle.schemaVersion == (artifact.manifest.schemaVersion >= 8
+                    ? 4 : (artifact.manifest.schemaVersion >= 7 ? 3 : 2)),
                   EvidenceLifecycleStore.verify(
                     lifecycle, artifactSha256: artifact.manifest.sha256,
                     provenanceKeyID: artifact.manifest.provenance?.keyID
+                  ), EvidenceLifecycleStore.rollbackAnchorValid(
+                    lifecycle, entry: entry, allowMigration: true
                   ) else {
                 throw EvidenceArtifactFailure.invalidLifecycle
             }
@@ -213,7 +216,7 @@ struct ValidatedEvidenceArtifact: Sendable {
         trustedAnchor: LocalCaptureChainAnchor? = nil
     ) throws -> ValidatedEvidenceArtifact {
         guard let manifest = try? JSONDecoder().decode(CaptureManifest.self, from: manifestData),
-              [6, 7].contains(manifest.schemaVersion),
+              [6, 7, 8].contains(manifest.schemaVersion),
               manifest.evidenceID.range(of: #"^EV-[A-Z0-9]{1,76}$"#, options: .regularExpression) != nil,
               manifest.screenshotFilename == expectedImageURL.lastPathComponent,
               URL(fileURLWithPath: manifest.screenshotFilename).lastPathComponent == manifest.screenshotFilename,
@@ -229,8 +232,16 @@ struct ValidatedEvidenceArtifact: Sendable {
               manifest.chainEventHash == expectedChainHash else {
             throw EvidenceArtifactFailure.invalidManifest
         }
+        if manifest.schemaVersion >= 8 {
+            guard let tenantID = manifest.tenantID, let workspaceID = manifest.workspaceID,
+                  TenantWorkspaceBinding.validated(
+                    tenantID: tenantID, workspaceID: workspaceID
+                  ) == TenantWorkspaceBinding(tenantID: tenantID, workspaceID: workspaceID) else {
+                throw EvidenceArtifactFailure.invalidManifest
+            }
+        }
         let provenanceVerified: Bool
-        if manifest.schemaVersion == 7 {
+        if manifest.schemaVersion >= 7 {
             guard let chainSequence = manifest.chainSequence, chainSequence > 0,
                   LocalProvenance.verifyManifest(manifest) else {
                 throw EvidenceArtifactFailure.invalidManifest
@@ -238,7 +249,9 @@ struct ValidatedEvidenceArtifact: Sendable {
             provenanceVerified = true
             if requireLocalAnchor {
                 do {
-                    guard let anchor = try trustedAnchor ?? KeychainStore.captureChainAnchor(),
+                    guard let anchor = try trustedAnchor ?? KeychainStore.captureChainAnchor(
+                        binding: manifest.tenantBinding ?? .localDefault
+                    ),
                           chainSequence <= anchor.sequence,
                           manifest.provenance?.keyID == anchor.signingKeyID,
                           chainSequence != anchor.sequence || manifest.chainEventHash == anchor.eventHash else {

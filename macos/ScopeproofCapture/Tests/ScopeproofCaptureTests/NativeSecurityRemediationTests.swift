@@ -5,6 +5,73 @@ import Testing
 
 @Suite("Native evidence security remediations", .serialized)
 struct NativeSecurityRemediationTests {
+    @Test("Capture-chain rollback heads are isolated across tenant workspaces")
+    func isolatesCaptureChainHeadsByTenantWorkspace() throws {
+        let suffix = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+        let first = try #require(TenantWorkspaceBinding.validated(
+            tenantID: "tenant-a-\(suffix.prefix(12))", workspaceID: "audit"
+        ))
+        let second = try #require(TenantWorkspaceBinding.validated(
+            tenantID: "tenant-b-\(suffix.prefix(12))", workspaceID: "audit"
+        ))
+        let firstScope = KeychainStore.captureChainScopeIdentifier(binding: first)
+        let secondScope = KeychainStore.captureChainScopeIdentifier(binding: second)
+        #expect(firstScope != secondScope)
+        #expect(firstScope == KeychainStore.captureChainScopeIdentifier(binding: first))
+        #expect(firstScope.range(of: #"^local-capture-chain-anchor-v2-[a-f0-9]{64}$"#, options: .regularExpression) != nil)
+    }
+
+    @Test("Pending capture journals require complete tenant-bound chain metadata")
+    func validatesCaptureCommitJournal() throws {
+        let root = "/Users/tester/Documents/Scopeproof Evidence/tenants/customer/workspaces/audit"
+        var journal = LocalCaptureCommitJournal(
+            schemaVersion: LocalCaptureCommitJournal.currentSchemaVersion,
+            evidenceID: "EV-ABC123", tenantID: "customer", workspaceID: "audit",
+            evidenceRootPath: root,
+            imagePath: "\(root)/PCI/8.3/2026-Q3/evidence.png",
+            manifestPath: "\(root)/PCI/8.3/2026-Q3/evidence.json",
+            lifecyclePath: "\(root)/PCI/8.3/2026-Q3/evidence.review.json",
+            startedAt: "2026-09-01T12:00:00Z"
+        )
+        #expect(journal.isValid)
+        #expect(journal.prospectiveAnchor == nil)
+        journal.chainPreviousHash = "GENESIS"
+        journal.chainSequence = 1
+        journal.chainEventHash = String(repeating: "b", count: 64)
+        journal.signingKeyID = String(repeating: "c", count: 64)
+        #expect(journal.prospectiveAnchor?.sequence == 1)
+    }
+
+    @Test("Lifecycle and hold signatures use distinct trust domains and keys")
+    func separatesTrustSigningDomains() throws {
+        var event = EvidenceLifecycleEvent(
+            sequence: 1, occurredAt: "2026-09-01T12:00:00Z", actor: "Reviewer",
+            action: "status.approved", status: .approved, owner: "Owner", reviewer: "Reviewer",
+            actorSubjectID: "test-reviewer", authenticationMethod: "test-override",
+            authenticatedAt: "2026-09-01T12:00:00Z", reviewNotes: "Reviewed evidence",
+            tags: [], supersedesEvidenceID: nil, artifactSha256: String(repeating: "d", count: 64),
+            policyVersion: EvidenceLifecycleStore.policyVersion, safetyScanPolicy: "test",
+            previousHash: "GENESIS", eventHash: String(repeating: "e", count: 64), provenance: nil
+        )
+        let lifecycleKey = P256.Signing.PrivateKey().rawRepresentation
+        let holdKey = P256.Signing.PrivateKey().rawRepresentation
+        let lifecycle = try LocalProvenance.signLifecycleEvent(
+            event, evidenceID: "EV-ABC123", privateKeyData: lifecycleKey
+        )
+        event.provenance = lifecycle
+        var hold = LocalEvidenceHoldRecord(
+            schemaVersion: 2, evidenceID: "EV-ABC123",
+            artifactSha256: String(repeating: "d", count: 64), active: true,
+            updatedAt: "2026-09-01T12:00:00Z", actor: "Reviewer", reason: "Matter 12345",
+            sequence: 1, previousHash: "GENESIS", eventHash: String(repeating: "f", count: 64),
+            actorSubjectID: "test-reviewer", authenticationMethod: "test-override",
+            authenticatedAt: "2026-09-01T12:00:00Z", provenance: nil
+        )
+        hold.provenance = try LocalProvenance.signHold(hold, privateKeyData: holdKey)
+        #expect(lifecycle.keyID != hold.provenance?.keyID)
+        #expect(LocalProvenance.verifyLifecycleEvent(event, evidenceID: "EV-ABC123"))
+        #expect(LocalProvenance.verifyHold(hold))
+    }
     @Test("Legacy artifacts are browsing-only and the central loader rejects unsafe files")
     func validatesEvidenceFilesWithoutFollowingLinks() throws {
         let root = temporaryDirectory("artifact-loader")
@@ -191,6 +258,43 @@ struct NativeSecurityRemediationTests {
         }
     }
 
+    @Test("Schema-8 captures create signed schema-4 lifecycle records")
+    func signsCurrentLifecycleSchema() throws {
+        let root = temporaryDirectory("schema-4-lifecycle")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let imageURL = root.appendingPathComponent("current.png")
+        try validPNG.write(to: imageURL)
+        let privateKey = P256.Signing.PrivateKey().rawRepresentation
+        var manifest = makeManifest(baseName: "current", schemaVersion: 8, chainSequence: 1)
+        manifest.provenance = try LocalProvenance.signManifest(manifest, privateKeyData: privateKey)
+        let manifestURL = root.appendingPathComponent("current.json")
+        try JSONEncoder().encode(manifest).write(to: manifestURL)
+        let entry = CaptureHistoryEntry(
+            manifest: manifest, manifestURL: manifestURL, imageURL: imageURL,
+            receiptURL: root.appendingPathComponent("current.receipt.json"), evidenceRoot: root
+        )
+        let anchor = LocalCaptureChainAnchor(
+            schemaVersion: LocalCaptureChainAnchor.currentSchemaVersion,
+            sequence: 1, eventHash: manifest.chainEventHash,
+            signingKeyID: try #require(manifest.provenance?.keyID),
+            anchoredAt: manifest.capturedAt
+        )
+
+        let lifecycle = try EvidenceLifecycleStore.update(
+            entry: entry, status: .draft, owner: "Control Owner", reviewer: "Capture workflow",
+            notes: "Capture created and bound to the current lifecycle schema.", tags: ["current"],
+            privateKeyDataOverride: privateKey, trustedAnchor: anchor
+        )
+
+        #expect(lifecycle.schemaVersion == 4)
+        #expect(lifecycle.events.count == 1)
+        #expect(lifecycle.events[0].provenance != nil)
+        #expect(EvidenceLifecycleStore.verify(
+            lifecycle, artifactSha256: manifest.sha256,
+            provenanceKeyID: manifest.provenance?.keyID
+        ))
+    }
+
     @Test("Local retention requires an unexpired exact-version locked S3 receipt and fails closed on holds")
     func requiresDurableLockedCopyForRetention() throws {
         let root = temporaryDirectory("durable-copy")
@@ -231,6 +335,109 @@ struct NativeSecurityRemediationTests {
 
         try Data("{}".utf8).write(to: LocalEvidenceHoldStore.url(for: entry.manifestURL))
         #expect(LocalEvidenceHoldStore.state(for: entry) == .invalid)
+    }
+
+    @Test("Deleting a legal-hold marker fails closed when the trust head remains")
+    func rejectsDeletedLegalHoldMarker() throws {
+        let root = temporaryDirectory("deleted-hold")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let entry = try makeEvidence(in: root, baseName: UUID().uuidString)
+        _ = try installHold(for: entry)
+        let markerURL = LocalEvidenceHoldStore.url(for: entry.manifestURL)
+
+        #expect({
+            guard case .active = LocalEvidenceHoldStore.state(for: entry) else { return false }
+            return true
+        }())
+        try FileManager.default.removeItem(at: markerURL)
+
+        #expect(LocalEvidenceHoldStore.state(for: entry) == .invalid)
+    }
+
+    @Test("Legacy signed holds migrate to an immutable trust head")
+    func anchorsLegacyLegalHoldBeforeDeletion() throws {
+        let root = temporaryDirectory("legacy-hold")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let entry = try makeEvidence(in: root, baseName: UUID().uuidString)
+        var record = LocalEvidenceHoldRecord(
+            schemaVersion: 1, evidenceID: entry.manifest.evidenceID,
+            artifactSha256: entry.manifest.sha256, active: true,
+            updatedAt: "2026-08-28T11:00:00Z", actor: "Security Reviewer",
+            reason: "Preserve legacy evidence for matter 12345", provenance: nil
+        )
+        record.provenance = try LocalProvenance.signHold(
+            record, privateKeyData: P256.Signing.PrivateKey().rawRepresentation
+        )
+        let markerURL = LocalEvidenceHoldStore.url(for: entry.manifestURL)
+        try JSONEncoder().encode(record).write(to: markerURL, options: .atomic)
+
+        #expect({
+            guard case .active = LocalEvidenceHoldStore.state(for: entry) else { return false }
+            return true
+        }())
+        let scope = LocalEvidenceHoldStore.trustScope(for: entry)
+        let storedHead = try KeychainStore.localTrustHead(domain: .legalHold, scope: scope)
+        let migratedHead = try #require(storedHead)
+        let currentHoldKey = try P256.Signing.PrivateKey(
+            rawRepresentation: KeychainStore.localHoldPrivateKey()
+        )
+        let currentHoldKeyID = SHA256.hash(data: currentHoldKey.publicKey.x963Representation)
+            .map { String(format: "%02x", $0) }.joined()
+        #expect(migratedHead.signingKeyID == currentHoldKeyID)
+        try FileManager.default.removeItem(at: markerURL)
+        #expect(LocalEvidenceHoldStore.state(for: entry) == .invalid)
+    }
+
+    @Test("Moving held evidence preserves its immutable legal-hold trust scope")
+    func preservesLegalHoldAcrossMove() throws {
+        let root = temporaryDirectory("moved-hold")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let source = root.appendingPathComponent("source", isDirectory: true)
+        let destination = root.appendingPathComponent("destination", isDirectory: true)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        let entry = try makeEvidence(in: source, baseName: UUID().uuidString)
+        _ = try installHold(for: entry)
+        let originalScope = LocalEvidenceHoldStore.trustScope(for: entry)
+
+        try FileManager.default.moveItem(at: source, to: destination)
+        let movedEntry = CaptureHistoryEntry(
+            manifest: entry.manifest,
+            manifestURL: destination.appendingPathComponent(entry.manifestURL.lastPathComponent),
+            imageURL: destination.appendingPathComponent(entry.imageURL.lastPathComponent),
+            receiptURL: destination.appendingPathComponent(entry.receiptURL.lastPathComponent),
+            evidenceRoot: destination
+        )
+
+        #expect(LocalEvidenceHoldStore.trustScope(for: movedEntry) == originalScope)
+        #expect({
+            guard case .active = LocalEvidenceHoldStore.state(for: movedEntry) else { return false }
+            return true
+        }())
+    }
+
+    @Test("Retention preserves evidence when a hold marker is missing during a pending trust advance")
+    @MainActor
+    func retentionRejectsMissingPendingHoldMarker() async throws {
+        let root = temporaryDirectory("pending-hold-retention")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let entry = try makeEvidence(in: root, baseName: UUID().uuidString)
+        let (_, advance) = try installHold(for: entry, writeMarker: false, commit: false)
+        defer {
+            KeychainStore.cancelLocalTrustAdvance(
+                advance, scope: LocalEvidenceHoldStore.trustScope(for: entry)
+            )
+        }
+
+        #expect(LocalEvidenceHoldStore.state(for: entry) == .invalid)
+        let report = try await CaptureHistory.removeExpired(
+            in: root, retentionDays: 1,
+            now: try #require(ISO8601DateFormatter().date(from: "2026-08-28T12:00:00Z"))
+        ) { _ in true }
+
+        #expect(report.movedToTrash == 0)
+        #expect(report.skippedLegalHold == 1)
+        #expect(FileManager.default.fileExists(atPath: entry.manifestURL.path))
+        #expect(FileManager.default.fileExists(atPath: entry.imageURL.path))
     }
 
     private func makeEvidence(
@@ -292,6 +499,51 @@ struct NativeSecurityRemediationTests {
         )
     }
 
+    private func installHold(
+        for entry: CaptureHistoryEntry, writeMarker: Bool = true, commit: Bool = true
+    ) throws -> (LocalEvidenceHoldRecord, LocalTrustAdvance) {
+        let privateKey = P256.Signing.PrivateKey().rawRepresentation
+        let updatedAt = "2026-08-28T11:00:00Z"
+        let actor = "Security Reviewer"
+        let reason = "Preserve evidence for matter 12345"
+        let subjectID = "reviewer-(UUID().uuidString.lowercased())"
+        let previousHash = "GENESIS"
+        let sequence = 1
+        let eventHash = holdDigest([
+            previousHash, entry.manifest.evidenceID, String(sequence), String(true),
+            updatedAt, subjectID, actor, reason,
+        ])
+        var record = LocalEvidenceHoldRecord(
+            schemaVersion: LocalEvidenceHoldRecord.currentSchemaVersion,
+            evidenceID: entry.manifest.evidenceID, artifactSha256: entry.manifest.sha256,
+            active: true, updatedAt: updatedAt, actor: actor, reason: reason,
+            sequence: sequence, previousHash: previousHash, eventHash: eventHash,
+            actorSubjectID: subjectID, authenticationMethod: "test-override",
+            authenticatedAt: updatedAt, provenance: nil
+        )
+        record.provenance = try LocalProvenance.signHold(record, privateKeyData: privateKey)
+        let scope = LocalEvidenceHoldStore.trustScope(for: entry)
+        let advance = try KeychainStore.prepareLocalTrustAdvance(
+            domain: .legalHold, scope: scope, previousHash: previousHash,
+            sequence: sequence, eventHash: eventHash,
+            signingKeyID: try #require(record.provenance?.keyID)
+        )
+        if writeMarker {
+            try JSONEncoder().encode(record).write(
+                to: LocalEvidenceHoldStore.url(for: entry.manifestURL), options: .atomic
+            )
+        }
+        if commit {
+            try KeychainStore.commitLocalTrustAdvance(advance, scope: scope)
+        }
+        return (record, advance)
+    }
+
+    private func holdDigest(_ fields: [String]) -> String {
+        let payload = fields.map { "\($0.utf8.count):\($0)" }.joined(separator: "|")
+        return sha256(Data(payload.utf8))
+    }
+
     private func makeManifest(
         baseName: String, schemaVersion: Int = 6, chainSequence: Int? = nil,
         chainPreviousHash: String = "GENESIS",
@@ -320,6 +572,8 @@ struct NativeSecurityRemediationTests {
                 frameworkName: "PCI DSS 4.0.1", controlID: "8.3.1"
             ),
             manualRedactions: 0, reviewerNote: nil, jiraIssueKey: nil, jiraIssueURL: nil,
+            tenantID: schemaVersion >= 8 ? "tenant-test" : nil,
+            workspaceID: schemaVersion >= 8 ? "workspace-test" : nil,
             chainPreviousHash: chainPreviousHash, chainEventHash: chainHash,
             chainSequence: chainSequence, provenance: nil
         )
