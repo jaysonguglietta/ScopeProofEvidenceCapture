@@ -370,11 +370,12 @@ pinned to immutable commit SHAs and checkout credentials are not persisted.
 
 GitHub default setup was disabled on 2026-08-27 after the advanced workflow was
 opened in the pull request, because default setup rejects custom CodeQL result
-uploads. Merge this workflow to `main` promptly; until then, the default branch
-does not contain the replacement workflow. Require all three advanced checks—
-Swift, JavaScript/TypeScript, and Actions—and confirm the CodeQL tool-status page
-shows current coverage for each language after the merge. Existing alerts are
-preserved by GitHub during the setup transition.
+uploads. The replacement workflow is now present on `main`, and its Swift,
+JavaScript/TypeScript, and Actions jobs are required branch checks alongside
+`verify`, `macos`, and `dependency-review`. Confirm the CodeQL tool-status page
+shows current coverage for each language after any workflow or branch-
+protection change. Existing alerts were preserved by GitHub during the setup
+transition.
 
 ## Known external dependencies
 

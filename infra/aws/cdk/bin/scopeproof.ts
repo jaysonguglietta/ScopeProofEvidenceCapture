@@ -4,6 +4,7 @@ import {
   parseTenants,
   validateAlertEmail,
   validateBranchName,
+  validateMaintenanceLifecycleMode,
   validateMonthlyBudgetUsd,
   validateRootDomain,
 } from "../lib/config";
@@ -26,6 +27,7 @@ if (Boolean(hostedZoneId) === createHostedZone) {
 }
 const alertEmail = validateAlertEmail(app.node.tryGetContext("alertEmail"));
 const monthlyBudgetUsd = validateMonthlyBudgetUsd(app.node.tryGetContext("monthlyBudgetUsd"));
+const maintenanceLifecycleMode = validateMaintenanceLifecycleMode(app.node.tryGetContext("maintenanceLifecycleMode"));
 const tenants = parseTenants(app.node.tryGetContext("tenants"));
 const deploymentEnvironment = validateDeploymentEnvironment(
   app.node.tryGetContext("deploymentEnvironment"),
@@ -76,6 +78,7 @@ if (recovery.mode === "bootstrap") {
     tenantSlugs: tenants.map((tenant) => tenant.slug),
     alertEmail,
     monthlyBudgetUsd,
+    maintenanceLifecycleMode,
     recovery,
     description: "Shared low-idle-cost AWS platform for Scopeproof",
   });

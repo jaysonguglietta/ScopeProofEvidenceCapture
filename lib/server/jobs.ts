@@ -6,6 +6,7 @@ import { randomId } from "./crypto";
 import { getEnv } from "./env";
 import { rotateStoredKeys } from "./key-operations";
 import { publishOperationalHealth } from "./monitoring";
+import { reconcileNativeProvenanceOrphans } from "./native-provenance-reconciliation";
 import { storeEvidence } from "./evidence";
 import { purgeRateLimitBuckets } from "./rate-limit";
 import { purgeExpiredEvidence } from "./retention";
@@ -142,6 +143,7 @@ export async function processDueWork(now = new Date()): Promise<void> {
     for (const job of dueRetries) await isolate("collection_job", async () => { await processJob(job.id); }, job.id);
   });
   await isolate("sbom_jobs", async () => { await processDueSbomWork(now); });
+  await isolate("native_provenance_reconciliation", async () => { await reconcileNativeProvenanceOrphans(now); });
   await isolate("scheduled_collectors", async () => {
     const collectors = (await env.DB.prepare("SELECT id, schedule_cron, last_run_at FROM collectors WHERE enabled = 1 AND schedule_cron IS NOT NULL").all<{ id: string; schedule_cron: string; last_run_at: string | null }>()).results;
     for (const collector of collectors) await isolate("scheduled_collector", async () => {

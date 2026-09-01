@@ -67,6 +67,9 @@ type DynamoAttribute = Readonly<{
   M?: Readonly<Record<string, DynamoAttribute>>;
 }>;
 
+export const UPLOAD_RECONCILIATION_GRACE_SECONDS = 7 * 24 * 60 * 60;
+export const UPLOAD_LIFECYCLE_TTL_BUFFER_SECONDS = 15 * 24 * 60 * 60;
+
 interface DynamoTransactWriteInput {
   readonly ClientRequestToken?: string;
   readonly TransactItems: readonly Readonly<{
@@ -169,7 +172,12 @@ export class DynamoConditionalUploadIntentStore implements ConditionalUploadInte
     const prior = await this.#readExactExisting(intent, recovery, false);
     if (prior) return Object.freeze({ outcome: "existing", intent: prior });
     const nonceTtlEpochSeconds = Math.floor(Date.parse(intent.expiresAt) / 1_000);
-    const lifecycleTtlEpochSeconds = nonceTtlEpochSeconds + (7 * 24 * 60 * 60);
+    const reconciliationDeadline = canonicalInstant(
+      new Date(Date.parse(intent.expiresAt) + UPLOAD_RECONCILIATION_GRACE_SECONDS * 1_000),
+      "Upload reconciliation deadline",
+    );
+    const lifecycleTtlEpochSeconds = nonceTtlEpochSeconds +
+      UPLOAD_RECONCILIATION_GRACE_SECONDS + UPLOAD_LIFECYCLE_TTL_BUFFER_SECONDS;
     if (!Number.isSafeInteger(nonceTtlEpochSeconds) || !Number.isSafeInteger(lifecycleTtlEpochSeconds)) {
       throw new TenantSecurityError("INVALID_UPLOAD_INTENT", "Upload expiry is invalid.");
     }
@@ -179,6 +187,8 @@ export class DynamoConditionalUploadIntentStore implements ConditionalUploadInte
     const lifecycle: Readonly<Record<string, DynamoAttribute>> = Object.freeze({
       PK: { S: tenantKey },
       SK: { S: `UPLOAD#${intent.id}` },
+      GSI1PK: { S: `MAINTENANCE#UPLOAD#${intent.tenantId}` },
+      GSI1SK: { S: `${reconciliationDeadline}#${intent.id}` },
       kind: { S: "UploadLifecycle" },
       schemaVersion: { N: "1" },
       id: { S: intent.id },
@@ -287,6 +297,7 @@ export class DynamoConditionalUploadIntentStore implements ConditionalUploadInte
     candidate: ControlledUploadIntent,
     recovery: UploadIntentRecoveryProjection,
     missingIsConflict: boolean,
+    allowLegacyUpgrade = true,
   ): Promise<ControlledUploadIntent | undefined> {
     const tenantKey = `TENANT#${candidate.tenantId}`;
     const item = await this.#getStronglyConsistent(tenantKey, `UPLOAD#${candidate.id}`);
@@ -322,8 +333,24 @@ export class DynamoConditionalUploadIntentStore implements ConditionalUploadInte
     const stringMismatch = Object.entries(exactStrings).some(([name, expected]) => exactDynamoString(item, name) !== expected);
     const issuedAt = canonicalDynamoInstant(item, "issuedAt");
     const expiresAt = canonicalDynamoInstant(item, "expiresAt");
+    const reconciliationDeadline = canonicalInstant(
+      new Date(Date.parse(expiresAt) + UPLOAD_RECONCILIATION_GRACE_SECONDS * 1_000),
+      "Upload reconciliation deadline",
+    );
     const lifecycleTtlEpochSeconds = exactDynamoInteger(item, "ttlEpochSeconds");
-    const expectedLifecycleTtl = Math.floor(Date.parse(expiresAt) / 1_000) + (7 * 24 * 60 * 60);
+    const legacyLifecycleTtl = Math.floor(Date.parse(expiresAt) / 1_000) +
+      UPLOAD_RECONCILIATION_GRACE_SECONDS;
+    const expectedLifecycleTtl = Math.floor(Date.parse(expiresAt) / 1_000) +
+      UPLOAD_RECONCILIATION_GRACE_SECONDS + UPLOAD_LIFECYCLE_TTL_BUFFER_SECONDS;
+    const expectedMaintenancePartition = `MAINTENANCE#UPLOAD#${candidate.tenantId}`;
+    const expectedMaintenanceSort = `${reconciliationDeadline}#${candidate.id}`;
+    const currentMaintenanceShape = item.GSI1PK?.S === expectedMaintenancePartition &&
+      item.GSI1SK?.S === expectedMaintenanceSort && lifecycleTtlEpochSeconds === expectedLifecycleTtl;
+    const legacyMaintenanceShape = item.GSI1PK === undefined && item.GSI1SK === undefined &&
+      lifecycleTtlEpochSeconds === legacyLifecycleTtl;
+    if (!currentMaintenanceShape && !legacyMaintenanceShape) {
+      throw new TenantSecurityError("UPLOAD_MISMATCH", "Stored upload maintenance authority is malformed.", 409);
+    }
     const [nonceReservation, requestReservation] = await Promise.all([
       this.#getStronglyConsistent(tenantKey, `UPLOAD_NONCE#${candidate.nonceDigest}`),
       this.#getStronglyConsistent(tenantKey, `UPLOAD_REQUEST#${candidate.idempotencyDigest}`),
@@ -349,7 +376,7 @@ export class DynamoConditionalUploadIntentStore implements ConditionalUploadInte
       exactDynamoString(requestReservation, "idempotencyDigest") !== candidate.idempotencyDigest ||
       exactDynamoString(requestReservation, "requestFingerprint") !== candidate.requestFingerprint ||
       exactDynamoString(requestReservation, "evidenceProjectionDigest") !== recovery.evidenceProjectionDigest ||
-      exactDynamoInteger(requestReservation, "ttlEpochSeconds") !== expectedLifecycleTtl;
+      exactDynamoInteger(requestReservation, "ttlEpochSeconds") !== lifecycleTtlEpochSeconds;
     if (
       stringMismatch ||
       nonceMismatch ||
@@ -359,12 +386,100 @@ export class DynamoConditionalUploadIntentStore implements ConditionalUploadInte
       exactDynamoInteger(item, "databaseUploadRevision") !== 0 ||
       exactDynamoInteger(item, "databaseEvidenceRevision") !== 0 ||
       exactDynamoInteger(item, "revision") !== 0 ||
-      lifecycleTtlEpochSeconds !== expectedLifecycleTtl ||
       Date.parse(expiresAt) - Date.parse(issuedAt) !== Date.parse(candidate.expiresAt) - Date.parse(candidate.issuedAt)
     ) {
       throw new TenantSecurityError("UPLOAD_MISMATCH", "The idempotency key is already bound to different or malformed upload facts.", 409);
     }
+    if (legacyMaintenanceShape) {
+      if (!allowLegacyUpgrade) {
+        throw new TenantSecurityError(
+          "CONCURRENT_MODIFICATION",
+          "The upload maintenance authority changed while it was being upgraded.",
+          409,
+        );
+      }
+      await this.#upgradeLegacyUploadMaintenanceAuthority({
+        candidate,
+        expectedLifecycleTtl,
+        expectedMaintenancePartition,
+        expectedMaintenanceSort,
+        expiresAt,
+        legacyLifecycleTtl,
+        recovery,
+        tenantKey,
+      });
+      // One strong re-read proves the transaction's exact result. Never retry
+      // the conditional migration recursively: a permanently conflicting row
+      // must fail closed in bounded time rather than consuming the request's
+      // entire Lambda duration.
+      return this.#readExactExisting(candidate, recovery, missingIsConflict, false);
+    }
     return Object.freeze({ ...candidate, issuedAt, expiresAt });
+  }
+
+  async #upgradeLegacyUploadMaintenanceAuthority(input: Readonly<{
+    candidate: ControlledUploadIntent;
+    expectedLifecycleTtl: number;
+    expectedMaintenancePartition: string;
+    expectedMaintenanceSort: string;
+    expiresAt: string;
+    legacyLifecycleTtl: number;
+    recovery: UploadIntentRecoveryProjection;
+    tenantKey: string;
+  }>): Promise<void> {
+    const values = Object.freeze({
+      ":evidenceProjectionDigest": { S: input.recovery.evidenceProjectionDigest },
+      ":expiresAt": { S: input.expiresAt },
+      ":id": { S: input.candidate.id },
+      ":idempotencyDigest": { S: input.candidate.idempotencyDigest },
+      ":intentId": { S: input.candidate.id },
+      ":kind": { S: "UploadLifecycle" },
+      ":legacyTtl": { N: String(input.legacyLifecycleTtl) },
+      ":maintenancePk": { S: input.expectedMaintenancePartition },
+      ":maintenanceSk": { S: input.expectedMaintenanceSort },
+      ":newTtl": { N: String(input.expectedLifecycleTtl) },
+      ":requestFingerprint": { S: input.candidate.requestFingerprint },
+      ":requestKind": { S: "UploadIdempotencyReservation" },
+      ":schema": { N: "1" },
+      ":status": { S: "issued" },
+      ":tenant": { S: input.candidate.tenantId },
+      ":zero": { N: "0" },
+    });
+    try {
+      await this.#client.send(new this.#TransactWriteItemsCommand({
+        ClientRequestToken: await sha256Hex(stableJson({
+          domain: "scopeproof-upload-lifecycle-legacy-upgrade-v1",
+          tenantId: input.candidate.tenantId,
+          id: input.candidate.id,
+          expiresAt: input.expiresAt,
+          legacyTtl: input.legacyLifecycleTtl,
+          newTtl: input.expectedLifecycleTtl,
+        })).then((digest) => digest.slice(0, 36)),
+        TransactItems: [
+          { Update: {
+            TableName: this.#tableName,
+            Key: { PK: { S: input.tenantKey }, SK: { S: `UPLOAD#${input.candidate.id}` } },
+            ConditionExpression: "#kind = :kind AND schemaVersion = :schema AND tenantId = :tenant AND id = :id AND #status = :status AND #revision = :zero AND expiresAt = :expiresAt AND ttlEpochSeconds = :legacyTtl AND idempotencyDigest = :idempotencyDigest AND requestFingerprint = :requestFingerprint AND evidenceProjectionDigest = :evidenceProjectionDigest AND attribute_not_exists(GSI1PK) AND attribute_not_exists(GSI1SK)",
+            UpdateExpression: "SET GSI1PK = :maintenancePk, GSI1SK = :maintenanceSk, ttlEpochSeconds = :newTtl",
+            ExpressionAttributeNames: { "#kind": "kind", "#revision": "revision", "#status": "status" },
+            ExpressionAttributeValues: values,
+          } },
+          { Update: {
+            TableName: this.#tableName,
+            Key: { PK: { S: input.tenantKey }, SK: { S: `UPLOAD_REQUEST#${input.candidate.idempotencyDigest}` } },
+            ConditionExpression: "#kind = :requestKind AND tenantId = :tenant AND intentId = :intentId AND idempotencyDigest = :idempotencyDigest AND requestFingerprint = :requestFingerprint AND evidenceProjectionDigest = :evidenceProjectionDigest AND ttlEpochSeconds = :legacyTtl",
+            UpdateExpression: "SET ttlEpochSeconds = :newTtl",
+            ExpressionAttributeNames: { "#kind": "kind" },
+            ExpressionAttributeValues: values,
+          } },
+        ],
+      }));
+    } catch (error) {
+      if (!conditionalCancellationCodes(error, 2)) throw error;
+      // A concurrent retry or lifecycle transition won the CAS. The caller's
+      // immediate strong re-read proves either the exact upgraded record or a
+      // fail-closed conflict; never infer success from the cancellation.
+    }
   }
 
   async #getStronglyConsistent(

@@ -1,11 +1,12 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { NativeManifestError, parseNativeManifest, validatePng, verifyNativeManifestProvenance } from "../lib/server/native-manifest.ts";
 import { stableJson } from "../lib/server/canonical-json.ts";
 
 function manifest(overrides: Record<string, unknown> = {}): Uint8Array {
   return new TextEncoder().encode(JSON.stringify({
-    schemaVersion: 7,
+    schemaVersion: 8,
     evidenceID: "EV-0123456789",
     capturedAt: new Date().toISOString(),
     localTimestamp: "2026-08-11 16:00:00 EDT",
@@ -41,6 +42,8 @@ function manifest(overrides: Record<string, unknown> = {}): Uint8Array {
     expectedEvidence: "MFA policy",
     mappedControls: [],
     manualRedactions: 0,
+    tenantID: "customer-a",
+    workspaceID: "pci-2026",
     chainPreviousHash: "GENESIS",
     chainEventHash: "b".repeat(64),
     chainSequence: 1,
@@ -49,11 +52,24 @@ function manifest(overrides: Record<string, unknown> = {}): Uint8Array {
   }));
 }
 
-test("native manifest parser accepts the versioned schema and rejects ambiguity", () => {
+test("native ingestion compares signed schema-8 binding to the isolated deployment", async () => {
+  const [route, uploader] = await Promise.all([
+    readFile(new URL("../app/api/native/evidence/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../macos/ScopeproofCapture/Sources/ScopeproofCapture/UploadService.swift", import.meta.url), "utf8"),
+  ]);
+  assert.match(route, /validateLegacyTenantBinding\(getEnv\(\)\.LEGACY_TENANT_ID, getEnv\(\)\.LEGACY_WORKSPACE_ID\)/);
+  assert.match(route, /manifest\.tenantID !== expectedBinding\.tenantID/);
+  assert.match(route, /manifest\.workspaceID !== expectedBinding\.workspaceID/);
+  assert.ok(route.indexOf("manifest.tenantID !== expectedBinding.tenantID") < route.indexOf("scanExactEvidencePixels(image"));
+  assert.match(uploader, /guard manifestModel\.schemaVersion == 8 else \{ throw UploadFailure\.hostedSchemaRequired \}/);
+});
+
+test("native manifest parser accepts schema-8 tenant binding and rejects ambiguity", () => {
   const parsed = parseNativeManifest(manifest());
-  assert.equal(parsed.schemaVersion, 7);
+  assert.equal(parsed.schemaVersion, 8);
   assert.equal(parsed.controlID, "8.3.1");
   assert.equal(parsed.sourceURL, "https://admin.example.com");
+  assert.deepEqual({ tenantID: parsed.tenantID, workspaceID: parsed.workspaceID }, { tenantID: "customer-a", workspaceID: "pci-2026" });
   assert.throws(() => parseNativeManifest(manifest({ unsupported: true })), NativeManifestError);
   assert.throws(() => parseNativeManifest(manifest({ safetyStatus: "passed", pixelWidth: 20_000 })), NativeManifestError);
   assert.throws(() => parseNativeManifest(manifest({ safetyScanSha256: "c".repeat(64) })), /not bound/);
@@ -61,7 +77,11 @@ test("native manifest parser accepts the versioned schema and rejects ambiguity"
   assert.throws(() => parseNativeManifest(manifest({ sourceURL: "https://admin.example.com/settings", sourceHost: "evil.example" })), NativeManifestError);
   assert.throws(() => parseNativeManifest(manifest({ sourceURL: "https://admin.example.com/settings", sourceHost: "admin.example.com" })), NativeManifestError);
   assert.throws(() => parseNativeManifest(manifest({ sourceURL: "https://admin.example.com/settings?token=secret-value", sourceHost: "admin.example.com" })), NativeManifestError);
-  assert.throws(() => parseNativeManifest(manifest({ schemaVersion: 6, chainSequence: undefined, provenance: undefined })), /schema-7/);
+  assert.throws(() => parseNativeManifest(manifest({ schemaVersion: 7 })), /schema-8/);
+  assert.throws(() => parseNativeManifest(manifest({ tenantID: "Customer A" })), /tenant or workspace/);
+  assert.throws(() => parseNativeManifest(manifest({ tenantID: " customer-a" })), /tenant or workspace/);
+  assert.throws(() => parseNativeManifest(manifest({ workspaceID: "../other" })), /tenant or workspace/);
+  assert.throws(() => parseNativeManifest(manifest({ tenantID: undefined })), /tenantID is required/);
 });
 
 function p1363ToDer(signature: Uint8Array): Uint8Array {
@@ -87,7 +107,7 @@ function p1363ToDer(signature: Uint8Array): Uint8Array {
   return der;
 }
 
-test("schema-7 device provenance is verified over the exact canonical manifest", async () => {
+test("schema-8 device provenance binds the exact tenant and workspace", async () => {
   const unsigned = JSON.parse(new TextDecoder().decode(manifest())) as Record<string, unknown>;
   delete unsigned.provenance;
   const keys = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
@@ -114,6 +134,8 @@ test("schema-7 device provenance is verified over the exact canonical manifest",
   assert.equal(await verifyNativeManifestProvenance(parsed), true);
   const tampered = parseNativeManifest(new TextEncoder().encode(JSON.stringify({ ...unsigned, title: "Tampered after signing" })));
   assert.equal(await verifyNativeManifestProvenance(tampered), false);
+  const rebound = parseNativeManifest(new TextEncoder().encode(JSON.stringify({ ...unsigned, workspaceID: "other-workspace" })));
+  assert.equal(await verifyNativeManifestProvenance(rebound), false);
 });
 
 test("PNG validator decodes image data and rejects CRC/trailing-data tampering", async () => {

@@ -1412,7 +1412,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
                 await MainActor.run {
                     self.preferences.lastUpdateCheck = Date()
-                    let alert = NSAlert(); alert.messageText = "Scopeproof Capture \(release.version) is available"; alert.informativeText = release.notes
+                    let alert = NSAlert(); alert.messageText = "Scopeproof Capture \(release.manifest.version) is available"; alert.informativeText = release.manifest.notes
                     alert.addButton(withTitle: "Download and Verify"); alert.addButton(withTitle: "Later")
                     guard alert.runModal() == .alertFirstButtonReturn else { return }
                     self.setBusy("Downloading and verifying update…")

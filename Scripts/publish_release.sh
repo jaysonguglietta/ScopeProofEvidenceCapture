@@ -93,9 +93,11 @@ chmod 0700 "$verify_temp"
 candidate_dir="$verify_temp/candidate"
 mount_root="$verify_temp/mount"
 mounted=false
+envelope_staging_dir=""
 cleanup() {
   if [[ "$mounted" == true ]]; then hdiutil detach "$mount_root" >/dev/null 2>&1 || true; fi
-  rm -rf "$verify_temp"
+  /bin/rm -rf -- "$verify_temp"
+  if [[ -n "$envelope_staging_dir" ]]; then /bin/rm -rf -- "$envelope_staging_dir"; fi
 }
 trap cleanup EXIT HUP INT TERM
 mkdir -p "$candidate_dir" "$mount_root"
@@ -180,9 +182,17 @@ publication_world_digit="${publication_mode[-1]}"
 [[ "$publication_group_digit" != [2367] && "$publication_world_digit" != [2367] ]] || { echo "Publication output directory must not be group- or world-writable." >&2; exit 1; }
 envelope="$publication_dir/$stem.release-envelope.json"
 [[ ! -e "$envelope" ]] || { echo "Refusing to overwrite publication envelope: $envelope" >&2; exit 1; }
+envelope_staging_dir="$(mktemp -d "$publication_dir/.scopeproof-envelope.XXXXXX")"
+chmod 0700 "$envelope_staging_dir"
+staged_envelope="$envelope_staging_dir/$stem.release-envelope.json"
 SCOPEPROOF_UPDATE_PRIVATE_KEY="$private_key" \
   SCOPEPROOF_RELEASE_DOWNLOAD_ORIGIN="$compiled_download_origin" \
-  node "$project_root/Scripts/sign_update_manifest.mjs" "$archive" "$envelope"
+  node "$project_root/Scripts/sign_update_manifest.mjs" "$archive" "$staged_envelope"
+printf '%s' "$trusted_keys" | node "$project_root/Scripts/validate_macos_update_keys.mjs" envelope \
+  "$SCOPEPROOF_UPDATE_KEY_ID" "$SCOPEPROOF_UPDATE_PUBLIC_KEY_X963_BASE64" "$staged_envelope"
+# The staging directory and destination are on the same filesystem. A hard link
+# publishes the exact validated inode and fails atomically if a competing output exists.
+/bin/ln "$staged_envelope" "$envelope"
 
 echo "Verified the exact attested and notarized candidate without rebuilding: $archive"
 echo "$envelope"

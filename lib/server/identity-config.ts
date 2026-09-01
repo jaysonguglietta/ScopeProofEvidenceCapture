@@ -27,3 +27,25 @@ export function validateBootstrapAdministratorAllowlist(value: string | undefine
   }
   return new Set(values);
 }
+
+const legacyBindingIdentifier = /^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$/;
+
+/**
+ * The legacy runtime has one physical D1/R2/key boundary. Native schema-8
+ * evidence must name that exact configured customer/workspace rather than
+ * trusting a client-selected label.
+ */
+export function validateLegacyTenantBinding(
+  tenantValue: string | undefined,
+  workspaceValue: string | undefined,
+): Readonly<{ tenantID: string; workspaceID: string }> {
+  const rawTenantID = String(tenantValue || "");
+  const rawWorkspaceID = String(workspaceValue || "");
+  const tenantID = rawTenantID.trim();
+  const workspaceID = rawWorkspaceID.trim();
+  if (rawTenantID !== tenantID || rawWorkspaceID !== workspaceID ||
+      !legacyBindingIdentifier.test(tenantID) || !legacyBindingIdentifier.test(workspaceID)) {
+    throw new Error("The legacy tenant and workspace binding is missing or unsafe.");
+  }
+  return Object.freeze({ tenantID, workspaceID });
+}

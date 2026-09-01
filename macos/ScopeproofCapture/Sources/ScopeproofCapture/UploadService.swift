@@ -7,6 +7,7 @@ enum UploadFailure: LocalizedError {
     case rejected(String)
     case invalidResponse
     case invalidEvidence
+    case hostedSchemaRequired
 
     var errorDescription: String? {
         switch self {
@@ -15,6 +16,7 @@ enum UploadFailure: LocalizedError {
         case .rejected(let message): return "Scopeproof rejected the upload: \(message)"
         case .invalidResponse: return "Scopeproof returned an invalid upload response."
         case .invalidEvidence: return "The local evidence failed bounded file, PNG, manifest, or digest validation and was not uploaded."
+        case .hostedSchemaRequired: return "Hosted upload requires a current schema-8 capture with a signed customer/workspace binding. Recapture this evidence with the current app."
         }
     }
 }
@@ -33,6 +35,7 @@ actor UploadService {
         let image = artifact.imageData
         let manifest = artifact.manifestData
         let manifestModel = artifact.manifest
+        guard manifestModel.schemaVersion == 8 else { throw UploadFailure.hostedSchemaRequired }
         guard manifestModel.tenantBinding == binding else { throw UploadFailure.invalidEvidence }
         let boundary = "ScopeproofBoundary\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))"
         var request = URLRequest(url: serverURL.appendingPathComponent("api/native/evidence"))

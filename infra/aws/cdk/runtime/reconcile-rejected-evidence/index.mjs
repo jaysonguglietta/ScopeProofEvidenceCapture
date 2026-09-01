@@ -95,12 +95,22 @@ async function reconcileRecord(record) {
   const receiptId = `rej_${sha256(`scopeproof-ingest-rejection-id-v1\n${canonical}`).slice(0, 32)}`;
   if (intent.status !== "rejected") {
     const nextRevision = intent.revision + 1;
+    const hasMaintenanceAction = intent.reconciliationDisposition === "ACTION_REQUIRED";
     await dynamo.send(new TransactWriteItemsCommand({
       ClientRequestToken: sha256(`${messageId}\0${receiptSha256}`).slice(0, 36),
       TransactItems: [{ Update: {
-        ConditionExpression: "#status = :status AND #revision = :revision AND quarantineKey = :key AND resourceId = :evidenceId AND databaseUploadRevision = :dbZero AND databaseEvidenceRevision = :dbZero",
+        ConditionExpression: [
+          "#status = :status AND #revision = :revision AND quarantineKey = :key AND resourceId = :evidenceId AND databaseUploadRevision = :dbZero AND databaseEvidenceRevision = :dbZero",
+          hasMaintenanceAction
+            ? "reconciliationDisposition = :action AND reconciliationActionKey = :actionKey AND reconciliationDetectedAt = :actionDetected AND reconciliationReason = :actionReason"
+            : "attribute_not_exists(reconciliationDisposition) AND attribute_not_exists(reconciliationActionKey)",
+        ].join(" AND "),
         ExpressionAttributeNames: { "#revision": "revision", "#status": "status" },
         ExpressionAttributeValues: {
+          ...(hasMaintenanceAction ? {
+            ":action": { S: "ACTION_REQUIRED" }, ":actionDetected": { S: intent.reconciliationDetectedAt },
+            ":actionKey": { S: intent.reconciliationActionKey }, ":actionReason": { S: intent.reconciliationReason },
+          } : {}),
           ":dbZero": { N: "0" }, ":evidenceId": { S: intent.resourceId }, ":key": { S: key },
           ":next": { N: String(nextRevision) }, ":rejected": { S: "rejected" },
           ":rejectedAt": { S: rejectedAt },
@@ -108,8 +118,8 @@ async function reconcileRecord(record) {
           ":revision": { N: String(intent.revision) }, ":status": { S: intent.status },
         },
         Key: intentKey, TableName: config.controlTable,
-        UpdateExpression: "SET #status = :rejected, #revision = :next, rejectionReceipt = :receipt, consumedAt = :rejectedAt REMOVE promotionLeaseId, promotionLeaseExpiresAt",
-      } }],
+        UpdateExpression: "SET #status = :rejected, #revision = :next, rejectionReceipt = :receipt, consumedAt = :rejectedAt REMOVE promotionLeaseId, promotionLeaseExpiresAt, GSI1PK, GSI1SK, reconciliationDisposition, reconciliationReason, reconciliationDetectedAt, reconciliationActionKey",
+      } }, ...(hasMaintenanceAction ? [maintenanceActionResolution(intent, rejectedAt)] : [])],
     }));
     intent = { ...intent, status: "rejected", revision: nextRevision, rejectionReceipt: { ...facts, canonical, receiptId, receiptSha256 } };
   } else {
@@ -137,19 +147,54 @@ function parseIntent(item, expected) {
   const parsed = {
     databaseEvidenceRevision: number(item.databaseEvidenceRevision), databaseUploadRevision: number(item.databaseUploadRevision),
     id: item.id?.S, resourceId: item.resourceId?.S, revision: number(item.revision), status: item.status?.S,
+    reconciliationActionKey: item.reconciliationActionKey?.S,
+    reconciliationDetectedAt: item.reconciliationDetectedAt?.S,
+    reconciliationDisposition: item.reconciliationDisposition?.S,
+    reconciliationReason: item.reconciliationReason?.S,
     rejectionReceipt: item.rejectionReceipt?.M ? Object.fromEntries(Object.entries(item.rejectionReceipt.M).map(([k, v]) => [k, v.S ?? Number(v.N)])) : undefined,
   };
   const expectedRevision = { issued: 0, quarantined: 1, validated: 2 }[parsed.status];
+  const actionValid = parsed.reconciliationDisposition === undefined
+    ? parsed.reconciliationActionKey === undefined && parsed.reconciliationDetectedAt === undefined &&
+      parsed.reconciliationReason === undefined
+    : parsed.reconciliationDisposition === "ACTION_REQUIRED" &&
+      new RegExp(`^UPLOAD#${parsed.id}#REVISION#${parsed.revision}#EVENT#[a-f0-9]{32}$`).test(parsed.reconciliationActionKey ?? "") &&
+      validInstant(parsed.reconciliationDetectedAt) &&
+      /^(STALE_PROMOTION_LEASE|MISSING_PROMOTION_LEASE)$/.test(parsed.reconciliationReason ?? "");
   if (item.kind?.S !== "UploadLifecycle" || item.schemaVersion?.N !== "1" || item.tenantId?.S !== config.tenantId ||
       parsed.id !== expected.intentId || item.controlId?.S !== expected.controlId || item.quarantineBucket?.S !== config.ingestBucket ||
       item.quarantineKey?.S !== expected.key || !/^evd_[a-f0-9]{32}$/.test(parsed.resourceId ?? "") ||
       ![0, 1].includes(parsed.databaseUploadRevision) || ![0, 1].includes(parsed.databaseEvidenceRevision) ||
       parsed.databaseUploadRevision !== parsed.databaseEvidenceRevision || !Number.isSafeInteger(parsed.revision) ||
       (parsed.status !== "rejected" && parsed.revision !== expectedRevision) ||
-      !new Set(["issued", "quarantined", "validated", "rejected"]).has(parsed.status)) {
+      !new Set(["issued", "quarantined", "validated", "rejected"]).has(parsed.status) || !actionValid) {
     throw new Error("The rejected upload intent failed its security contract.");
   }
   return parsed;
+}
+
+function validInstant(value) {
+  if (typeof value !== "string") return false;
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds) && new Date(milliseconds).toISOString() === value;
+}
+
+function maintenanceActionResolution(intent, resolvedAt) {
+  return { Update: {
+    ConditionExpression: "#status = :outstanding AND #kind = :kind AND schemaVersion = :schema AND tenantId = :tenantId AND id = :id AND sourceRevision = :sourceRevision AND detectedAt = :detected AND reason = :reason AND GSI1SK = :indexSk",
+    ExpressionAttributeNames: { "#kind": "kind", "#status": "status" },
+    ExpressionAttributeValues: {
+      ":detected": { S: intent.reconciliationDetectedAt }, ":id": { S: intent.id },
+      ":indexSk": { S: `${intent.reconciliationDetectedAt}#${config.tenantId}#${intent.id}#${intent.revision}` },
+      ":kind": { S: "UploadMaintenanceAction" }, ":outstanding": { S: "OUTSTANDING" },
+      ":reason": { S: intent.reconciliationReason }, ":resolved": { S: "RESOLVED" },
+      ":resolvedAt": { S: resolvedAt }, ":schema": { N: "1" },
+      ":sourceRevision": { N: String(intent.revision) }, ":tenantId": { S: config.tenantId },
+    },
+    Key: { PK: { S: `MAINTENANCE#ACTION_REQUIRED#${config.tenantId}` }, SK: { S: intent.reconciliationActionKey } },
+    TableName: config.controlTable,
+    UpdateExpression: "SET #status = :resolved, resolvedAt = :resolvedAt REMOVE GSI1SK",
+  } };
 }
 
 async function reconcileDatabase(intent, receipt) {

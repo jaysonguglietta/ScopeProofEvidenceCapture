@@ -6,7 +6,8 @@ This guide is the shortest complete path from a new Mac to a reviewed evidence p
 
 | Goal | Recommended path | Account or cloud required? |
 | --- | --- | --- |
-| Capture, review, search, and export evidence on one Mac | Install the DMG and use the Local Console | No |
+| Use the current capture, review, search, and export behavior on one Mac | Build an exact reviewed source commit and use the Local Console | No hosted account; Apple Swift toolchain required |
+| Evaluate the older published 1.8.1 preview | Install its checksum-verified DMG | No; this preview predates the current workflows |
 | Evaluate or modify the source | Clone the repository and run the local build script | No hosted account; Apple Swift toolchain required |
 | Copy local evidence into an organization-owned S3 bucket | Configure **AWS S3 Storage…** after local setup | Prefer an IAM Identity Center profile; S3 remains optional |
 | Generate an SBOM for one GitHub repository | Choose **Generate Repository SBOM…** | A short-lived, repository-scoped GitHub token for private repositories |
@@ -23,7 +24,7 @@ Local capture is intentionally independent from hosted services. The Mac perform
 
 Hosted use adds a second, stricter trust boundary. A production hosted upload is not eligible to be read, previewed, approved, packaged, exported, or disclosed to Jira until all of the following are true:
 
-1. The current Mac app submitted the exact PNG and a schema-7 manifest signed by its device-only P-256 provenance key.
+1. The current Mac app submitted the exact PNG and a schema-8 manifest whose signed tenant/workspace matches the isolated deployment, using its device-only P-256 provenance key.
 2. The server independently scanned those exact PNG bytes through the configured OCR/DLP service and bound the result to the PNG SHA-256. The historical variable names `BROWSER_OCR_ENDPOINT`, `BROWSER_OCR_TOKEN`, and `BROWSER_OCR_ALLOWED_HOSTS` configure this scanner for every hosted screenshot, including native uploads; they do not mean that native evidence may skip the server scan.
 3. The server obtained and verified the required RFC 3161 timestamp.
 4. The server finalized the manifest's contiguous device-chain sequence, prior hash, event hash, signing-key ID, artifact ID, and image/manifest digests in the hosted database.
@@ -87,12 +88,12 @@ The preview is ad-hoc signed and is not Apple-notarized. After verifying the che
    cd ScopeProofEvidenceCapture
    ```
 
-   As of 2026-09-01, a plain clone checks out an older public default branch and
-   does not contain the current **Unreleased** hardening work. Before building,
-   check out the exact reviewed commit or branch supplied by the maintainer and
-   confirm `git status --short` is clean. Do not infer release status from the
-   `1.10.0` bundle version: build `24` is currently source-only and no 1.10.0 DMG
-   has been published.
+   Before building, confirm that the selected commit contains the hardening you
+   intend to evaluate, record its full SHA, and confirm `git status --short` is
+   clean. A branch name or bundle version does not prove that a checkout contains
+   the current unreleased changes. Do not infer release status from the `1.10.0`
+   bundle version: build `25` is source-only until an exact reviewed commit is
+   merged and a separately verified 1.10.0 artifact is published.
 
 3. Build, install into your personal Applications folder, and launch:
 
@@ -239,7 +240,7 @@ After the Mac is enrolled with that hosted deployment:
 
 1. Enter a destination issue key during capture classification.
 2. Approve the artifact locally.
-3. Upload the exact schema-7 artifact to Scopeproof. The server must independently scan its pixels, verify the trusted RFC 3161 timestamp, and finalize its signed device-chain link before an authenticated reviewer can read or approve it.
+3. Upload the exact schema-8 tenant/workspace-bound artifact to Scopeproof. The server must match the signed binding, independently scan its pixels, verify the trusted RFC 3161 timestamp, and finalize its signed device-chain link before an authenticated reviewer can read or approve it.
 4. Choose **Search Evidence… → Upload to Jira Cloud…**.
 5. Confirm the live issue summary, site, project, and attachment set.
 
@@ -251,7 +252,7 @@ The current public code still contains the legacy single-tenant hosted runtime. 
 
 For an existing approved single-tenant service, the bootstrap administrator first uses **Settings → Team & access** to create expiring invitations and assign roles. An administrator or compliance lead can then enroll a capture device and provide its one-time `spdev_dev_…` token. The release must already contain that exact HTTPS origin in `ScopeproofHostedAPIOrigins`; the checked-in source array is empty. Enter the same origin and token under **Capture & Jira Settings…**. The token is audience-bound, stored in Keychain, expires after 30 days, and is shown again only when an administrator rotates it. Rotation invalidates the old token immediately. Leave the Server URL blank for local-only operation.
 
-Before enabling native hosted uploads, the service operator must apply database migrations through `0027_lonely_guardian.sql`, run `npm run db:verify`, configure the independent scanner through the legacy-named `BROWSER_OCR_*` settings, configure the RFC 3161 issuer/verifier trust boundary, and confirm the administrator readiness endpoint has no failures. Hosted assessments must use an explicit digest-verified catalog/system/control scope; package export runs one shared fail-closed eligibility policy at preflight and publication; durable findings separate reviewer maintenance from compliance-lead/administrator disposition. Immutable external-checkpoint delivery attempts, atomic checkpoint retry leases, and durable per-record key-rotation retries must be healthy before launch. Production readiness fails when the scanner is missing or unsafe, when trusted timestamp enforcement is disabled, or when the timestamp service/trust material is incomplete. No AWS environment has been deployed by this repository work; the AWS files are reviewed templates and implementation source only.
+Before enabling native hosted uploads, the service operator must apply database migrations through `0028_native_reconciliation_cursor.sql`, run `npm run db:verify`, configure the independent scanner through the legacy-named `BROWSER_OCR_*` settings, configure the RFC 3161 issuer/verifier trust boundary, and confirm the administrator readiness endpoint has no failures. Hosted assessments must use an explicit digest-verified catalog/system/control scope; package export runs one shared fail-closed eligibility policy at preflight and publication; durable findings separate reviewer maintenance from compliance-lead/administrator disposition. Immutable external-checkpoint delivery attempts, atomic checkpoint retry leases, durable per-record key-rotation retries, and the sparse native-reconciliation queue/cursors must be healthy before launch. Production readiness fails when the scanner is missing or unsafe, when trusted timestamp enforcement is disabled, or when the timestamp service/trust material is incomplete. The legacy application does not cryptographically authenticate its expected identity headers; separately prove in the authorized deployed environment that an identity-aware private dispatcher overwrites every caller-supplied header variant and that no direct Worker, preview, or origin route is reachable. No AWS environment was deployed by this repository work; the AWS files are reviewed templates and implementation source only.
 
 ## Routine operator checklist
 
@@ -285,7 +286,7 @@ After the session:
 - **S3 cannot browse:** add prefix-scoped `s3:ListBucketVersions`; exact downloads require `s3:GetObjectVersion` and `kms:Decrypt`.
 - **Checksum mismatch:** do not overwrite the local evidence. Preserve the receipt and investigate CloudTrail/request IDs as an integrity event.
 - **Local expiry says the S3 copy is not durable:** refresh the temporary session for the same tenant/workspace and correct the exact version, ETag, checksum, KMS, or COMPLIANCE-retention issue. Scopeproof intentionally leaves local evidence in place when live verification cannot complete.
-- **Hosted upload is unavailable:** verify the exact server URL and replace a revoked or expired device token. A server-side scanner or RFC 3161 outage intentionally rejects the upload without storing it; retry the unchanged schema-7 pair after the service recovers.
+- **Hosted upload is unavailable:** verify the exact server URL, match the Mac customer/workspace to `LEGACY_TENANT_ID`/`LEGACY_WORKSPACE_ID`, and replace a revoked or expired device token. A server-side scanner or RFC 3161 outage intentionally rejects the upload without storing it; retry the unchanged schema-8 pair after the service recovers.
 - **Hosted evidence says unverified or pending:** do not approve, download, package, export, or send it to Jira. Retry the original exact upload so the server can rescan and finalize the device-chain link. Recapture unsigned legacy evidence with the current Mac app; do not ask an administrator to grandfather it in the database.
 - **Export is disabled:** at least one selected artifact must have a valid bound Approved lifecycle state.
 

@@ -466,12 +466,24 @@ export class TenantStack extends Stack {
     databaseSecret.grantRead(tenantDataRole);
     uploadIdempotencySecret.grantRead(tenantDataRole);
     tenantDataRole.addToPolicy(new iam.PolicyStatement({
-      actions: ["dynamodb:GetItem", "dynamodb:TransactWriteItems"],
+      actions: ["dynamodb:GetItem"],
       conditions: {
         Null: { "dynamodb:LeadingKeys": "false" },
         "ForAllValues:StringEquals": {
           "dynamodb:LeadingKeys": [`TENANT#${tenant.id}`],
         },
+      },
+      resources: [shared.controlTable.tableArn],
+    }));
+    tenantDataRole.addToPolicy(new iam.PolicyStatement({
+      actions: ["dynamodb:PutItem", "dynamodb:UpdateItem"],
+      conditions: {
+        Null: { "dynamodb:LeadingKeys": "false" },
+        "ForAllValues:StringEquals": {
+          "dynamodb:LeadingKeys": [`TENANT#${tenant.id}`],
+        },
+        StringEquals: { "dynamodb:EnclosingOperation": "TransactWriteItems" },
+        StringEqualsIfExists: { "dynamodb:ReturnValues": "NONE" },
       },
       resources: [shared.controlTable.tableArn],
     }));
@@ -568,12 +580,14 @@ export class TenantStack extends Stack {
       resources: [shared.controlTable.tableArn],
     }));
     tenantEvidenceReadApiExecutionRole.addToPolicy(new iam.PolicyStatement({
-      actions: ["dynamodb:TransactWriteItems"],
+      actions: ["dynamodb:UpdateItem"],
       conditions: {
         Null: { "dynamodb:LeadingKeys": "false" },
         "ForAllValues:StringEquals": {
           "dynamodb:LeadingKeys": [`TENANT#${tenant.id}`],
         },
+        StringEquals: { "dynamodb:EnclosingOperation": "TransactWriteItems" },
+        StringEqualsIfExists: { "dynamodb:ReturnValues": "NONE" },
       },
       resources: [shared.controlTable.tableArn],
     }));
@@ -596,12 +610,14 @@ export class TenantStack extends Stack {
       resources: [shared.controlTable.tableArn],
     }));
     tenantLegalHoldApiExecutionRole.addToPolicy(new iam.PolicyStatement({
-      actions: ["dynamodb:TransactWriteItems"],
+      actions: ["dynamodb:UpdateItem"],
       conditions: {
         Null: { "dynamodb:LeadingKeys": "false" },
         "ForAllValues:StringEquals": {
           "dynamodb:LeadingKeys": [`TENANT#${tenant.id}`],
         },
+        StringEquals: { "dynamodb:EnclosingOperation": "TransactWriteItems" },
+        StringEqualsIfExists: { "dynamodb:ReturnValues": "NONE" },
       },
       resources: [shared.controlTable.tableArn],
     }));
@@ -614,12 +630,24 @@ export class TenantStack extends Stack {
       resources: [evidenceControlRole.roleArn],
     }));
     tenantLegalHoldWorkerExecutionRole.addToPolicy(new iam.PolicyStatement({
-      actions: ["dynamodb:GetItem", "dynamodb:TransactWriteItems"],
+      actions: ["dynamodb:GetItem"],
       conditions: {
         Null: { "dynamodb:LeadingKeys": "false" },
         "ForAllValues:StringEquals": {
           "dynamodb:LeadingKeys": [`RECOVERY#TENANT#${tenant.id}`],
         },
+      },
+      resources: [shared.controlTable.tableArn],
+    }));
+    tenantLegalHoldWorkerExecutionRole.addToPolicy(new iam.PolicyStatement({
+      actions: ["dynamodb:PutItem"],
+      conditions: {
+        Null: { "dynamodb:LeadingKeys": "false" },
+        "ForAllValues:StringEquals": {
+          "dynamodb:LeadingKeys": [`RECOVERY#TENANT#${tenant.id}`],
+        },
+        StringEquals: { "dynamodb:EnclosingOperation": "TransactWriteItems" },
+        StringEqualsIfExists: { "dynamodb:ReturnValues": "NONE" },
       },
       resources: [shared.controlTable.tableArn],
     }));
@@ -1419,12 +1447,14 @@ export class TenantStack extends Stack {
     });
     provisioner.addToRolePolicy(
       new iam.PolicyStatement({
-        actions: ["dynamodb:TransactWriteItems"],
+        actions: ["dynamodb:UpdateItem"],
         conditions: {
           Null: { "dynamodb:LeadingKeys": "false" },
           "ForAllValues:StringEquals": {
             "dynamodb:LeadingKeys": [`TENANT#${tenant.id}`, `DOMAIN#${hostname}`, `DOMAIN#${apiHostname}`],
           },
+          StringEquals: { "dynamodb:EnclosingOperation": "TransactWriteItems" },
+          StringEqualsIfExists: { "dynamodb:ReturnValues": "NONE" },
         },
         resources: [shared.controlTable.tableArn],
       }),
@@ -1432,7 +1462,9 @@ export class TenantStack extends Stack {
     provisioner.addToRolePolicy(new iam.PolicyStatement({
       actions: ["dynamodb:GetItem"],
       conditions: {
-        "ForAllValues:StringEquals": { "dynamodb:LeadingKeys": [`TENANT#${tenant.id}`] },
+        "ForAllValues:StringEquals": {
+          "dynamodb:LeadingKeys": [`TENANT#${tenant.id}`],
+        },
         Null: { "dynamodb:LeadingKeys": "false" },
       },
       resources: [shared.customerActivationTable.tableArn],
@@ -1754,10 +1786,30 @@ export class TenantStack extends Stack {
       reportBatchItemFailures: true,
     }));
     rejectionReconciler.addToRolePolicy(new iam.PolicyStatement({
-      actions: ["dynamodb:GetItem", "dynamodb:TransactWriteItems"],
+      actions: ["dynamodb:GetItem"],
       conditions: {
         Null: { "dynamodb:LeadingKeys": "false" },
-        "ForAllValues:StringEquals": { "dynamodb:LeadingKeys": [`TENANT#${tenant.id}`] },
+        "ForAllValues:StringEquals": {
+          "dynamodb:LeadingKeys": [
+            `TENANT#${tenant.id}`,
+            `MAINTENANCE#ACTION_REQUIRED#${tenant.id}`,
+          ],
+        },
+      },
+      resources: [shared.controlTable.tableArn],
+    }));
+    rejectionReconciler.addToRolePolicy(new iam.PolicyStatement({
+      actions: ["dynamodb:UpdateItem"],
+      conditions: {
+        Null: { "dynamodb:LeadingKeys": "false" },
+        "ForAllValues:StringEquals": {
+          "dynamodb:LeadingKeys": [
+            `TENANT#${tenant.id}`,
+            `MAINTENANCE#ACTION_REQUIRED#${tenant.id}`,
+          ],
+        },
+        StringEquals: { "dynamodb:EnclosingOperation": "TransactWriteItems" },
+        StringEqualsIfExists: { "dynamodb:ReturnValues": "NONE" },
       },
       resources: [shared.controlTable.tableArn],
     }));
@@ -1895,15 +1947,34 @@ export class TenantStack extends Stack {
     );
     promoter.addToRolePolicy(
       new iam.PolicyStatement({
-        actions: ["dynamodb:GetItem", "dynamodb:Query", "dynamodb:TransactWriteItems"],
+        actions: ["dynamodb:GetItem", "dynamodb:Query"],
         conditions: {
           Null: { "dynamodb:LeadingKeys": "false" },
           "ForAllValues:StringEquals": {
             "dynamodb:LeadingKeys": [
               `TENANT#${tenant.id}`,
               `RECOVERY#TENANT#${tenant.id}`,
+              `MAINTENANCE#ACTION_REQUIRED#${tenant.id}`,
             ],
           },
+        },
+        resources: [shared.controlTable.tableArn],
+      }),
+    );
+    promoter.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["dynamodb:PutItem", "dynamodb:UpdateItem"],
+        conditions: {
+          Null: { "dynamodb:LeadingKeys": "false" },
+          "ForAllValues:StringEquals": {
+            "dynamodb:LeadingKeys": [
+              `TENANT#${tenant.id}`,
+              `RECOVERY#TENANT#${tenant.id}`,
+              `MAINTENANCE#ACTION_REQUIRED#${tenant.id}`,
+            ],
+          },
+          StringEquals: { "dynamodb:EnclosingOperation": "TransactWriteItems" },
+          StringEqualsIfExists: { "dynamodb:ReturnValues": "NONE" },
         },
         resources: [shared.controlTable.tableArn],
       }),
@@ -2028,9 +2099,20 @@ export class TenantStack extends Stack {
         uploadIdempotencySecret.secretArn,
         false,
       ),
-      policy: cr.AwsCustomResourcePolicy.fromSdkCalls({
-        resources: [shared.controlTable.tableArn],
-      }),
+      policy: cr.AwsCustomResourcePolicy.fromStatements([
+        new iam.PolicyStatement({
+          actions: ["dynamodb:UpdateItem"],
+          conditions: {
+            Null: { "dynamodb:LeadingKeys": "false" },
+            "ForAllValues:StringEquals": {
+              "dynamodb:LeadingKeys": [`TENANT#${tenant.id}`, `DOMAIN#${hostname}`, `DOMAIN#${apiHostname}`],
+            },
+            StringEquals: { "dynamodb:EnclosingOperation": "TransactWriteItems" },
+            StringEqualsIfExists: { "dynamodb:ReturnValues": "NONE" },
+          },
+          resources: [shared.controlTable.tableArn],
+        }),
+      ]),
     });
 
     new CfnOutput(this, "TenantHostname", { value: hostname });
@@ -2208,6 +2290,29 @@ function tenantRegistryUpdate(
               ":uploadIdempotencySecretArn": { S: uploadIdempotencySecretArn },
               ":retentionDays": { N: String(tenant.retentionDays ?? 365) },
               ":retentionMode": { S: tenant.retentionMode ?? "GOVERNANCE" },
+            },
+          },
+        },
+        {
+          Update: {
+            TableName: tableName,
+            Key: {
+              PK: { S: "MAINTENANCE#TENANT_DIRECTORY" },
+              SK: { S: `TENANT#${tenant.id}` },
+            },
+            ConditionExpression: "attribute_not_exists(PK) OR (#kind = :kind AND #tenantId = :tenantId)",
+            UpdateExpression: "SET #kind = :kind, #schemaVersion = :schemaVersion, #tenantId = :tenantId, #status = :registered",
+            ExpressionAttributeNames: {
+              "#kind": "kind",
+              "#schemaVersion": "schemaVersion",
+              "#tenantId": "tenantId",
+              "#status": "status",
+            },
+            ExpressionAttributeValues: {
+              ":kind": { S: "TenantMaintenanceRegistration" },
+              ":schemaVersion": { N: "1" },
+              ":tenantId": { S: tenant.id },
+              ":registered": { S: "REGISTERED" },
             },
           },
         },

@@ -92,6 +92,9 @@ export const captureDevices = sqliteTable("capture_devices", {
   uniqueIndex("idx_capture_devices_token_hash").on(table.tokenHash),
   uniqueIndex("idx_capture_devices_provenance_key").on(table.provenanceKeyId),
   index("idx_capture_devices_owner_status").on(table.ownerId, table.status),
+  index("idx_capture_devices_pending_reconciliation_cursor")
+    .on(sql`unixepoch(${table.chainPendingExpiresAt})`, table.id)
+    .where(sql`${table.chainPendingLeaseId} IS NOT NULL AND ${table.chainPendingExpiresAt} IS NOT NULL`),
 ]);
 
 export const captureSessions = sqliteTable("capture_sessions", {
@@ -399,6 +402,42 @@ export const nativeEvidenceManifests = sqliteTable("native_evidence_manifests", 
   uniqueIndex("idx_native_manifest_device_local").on(table.deviceId, table.localEvidenceId),
   uniqueIndex("idx_native_manifest_device_sequence").on(table.deviceId, table.chainSequence),
   index("idx_native_manifest_artifact").on(table.artifactId),
+]);
+
+// Sparse work authority for native artifacts whose chain manifest has not yet
+// committed. Finalized native throughput never consumes the reconciler budget.
+export const nativeProvenanceReconciliationQueue = sqliteTable("native_provenance_reconciliation_queue", {
+  artifactId: text("artifact_id").primaryKey(),
+  dueAt: text("due_at").notNull(),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [
+  index("idx_native_reconciliation_queue_due").on(sql`unixepoch(${table.dueAt})`, table.artifactId),
+  check("native_reconciliation_queue_due_valid", sql`unixepoch(${table.dueAt}) IS NOT NULL`),
+]);
+
+// A singleton, durable scheduler cursor keeps each native reconciliation
+// domain independently fair. Cursor records are operational authority: they
+// are advanced with an audited revision CAS after every bounded page.
+export const nativeProvenanceReconciliationState = sqliteTable("native_provenance_reconciliation_state", {
+  id: text("id").primaryKey(),
+  revision: integer("revision").notNull().default(0),
+  pendingCursorExpiresEpoch: integer("pending_cursor_expires_epoch"),
+  pendingCursorDeviceId: text("pending_cursor_device_id"),
+  orphanCursorDueEpoch: integer("orphan_cursor_due_epoch"),
+  orphanCursorArtifactId: text("orphan_cursor_artifact_id"),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [
+  check("native_reconciliation_singleton_identity", sql`${table.id} = 'native_provenance'`),
+  check("native_reconciliation_revision_nonnegative", sql`${table.revision} >= 0`),
+  check("native_reconciliation_pending_cursor_shape", sql`
+    (${table.pendingCursorExpiresEpoch} IS NULL AND ${table.pendingCursorDeviceId} IS NULL)
+    OR (${table.pendingCursorExpiresEpoch} IS NOT NULL AND ${table.pendingCursorDeviceId} IS NOT NULL)
+  `),
+  check("native_reconciliation_orphan_cursor_shape", sql`
+    (${table.orphanCursorDueEpoch} IS NULL AND ${table.orphanCursorArtifactId} IS NULL)
+    OR (${table.orphanCursorDueEpoch} IS NOT NULL AND ${table.orphanCursorArtifactId} IS NOT NULL)
+  `),
 ]);
 
 export const auditEvents = sqliteTable("audit_events", {

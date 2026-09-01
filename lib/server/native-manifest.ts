@@ -14,12 +14,13 @@ const allowedManifestKeys = new Set([
   "redactionFindings", "redactedRegions", "safetyScanSha256", "safetyScanPolicy", "safetyScanCompletedAt", "sessionID", "sessionName", "controlID", "title", "system", "environment",
   "assessmentPeriod", "description", "complianceArea", "controlTitle", "customFileName", "catalogVersion", "evidenceOwner", "tags",
   "expectedEvidence", "mappedControls", "manualRedactions", "reviewerNote", "jiraIssueKey", "jiraIssueURL", "chainPreviousHash", "chainEventHash",
-  "chainSequence", "provenance",
+  "tenantID", "workspaceID", "chainSequence", "provenance",
 ]);
+const tenantBindingPattern = /^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$/;
 
 export type NativeControlMapping = { framework: string; controlID: string; relationship: string };
 export type NativeCaptureManifest = {
-  schemaVersion: 7;
+  schemaVersion: 8;
   evidenceID: string;
   capturedAt: string;
   sourceURL: string;
@@ -51,6 +52,8 @@ export type NativeCaptureManifest = {
   manualRedactions: number;
   jiraIssueKey: string;
   jiraIssueURL: string;
+  tenantID: string;
+  workspaceID: string;
   chainPreviousHash: string;
   chainEventHash: string;
   chainSequence: number;
@@ -176,7 +179,7 @@ export function parseNativeManifest(bytes: Uint8Array): NativeCaptureManifest {
   try { parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); } catch { throw new NativeManifestError("Manifest must be valid UTF-8 JSON."); }
   const source = record(parsed);
   if (!source || Object.keys(source).some((key) => !allowedManifestKeys.has(key))) throw new NativeManifestError("Manifest schema contains unsupported fields.");
-  if (source.schemaVersion !== 7) throw new NativeManifestError("Only signed schema-7 evidence can be uploaded. Recapture legacy evidence with the current Scopeproof Capture application.");
+  if (source.schemaVersion !== 8) throw new NativeManifestError("Only signed schema-8 tenant-bound evidence can be uploaded. Recapture legacy evidence with the current Scopeproof Capture application.");
   const evidenceID = text(source, "evidenceID", 35, true);
   if (!evidenceIdPattern.test(evidenceID)) throw new NativeManifestError("Manifest evidence ID is invalid.");
   const capturedAt = text(source, "capturedAt", 64, true);
@@ -203,6 +206,12 @@ export function parseNativeManifest(bytes: Uint8Array): NativeCaptureManifest {
   const sourceURL = text(source, "sourceURL", 2_048);
   const sourceHost = text(source, "sourceHost", 253);
   if (!cleanSourceUrl(sourceURL, sourceHost)) throw new NativeManifestError("Manifest source URL is invalid or does not match its source host.");
+  const tenantID = text(source, "tenantID", 64, true);
+  const workspaceID = text(source, "workspaceID", 64, true);
+  if (source.tenantID !== tenantID || source.workspaceID !== workspaceID ||
+      !tenantBindingPattern.test(tenantID) || !tenantBindingPattern.test(workspaceID)) {
+    throw new NativeManifestError("Manifest tenant or workspace binding is invalid.");
+  }
   const chainPreviousHash = text(source, "chainPreviousHash", 128, true);
   const chainEventHash = text(source, "chainEventHash", 128, true);
   if ((chainPreviousHash !== "GENESIS" && !digestPattern.test(chainPreviousHash)) || !digestPattern.test(chainEventHash)) throw new NativeManifestError("Manifest capture-chain hashes are invalid.");
@@ -213,7 +222,7 @@ export function parseNativeManifest(bytes: Uint8Array): NativeCaptureManifest {
   let provenancePayload: string;
   try { provenancePayload = stableJson(unsignedManifest); } catch { throw new NativeManifestError("Manifest provenance payload is not canonicalizable JSON."); }
   return {
-    schemaVersion: 7,
+    schemaVersion: 8,
     evidenceID,
     capturedAt,
     sourceURL,
@@ -245,6 +254,8 @@ export function parseNativeManifest(bytes: Uint8Array): NativeCaptureManifest {
     manualRedactions: source.manualRedactions === undefined || source.manualRedactions === null ? 0 : integer(source, "manualRedactions", 0, 10_000),
     jiraIssueKey,
     jiraIssueURL,
+    tenantID,
+    workspaceID,
     chainPreviousHash,
     chainEventHash,
     chainSequence,

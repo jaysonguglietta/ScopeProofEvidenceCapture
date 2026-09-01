@@ -1,17 +1,17 @@
 # Deployment and administration
 
-> This guide currently describes the single-tenant Sites deployment. The selected replacement is the [AWS-only multi-tenant hosting architecture](AWS_MULTI_TENANT_HOSTING.md). Use the separate [AWS platform runbook](AWS_PLATFORM_RUNBOOK.md) for that target and review its [adversarial security findings](AWS_SECURITY_REVIEW.md). The legacy runtime deliberately accepts exactly one canonical origin and requires an explicit `single-tenant-only` acknowledgement. Do not provision a second customer hostname or share its D1/R2/key boundary. No AWS resource has been deployed from the source or templates in this repository.
+> This guide describes the conditional configuration of the legacy single-tenant Sites/D1/R2 source if an authorized, private deployment boundary is available. It is not evidence that such a deployment or identity dispatcher exists. The selected replacement is the [AWS-only multi-tenant hosting architecture](AWS_MULTI_TENANT_HOSTING.md). Use the separate [AWS platform runbook](AWS_PLATFORM_RUNBOOK.md) for that target and review its [adversarial security findings](AWS_SECURITY_REVIEW.md). The legacy runtime deliberately accepts exactly one canonical origin and requires an explicit `single-tenant-only` acknowledgement. Do not provision a second customer hostname or share its D1/R2/key boundary. No AWS resource was deployed by this repository work.
 
 ## Prerequisites
 
 - Node.js 22.13 or newer and npm.
-- A Sites project with D1 bound as `DB` and R2 bound as `EVIDENCE_BUCKET`.
+- An explicitly authorized private hosted project with D1 bound as `DB`, R2 bound as `EVIDENCE_BUCKET`, and deployed proof of exclusive identity-aware ingress. Do not infer that this boundary is available from repository source.
 - Xcode with the Swift 6 toolchain for the macOS application.
 - Production cryptographic keys and least-privilege provider credentials.
 
 The logical hosted bindings are declared in `.openai/hosting.json`. Do not place physical resource identifiers or secret values in that file.
 
-Save Sites releases from the validated `dist/` archive produced by the official Sites packaging helper. This preserves the reviewed vendored dependency graph; source-only rebuilds intentionally reject local `file:` dependencies.
+If the legacy hosted deployment is explicitly authorized and supported, save its release from the validated `dist/` archive produced by the reviewed packaging path. This preserves the reviewed vendored dependency graph; source-only rebuilds intentionally reject local `file:` dependencies. Do not release it until direct Worker/preview/origin access and caller-supplied identity-header variants have been denied in deployed negative tests.
 
 ## Required hosted secrets
 
@@ -22,8 +22,9 @@ Save Sites releases from the validated `dist/` archive produced by the official 
 | `PACKAGE_SIGNING_PRIVATE_KEY` | Base64 PKCS#8 ECDSA P-256 private key. |
 | `PACKAGE_SIGNING_PUBLIC_KEY` | Matching base64 SPKI public key. |
 | `BOOTSTRAP_ADMIN_EMAILS` | Lowercase email allowlist for the one available bootstrap-administrator claim. After that claim, allowlisted addresses still require an invitation. |
-| `TRUSTED_APP_ORIGINS` | Exactly one canonical HTTPS Sites origin allowed to carry platform identity headers; no comma-separated alternates, paths, or wildcards. |
+| `TRUSTED_APP_ORIGINS` | Exactly one canonical HTTPS origin on which the application may consume the expected platform identity headers; no comma-separated alternates, paths, or wildcards. This setting does not authenticate those headers. |
 | `LEGACY_SINGLE_TENANT_ACKNOWLEDGEMENT` | Must equal `single-tenant-only`. Missing or different values disable authenticated APIs. |
+| `LEGACY_TENANT_ID`, `LEGACY_WORKSPACE_ID` | Exact lowercase, path-safe customer/workspace identifiers for the isolated legacy deployment. Current native schema-8 uploads are rejected unless both signed values match these settings. |
 | `REQUIRE_TRUSTED_TIMESTAMP` | Must be `true` or omitted in production. `false` is a diagnostic-only bypass and makes production readiness fail. |
 
 Use versioned keyrings for production rotation. See the [key-management guide](KEY_MANAGEMENT.md). Configure `AUDIT_CHECKPOINT_ENDPOINT`, `AUDIT_CHECKPOINT_ALLOWED_HOSTS`, and `AUDIT_CHECKPOINT_RECEIPT_PUBLIC_KEY` for an organization-controlled append-only service in a different administrative boundary; set `AUDIT_CHECKPOINT_TOKEN` when that receiver requires bearer authentication. Readiness and audit verification fail until a signed receipt for a checkpoint is delivered and verified. Configure the required `SECURITY_EVENT_ENDPOINT`, `SECURITY_EVENT_ALLOWED_HOSTS`, and `SECURITY_EVENT_TOKEN` for the authenticated monitoring ingress described in the [production-operations runbook](PRODUCTION_OPERATIONS.md).
@@ -69,7 +70,7 @@ npm run db:generate
 Inspect generated SQL for destructive operations, unintended nullability changes, missing indexes, and table rebuilds. Apply migrations in journal order. Never edit a migration already applied to production; add a new forward migration.
 
 The current application requires every migration through
-`drizzle/0027_lonely_guardian.sql`. Migrations 0016–0019 add rotation
+`drizzle/0028_native_reconciliation_cursor.sql`. Migrations 0016–0019 add rotation
 leases, occurrence-owned lifecycle state, active-record de-duplication, and
 audited compare-and-swap guards. Migrations 0020–0022 add per-device P-256
 provenance keys, monotonic chain leases/heads, immutable checkpoint receipts,
@@ -87,16 +88,19 @@ positive attempt counts, retry/action-required/resolved state-shape constraints,
 and an index the application uses for bounded due work and backoff. Migration
 0027 adds atomic, leased audit-checkpoint delivery retry state with bounded
 backoff, stale-claim recovery, and terminal operator action.
+Migration 0028 adds the sparse due-work queue, independent pending/orphan
+circular keyset cursors, revision-CAS-protected singleton cursor state, and
+indexes used by the two separately bounded native-reconciliation domains.
 
-Before applying migrations to a hosted environment or deploying application code, run the populated upgrade-path preflight:
+Before applying migrations to a hosted environment or deploying application code, run the fresh- and populated-database preflight:
 
 ```bash
 npm run db:verify
 ```
 
-The preflight replays the complete journal through 0027 against a populated
-database containing a legacy device and same-digest evidence in two different
-systems with a null legacy assessment scope. It runs `PRAGMA integrity_check`
+The preflight replays the complete journal through 0028 against both an empty
+database and a populated database containing a legacy device and same-digest
+evidence in two different systems with a null legacy assessment scope. It runs `PRAGMA integrity_check`
 and proves that the populated upgrade preserves both artifacts and creates their
 occurrences; initializes legacy token/chain state; installs the native-chain,
 quarantine, independent-image-safety, catalog/scope, review/finding, and hold
@@ -134,10 +138,11 @@ For managed distribution:
 2. Download its exact seven-file artifact set; do not rebuild or re-archive the ZIP during publication.
 3. Verify the candidate on macOS with `./Scripts/publish_release.sh`, including `SCOPEPROOF_RELEASE_CANDIDATE_DIR`, `SCOPEPROOF_RELEASE_ATTESTATION_REPOSITORY`, and `SCOPEPROOF_RELEASE_EXPECTED_COMMIT`.
 4. Generate an offline P-256 release key, compile its X9.63 public key and validity window into `ScopeproofUpdatePublicKeys` in `Info.plist`, and keep the private key outside the repository. `./Scripts/configure_macos_release_identity.sh` validates and writes the public release identity from `SCOPEPROOF_UPDATE_*` and `SCOPEPROOF_RELEASE_*` variables. It also requires `SCOPEPROOF_HOSTED_API_ORIGIN` and writes that one exact pathless HTTPS origin into `ScopeproofHostedAPIOrigins`; the checked-in array is empty so an unconfigured source build cannot contact a remote hosted service. Review and commit only that public metadata, never a personal or preview host.
-5. Compile the exact HTTPS `ScopeproofUpdateDownloadOrigin` into `Info.plist` through `SCOPEPROOF_RELEASE_DOWNLOAD_ORIGIN`, then set the remaining `SCOPEPROOF_UPDATE_*` and `SCOPEPROOF_RELEASE_*` variables required by `./Scripts/publish_release.sh`. The final URL must be `<compiled-origin>/macos/<version>/Scopeproof-Capture-<version>.zip`. The script privately snapshots all seven candidate files before verification, refuses unattested, checksum/provenance-mismatched, unsigned, non-notarized, identity-mismatched, or key-mismatched candidates, and emits an envelope under `DerivedData/Publication/` over the exact snapshot ZIP.
+5. Compile the exact HTTPS `ScopeproofUpdateDownloadOrigin` into `Info.plist` through `SCOPEPROOF_RELEASE_DOWNLOAD_ORIGIN`, then set the remaining `SCOPEPROOF_UPDATE_*` and `SCOPEPROOF_RELEASE_*` variables required by `./Scripts/publish_release.sh`. The final URL must be `<compiled-origin>/macos/<version>/Scopeproof-Capture-<version>.zip`. The script privately snapshots all seven candidate files before verification, refuses unattested, checksum/provenance-mismatched, unsigned, non-notarized, identity-mismatched, or key-mismatched candidates, and emits an envelope under `DerivedData/Publication/` over the exact snapshot ZIP. Before hard-link publication, the validator independently reconstructs the canonical envelope payload, verifies its P-256 signature and public-key digest, and confirms the selected key covers the complete publication-to-expiry window.
 6. Publish the exact ZIP to that immutable versioned HTTPS path. Store only the envelope's `manifest` as `MACOS_RELEASE_MANIFEST_JSON`, its `signatureDERBase64` as `MACOS_RELEASE_SIGNATURE_DER_BASE64`, and configure the exact hostname in `MACOS_RELEASE_ALLOWED_HOSTS`. The client derives the URL from its compiled origin, rejects redirects, verifies the embedded bundle identifier/version, and stores a device-only Keychain `(sequence, version, SHA-256)` tuple to prevent rollback and same-sequence equivocation.
-7. If hosted synchronization is enabled, enroll each Mac separately from **Connections**. The current client generates a schema-7 ECDSA P-256-signed manifest and monotonically chained event for every upload. Tokens expire after 30 days; rotate before expiry and replace the Keychain value on the Mac. Rotation invalidates the previous token immediately. Revoke devices when reassigned, lost, or retired. Leave the native Server URL blank when policy requires local-only operation.
-8. Approve Documents Folder access and verify that `~/Documents/Scopeproof Evidence` is covered by the intended FileVault, backup, DLP, retention, and recovery policies. Disable or explicitly approve iCloud Drive and enterprise synchronization for that evidence classification. Inventory the legacy `~/Pictures/Scopeproof Evidence` root until its retained evidence expires or is dispositioned.
+7. Treat publication as incomplete until a separate clean environment downloads the exact files through the final HTTPS URL—not from the local candidate directory or backing bucket—and compares exact byte size and SHA-256 with the attested candidate. Re-verify the signed update envelope and selected-key validity, extract the downloaded ZIP through the production validator, and verify the embedded app's bundle ID/version/build, Developer ID code signature, designated requirement, Team ID, hardened runtime, stapled notarization ticket, and Gatekeeper assessment. Record the final URL and readback evidence. `Scripts/publish_release.sh` validates the local candidate and emits publication metadata; it does not prove that the bytes served by the final host match what was uploaded.
+8. If hosted synchronization is enabled, configure the server's one exact `LEGACY_TENANT_ID`/`LEGACY_WORKSPACE_ID`, set the same customer/workspace on each Mac, and enroll each Mac separately from **Connections**. The current client generates a schema-8 ECDSA P-256-signed manifest that includes that binding and a monotonically chained event for every upload. Tokens expire after 30 days; rotate before expiry and replace the Keychain value on the Mac. Rotation invalidates the previous token immediately. Revoke devices when reassigned, lost, or retired. Leave the native Server URL blank when policy requires local-only operation.
+9. Approve Documents Folder access and verify that `~/Documents/Scopeproof Evidence` is covered by the intended FileVault, backup, DLP, retention, and recovery policies. Disable or explicitly approve iCloud Drive and enterprise synchronization for that evidence classification. Inventory the legacy `~/Pictures/Scopeproof Evidence` root until its retained evidence expires or is dispositioned.
 
 The development build and development-preview DMG are ad-hoc signed with a stable designated requirement for `com.scopeproof.capture`; neither is a notarized production release. A checksum detects changed bytes but does not establish an Apple-trusted publisher identity. The Local Console is embedded in the native process, binds to a random loopback-only port, and stops when the app quits. It does not require or deploy the hosted Sites application. Local-only capture also does not require the hosted independent scanner or RFC 3161 path; those controls become mandatory when the screenshot crosses the hosted evidence boundary.
 
@@ -179,7 +184,7 @@ npx tsc --noEmit
 npm test
 ```
 
-Run the native tests with the Xcode Swift toolchain, build the `.app`, confirm its bundle version/signature, and smoke-test the menu, one-time repository SBOM dialog/export/checksum, S3 posture verification/upload/version browser/quarantined download, settings, capture classification, redaction review, search, Jira comment, and package export on non-production sources. At the hosted boundary, verify a valid schema-7 upload advances the device chain once, while schema 6, invalid P-256 signatures, duplicate/out-of-order chain links, missing/mismatched safety receipts, sensitive scanner findings, and unavailable/invalid RFC 3161 verification all fail before disclosure or storage as applicable. Confirm older/unbound native rows cannot be read, approved, packaged, or sent to Jira. Never use production AWS credentials in an automated test.
+Run the native tests with the Xcode Swift toolchain, build the `.app`, confirm its bundle version/signature, and smoke-test the menu, one-time repository SBOM dialog/export/checksum, S3 posture verification/upload/version browser/quarantined download, settings, capture classification, redaction review, search, Jira comment, and package export on non-production sources. At the hosted boundary, verify a valid schema-8 upload with the exact configured tenant/workspace advances the device chain once, while schema 7 or older, tenant/workspace rebinding, invalid P-256 signatures, duplicate/out-of-order chain links, missing/mismatched safety receipts, sensitive scanner findings, and unavailable/invalid RFC 3161 verification all fail before disclosure or storage as applicable. Confirm older/unbound native rows cannot be read, approved, packaged, or sent to Jira. Never use production AWS credentials in an automated test.
 
 ## Backup, retention, and recovery
 

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawnSync } from "node:child_process";
-import { createPublicKey, generateKeyPairSync } from "node:crypto";
+import { createHash, createPublicKey, generateKeyPairSync, sign } from "node:crypto";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,6 +13,7 @@ const securityWorkflowPath = new URL("../.github/workflows/security.yml", import
 const trivyIgnorePath = new URL("../.trivyignore.yaml", import.meta.url);
 const dependabotPath = new URL("../.github/dependabot.yml", import.meta.url);
 const buildScriptPath = new URL("../Scripts/build_macos_production_release.sh", import.meta.url);
+const localBuildScriptPath = new URL("../Scripts/build_macos_capture.sh", import.meta.url);
 const prepareScriptPath = new URL("../Scripts/prepare_macos_release_candidate.sh", import.meta.url);
 const publishScriptPath = new URL("../Scripts/publish_release.sh", import.meta.url);
 const entitlementValidatorPath = new URL("../Scripts/validate_macos_release_entitlements.mjs", import.meta.url);
@@ -161,8 +162,9 @@ test("AWS pnpm lockfile produces a complete deterministic CycloneDX dependency g
 });
 
 test("production builder enforces hardened signing, notarization, stapling, and final assessment", async () => {
-  const [build, prepare, configure] = await Promise.all([
+  const [build, localBuild, prepare, configure] = await Promise.all([
     readFile(buildScriptPath, "utf8"),
+    readFile(localBuildScriptPath, "utf8"),
     readFile(prepareScriptPath, "utf8"),
     readFile(notaryScriptPath, "utf8"),
   ]);
@@ -188,7 +190,7 @@ test("production builder enforces hardened signing, notarization, stapling, and 
   assert.match(configure, /Refusing to read an App Store Connect private key from the repository/);
   assert.match(configure, /must not have additional hard links/);
   assert.match(configure, /must not have extended ACLs/);
-  assert.doesNotMatch(`${build}\n${configure}`, /--disable-sandbox/);
+  assert.doesNotMatch(`${build}\n${localBuild}\n${configure}`, /--disable-sandbox/);
 });
 
 test("production update keys are canonical P-256 points with a current non-duplicated validity window", async () => {
@@ -229,6 +231,140 @@ test("production update keys are canonical P-256 points with a current non-dupli
   });
   assert.notEqual(duplicate.status, 0);
   assert.match(duplicate.stderr, /Duplicate update key IDs/);
+
+  const deterministic = spawnSync(process.execPath, [
+    updateKeyValidatorPath.pathname,
+    "json-at",
+    "2030-06-01T00:00:00.000Z",
+    "release-2026",
+    key,
+  ], {
+    encoding: "utf8",
+    input: JSON.stringify([{ ...entry, notBefore: "2030-01-01T00:00:00.000Z", notAfter: "2031-01-01T00:00:00.000Z" }]),
+  });
+  assert.equal(deterministic.status, 0, deterministic.stderr);
+});
+
+test("publication requires the selected compiled key to cover the exact signed envelope window", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "scopeproof-update-key-window-"));
+  try {
+    const keyPair = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+    const jwk = keyPair.publicKey.export({ format: "jwk" });
+    assert.equal(jwk.kty, "EC");
+    const key = Buffer.concat([
+      Buffer.from([4]),
+      Buffer.from(jwk.x!, "base64url"),
+      Buffer.from(jwk.y!, "base64url"),
+    ]).toString("base64");
+    const otherPair = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+    const otherJwk = otherPair.publicKey.export({ format: "jwk" });
+    assert.equal(otherJwk.kty, "EC");
+    const otherKey = Buffer.concat([
+      Buffer.from([4]),
+      Buffer.from(otherJwk.x!, "base64url"),
+      Buffer.from(otherJwk.y!, "base64url"),
+    ]).toString("base64");
+    const envelopePath = join(directory, "release-envelope.json");
+    const manifest = {
+      schemaVersion: 1,
+      version: "99.0.0",
+      sequence: 42,
+      downloadUrl: "https://downloads.scopeproof.example/macos/99.0.0/Scopeproof-Capture-99.0.0.zip",
+      sha256: "a".repeat(64),
+      byteSize: 1024,
+      publishedAt: "2030-06-01T00:00:00.000Z",
+      expiresAt: "2030-07-01T00:00:00.000Z",
+      minimumSystemVersion: "14.0",
+      teamIdentifier: "ABCDE12345",
+      designatedRequirement: 'identifier "com.scopeproof.capture" and anchor apple generic',
+      keyId: "selected-2030",
+      notes: "Security update",
+    };
+    const payload = [
+      "scopeproof-update-manifest-v1",
+      manifest.schemaVersion,
+      manifest.version,
+      manifest.sequence,
+      manifest.downloadUrl,
+      manifest.sha256,
+      manifest.byteSize,
+      manifest.publishedAt,
+      manifest.expiresAt,
+      manifest.minimumSystemVersion,
+      manifest.teamIdentifier,
+      manifest.designatedRequirement,
+      manifest.keyId,
+      Buffer.from(manifest.notes).toString("base64"),
+    ].join("\n");
+    const signatureDERBase64 = Buffer.from(sign("sha256", Buffer.from(payload), keyPair.privateKey)).toString("base64");
+    const publicKeySpkiSha256 = createHash("sha256")
+      .update(keyPair.publicKey.export({ type: "spki", format: "der" }))
+      .digest("hex");
+    const envelope = {
+      manifest,
+      signatureDERBase64,
+      releaseArtifact: "Scopeproof-Capture-99.0.0.zip",
+      publicKeySpkiSha256,
+      publicKeyX963Base64: key,
+    };
+    await writeFile(envelopePath, JSON.stringify(envelope));
+    const runEnvelope = (entries: unknown[]) => spawnSync(process.execPath, [
+      updateKeyValidatorPath.pathname,
+      "envelope",
+      "selected-2030",
+      key,
+      envelopePath,
+    ], { encoding: "utf8", input: JSON.stringify(entries) });
+    const selected = {
+      keyId: "selected-2030",
+      publicKeyX963Base64: key,
+      notBefore: "2030-06-01T00:00:00.000Z",
+      notAfter: "2030-07-01T00:00:00.000Z",
+    };
+    const other = {
+      keyId: "other-2030",
+      publicKeyX963Base64: otherKey,
+      notBefore: "2029-01-01T00:00:00.000Z",
+      notAfter: "2032-01-01T00:00:00.000Z",
+    };
+    const valid = runEnvelope([selected, other]);
+    assert.equal(valid.status, 0, valid.stderr);
+
+    await writeFile(envelopePath, JSON.stringify({
+      ...envelope,
+      manifest: { ...manifest, sha256: "b".repeat(64) },
+    }));
+    const tamperedManifest = runEnvelope([selected, other]);
+    assert.notEqual(tamperedManifest.status, 0);
+    assert.match(tamperedManifest.stderr, /signature is invalid/);
+    const corruptSignature = `${signatureDERBase64[0] === "A" ? "B" : "A"}${signatureDERBase64.slice(1)}`;
+    await writeFile(envelopePath, JSON.stringify({ ...envelope, signatureDERBase64: corruptSignature }));
+    const tamperedSignature = runEnvelope([selected, other]);
+    assert.notEqual(tamperedSignature.status, 0);
+    assert.match(tamperedSignature.stderr, /signature is invalid/);
+    await writeFile(envelopePath, JSON.stringify(envelope));
+
+    const startsLate = runEnvelope([{ ...selected, notBefore: "2030-06-01T00:00:00.001Z" }, other]);
+    assert.notEqual(startsLate.status, 0);
+    assert.match(startsLate.stderr, /complete release validity window/);
+    const expiresEarly = runEnvelope([{ ...selected, notAfter: "2030-06-30T23:59:59.999Z" }, other]);
+    assert.notEqual(expiresEarly.status, 0);
+    assert.match(expiresEarly.stderr, /complete release validity window/);
+
+    await writeFile(envelopePath, JSON.stringify({ ...envelope, publicKeyX963Base64: otherKey }));
+    const wrongEnvelopeKey = runEnvelope([selected, other]);
+    assert.notEqual(wrongEnvelopeKey.status, 0);
+    assert.match(wrongEnvelopeKey.stderr, /does not use the selected update-signing key/);
+    await writeFile(envelopePath, JSON.stringify({
+      ...envelope,
+      manifest: { ...envelope.manifest, keyId: "other-2030" },
+    }));
+    const wrongEnvelopeKeyId = runEnvelope([selected, other]);
+    assert.notEqual(wrongEnvelopeKeyId.status, 0);
+    assert.match(wrongEnvelopeKeyId.stderr, /does not use the selected update-signing key/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("production entitlement validation rejects every capability outside the exact reviewed allowlist", async () => {
@@ -269,6 +405,8 @@ test("publication verifies the exact attested candidate and never rebuilds or re
   assert.match(publish, /ScopeproofUpdateDownloadOrigin/);
   assert.match(publish, /SCOPEPROOF_RELEASE_DOWNLOAD_ORIGIN/);
   assert.match(publish, /validate_macos_update_keys\.mjs/);
+  assert.match(publish, /validate_macos_update_keys\.mjs" envelope/);
+  assert.match(publish, /\/bin\/ln "\$staged_envelope" "\$envelope"/);
   assert.match(publish, /stapler validate/);
   assert.match(publish, /spctl --assess/);
   assert.match(publish, /sign_update_manifest\.mjs" "\$archive"/);
@@ -386,7 +524,7 @@ test("release evidence is complete, redacted, digest-bound, and tamper evident",
 test("advanced CodeQL documents the managed-setup replacement and preserves complete coverage", async () => {
   const runbook = await readFile(releaseRunbookPath, "utf8");
   assert.match(runbook, /GitHub default setup was disabled on 2026-08-27/);
-  assert.match(runbook, /default branch\s+does not contain the replacement workflow/);
+  assert.match(runbook, /replacement workflow is now present on `main`/);
   assert.match(runbook, /JavaScript, TypeScript, and GitHub Actions\s+coverage/);
   assert.doesNotMatch(runbook, /Keep GitHub's managed\/default CodeQL setup enabled/);
 });

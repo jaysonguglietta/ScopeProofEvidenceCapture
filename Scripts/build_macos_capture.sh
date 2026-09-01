@@ -27,7 +27,7 @@ trap cleanup EXIT INT TERM
 export CLANG_MODULE_CACHE_PATH="$module_cache"
 export SWIFTPM_MODULECACHE_OVERRIDE="$module_cache"
 cd "$package_root"
-swift build -c release --disable-sandbox --scratch-path "$package_root/.build"
+swift build -c release --scratch-path "$package_root/.build"
 
 binary_candidates=(
   "$package_root"/.build/*-apple-macosx/release/ScopeproofCapture(N)

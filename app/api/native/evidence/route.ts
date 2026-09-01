@@ -9,6 +9,7 @@ import { requestTrustedTimestamp } from "../../../../lib/server/timestamp";
 import { classifyErrorForLogging, type SafeErrorClass } from "../../../../lib/server/safe-error";
 import { enforceRateLimit, requireBoundedContentLength } from "../../../../lib/server/rate-limit";
 import { EvidenceSafetyScanError, scanExactEvidencePixels } from "../../../../lib/server/image-safety";
+import { validateLegacyTenantBinding } from "../../../../lib/server/identity-config";
 
 export async function POST(request: Request) {
   try {
@@ -25,6 +26,15 @@ export async function POST(request: Request) {
     const image = new Uint8Array(await screenshot.arrayBuffer());
     const manifestBytes = new Uint8Array(await manifestFile.arrayBuffer());
     const manifest = parseNativeManifest(manifestBytes);
+    let expectedBinding: ReturnType<typeof validateLegacyTenantBinding>;
+    try {
+      expectedBinding = validateLegacyTenantBinding(getEnv().LEGACY_TENANT_ID, getEnv().LEGACY_WORKSPACE_ID);
+    } catch {
+      return Response.json({ error: "Native synchronization is disabled until the isolated tenant and workspace are configured." }, { status: 503 });
+    }
+    if (manifest.tenantID !== expectedBinding.tenantID || manifest.workspaceID !== expectedBinding.workspaceID) {
+      return Response.json({ error: "Capture tenant or workspace does not match this isolated Scopeproof deployment." }, { status: 409 });
+    }
     if (screenshot.type !== "image/png" || manifestFile.type !== "application/json" || screenshot.name !== manifest.screenshotFilename) return Response.json({ error: "Capture filenames or content types do not match the manifest." }, { status: 422 });
     const dimensions = await validatePng(image);
     if (dimensions.width !== manifest.pixelWidth || dimensions.height !== manifest.pixelHeight) return Response.json({ error: "Screenshot dimensions do not match the manifest." }, { status: 422 });
@@ -36,7 +46,7 @@ export async function POST(request: Request) {
     if (!await verifyUploadSignature(manifestSha256, imageDigest, signature)) return Response.json({ error: "Capture manifest signature is invalid." }, { status: 401 });
     const expectedChainHash = await sha256(`${manifest.chainPreviousHash}|${imageDigest}|${manifest.evidenceID}|${manifest.capturedAt}|${manifest.sessionID}`);
     if (manifest.chainEventHash !== expectedChainHash) return Response.json({ error: "Capture-chain event does not match the signed manifest." }, { status: 422 });
-    if (!await verifyNativeManifestProvenance(manifest)) return Response.json({ error: "The schema-7 device provenance signature is invalid." }, { status: 401 });
+    if (!await verifyNativeManifestProvenance(manifest)) return Response.json({ error: "The schema-8 device provenance signature is invalid." }, { status: 401 });
     const { complianceArea, controlID: controlId, system, title, environment, assessmentPeriod, evidenceOwner, catalogVersion, expectedEvidence, jiraIssueKey, jiraIssueURL, manualRedactions, tags, mappedControls, sessionID: sessionId } = manifest;
     if (!/^[A-Za-z0-9._:-]{3,96}$/.test(sessionId)) return Response.json({ error: "Capture session identifier is invalid." }, { status: 422 });
     let session = await getEnv().DB.prepare("SELECT display_name, control_id, system_name, environment, assessment_period, created_by, status FROM capture_sessions WHERE id = ?")

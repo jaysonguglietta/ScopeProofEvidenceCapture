@@ -2,7 +2,7 @@
 
 Scopeproof documentation is organized by the person performing the work.
 
-The most recent public DMG is the older [Scopeproof Capture 1.8.1 development preview](https://github.com/jaysonguglietta/ScopeProofEvidenceCapture/releases/tag/v1.8.1-development-preview.1) built from `8cd2d5c`. It is Apple Silicon-only, ad-hoc signed, and does not contain the current **Unreleased 1.10.0 (build 24)** working-tree changes. No 1.10.0 DMG exists. Verify the checksum and read the [macOS installation guide](MACOS_INSTALLATION.md) before opening the preview; use an exact reviewed source checkout for current behavior until a new release is published.
+The most recent public DMG is the older [Scopeproof Capture 1.8.1 development preview](https://github.com/jaysonguglietta/ScopeProofEvidenceCapture/releases/tag/v1.8.1-development-preview.1) built from `8cd2d5c`. It is Apple Silicon-only, ad-hoc signed, and does not contain the current **Unreleased 1.10.0 (build 25)** source changes. No 1.10.0 DMG exists. Verify the checksum and read the [macOS installation guide](MACOS_INSTALLATION.md) before opening the preview; use an exact reviewed source checkout for current behavior until a new release is published.
 
 | Guide | Primary audience | Purpose |
 | --- | --- | --- |

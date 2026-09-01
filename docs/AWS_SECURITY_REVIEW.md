@@ -5,7 +5,7 @@
 **Review basis:** the working-tree implementation under `infra/aws/cdk`, `infra/aws/database`, `lib/aws-runtime`, and the hosted-authentication primitives in `macos/ScopeproofCapture`. The existing web runtime was inspected only where necessary to determine whether it can safely serve the new tenant hostnames.
 
 **Deployment status:** **no AWS deployment was performed.** The resources and findings below describe code and synthesized design, not controls verified in a live AWS account.
-**Important boundary:** the current web application remains a single-workspace Cloudflare/D1/R2 application. It is not the AWS multi-tenant runtime described by the new contracts and infrastructure.
+**Important boundary:** the current web application source remains a single-workspace Cloudflare/D1/R2 application. It is not the AWS multi-tenant runtime described by the new contracts and infrastructure, and this repository does not establish that the conditional Sites runtime or its expected private identity dispatcher is deployed.
 
 ## 1. Executive Summary
 
@@ -16,7 +16,9 @@ retaining Lambda JWT/tenant/membership/RBAC enforcement; makes exact-version
 DLP configuration mandatory for production tenants; KMS-signs and verifies the
 canonical DLP receipt; binds those facts into promotion, S3 metadata, DynamoDB,
 and PostgreSQL reconciliation; persists immutable rejected-ingest receipts;
-ships forward-only PostgreSQL migration `009_runtime_hardening.sql`; and blocks
+ships forward-only PostgreSQL migration `009_runtime_hardening.sql`, advances
+the attested tenant database contract to schema version 3 across all nine SQL
+files and the live function/index catalog; and blocks
 DNS activation without a current `CUSTOMER_ENABLED` approval bound to the exact
 provisioning execution.
 
@@ -98,7 +100,7 @@ was signed, submitted, or notarized by this work.**
 | AWS-08 | Addressed in source; delivery proof open | Production cannot disable recovery, and the production recovery stack refuses synthesis without a validated operations alert email. The same address is wired to encrypted operations/recovery SNS topics, budgets, cost anomalies, and alarm actions. | CloudFormation cannot prove that the email subscription was confirmed, delivered, acknowledged, or integrated with the approved on-call process. Run deployment and recurring delivery canaries before production use. |
 | AWS-09 | Addressed in source; deployment proof open | The multi-region, file-validation-enabled CloudTrail now selects `ALL` data events for the exact authoritative control-table ARN in addition to exact tenant S3 object events, and writes to the retained KMS-encrypted Object-Locked audit bucket. | Synthesis tests prove the selector is present, not that CloudTrail delivered complete records or that unexpected-principal alarms and forensic queries work. Validate both authorized and denied writes in staging. |
 | AWS-10 | Substantially addressed in source; drills open | Recovery now includes a recovery-region global-table replica, exact-prefix S3 CRR/RTC with Object Lock/KMS, deterministic S3 Batch backfill for existing `NONE`/`FAILED` versions, bounded exact source/replica verification, failure-triggered repair, and Aurora AWS Backup/Vault Lock copies. Initial and repair scans remain bounded S3 version walks; every generation verifies immutable checksum, receipt, KMS, retention, and metadata facts even when a post-cutoff legal-hold projection makes only the mutable hold assertion deferrable. Each generation finishes with a bounded destination inventory and cannot report `VERIFIED` while any pre-cutoff destination delete marker or exact version absent from the source exists. The destination evidence prefix explicitly denies both object and exact-version deletion. Verified periodic generations use a strongly consistent immutable promotion/legal-hold change ledger, an explicit 900-second writer safety lag, exact KMS-verified promotion receipts, separate mutable recovery-state and authoritative recovery partitions, and stale/missing freshness alarms. The reconciler's narrowly scoped source and destination KMS permissions include the data-key operation required for checksum-mode HEAD of SSE-KMS objects. | Same-account design does not survive account compromise; no deployment, backfill, existing-table migration, restore/cutover, audit-bucket replication, or demonstrated RPO/RTO. Existing `AWS::DynamoDB::Table` stacks require retain/remove/convert/import—not a direct update. |
-| AWS-11 | Substantially addressed in source | GitHub actions are SHA-pinned, advanced CodeQL uses an explicit manual arm64 Swift build plus separate JavaScript/TypeScript and Actions jobs, and the production release workflow requires a clean approved commit, ephemeral Keychain, hardened Developer ID signing, Apple acceptance, stapling/Gatekeeper checks, bounded artifacts, and attestations. Release identity configuration and production build both validate canonical base64 for a 65-byte uncompressed P-256 point, a unique key ID, canonical ordered timestamps, and a key validity window that includes the build time. Direct CDK and AWS SDK dependencies are exact-version pinned in `infra/aws/cdk/package.json` and `pnpm-lock.yaml`; the reviewed TypeScript runtime Lambdas use `NodejsFunction` with `externalModules: []`, producing self-contained bundles rather than relying on the Lambda runtime's SDK. | Switch the repository from default to advanced CodeQL, require all three analysis checks, and successfully run the protected production-release workflow; configure protected Apple/repository settings; verify Lambda SBOM/provenance and deployed hashes; exercise failure diagnostics in AWS. No Apple submission, production release, or live Lambda deployment has run. |
+| AWS-11 | Substantially addressed in source | GitHub actions are SHA-pinned, advanced CodeQL uses an explicit manual arm64 Swift build plus separate JavaScript/TypeScript and Actions jobs, and the production release workflow requires a clean approved commit, ephemeral Keychain, hardened Developer ID signing, Apple acceptance, stapling/Gatekeeper checks, bounded artifacts, and attestations. All three CodeQL jobs, `verify`, `macos`, and `dependency-review` are required GitHub Actions checks on `main`. Release identity configuration and production build both validate canonical base64 for a 65-byte uncompressed P-256 point, a unique key ID, canonical ordered timestamps, and a key validity window that includes the complete signed-envelope lifetime. Direct CDK and AWS SDK dependencies are exact-version pinned in `infra/aws/cdk/package.json` and `pnpm-lock.yaml`; the reviewed TypeScript runtime Lambdas use `NodejsFunction` with `externalModules: []`, producing self-contained bundles rather than relying on the Lambda runtime's SDK. | Successfully run the protected production-release workflow; configure protected Apple/repository settings and a second independent reviewer; verify Lambda SBOM/provenance and deployed hashes; exercise failure diagnostics in AWS. No Apple submission, production release, or live Lambda deployment has run. |
 
 The original severity reflects risk at discovery. “Addressed in source” means a
 reviewed code path now exists; it does not mean the finding is closed for
@@ -217,7 +219,7 @@ deployed-bundle hash comparison.
 - Tenant activation now verifies `NOINHERIT` on all six application logins and
   requires zero `pg_auth_members` edges involving any managed owner/application
   role before and after the temporary administrator-to-owner migration grant.
-- Tenant activation now binds the digest of all eight packaged SQL files to an
+- Tenant activation now binds the digest of all nine packaged SQL files to an
   ordered digest of the live `scopeproof` function and index definitions in the
   database itself, then recomputes and checks that marker before activation.
   Application-role verification also covers migration metadata tables, not only
@@ -623,12 +625,13 @@ effectiveness.
   require public update keys to be canonical, currently valid, unique P-256
   points. No workflow run, Apple submission, artifact publication, or updater
   discovery test has occurred.
-- **Advanced CodeQL is repository-activated but not yet on `main`:** The
+- **Advanced CodeQL is enforced on `main`:** The
   SHA-pinned workflow uses a manual arm64 Swift build and separate
   JavaScript/TypeScript and Actions jobs. GitHub default setup was disabled on
-  2026-08-27 so advanced-analysis uploads are accepted. Until this pull request
-  is merged, `main` does not contain that workflow; merge promptly, require all
-  three checks, and confirm current coverage for every language.
+  2026-08-27 so advanced-analysis uploads are accepted. All three jobs are
+  required GitHub Actions checks together with `verify`, `macos`, and
+  `dependency-review`. Confirm current coverage for every language after any
+  workflow or branch-protection change.
 - **Domain and hosted-zone choice fail closed in current source:** `cdk.json` leaves `rootDomain` blank, and synthesis rejects an invalid/empty domain. The app also requires exactly one of an existing `hostedZoneId` or the explicit `createHostedZone=true` opt-in. This removes the prior implicit placeholder/zone-creation behavior; production still requires proof of ownership, delegation, and an approved certificate/DNS change procedure.
 - **No source-connected Amplify build:** `CfnApp` has no repository configuration and the branch disables automatic builds. This is good evidence that nothing was deployed, but it is also a production blocker requiring a controlled, signed build pipeline.
 - **Manual alert confirmation:** Email SNS subscriptions require confirmation. Infrastructure creation does not mean notification delivery works.
@@ -708,7 +711,7 @@ effectiveness.
 2. Complete Mac `ASWebAuthenticationSession`, token/JWKS/nonce validation, rotation/revocation, signed discovery, and device enrollment.
 3. Extend authenticated quotas, bounded pagination, request size/time limits, cache isolation, and abuse alarms to every migrated route.
 4. Run PostgreSQL 16 migration/role/RLS tests and full two-tenant AWS integration tests in a disposable staging account.
-5. Enable advanced CodeQL, require all three language checks, and run the protected production release through Apple notarization without publishing customer-facing assets.
+5. Preserve the required advanced CodeQL and dependency-review checks, then run the protected production release through Apple notarization without publishing customer-facing assets.
 
 ### P2 — Before general availability
 
