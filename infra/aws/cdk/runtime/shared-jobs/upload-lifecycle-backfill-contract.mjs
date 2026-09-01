@@ -27,6 +27,8 @@ const validationFields = Object.freeze([
   "tenantId",
   "versionId",
 ]);
+const requiredBackfillEventKeys = Object.freeze(["limit", "mode", "schemaVersion", "tenantId", "type"]);
+const optionalBackfillEventKeys = Object.freeze(["cursor"]);
 
 export const UPLOAD_LIFECYCLE_BACKFILL_SCHEMA_VERSION = 1;
 export const UPLOAD_LIFECYCLE_LEGACY_TTL_SECONDS = 7 * 24 * 60 * 60;
@@ -38,6 +40,40 @@ export class MalformedUploadLifecycleBackfillAuthorityError extends Error {
     super("Upload lifecycle backfill authority is malformed.");
     this.name = "MalformedUploadLifecycleBackfillAuthorityError";
   }
+}
+
+/**
+ * Parse the operator-controlled backfill request without loading an AWS SDK.
+ * Keeping this boundary in the pure contract module lets CI and operator tools
+ * validate an invocation before the provider runtime is initialized.
+ */
+export function parseUploadLifecycleBackfillEvent(value, configuredMaximum) {
+  if (!isRecord(value) || !Number.isSafeInteger(configuredMaximum) || configuredMaximum < 1 || configuredMaximum > 100) {
+    throw new Error("Upload lifecycle backfill event is invalid.");
+  }
+  const expected = value.cursor === undefined
+    ? requiredBackfillEventKeys
+    : [...requiredBackfillEventKeys, ...optionalBackfillEventKeys];
+  if (!sameKeys(value, expected) || value.schemaVersion !== 1 ||
+      value.type !== "scopeproof.upload-lifecycle.backfill" || value.mode !== "APPLY_EXACT_CAS" ||
+      typeof value.tenantId !== "string" || !tenantPattern.test(value.tenantId) ||
+      !Number.isSafeInteger(value.limit) || value.limit < 1 || value.limit > configuredMaximum) {
+    throw new Error("Upload lifecycle backfill event is invalid.");
+  }
+  const cursor = value.cursor === undefined
+    ? undefined
+    : parseUploadLifecycleBackfillCursor(value.cursor, value.tenantId);
+  return Object.freeze({ cursor, limit: value.limit, tenantId: value.tenantId });
+}
+
+function parseUploadLifecycleBackfillCursor(value, tenantId) {
+  if (!isRecord(value) || !sameKeys(value, ["partitionKey", "sortKey"]) ||
+      value.partitionKey !== `TENANT#${tenantId}` || typeof value.sortKey !== "string") {
+    throw new Error("Upload lifecycle backfill cursor is invalid.");
+  }
+  const match = /^UPLOAD#(upl_[a-f0-9]{32})$/.exec(value.sortKey);
+  if (!match || !uploadPattern.test(match[1])) throw new Error("Upload lifecycle backfill cursor is invalid.");
+  return Object.freeze({ partitionKey: value.partitionKey, sortKey: value.sortKey });
 }
 
 /**

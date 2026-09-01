@@ -7,7 +7,7 @@ process.env.CONTROL_TABLE_NAME = "scopeproof-control-plane";
 process.env.MAXIMUM_BACKFILL_ITEMS = "25";
 
 const { parseUploadLifecycleBackfillEvent } = await import(
-  "../infra/aws/cdk/runtime/shared-jobs/upload-lifecycle-backfill.mjs"
+  "../infra/aws/cdk/runtime/shared-jobs/upload-lifecycle-backfill-contract.mjs"
 );
 
 const tenantId = `ten_${"a".repeat(32)}`;

@@ -7,18 +7,16 @@ import {
 } from "@aws-sdk/client-dynamodb";
 import {
   MalformedUploadLifecycleBackfillAuthorityError,
+  parseUploadLifecycleBackfillEvent,
   planUploadLifecycleBackfill,
 } from "./upload-lifecycle-backfill-contract.mjs";
 
-const tenantPattern = /^ten_[a-f0-9]{32}$/;
 const uploadPattern = /^upl_[a-f0-9]{32}$/;
 const digestPattern = /^[a-f0-9]{64}$/;
 const tableNamePattern = /^[A-Za-z0-9_.-]{3,255}$/;
 const regionPattern = /^[a-z]{2}(?:-gov)?-[a-z]+-\d$/;
 const activeStatuses = new Set(["issued", "quarantined", "validated"]);
 const terminalStatuses = new Set(["promoted", "rejected", "expired"]);
-const requiredEventKeys = Object.freeze(["limit", "mode", "schemaVersion", "tenantId", "type"]);
-const optionalEventKeys = Object.freeze(["cursor"]);
 
 const tableName = String(process.env.CONTROL_TABLE_NAME ?? "");
 const region = String(process.env.AWS_REGION ?? "");
@@ -50,22 +48,6 @@ export async function handler(event) {
     console.error("scopeproof_upload_lifecycle_backfill_failed", { errorClass: safeErrorClass(error) });
     throw new Error("Upload lifecycle backfill page failed.");
   }
-}
-
-export function parseUploadLifecycleBackfillEvent(value, configuredMaximum = maximumItems) {
-  if (!isRecord(value) || !Number.isSafeInteger(configuredMaximum) || configuredMaximum < 1 || configuredMaximum > 100) {
-    throw new Error("Upload lifecycle backfill event is invalid.");
-  }
-  const keys = Object.keys(value).sort();
-  const expected = value.cursor === undefined ? requiredEventKeys : [...requiredEventKeys, ...optionalEventKeys].sort();
-  if (!sameKeys(keys, expected) || value.schemaVersion !== 1 ||
-      value.type !== "scopeproof.upload-lifecycle.backfill" || value.mode !== "APPLY_EXACT_CAS" ||
-      typeof value.tenantId !== "string" || !tenantPattern.test(value.tenantId) ||
-      !Number.isSafeInteger(value.limit) || value.limit < 1 || value.limit > configuredMaximum) {
-    throw new Error("Upload lifecycle backfill event is invalid.");
-  }
-  const cursor = value.cursor === undefined ? undefined : parseCursor(value.cursor, value.tenantId);
-  return Object.freeze({ cursor, limit: value.limit, tenantId: value.tenantId });
 }
 
 async function backfillPage(request) {

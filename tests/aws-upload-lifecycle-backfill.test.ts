@@ -237,7 +237,7 @@ test("manual backfill invocation is exact, tenant-bound, and page-bounded", asyn
   process.env.MAXIMUM_BACKFILL_ITEMS = "100";
   try {
     const { parseUploadLifecycleBackfillEvent } = await import(
-      "../infra/aws/cdk/runtime/shared-jobs/upload-lifecycle-backfill.mjs"
+      "../infra/aws/cdk/runtime/shared-jobs/upload-lifecycle-backfill-contract.mjs"
     );
     const exact = {
       limit: 100,
@@ -246,7 +246,7 @@ test("manual backfill invocation is exact, tenant-bound, and page-bounded", asyn
       tenantId,
       type: "scopeproof.upload-lifecycle.backfill",
     };
-    assert.deepEqual(parseUploadLifecycleBackfillEvent(exact), {
+    assert.deepEqual(parseUploadLifecycleBackfillEvent(exact, 100), {
       cursor: undefined,
       limit: 100,
       tenantId,
@@ -257,19 +257,19 @@ test("manual backfill invocation is exact, tenant-bound, and page-bounded", asyn
         partitionKey: `TENANT#${tenantId}`,
         sortKey: `UPLOAD#${uploadId}`,
       },
-    }).cursor, {
+    }, 100).cursor, {
       partitionKey: `TENANT#${tenantId}`,
       sortKey: `UPLOAD#${uploadId}`,
     });
-    assert.throws(() => parseUploadLifecycleBackfillEvent({ ...exact, limit: 101 }), /event is invalid/);
-    assert.throws(() => parseUploadLifecycleBackfillEvent({ ...exact, unexpected: true }), /event is invalid/);
+    assert.throws(() => parseUploadLifecycleBackfillEvent({ ...exact, limit: 101 }, 100), /event is invalid/);
+    assert.throws(() => parseUploadLifecycleBackfillEvent({ ...exact, unexpected: true }, 100), /event is invalid/);
     assert.throws(() => parseUploadLifecycleBackfillEvent({
       ...exact,
       cursor: {
         partitionKey: `TENANT#ten_${"9".repeat(32)}`,
         sortKey: `UPLOAD#${uploadId}`,
       },
-    }), /cursor is invalid/);
+    }, 100), /cursor is invalid/);
   } finally {
     if (previous.region === undefined) delete process.env.AWS_REGION;
     else process.env.AWS_REGION = previous.region;
