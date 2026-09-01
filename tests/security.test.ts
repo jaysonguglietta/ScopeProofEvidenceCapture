@@ -4,7 +4,25 @@ import test from "node:test";
 import { redactJson, redactText } from "../lib/server/redaction.ts";
 import { csvCell } from "../lib/server/csv.ts";
 import { configuredMacRelease, releaseSigningPayload } from "../lib/server/releases.ts";
+import { classifyErrorForLogging } from "../lib/server/safe-error.ts";
 import type { ScopeproofEnv } from "../lib/server/env.ts";
+
+test("classifies operational failures without logging exception contents", () => {
+  const marker = "JIRA_OAUTH_ACTIVE_KEY_ID=must-not-appear";
+  const cases: Array<[unknown, string]> = [
+    [new Error(marker), "error"],
+    [new TypeError(marker), "type_error"],
+    [new SyntaxError(marker), "syntax_error"],
+    [new RangeError(marker), "range_error"],
+    [new Response(marker, { status: 503 }), "http_5xx"],
+    [{ message: marker }, "non_error"],
+  ];
+  for (const [error, expected] of cases) {
+    const classification = classifyErrorForLogging(error);
+    assert.equal(classification, expected);
+    assert.equal(classification.includes(marker), false);
+  }
+});
 
 test("neutralizes spreadsheet formulas in every server CSV cell", () => {
   for (const value of ["=1+1", "+cmd|' /C calc'!A0", "-42", "@SUM(A1:A2)", " \t=HYPERLINK(\"https://evil\")", "\u0000@payload"]) {
@@ -23,7 +41,7 @@ test("strictly validates signed release envelopes and approved download hosts", 
 });
 
 test("production hardening bounds abuse, claims jobs atomically, and enforces retention", async () => {
-  const [rateLimit, jobs, collectors, outbound, retention, evidence, packages, migration, backend, updater, releaseRoute] = await Promise.all([
+  const [rateLimit, jobs, collectors, outbound, retention, evidence, packages, eligibility, migration, backend, updater, releaseRoute] = await Promise.all([
     readFile(new URL("../lib/server/rate-limit.ts", import.meta.url), "utf8"),
     readFile(new URL("../lib/server/jobs.ts", import.meta.url), "utf8"),
     readFile(new URL("../lib/server/collectors.ts", import.meta.url), "utf8"),
@@ -31,6 +49,7 @@ test("production hardening bounds abuse, claims jobs atomically, and enforces re
     readFile(new URL("../lib/server/retention.ts", import.meta.url), "utf8"),
     readFile(new URL("../lib/server/evidence.ts", import.meta.url), "utf8"),
     readFile(new URL("../lib/server/packages.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/server/package-eligibility.ts", import.meta.url), "utf8"),
     readFile(new URL("../drizzle/0009_chubby_martin_li.sql", import.meta.url), "utf8"),
     readFile(new URL("../macos/ScopeproofCapture/Sources/ScopeproofCapture/BackendTrust.swift", import.meta.url), "utf8"),
     readFile(new URL("../macos/ScopeproofCapture/Sources/ScopeproofCapture/UpdateService.swift", import.meta.url), "utf8"),
@@ -42,10 +61,10 @@ test("production hardening bounds abuse, claims jobs atomically, and enforces re
   assert.match(outbound, /allowedOrigins/); assert.match(outbound, /maximumBytes/); assert.match(outbound, /redirect: "error"/);
   assert.match(retention, /retention\.purge_started/); assert.match(retention, /evidence\.purged/); assert.match(retention, /retention_holds/);
   assert.match(evidence, /This evidence has expired/); assert.match(evidence, /Expired evidence cannot be approved/);
-  assert.match(packages, /e\.status = 'approved' AND e\.expires_at > \?/); assert.match(packages, /csvCell/);
+  assert.match(eligibility, /o\.status = 'approved' AND o\.expires_at > \?/); assert.match(packages, /csvCell/);
   for (const table of ["rate_limit_buckets", "retention_holds"]) assert.ok(migration.includes(`CREATE TABLE \`${table}\``));
   assert.match(backend, /productionOrigins/); assert.match(backend, /completionHandler\(nil\)/); assert.match(backend, /sameOrigin/);
-  assert.match(updater, /isValidSignature/); assert.match(updater, /codesign/); assert.match(updater, /TeamIdentifier/); assert.match(updater, /stapler/); assert.match(updater, /previousRelease/);
+  assert.match(updater, /isValidSignature/); assert.match(updater, /UpdateArchiveValidator/); assert.match(updater, /maximumTotalUncompressedBytes/); assert.match(updater, /requireAvailableExtractionCapacity/); assert.match(updater, /codesign/); assert.match(updater, /TeamIdentifier/); assert.match(updater, /stapler/); assert.match(updater, /previousRelease/);
   assert.match(releaseRoute, /configuredMacRelease/);
 });
 
@@ -57,14 +76,16 @@ test("redacts Luhn-valid PANs while preserving invalid numeric identifiers", () 
 });
 
 test("redacts high-confidence credentials and private keys", () => {
+  const syntheticAccessKey = "AK" + "IA" + "T".repeat(16);
   const result = redactText([
-    "aws=AKIAIOSFODNN7EXAMPLE",
+    `aws=${syntheticAccessKey}`,
     "authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signaturevalue",
     "api_token=very-sensitive-token-value-12345",
     "-----BEGIN PRIVATE KEY-----\nabc123\n-----END PRIVATE KEY-----",
   ].join("\n"));
   assert.ok(result.total >= 4);
-  assert.doesNotMatch(result.value, /AKIAIOSFODNN7EXAMPLE|very-sensitive-token-value|BEGIN PRIVATE KEY/);
+  assert.equal(result.value.includes(syntheticAccessKey), false);
+  assert.doesNotMatch(result.value, /very-sensitive-token-value|BEGIN PRIVATE KEY/);
 });
 
 test("redacts secrets bound to quoted JSON, XML, and YAML keys", () => {

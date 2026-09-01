@@ -36,6 +36,9 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 .workspace-switch strong { color: #ecf1f8; font-size: 12px; }
 .workspace-switch small { margin-top: 2px; color: #738199; font-size: 10px; }
 .workspace-switch b { font-weight: 400; color: #708097; }
+.workspace-switch > button { flex: 0 0 27px; width: 27px; height: 27px; border: 1px solid #34435d; border-radius: 6px; background: #1c2940; color: #a9b9d5; cursor: pointer; }
+.workspace-switch > button:hover { border-color: #52698d; background: #263650; color: #fff; }
+.workspace-switch > button:disabled { cursor: wait; opacity: .55; }
 .sidebar nav { padding: 10px 9px; flex: 1; }
 .nav-label { display: block; padding: 9px 11px 6px; color: #67768e; font-size: 10px; font-weight: 650; letter-spacing: .09em; text-transform: uppercase; }
 .nav-label.manage { margin-top: 13px; }

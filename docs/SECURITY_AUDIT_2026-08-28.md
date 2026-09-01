@@ -18,6 +18,48 @@ The current source also closes the previously confirmed client-only screenshot-s
 
 No confirmed remotely exploitable command injection, SQL injection, template injection, path traversal, unsafe deserialization, arbitrary SSRF, or remote-code-execution path was found in the reviewed source. That conclusion is limited to static inspection and local tests. It does not cover a live Cloudflare dispatcher, Cognito user pool, Aurora cluster, IAM policy evaluation, S3 Object Lock behavior, KMS key policy, GuardDuty event flow, DNS/TLS configuration, Apple notarization, or the actual contents of deployed secrets.
 
+### Source-remediation follow-up — 2026-09-01
+
+The subsequent hardening pass confirmed these additional source remediations;
+the dated findings below remain unchanged as historical review evidence:
+
+- Audit-checkpoint delivery retries are append-only, restricted to the exact
+  checkpoint while it remains the current audit head, witness-idempotent by
+  checkpoint digest, and single-winner under concurrency. Losing receipt objects
+  are removed, and a newly delivered attempt changes the verification cache key
+  so a prior cached failure cannot mask successful recovery.
+- Package preflight and final package construction now use one shared behavioral
+  eligibility policy, including screenshot-safety, native-chain, expiry,
+  approval, and partial-coverage replacement rules. This removes a UI/build
+  policy split; final publication still performs its transactional revalidation.
+- Assessment browsing uses stable cursor pagination, loads active workspaces
+  independently so they cannot disappear behind newer closed assessments, and
+  incrementally exposes all remaining active and historical pages without
+  silently treating the first page as complete.
+- Maintenance domains run in isolated stages so retention, collection, SBOM, or
+  rotation failure cannot suppress checkpoint and operational-health work.
+  Key-rotation failures persist per-record attempt count, bounded backoff,
+  retry/action-required status, safe error code, and audited recovery state so
+  one poisoned record does not hot-loop or starve unrelated records.
+- The security workflow now enforces both ESLint and a no-emit TypeScript
+  typecheck before the existing test, migration, audit, and infrastructure gates.
+- The native updater validates signed ZIP central/local records, paths, entry and
+  aggregate expansion, compression ratios, file types, and extracted-tree size;
+  requires measured temporary free space plus a safety margin; and bounds,
+  times out, cancels, and terminates release-verification subprocesses.
+- Operational error logging uses a bounded allowlisted error classification
+  instead of raw exception messages where attacker/provider data could contain
+  tokens or secrets. Secret-scanning test fixtures now generate valid-shaped
+  synthetic credentials at runtime instead of embedding literal AWS examples.
+
+These are source controls, not production closure. They do not change the
+conditional SP-01 proxy-authentication boundary: deployment must still prove
+that the private edge strips attacker-supplied identity headers, injects trusted
+identity, and prevents direct Worker access. They also do not prove a live
+Cloudflare/AWS deployment, scanner/witness/timestamp-service operation, alert
+delivery, recovery, Apple Developer ID signing, notarization, stapling,
+Gatekeeper acceptance, or protected release publication.
+
 ### Risk summary
 
 | ID | Finding | Severity | Confidence | Status |

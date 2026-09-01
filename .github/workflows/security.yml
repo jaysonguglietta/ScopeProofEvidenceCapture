@@ -53,6 +53,10 @@ jobs:
           node-version: "22.13.0"
           cache: npm
       - run: npm ci --ignore-scripts
+      - name: Enforce lint and TypeScript contracts
+        run: |
+          npm run lint
+          npm run typecheck
       - name: Validate CloudFormation security templates
         run: npm run test:cloudformation
       - run: npm test

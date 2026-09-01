@@ -67,7 +67,7 @@ pnpm run synth \
   -c 'tenants=[]'
 ```
 
-The checked-in CDK context intentionally leaves `rootDomain` and `deploymentEnvironment` blank. Every synthesis must supply both, the complete tenant array, an explicit recovery object, and exactly one Route 53 mode: an existing `hostedZoneId` (recommended) or the explicit `-c createHostedZone=true` opt-in. Tenant stacks reject missing recovery configuration. `jsontechology.com` is only a planning example; it is not a configured default. Do not deploy any example domain unless the organization controls it. Infrastructure synthesis is not authorization to expose the current D1/R2 application to a second customer; the AWS application, tenant-aware PostgreSQL schema, Cognito membership enforcement, Mac enrollment, and migration/reconciliation work must be complete first.
+The checked-in CDK context intentionally leaves `rootDomain` and `deploymentEnvironment` blank. Every synthesis must supply both, the complete tenant array, an explicit recovery object, and exactly one Route 53 mode: an existing `hostedZoneId` (recommended) or the explicit `-c createHostedZone=true` opt-in. Tenant stacks reject missing recovery configuration. The complete application also performs an account/Region availability-zone context lookup for its VPC; run target-environment synth/diff with a read-only AWS profile. The test suite supplies an explicit synthetic context, but a placeholder account with `--no-lookups` is not a valid substitute. Do not commit credentials or an unreviewed generated `cdk.context.json` to bypass that gate. `jsontechology.com` is only a planning example; it is not a configured default. Do not deploy any example domain unless the organization controls it. Infrastructure synthesis is not authorization to expose the current D1/R2 application to a second customer; the AWS application, tenant-aware PostgreSQL schema, Cognito membership enforcement, Mac enrollment, and migration/reconciliation work must be complete first.
 
 The checked-in macOS `Info.plist` likewise contains an empty `ScopeproofHostedAPIOrigins` array. Release builds must use `Scripts/configure_macos_release_identity.sh` with one exact pathless `SCOPEPROOF_HOSTED_API_ORIGIN`; unconfigured local release builds remain local-only for HTTPS hosted synchronization. Do not reintroduce a developer, personal, preview, or historical hosted URL as a source default.
 
@@ -87,7 +87,7 @@ Hosted ingestion adds independent controls in this order: validate schema-7 prov
 
 `BROWSER_OCR_ENDPOINT`, `BROWSER_OCR_TOKEN`, and `BROWSER_OCR_ALLOWED_HOSTS` are legacy names retained for configuration compatibility. They now configure the independent server OCR/DLP processor for every hosted screenshot, including native captures. The processor response text is bounded and examined in memory only; never return it from `scanExactEvidencePixels`, place it in evidence/audit/database records, or log it. Persist only the exact digest, policy version, completion time, scanner origin, and receipt digest.
 
-Production readiness must fail if independent scanner configuration is missing or unsafe, if `REQUIRE_TRUSTED_TIMESTAMP` is false/invalid, or if the RFC 3161 issuer/verifier trust material is incomplete. Development may exercise explicit failure fixtures, but must not relabel a readiness failure as production-capable. Replay all migrations through `0023_independent_image_safety.sql`; do not backfill `0022` provenance or `0023` scan fields to make legacy/unbound records eligible. Test recovery by retrying the exact current artifact and proving reconciliation finalizes it without duplicate occurrence multiplication.
+Production readiness must fail if independent scanner configuration is missing or unsafe, if `REQUIRE_TRUSTED_TIMESTAMP` is false/invalid, or if the RFC 3161 issuer/verifier trust material is incomplete. Development may exercise explicit failure fixtures, but must not relabel a readiness failure as production-capable. Replay all migrations through `0027_lonely_guardian.sql`; do not backfill `0022` provenance or `0023` scan fields to make legacy/unbound records eligible. Test recovery by retrying the exact current artifact and proving reconciliation finalizes it without duplicate occurrence multiplication.
 
 ## Change discipline
 
@@ -97,7 +97,7 @@ Production readiness must fail if independent scanner configuration is missing o
 - Use bound SQL parameters and strict size/type limits.
 - Never log secrets, decrypted evidence, device tokens, or recognized OCR text.
 - Keep original capture manifests immutable; record later decisions in lifecycle/audit records.
-- Generate and inspect a forward migration for every D1 schema change. The current ordered migration set runs through `0023_independent_image_safety.sql`; a fresh-database replay and an upgrade replay must both pass.
+- Generate and inspect a forward migration for every D1 schema change. The current ordered migration set runs through `0027_lonely_guardian.sql`; a fresh-database replay and an upgrade replay must both pass.
 - Update root, operator, assessor, security, deployment, native, in-app Help, and changelog documentation when behavior or trust boundaries change.
 
 ## Extending SBOM support
@@ -124,6 +124,14 @@ Build from the repository root:
 ```
 
 The app is produced at `DerivedData/Scopeproof Capture.app`. The builder constructs and verifies a fresh staged bundle, then replaces the prior output with a same-volume rename and restores that prior bundle if publication fails; do not replace this with a merge-copy that can retain obsolete resources. `Scripts/run_macos_capture.sh` applies the same staging/verification/rollback rule to `~/Applications` and stops an existing process even with `--no-launch`. Update `macos/ScopeproofCapture/Resources/Info.plist`, `.env.example`, the changelog, and operator documentation together for a new version. Production releases require Developer ID signing, hardened runtime, notarization, stapling, an HTTPS download, and a separately verified digest.
+
+### Trusted production updater boundary
+
+Keep `UpdateArchivePolicy.production` and `UpdateProcessRunner` fail closed. Pre-extraction validation must parse both ZIP central-directory and local-file metadata, strictly validate the 12/16-byte non-ZIP64 data descriptors emitted by `ditto`, require names/flags/methods/CRC/sizes to agree, and require every complete local record to be non-overlapping and end before the central directory. It must stream stored and raw-deflate bytes to verify actual expanded counts and CRC-32 before invoking the extractor. It rejects encrypted, split, ZIP64, unsupported-compression, unsafe or canonically colliding paths, duplicate/overlapping records, symbolic links, and other special files. The production limits are 10,000 entries, 1,024 UTF-8 path bytes per entry, 512 MiB actually expanded per file, 1 GiB actually expanded total, and a 200:1 per-entry and aggregate compression ratio. Post-extraction traversal repeats the file-type, entry-count, and expanded-size checks and rejects hard links rather than trusting the extractor.
+
+Before invoking `/usr/bin/ditto`, the destination volume must report available capacity for the validated uncompressed total plus a fixed 256 MiB safety margin. An unavailable capacity value, arithmetic overflow, or insufficient capacity rejects the update before extraction. Do not replace this with a best-effort warning or rely on compressed download size.
+
+Every release subprocess uses the bounded runner: a 180-second deadline, no more than 32 arguments of 4,096 UTF-8 bytes each, and separate 1 MiB stdout and stderr limits. Cancellation, timeout, or excess output stops and, if necessary, force-terminates the process before the update fails. Tests in `macos/ScopeproofCapture/Tests/ScopeproofCaptureTests/UpdateServiceTests.swift` must continue to cover valid `ditto` archives; malformed headers and paths; special-file, ZIP64, decompression-bomb, central-directory-overlap, and disk-capacity rejection; and bounded success, timeout, cancellation, and output overflow.
 
 For a clearly labeled ad-hoc testing image, run `./Scripts/build_development_dmg.sh`. It produces a verified drag-to-Applications DMG and SHA-256 file under `DerivedData/`. Never rename or promote that development-preview artifact as a production release.
 

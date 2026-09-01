@@ -165,6 +165,15 @@ implemented in this slice.
 
 ## Baseline context example
 
+The complete application contains account/Region-aware VPC resources, so this
+command performs an AWS availability-zone context lookup. Run it with a
+read-only bootstrap/profile for the exact target account and Region. The
+repository's CDK tests synthesize with an explicit test context and require no
+AWS access, but a placeholder account plus `--no-lookups` is not equivalent to
+a target-environment synth and is expected to fail when the AZ context is not
+already present. Never commit credentials or an unreviewed machine-generated
+`cdk.context.json` merely to make an offline synth pass.
+
 ```bash
 pnpm exec cdk synth \
   -c deploymentEnvironment=dev \

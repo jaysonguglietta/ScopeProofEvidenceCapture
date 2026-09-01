@@ -54,7 +54,29 @@ function formatDate(value: unknown): string { const date = new Date(String(value
 async function apiError(response: Response): Promise<string> { try { const data = await response.json() as { error?: string }; return data.error || `Request failed (${response.status})`; } catch { return `Request failed (${response.status})`; } }
 function appendUnique<T extends { id: string }>(current: T[], incoming: T[]): T[] {
   const known = new Set(current.map((item) => item.id));
-  return [...current, ...incoming.filter((item) => !known.has(item.id))];
+  const merged = [...current];
+  for (const item of incoming) {
+    if (known.has(item.id)) continue;
+    known.add(item.id);
+    merged.push(item);
+  }
+  return merged;
+}
+
+type AssessmentPageResult = { assessments: ApiAssessment[]; catalogs: ControlCatalog[]; page: ApiPage };
+
+async function loadAssessmentPage(cursor: string | null = null, status: ApiAssessment["status"] | null = null): Promise<AssessmentPageResult> {
+  const query = new URLSearchParams({ limit: "100" });
+  if (cursor) query.set("cursor", cursor);
+  if (status) query.set("status", status);
+  const response = await fetch(`/api/assessments?${query.toString()}`, { cache: "no-store" });
+  if (!response.ok) throw new Error(await apiError(response));
+  const data = await response.json() as AssessmentPageResult;
+  if (!Array.isArray(data.assessments) || !Array.isArray(data.catalogs) || !data.page || !Number.isSafeInteger(data.page.total) || data.page.total < 0
+    || data.page.hasMore && (!data.page.nextCursor || data.page.nextCursor === cursor)) {
+    throw new Error("Assessment catalog returned an invalid or non-advancing page.");
+  }
+  return data;
 }
 
 function mapApiEvidence(row: Record<string, unknown>): Evidence {
@@ -149,6 +171,9 @@ export function EvidenceConsole() {
   const [evidenceItems, setEvidenceItems] = useState<Evidence[]>([]);
   const [runItems, setRunItems] = useState<CollectionRun[]>([]);
   const [assessmentItems, setAssessmentItems] = useState<ApiAssessment[]>([]);
+  const [assessmentPage, setAssessmentPage] = useState<ApiPage | null>(null);
+  const [activeAssessmentPage, setActiveAssessmentPage] = useState<ApiPage | null>(null);
+  const [loadingAssessments, setLoadingAssessments] = useState(false);
   const [catalogItems, setCatalogItems] = useState<ControlCatalog[]>([]);
   const [sbomItems, setSbomItems] = useState<ApiSbom[]>([]);
   const [repositoryItems, setRepositoryItems] = useState<ApiRepository[]>([]);
@@ -179,15 +204,23 @@ export function EvidenceConsole() {
     let cancelled = false;
     const load = async () => {
       try {
-        const [meResponse, collectorsResponse, auditResponse, assessmentsResponse] = await Promise.all([fetch("/api/me"), fetch("/api/collectors"), fetch("/api/audit"), fetch("/api/assessments?limit=100")]);
-        if (!meResponse.ok || !collectorsResponse.ok || !assessmentsResponse.ok) throw new Error("Backend unavailable");
-        const [me, collectorData, auditData, assessmentData] = await Promise.all([meResponse.json(), collectorsResponse.json(), auditResponse.ok ? auditResponse.json() : Promise.resolve(null), assessmentsResponse.json()]) as [{ user: ApiUser }, { collectors: ApiCollector[] }, { integrity: { valid: boolean; checked: number } } | null, { assessments: ApiAssessment[]; catalogs: ControlCatalog[] }];
+        // Load recent history and active workspaces independently. An active
+        // assessment therefore cannot disappear merely because 100 newer closed
+        // assessments exist, while older pages remain an explicit user action.
+        const [meResponse, collectorsResponse, auditResponse, assessmentData, activeAssessmentData] = await Promise.all([
+          fetch("/api/me"), fetch("/api/collectors"), fetch("/api/audit"), loadAssessmentPage(), loadAssessmentPage(null, "active"),
+        ]);
+        if (!meResponse.ok || !collectorsResponse.ok) throw new Error("Backend unavailable");
+        const [me, collectorData, auditData] = await Promise.all([meResponse.json(), collectorsResponse.json(), auditResponse.ok ? auditResponse.json() : Promise.resolve(null)]) as [{ user: ApiUser }, { collectors: ApiCollector[] }, { integrity: { valid: boolean; checked: number } } | null];
         if (cancelled) return;
         setCurrentUser(me.user);
         setCollectorItems(collectorData.collectors);
-        setAssessmentItems(assessmentData.assessments);
+        const initialAssessments = appendUnique(activeAssessmentData.assessments, assessmentData.assessments);
+        setAssessmentItems(initialAssessments);
+        setAssessmentPage(assessmentData.page);
+        setActiveAssessmentPage(activeAssessmentData.page);
         setCatalogItems(assessmentData.catalogs);
-        selectAssessment(assessmentData.assessments.find((item) => item.status === "active")?.id || "");
+        selectAssessment(initialAssessments.find((item) => item.status === "active")?.id || "");
         setAuditIntegrity(auditData?.integrity || null);
         if (["compliance_lead", "admin"].includes(me.user.role)) {
           const deviceResponse = await fetch("/api/devices");
@@ -197,12 +230,28 @@ export function EvidenceConsole() {
         }
         setBackendState("live");
       } catch {
-        if (!cancelled) { setEvidenceItems([]); setRunItems([]); setCollectorItems([]); setAssessmentItems([]); setCatalogItems([]); setSbomItems([]); setFindingItems([]); setFindingSummary(null); setRepositoryItems([]); setSbomManagedError(null); setCurrentUser(null); setAuditIntegrity(null); setBackendState("unavailable"); }
+        if (!cancelled) { setEvidenceItems([]); setRunItems([]); setCollectorItems([]); setAssessmentItems([]); setAssessmentPage(null); setActiveAssessmentPage(null); setCatalogItems([]); setSbomItems([]); setFindingItems([]); setFindingSummary(null); setRepositoryItems([]); setSbomManagedError(null); setCurrentUser(null); setAuditIntegrity(null); setBackendState("unavailable"); }
       }
     };
     void load();
     return () => { cancelled = true; };
   }, []);
+
+  async function loadMoreAssessments() {
+    if (loadingAssessments) return;
+    const activePage = activeAssessmentPage?.hasMore ? activeAssessmentPage : null;
+    const historicalPage = assessmentPage?.hasMore ? assessmentPage : null;
+    const page = activePage || historicalPage;
+    if (!page?.nextCursor) return;
+    setLoadingAssessments(true);
+    try {
+      const next = await loadAssessmentPage(page.nextCursor, activePage ? "active" : null);
+      setAssessmentItems((items) => appendUnique(items, next.assessments));
+      if (activePage) setActiveAssessmentPage(next.page); else setAssessmentPage(next.page);
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "More assessment workspaces could not be loaded.");
+    } finally { setLoadingAssessments(false); }
+  }
 
   useEffect(() => {
     if (!selectedAssessmentId || backendState !== "live") return;
@@ -562,7 +611,7 @@ export function EvidenceConsole() {
       <a className="skip-link" href="#main-content">Skip to content</a>
       <aside className={cls("sidebar", sidebarOpen && "open")}>
         <div className="brand"><div className="brand-mark">S</div><div><strong>Scopeproof</strong><span>PCI operations</span></div></div>
-        <div className="workspace-switch"><span>AS</span><div><label className="sr-only" htmlFor="assessment-workspace">Assessment workspace</label><select id="assessment-workspace" value={selectedAssessmentId} onChange={(event) => selectAssessment(event.target.value)}><option value="">No assessment selected</option>{assessmentItems.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.status}</option>)}</select><small>{activeAssessment?.framework || "Create a scope to begin"}</small></div>{activeAssessment?.status === "active" && canManageOperations ? <button disabled={busy} onClick={closeAssessment} title="Close this assessment">×</button> : <b>⌄</b>}</div>
+        <div className="workspace-switch"><span>AS</span><div><label className="sr-only" htmlFor="assessment-workspace">Assessment workspace</label><select id="assessment-workspace" value={selectedAssessmentId} onChange={(event) => selectAssessment(event.target.value)}><option value="">No assessment selected</option>{assessmentItems.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.status}</option>)}</select><small>{activeAssessment?.framework || "Create a scope to begin"}</small></div>{activeAssessmentPage?.hasMore || assessmentPage?.hasMore ? <button className="workspace-load-more" disabled={loadingAssessments} onClick={() => void loadMoreAssessments()} title="Load more assessment workspaces" aria-label="Load more assessment workspaces">{loadingAssessments ? "…" : "+"}</button> : null}{activeAssessment?.status === "active" && canManageOperations ? <button disabled={busy} onClick={closeAssessment} title="Close this assessment">×</button> : <b>⌄</b>}</div>
         <nav aria-label="Primary navigation">
           <span className="nav-label">Workspace</span>
           {nav.filter((item) => item.section === "workspace").map((item) => <button key={item.label} className={view === item.label ? "active" : ""} onClick={() => navigate(item.label)}><i>{item.mark}</i>{item.label}{item.label === "Findings" && activeFindingCount > 0 && <em>{activeFindingCount}</em>}</button>)}
@@ -717,9 +766,9 @@ function FindingRecord({ item, currentUser, busy, onUpdate }: { item: ApiFinding
   const [nextStatus, setNextStatus] = useState<ApiFinding["status"]>(item.status);
   const [resolution, setResolution] = useState(item.resolution || "");
   const mayDispose = ["compliance_lead", "admin"].includes(currentUser?.role || "");
-  const transitions: ApiFinding["status"][] = item.status === "closed" ? []
-    : item.status === "resolved" || item.status === "accepted" ? ["in_progress", ...(mayDispose ? ["closed" as const] : [])]
-    : ["in_progress", "resolved", ...(mayDispose ? ["accepted" as const] : [])].filter((status) => status !== item.status);
+  const transitions = (item.status === "closed" ? []
+    : item.status === "resolved" || item.status === "accepted" ? ["in_progress", ...(mayDispose ? ["closed"] : [])]
+    : ["in_progress", "resolved", ...(mayDispose ? ["accepted"] : [])].filter((status) => status !== item.status)) as ApiFinding["status"][];
   const requiresDisposition = ["accepted", "resolved", "closed"].includes(nextStatus);
   const canSubmit = nextStatus !== item.status && (!requiresDisposition || resolution.trim().length >= 20);
   return <article className="finding-record"><div className="finding-row"><span className={`severity-flag ${item.severity}`}>{titleCase(item.severity)}</span><div><strong>{item.title}</strong><p>{item.id}{item.control_id ? ` · Control ${item.control_id}` : ""}{item.evidence_id ? ` · Evidence ${item.evidence_id}` : item.job_id ? ` · Run ${item.job_id}` : ""}</p></div><div><small>Owner</small><span>{item.owner_email || "Unassigned"}</span></div><div><small>Due</small><span>{item.due_at ? formatDate(item.due_at) : "No due date"}</span></div><div className="finding-status-action"><StatusPill status={titleCase(item.status)} />{transitions.length ? <button className="button secondary" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}>{expanded ? "Cancel" : "Update"}</button> : null}</div></div>

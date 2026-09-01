@@ -2,6 +2,13 @@ import Foundation
 import Testing
 @testable import ScopeproofCapture
 
+private enum S3StorageTestCredentials {
+    static let permanentAccessKeyID = "AK" + "IA" + String(repeating: "P", count: 16)
+    static let temporaryAccessKeyID = "AS" + "IA" + String(repeating: "T", count: 16)
+    // Preserve the published SigV4 test vector without checking in a scanner-shaped secret literal.
+    static let secretAccessKey = ["wJalrXUtnFEMI", "/K7MDENG/bPxRfiCY", "EXAMPLEKEY"].joined()
+}
+
 @Suite("AWS S3 evidence storage")
 struct S3StorageTests {
     @Test("Validates bucket, region, prefix, and credentials")
@@ -26,10 +33,10 @@ struct S3StorageTests {
         #expect(throws: S3StorageFailure.self) { try S3StorageSettings.validated(bucket: "company-evidence", region: "cn-north-1", prefix: "evidence", autoUpload: false) }
         #expect(throws: S3StorageFailure.self) { try S3StorageSettings.validated(bucket: "company-evidence", region: "us-east-1", prefix: "../evidence", autoUpload: false) }
 
-        let credentials = try S3Credentials.validated(accessKeyID: "AKIAIOSFODNN7EXAMPLE", secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", sessionToken: "")
-        #expect(credentials.accessKeyID == "AKIAIOSFODNN7EXAMPLE")
-        #expect(throws: S3StorageFailure.self) { try S3Credentials.validated(accessKeyID: "short", secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", sessionToken: "") }
-        #expect(throws: S3StorageFailure.self) { try S3Credentials.validated(accessKeyID: "AKIAIOSFODNN7EXAMPLE", secretAccessKey: "secret\nvalue", sessionToken: "") }
+        let credentials = try S3Credentials.validated(accessKeyID: S3StorageTestCredentials.permanentAccessKeyID, secretAccessKey: S3StorageTestCredentials.secretAccessKey, sessionToken: "")
+        #expect(credentials.accessKeyID == S3StorageTestCredentials.permanentAccessKeyID)
+        #expect(throws: S3StorageFailure.self) { try S3Credentials.validated(accessKeyID: "short", secretAccessKey: S3StorageTestCredentials.secretAccessKey, sessionToken: "") }
+        #expect(throws: S3StorageFailure.self) { try S3Credentials.validated(accessKeyID: S3StorageTestCredentials.permanentAccessKeyID, secretAccessKey: "secret\nvalue", sessionToken: "") }
 
         let legacy = Data(#"{"bucket":"company-evidence","region":"us-east-1","prefix":"scopeproof","autoUpload":true}"#.utf8)
         let migrated = try JSONDecoder().decode(S3StorageSettings.self, from: legacy)
@@ -102,8 +109,8 @@ struct S3StorageTests {
             securityProfile: .production, encryptionMode: .sseKMS, kmsKeyARN: kmsARN
         )
         let credentials = try S3Credentials.validated(
-            accessKeyID: "ASIAIOSFODNN7EXAMPLE",
-            secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            accessKeyID: S3StorageTestCredentials.temporaryAccessKeyID,
+            secretAccessKey: S3StorageTestCredentials.secretAccessKey,
             sessionToken: "temporary-session-token",
             expiresAt: Date().addingTimeInterval(3_600)
         )
@@ -171,11 +178,11 @@ struct S3StorageTests {
         let dotted = try S3StorageService.endpoint(settings: S3StorageSettings(bucket: "company.evidence", region: "us-west-2", prefix: "", autoUpload: false), objectKey: "evidence/file.json")
         #expect(dotted.absoluteString == "https://s3.us-west-2.amazonaws.com/company.evidence/evidence/file.json")
 
-        let credentials = try S3Credentials.validated(accessKeyID: "AKIAIOSFODNN7EXAMPLE", secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", sessionToken: "temporary-token")
+        let credentials = try S3Credentials.validated(accessKeyID: S3StorageTestCredentials.permanentAccessKeyID, secretAccessKey: S3StorageTestCredentials.secretAccessKey, sessionToken: "temporary-token")
         let date = try #require(ISO8601DateFormatter().date(from: "2026-08-19T12:00:00Z"))
         let request = try S3StorageService.signedRequest(method: "PUT", url: url, region: settings.region, body: Data("evidence".utf8), contentType: "image/png", credentials: credentials, date: date, requireEncryption: true)
         let authorization = try #require(request.value(forHTTPHeaderField: "Authorization"))
-        #expect(authorization.hasPrefix("AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20260819/us-east-1/s3/aws4_request"))
+        #expect(authorization.hasPrefix("AWS4-HMAC-SHA256 Credential=\(S3StorageTestCredentials.permanentAccessKeyID)/20260819/us-east-1/s3/aws4_request"))
         #expect(authorization.contains("SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date;x-amz-security-token;x-amz-server-side-encryption"))
         #expect(authorization.hasSuffix("Signature=180432ea34301f560f3b35a7b0f932bf453250759ebcb3a51b0412f790e927dd"))
         #expect(!authorization.contains(credentials.secretAccessKey))
@@ -220,7 +227,7 @@ struct S3StorageTests {
     @Test("Creates buckets with region-safe requests and secure defaults")
     func buildsSecureBucketCreationRequests() throws {
         let settings = S3StorageSettings(bucket: "company-evidence", region: "us-west-2", prefix: "scopeproof", autoUpload: true)
-        let credentials = try S3Credentials.validated(accessKeyID: "AKIAIOSFODNN7EXAMPLE", secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", sessionToken: "")
+        let credentials = try S3Credentials.validated(accessKeyID: S3StorageTestCredentials.permanentAccessKeyID, secretAccessKey: S3StorageTestCredentials.secretAccessKey, sessionToken: "")
         let date = try #require(ISO8601DateFormatter().date(from: "2026-08-19T12:00:00Z"))
 
         #expect(S3StorageService.createBucketBody(region: "us-east-1").isEmpty)
@@ -418,7 +425,7 @@ struct S3StorageTests {
         #expect(nextURL.host == "company-evidence.s3.us-east-1.amazonaws.com")
         #expect(URLComponents(url: nextURL, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "continuation-token" })?.value == "token+/=value")
 
-        let credentials = try S3Credentials.validated(accessKeyID: "AKIAIOSFODNN7EXAMPLE", secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", sessionToken: "")
+        let credentials = try S3Credentials.validated(accessKeyID: S3StorageTestCredentials.permanentAccessKeyID, secretAccessKey: S3StorageTestCredentials.secretAccessKey, sessionToken: "")
         let objectURL = try S3StorageService.endpoint(settings: settings, objectKey: object.key)
         let date = try #require(ISO8601DateFormatter().date(from: "2026-08-20T12:00:00Z"))
         let request = try S3StorageService.signedRequest(

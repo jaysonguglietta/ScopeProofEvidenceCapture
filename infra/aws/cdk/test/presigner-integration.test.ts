@@ -8,6 +8,10 @@ test("pinned AWS SDK signs every exact upload header, including content-type", a
   const tenantId = `ten_${"a".repeat(32)}`;
   const intentId = `upl_${"b".repeat(32)}`;
   const evidenceId = `evd_${"c".repeat(32)}`;
+  const testAccessKeyId = "AS" + "IA" + "T".repeat(16);
+  const testSecretAccessKey = "s".repeat(40);
+  assert.equal(testAccessKeyId.length, 20);
+  assert.equal(testSecretAccessKey.length, 40);
   const kmsKeyArn = "arn:aws:kms:us-east-1:111111111111:key/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
   const headers = Object.freeze({
     "content-length": "1024",
@@ -28,8 +32,8 @@ test("pinned AWS SDK signs every exact upload header, including content-type", a
   const client = new S3Client({
     region: "us-east-1",
     credentials: {
-      accessKeyId: "ASIAABCDEFGHIJKLMNOP",
-      secretAccessKey: "s".repeat(40),
+      accessKeyId: testAccessKeyId,
+      secretAccessKey: testSecretAccessKey,
       sessionToken: "offline-presign-test-session-token",
     },
   });

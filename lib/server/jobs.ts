@@ -9,6 +9,7 @@ import { publishOperationalHealth } from "./monitoring";
 import { storeEvidence } from "./evidence";
 import { purgeRateLimitBuckets } from "./rate-limit";
 import { purgeExpiredEvidence } from "./retention";
+import { classifyErrorForLogging } from "./safe-error";
 import { processDueSbomWork } from "./sbom";
 
 const systemActor: AuthenticatedUser = { id: "system:scheduler", email: "scheduler@scopeproof.internal", displayName: "Scopeproof Scheduler", role: "admin" };
@@ -126,23 +127,41 @@ export async function processJob(jobId: string, actor?: AuthenticatedUser): Prom
 
 export async function processDueWork(now = new Date()): Promise<void> {
   const env = getEnv();
-  await purgeExpiredEvidence(now, systemActor);
-  await purgeRateLimitBuckets(Math.floor(now.getTime() / 1_000));
-  const dueRetries = (await env.DB.prepare("SELECT id FROM collection_jobs WHERE status = 'queued' OR (status = 'retrying' AND next_attempt_at <= ?) OR (status = 'running' AND lease_expires_at < ?) ORDER BY created_at, id LIMIT 10").bind(now.toISOString(), now.toISOString()).all<{ id: string }>()).results;
-  for (const job of dueRetries) await processJob(job.id);
-  await processDueSbomWork(now);
-  const collectors = (await env.DB.prepare("SELECT id, schedule_cron, last_run_at FROM collectors WHERE enabled = 1 AND schedule_cron IS NOT NULL").all<{ id: string; schedule_cron: string; last_run_at: string | null }>()).results;
-  for (const collector of collectors) {
-    if (!isCronDue(collector.schedule_cron, now, collector.last_run_at ? new Date(collector.last_run_at) : null)) continue;
-    const assessment = await env.DB.prepare("SELECT id FROM assessments WHERE status = 'active' ORDER BY period_end DESC LIMIT 1").first<{ id: string }>();
-    if (!assessment) { console.error("scopeproof_scheduled_collection_skipped", { collectorId: collector.id, reason: "no_active_assessment" }); continue; }
-    const jobId = await queueCollection(collector.id, systemActor, "scheduled", assessment.id);
-    await processJob(jobId, systemActor);
+  let isolatedFailures = 0;
+  const isolate = async (stage: string, operation: () => Promise<void>, resourceId?: string): Promise<void> => {
+    try { await operation(); }
+    catch (error) {
+      isolatedFailures += 1;
+      console.error("scopeproof_maintenance_stage_failure", { stage, resourceId, errorClass: classifyErrorForLogging(error) });
+    }
+  };
+  await isolate("evidence_retention", async () => { await purgeExpiredEvidence(now, systemActor); });
+  await isolate("rate_limit_retention", async () => { await purgeRateLimitBuckets(Math.floor(now.getTime() / 1_000)); });
+  await isolate("collection_retries", async () => {
+    const dueRetries = (await env.DB.prepare("SELECT id FROM collection_jobs WHERE status = 'queued' OR (status = 'retrying' AND next_attempt_at <= ?) OR (status = 'running' AND lease_expires_at < ?) ORDER BY created_at, id LIMIT 10").bind(now.toISOString(), now.toISOString()).all<{ id: string }>()).results;
+    for (const job of dueRetries) await isolate("collection_job", async () => { await processJob(job.id); }, job.id);
+  });
+  await isolate("sbom_jobs", async () => { await processDueSbomWork(now); });
+  await isolate("scheduled_collectors", async () => {
+    const collectors = (await env.DB.prepare("SELECT id, schedule_cron, last_run_at FROM collectors WHERE enabled = 1 AND schedule_cron IS NOT NULL").all<{ id: string; schedule_cron: string; last_run_at: string | null }>()).results;
+    for (const collector of collectors) await isolate("scheduled_collector", async () => {
+      if (!isCronDue(collector.schedule_cron, now, collector.last_run_at ? new Date(collector.last_run_at) : null)) return;
+      const assessment = await env.DB.prepare("SELECT id FROM assessments WHERE status = 'active' ORDER BY period_end DESC LIMIT 1").first<{ id: string }>();
+      if (!assessment) { console.error("scopeproof_scheduled_collection_skipped", { collectorId: collector.id, reason: "no_active_assessment" }); return; }
+      const jobId = await queueCollection(collector.id, systemActor, "scheduled", assessment.id);
+      await processJob(jobId, systemActor);
+    }, collector.id);
+  });
+  await isolate("key_rotation", async () => { await rotateStoredKeys(systemActor, 5); });
+  // These safeguards must be attempted even when every earlier maintenance
+  // domain is unhealthy. Their failures are independently observable.
+  await isolate("audit_checkpoint", async () => { await createAuditCheckpoint(now); });
+  await isolate("operational_health", async () => { await publishOperationalHealth(now); });
+  if (isolatedFailures > 0) {
+    // Keep the scheduled invocation visibly failed without retaining raw
+    // provider responses, user input, resource identifiers, or secrets.
+    throw new AggregateError([], `Scopeproof maintenance completed with ${isolatedFailures} isolated failure${isolatedFailures === 1 ? "" : "s"}.`);
   }
-  await rotateStoredKeys(systemActor, 5);
-  await createAuditCheckpoint(now);
-  try { await publishOperationalHealth(now); }
-  catch (error) { console.error("scopeproof_operational_health_delivery_failure", { error: error instanceof Error ? error.message : String(error) }); }
 }
 
 function isCronDue(expression: string, now: Date, lastRun: Date | null): boolean {

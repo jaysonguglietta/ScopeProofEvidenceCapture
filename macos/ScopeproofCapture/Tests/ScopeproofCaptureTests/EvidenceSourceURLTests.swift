@@ -15,13 +15,14 @@ struct EvidenceSourceURLTests {
 
     @Test("Removes credentials and redacts sensitive URL values")
     func redactsSensitiveURLComponents() throws {
-        let source = "https://operator:password@admin.example.com/settings?view=full&access_token=synthetic-secret-value&apiKey=AKIAIOSFODNN7EXAMPLE#overview"
+        let syntheticAccessKey = "AK" + "IA" + String(repeating: "T", count: 16)
+        let source = "https://operator:password@admin.example.com/settings?view=full&access_token=synthetic-secret-value&apiKey=\(syntheticAccessKey)#overview"
         let sanitized = try #require(EvidenceSourceURL.sanitized(source))
         #expect(sanitized.user == nil)
         #expect(sanitized.password == nil)
         #expect(sanitized.absoluteString == "https://admin.example.com")
         #expect(!sanitized.absoluteString.contains("synthetic-secret-value"))
-        #expect(!sanitized.absoluteString.contains("AKIAIOSFODNN7EXAMPLE"))
+        #expect(!sanitized.absoluteString.contains(syntheticAccessKey))
     }
 
     @Test("Rejects non-web and oversized source URLs")

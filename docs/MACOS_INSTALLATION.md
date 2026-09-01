@@ -86,11 +86,19 @@ Hosted synchronization is not required for installation or local use. The checke
 
 A production server accepts the current signed schema-7 PNG/manifest pair only. It independently rescans the exact PNG through the OCR/DLP service configured by the legacy-named `BROWSER_OCR_ENDPOINT`, `BROWSER_OCR_TOKEN`, and `BROWSER_OCR_ALLOWED_HOSTS` settings, verifies a trusted RFC 3161 timestamp, and finalizes the exact artifact into the server-side device chain. Recognized OCR text is evaluated transiently and is not retained. Until the scan, timestamp, and final chain linkage succeed, the hosted item is quarantined and cannot be read, previewed, approved, packaged, exported, or sent to Jira.
 
-If scanner or timestamp verification is unavailable, the hosted upload fails closed while the local artifact remains usable. Retry the unchanged current pair after recovery. An unsigned legacy capture must be recaptured; an older hosted item missing the independent scan or final linkage must be re-uploaded/rescanned. Administrators must never grandfather either population with direct database updates. Server operators must apply migrations through `0024_big_chamber.sql` and confirm production readiness has no scanner or trusted-timestamp failures before enabling native uploads. No AWS deployment is performed by installing or building the Mac app.
+If scanner or timestamp verification is unavailable, the hosted upload fails closed while the local artifact remains usable. Retry the unchanged current pair after recovery. An unsigned legacy capture must be recaptured; an older hosted item missing the independent scan or final linkage must be re-uploaded/rescanned. Administrators must never grandfather either population with direct database updates. Server operators must apply migrations through `0027_lonely_guardian.sql` and confirm production readiness has no scanner or trusted-timestamp failures before enabling native uploads. No AWS deployment is performed by installing or building the Mac app.
 
 ## Update the DMG installation
 
 Download the newer release DMG and checksum, verify them, quit Scopeproof, and replace the existing app in `/Applications`. Evidence under `~/Documents/Scopeproof Evidence` or the legacy `~/Pictures/Scopeproof Evidence` location, Keychain items, and user preferences are not removed. Do not overwrite a production-notarized installation with a development preview unless your organization has approved that downgrade in release trust.
+
+### Trusted production in-app updates
+
+The development-preview DMG does not use the trusted production updater. In a production build configured for the organization's exact download and hosted API origins, the updater verifies a signed manifest and immutable download before it examines the ZIP. Before extraction, it cross-checks central/local entry names, flags, methods, CRC/sizes, and strict non-ZIP64 data descriptors, rejects overlapping records, and streams every stored/raw-deflate payload to prove its actual expanded size and CRC-32. It rejects encrypted, split, ZIP64, unsupported-compression, traversal, absolute, ambiguous or colliding paths; symbolic links and other special files; duplicate local offsets; and any record that reaches or overlaps the central directory. A post-extraction walk repeats the count, type, and size checks and rejects symbolic links, hard links, and other special files.
+
+The archive may contain at most 10,000 entries. Each UTF-8 path is limited to 1,024 bytes, each file to 512 MiB uncompressed, the archive to 1 GiB uncompressed in total, and both per-entry and aggregate compression ratios to 200:1. The destination volume must report free capacity for the declared expanded total plus a fixed 256 MiB margin. Scopeproof fails closed when capacity cannot be determined or is insufficient; it does not attempt extraction first.
+
+Release verification and extraction subprocesses have a 180-second deadline and separate 1 MiB stdout and stderr limits. Cancelling an update, exceeding either output bound, or timing out stops the running subprocess. Those conditions and any archive, digest, identity, Gatekeeper, or notarization failure reject the update. The existing installed app and evidence remain unchanged; retry only with a fresh trusted release after resolving the reported cause.
 
 ## Update or rebuild from source
 
@@ -135,6 +143,7 @@ The script quits a running Scopeproof process before replacing the application, 
 | Local expiry cannot confirm a durable S3 copy | Use temporary credentials bound to the same tenant/workspace and re-verify the destination. Scopeproof requires live exact-version, ETag, checksum, KMS, and future COMPLIANCE-retention checks and intentionally preserves the local files if any check fails. |
 | Hosted upload reports scanner or timestamp unavailable | Keep using the local artifact, ask the service operator to restore the independent scanner/RFC 3161 boundary, then retry the unchanged schema-7 pair. The server intentionally stores nothing for this failed attempt. |
 | Hosted evidence is unverified or quarantined | Do not approve, export, package, download, or disclose it. Retry the original current upload to rescan/finalize it; recapture unsigned legacy evidence. Never manually change the trust fields. |
+| A production in-app update is rejected before extraction | Use a fresh release from the approved origin. If Scopeproof reports insufficient capacity, free enough space for the declared expanded archive plus the 256 MiB safety margin. Capacity-query, archive-structure, timeout, cancellation, or excess-output failures intentionally fail closed; do not bypass the updater or weaken its limits. |
 
 ## Managed distribution
 

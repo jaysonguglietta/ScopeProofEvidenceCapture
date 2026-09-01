@@ -260,6 +260,14 @@ must not be stored in GitHub Actions.
 Create a protected GitHub environment named `production-release` with required
 reviewers, protected `main` access, and no self-approval. Configure:
 
+The repository environment created on 2026-09-01 is an interim fail-closed
+release gate: it allows protected branches only, requires an explicit owner
+approval, and disables administrator bypass. The repository currently has no
+second collaborator, so self-approval cannot yet be disabled without making the
+only release approver ineligible. This interim gate is **not** two-person
+production authorization. Add a second trusted release reviewer, then set
+`prevent_self_review` to true before the first production release.
+
 | Name | Type | Purpose |
 | --- | --- | --- |
 | `MACOS_DEVELOPER_ID_P12_BASE64` | environment secret | Base64 Developer ID Application certificate and private key |

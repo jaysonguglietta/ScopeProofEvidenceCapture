@@ -6,6 +6,7 @@ import { storeEvidence } from "../../../../lib/server/evidence";
 import { getEnv } from "../../../../lib/server/env";
 import { NativeManifestError, parseNativeManifest, validatePng, verifyNativeManifestProvenance } from "../../../../lib/server/native-manifest";
 import { requestTrustedTimestamp } from "../../../../lib/server/timestamp";
+import { classifyErrorForLogging, type SafeErrorClass } from "../../../../lib/server/safe-error";
 import { enforceRateLimit, requireBoundedContentLength } from "../../../../lib/server/rate-limit";
 import { EvidenceSafetyScanError, scanExactEvidencePixels } from "../../../../lib/server/image-safety";
 
@@ -82,11 +83,11 @@ export async function POST(request: Request) {
     };
     const signed = await signPackage(stableJson(attestationBody));
     let trustedTimestamp: Awaited<ReturnType<typeof requestTrustedTimestamp>> = null;
-    let trustedTimestampError: string | null = null;
-    try { trustedTimestamp = await requestTrustedTimestamp(imageDigest); } catch (error) { trustedTimestampError = error instanceof Error ? error.message.slice(0, 300) : "Timestamp authority unavailable"; }
+    let trustedTimestampError: SafeErrorClass | null = null;
+    try { trustedTimestamp = await requestTrustedTimestamp(imageDigest); } catch (error) { trustedTimestampError = classifyErrorForLogging(error); }
     const requireTrustedTimestamp = getEnv().REQUIRE_TRUSTED_TIMESTAMP !== "false";
     if (requireTrustedTimestamp && !trustedTimestamp) {
-      console.error("scopeproof_trusted_timestamp_required", { deviceId: device.id, evidenceId: manifest.evidenceID, error: trustedTimestampError || "not_configured" });
+      console.error("scopeproof_trusted_timestamp_required", { deviceId: device.id, evidenceId: manifest.evidenceID, errorClass: trustedTimestampError || "not_configured" });
       return Response.json({ error: "Independent trusted timestamping is required and currently unavailable. The capture was not stored." }, { status: 503 });
     }
     const timestampAuthority = trustedTimestamp?.authority || "Scopeproof signed server time";

@@ -1,6 +1,7 @@
 import { requireApiPermission } from "../../../../../lib/server/auth";
 import { completeJiraOAuth } from "../../../../../lib/server/jira";
 import { enforceRateLimit } from "../../../../../lib/server/rate-limit";
+import { classifyErrorForLogging } from "../../../../../lib/server/safe-error";
 
 function destination(request: Request, status: "connected" | "error", reason?: string): URL {
   const url = new URL("/", request.url);
@@ -22,7 +23,7 @@ export async function GET(request: Request) {
   } catch (error) {
     if (error instanceof Response && [401, 403].includes(error.status)) return error;
     const requestId = crypto.randomUUID();
-    console.error("jira_oauth_callback_error", { requestId, error: error instanceof Error ? error.message : String(error) });
+    console.error("jira_oauth_callback_error", { requestId, errorClass: classifyErrorForLogging(error) });
     return Response.redirect(destination(request, "error", `callback_${requestId}`), 303);
   }
 }

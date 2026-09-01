@@ -88,6 +88,13 @@ test("the console browses complete pages and uses the persisted remediation work
   assert.match(consoleSource, /fetch\("\/api\/findings", \{ method: "POST"/u);
   assert.match(consoleSource, /fetch\(`\/api\/findings\/\$\{encodeURIComponent\(id\)\}`/u);
   assert.match(consoleSource, /packagePreflight\?\.ready/u);
+  assert.match(consoleSource, /async function loadAssessmentPage/);
+  assert.match(consoleSource, /loadAssessmentPage\(null, "active"\)/);
+  assert.match(consoleSource, /appendUnique\(activeAssessmentData\.assessments, assessmentData\.assessments\)/);
+  assert.match(consoleSource, /data\.page\.nextCursor === cursor/);
+  assert.match(consoleSource, /async function loadMoreAssessments/);
+  assert.match(consoleSource, /Load more assessment workspaces/);
+  assert.doesNotMatch(consoleSource, /fetch\("\/api\/assessments\?limit=100"\)/u);
   assert.doesNotMatch(consoleSource, /Derived from evidence and collection state/u);
   assert.doesNotMatch(consoleSource, /flagged for follow-up/u);
 });

@@ -1,5 +1,5 @@
 import { sql } from "drizzle-orm";
-import { check, index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+import { check, index, integer, primaryKey, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 export const users = sqliteTable("users", {
   id: text("id").primaryKey(),
@@ -520,6 +520,119 @@ export const auditCheckpoints = sqliteTable("audit_checkpoints", {
   externalReceiptR2Key: text("external_receipt_r2_key"),
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
 }, (table) => [uniqueIndex("idx_audit_checkpoints_sequence").on(table.sequence), uniqueIndex("idx_audit_checkpoints_sha").on(table.checkpointSha256)]);
+
+export const auditCheckpointDeliveryAttempts = sqliteTable("audit_checkpoint_delivery_attempts", {
+  id: text("id").primaryKey(),
+  checkpointId: text("checkpoint_id").notNull(),
+  checkpointSha256: text("checkpoint_sha256").notNull(),
+  sequence: integer("sequence").notNull(),
+  endpointOrigin: text("endpoint_origin").notNull(),
+  attemptedAt: text("attempted_at").notNull(),
+  status: text("status", { enum: ["delivered", "failed"] }).notNull(),
+  externalReceipt: text("external_receipt"),
+  externalReceiptSha256: text("external_receipt_sha256"),
+  externalReceiptSignature: text("external_receipt_signature"),
+  externalReceiptR2Key: text("external_receipt_r2_key"),
+  failureCode: text("failure_code"),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [
+  index("idx_checkpoint_delivery_attempts_checkpoint_created").on(table.checkpointId, table.createdAt),
+  uniqueIndex("idx_checkpoint_delivery_attempts_delivered").on(table.checkpointId).where(sql`${table.status} = 'delivered'`),
+  uniqueIndex("idx_checkpoint_delivery_attempts_r2_key").on(table.externalReceiptR2Key).where(sql`${table.externalReceiptR2Key} IS NOT NULL`),
+  check("checkpoint_delivery_attempt_shape", sql`
+    (${table.status} = 'delivered'
+      AND ${table.externalReceipt} IS NOT NULL
+      AND ${table.externalReceiptSha256} IS NOT NULL
+      AND ${table.externalReceiptSignature} IS NOT NULL
+      AND ${table.externalReceiptR2Key} IS NOT NULL
+      AND ${table.failureCode} IS NULL)
+    OR
+    (${table.status} = 'failed'
+      AND ${table.externalReceipt} IS NULL
+      AND ${table.externalReceiptSha256} IS NULL
+      AND ${table.externalReceiptSignature} IS NULL
+      AND ${table.externalReceiptR2Key} IS NULL
+      AND ${table.failureCode} IS NOT NULL)
+  `),
+]);
+
+export const auditCheckpointDeliveryRetryState = sqliteTable("audit_checkpoint_delivery_retry_state", {
+  checkpointId: text("checkpoint_id").primaryKey(),
+  checkpointSha256: text("checkpoint_sha256").notNull(),
+  status: text("status", { enum: ["retrying", "claimed", "action_required", "delivered"] }).notNull(),
+  attemptCount: integer("attempt_count").notNull().default(0),
+  nextAttemptAt: text("next_attempt_at"),
+  leaseId: text("lease_id"),
+  leaseExpiresAt: text("lease_expires_at"),
+  endpointOrigin: text("endpoint_origin"),
+  lastAttemptId: text("last_attempt_id"),
+  lastAttemptAt: text("last_attempt_at"),
+  lastFailureCode: text("last_failure_code"),
+  deliveredAttemptId: text("delivered_attempt_id"),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [
+  index("idx_checkpoint_delivery_retry_status_next").on(table.status, table.nextAttemptAt),
+  index("idx_checkpoint_delivery_retry_claim_expiry").on(table.status, table.leaseExpiresAt),
+  uniqueIndex("idx_checkpoint_delivery_retry_delivered_attempt").on(table.deliveredAttemptId)
+    .where(sql`${table.deliveredAttemptId} IS NOT NULL`),
+  check("checkpoint_delivery_retry_attempt_count_bounded", sql`${table.attemptCount} BETWEEN 0 AND 10`),
+  check("checkpoint_delivery_retry_failure_code_allowlist", sql`${table.lastFailureCode} IS NULL OR ${table.lastFailureCode} IN (
+    'AUDIT_HEAD_CHANGED', 'CHECKPOINT_CORE_INVALID', 'DELIVERY_REQUEST_FAILED', 'ENDPOINT_HTTP_ERROR',
+    'EXTERNAL_RECEIPT_INVALID', 'RECEIPT_BINDING_FAILED', 'RECEIPT_STORAGE_FAILED',
+    'DELIVERY_COMMIT_PRECONDITION_FAILED', 'DELIVERY_CLAIM_EXPIRED'
+  )`),
+  check("checkpoint_delivery_retry_state_shape", sql`
+    (${table.status} = 'retrying'
+      AND ${table.attemptCount} BETWEEN 0 AND 9
+      AND ${table.nextAttemptAt} IS NOT NULL
+      AND ${table.leaseId} IS NULL AND ${table.leaseExpiresAt} IS NULL AND ${table.endpointOrigin} IS NULL
+      AND ${table.deliveredAttemptId} IS NULL
+      AND ((${table.attemptCount} = 0 AND ${table.lastAttemptId} IS NULL AND ${table.lastAttemptAt} IS NULL AND ${table.lastFailureCode} IS NULL)
+        OR (${table.attemptCount} > 0 AND ${table.lastAttemptId} IS NOT NULL AND ${table.lastAttemptAt} IS NOT NULL AND ${table.lastFailureCode} IS NOT NULL)))
+    OR (${table.status} = 'claimed'
+      AND ${table.attemptCount} BETWEEN 1 AND 10
+      AND ${table.nextAttemptAt} IS NOT NULL
+      AND ${table.leaseId} IS NOT NULL AND ${table.leaseExpiresAt} IS NOT NULL AND ${table.endpointOrigin} IS NOT NULL
+      AND ${table.lastAttemptId} IS NOT NULL AND ${table.lastAttemptAt} IS NOT NULL
+      AND ${table.deliveredAttemptId} IS NULL)
+    OR (${table.status} = 'action_required'
+      AND ${table.attemptCount} = 10
+      AND ${table.nextAttemptAt} IS NULL
+      AND ${table.leaseId} IS NULL AND ${table.leaseExpiresAt} IS NULL AND ${table.endpointOrigin} IS NULL
+      AND ${table.lastAttemptId} IS NOT NULL AND ${table.lastAttemptAt} IS NOT NULL AND ${table.lastFailureCode} IS NOT NULL
+      AND ${table.deliveredAttemptId} IS NULL)
+    OR (${table.status} = 'delivered'
+      AND ${table.nextAttemptAt} IS NULL
+      AND ${table.leaseId} IS NULL AND ${table.leaseExpiresAt} IS NULL AND ${table.endpointOrigin} IS NULL
+      AND ${table.lastFailureCode} IS NULL
+      AND ((${table.deliveredAttemptId} IS NULL AND ${table.lastAttemptId} IS NULL AND ${table.lastAttemptAt} IS NULL)
+        OR (${table.deliveredAttemptId} IS NOT NULL AND ${table.deliveredAttemptId} = ${table.lastAttemptId} AND ${table.lastAttemptAt} IS NOT NULL)))
+  `),
+]);
+
+export const keyRotationAttempts = sqliteTable("key_rotation_attempts", {
+  resourceType: text("resource_type", { enum: ["evidence", "package", "jira_connection"] }).notNull(),
+  resourceId: text("resource_id").notNull(),
+  attemptCount: integer("attempt_count").notNull(),
+  status: text("status", { enum: ["retrying", "action_required", "resolved"] }).notNull(),
+  nextAttemptAt: text("next_attempt_at"),
+  lastErrorCode: text("last_error_code").notNull(),
+  firstFailedAt: text("first_failed_at").notNull(),
+  lastAttemptAt: text("last_attempt_at").notNull(),
+  lastAttemptId: text("last_attempt_id").notNull(),
+  resolvedAt: text("resolved_at"),
+}, (table) => [
+  primaryKey({ columns: [table.resourceType, table.resourceId] }),
+  index("idx_key_rotation_attempts_status_next").on(table.status, table.nextAttemptAt),
+  check("key_rotation_attempt_count_bounded", sql`${table.attemptCount} BETWEEN 1 AND 1000000`),
+  check("key_rotation_resource_type_allowlist", sql`${table.resourceType} IN ('evidence', 'package', 'jira_connection')`),
+  check("key_rotation_error_code_allowlist", sql`${table.lastErrorCode} IN ('CRYPTOGRAPHIC_FAILURE', 'MISSING_METADATA', 'MISSING_OBJECT', 'RETAINED_KEY_UNAVAILABLE', 'STORAGE_OR_DATABASE_FAILURE')`),
+  check("key_rotation_attempt_state_shape", sql`
+    (${table.status} IN ('retrying', 'action_required') AND ${table.nextAttemptAt} IS NOT NULL AND ${table.resolvedAt} IS NULL)
+    OR (${table.status} = 'resolved' AND ${table.nextAttemptAt} IS NULL AND ${table.resolvedAt} IS NOT NULL)
+  `),
+]);
 
 export const jiraUploadOperations = sqliteTable("jira_upload_operations", {
   id: text("id").primaryKey(),

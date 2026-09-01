@@ -10,7 +10,9 @@ export class CollectorError extends Error {
   constructor(message: string, public readonly code: string, public readonly retryable: boolean, public readonly status?: number) { super(message); }
 }
 
-type Artifact = Omit<EvidenceInput, "createdBy" | "collectorId" | "jobId">;
+// The scheduler binds every collector result to the authoritative job assessment
+// immediately before persistence. Providers must not be able to choose that scope.
+type Artifact = Omit<EvidenceInput, "assessmentId" | "createdBy" | "collectorId" | "jobId">;
 type CollectorContext = { actor: AuthenticatedUser; config: Record<string, unknown> };
 
 export type CollectorCoverage = { provider: CollectorProvider; complete: boolean; requestedScope: string; returnedCount: number; providerTotal?: number; pageCount: number; omissions: string[]; apiVersion: string; collectedAt: string; budget: { responseBytes: number; maximumResponseBytes: number; items: number; maximumItems: number; exhausted: boolean } };

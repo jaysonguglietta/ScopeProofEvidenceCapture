@@ -20,6 +20,17 @@ ships forward-only PostgreSQL migration `009_runtime_hardening.sql`; and blocks
 DNS activation without a current `CUSTOMER_ENABLED` approval bound to the exact
 provisioning execution.
 
+The source also implements the production alert fail-closed gate, immutable
+CloudTrail data events for the exact authoritative DynamoDB table, strict JWT
+verification and membership resolution, the upload issuer/presigner and durable
+projection repair, exact-version two-person legal holds, KMS signing workers,
+and the cross-region replication/backfill/reconciliation workers. Production
+recovery cannot be disabled, and production synthesis requires an operations
+alert address; the resulting subscription must still be confirmed and exercised
+outside CloudFormation. The `CUSTOMER_ENABLED` record is not a reusable boolean:
+activation strongly reads a short-lived out-of-band approval whose tenant and
+Step Functions execution ARN must exactly match the currently activating run.
+
 These controls materially narrow AWS-02, AWS-05, and AWS-06 and repair the
 source-enforceable rejection/upgrade/activation gaps found during integration
 review. They do not establish closure through live operation: scanner privacy,
@@ -44,25 +55,27 @@ The new foundation materially improves the security design. It establishes exact
 At the original review baseline, those controls were foundations rather than a
 completed hosted product: the hosted API/JWT/membership/upload/KMS/legal-hold
 adapters did not yet exist, the Amplify application had no repository/runtime
-connection, and the GuardDuty clean-event rule was disabled. The dated
-remediation addendum below records subsequent branch changes without rewriting
-the historical finding evidence. The legacy Cloudflare/Sites application still
-must never be attached to multiple customer hostnames.
+connection, and the GuardDuty clean-event rule was disabled. Those server and
+worker adapters, signing paths, recovery resources, and the enabled clean-event
+rule now exist in source. The dated remediation addendum below records those
+subsequent branch changes without treating synthesis as live proof. The legacy
+Cloudflare/Sites application still must never be attached to multiple customer
+hostnames.
 
 No confirmed remotely exploitable RCE, command injection, path traversal, SQL injection, SSRF, or cryptographic primitive failure was found in the dormant AWS foundation. That original statement was intentionally narrow: there was no exposed AWS runtime to test. A small source-defined AWS API now exists, but it has still not been deployed or tested against live AWS/PostgreSQL services. The original review found one conditional Critical deployment hazard, six High production blockers or integrity risks, three Medium defense-in-depth/operations gaps, and one Low supply-chain/diagnostic gap.
 
-| ID | Finding | Severity | Confidence | Classification |
+| ID | Original finding at the historical baseline | Severity | Confidence | Classification at discovery |
 |---|---|---:|---:|---|
 | AWS-01 | The legacy web runtime is single-tenant and must not serve AWS tenant hostnames | Critical | High | Confirmed deployment hazard; not currently deployed |
-| AWS-02 | Cryptographic JWT verification and the hosted OAuth network flow are absent | High | High | Production blocker |
+| AWS-02 | Cryptographic JWT verification and the hosted OAuth network flow were absent | High | High | Production blocker |
 | AWS-03 | Shared AWS roles and per-tenant provisioners retain broad cross-tenant blast radius | High | High | Confirmed architectural defense gap |
 | AWS-04 | Privileged tenant actions rely on future application authorization while the database role can write security state directly | High | High | Production blocker / defense gap |
-| AWS-05 | The secure upload issuer is absent and clean-object promotion is disabled | High | High | Production blocker; safe fail-closed default |
-| AWS-06 | Business audit and receipt signatures are placeholders rather than KMS-verifiable attestations | High | High | Confirmed integrity gap |
-| AWS-07 | Database legal holds are not enforced with S3 Object Lock legal holds | High | High | Production blocker for legal-hold claims |
-| AWS-08 | Security alert delivery is optional and can silently have no recipient | Medium | High | Confirmed secure-default gap |
-| AWS-09 | Immutable CloudTrail omits DynamoDB control-plane data events | Medium | High | Confirmed monitoring gap |
-| AWS-10 | Governance retention, short metadata backup retention, and no cross-region recovery leave administrator/region risks | Medium | High | Design/continuity gap |
+| AWS-05 | The secure upload issuer was absent and clean-object promotion was disabled | High | High | Production blocker; safe fail-closed default |
+| AWS-06 | Business audit and receipt signatures were placeholders rather than KMS-verifiable attestations | High | High | Confirmed integrity gap |
+| AWS-07 | Database legal holds were not enforced with S3 Object Lock legal holds | High | High | Production blocker for legal-hold claims |
+| AWS-08 | Security alert delivery was optional and could silently have no recipient | Medium | High | Confirmed secure-default gap |
+| AWS-09 | Immutable CloudTrail omitted DynamoDB control-plane data events | Medium | High | Confirmed monitoring gap |
+| AWS-10 | Governance retention, short metadata backup retention, and no cross-region recovery left administrator/region risks | Medium | High | Design/continuity gap |
 | AWS-11 | Lambda dependency provenance and failure diagnostics need hardening | Low | Medium | Defense in depth |
 
 ### Remediation status addendum — 2026-08-28
@@ -82,8 +95,8 @@ was signed, submitted, or notarized by this work.**
 | AWS-05 | Addressed in source; deployment gate remains | The upload-intent route derives retention from the tenant policy and canonical capture time, and PostgreSQL independently enforces the same boundary. Principal- and tenant-scoped budgets and atomic reservations prevent replay and quota bypass. The public API no longer returns the upload nonce; its digest is signed into exact S3 metadata and verified before promotion. The assumed upload role has quarantine-only write/KMS permissions and no evidence read, while a separate service lists Aurora metadata and signs 60-second exact-version reads without accepting client storage coordinates. The clean promotion rule and exact promoter are enabled in synthesized IaC. | No live DynamoDB contention/TTL/cost test, PostgreSQL close-versus-upload locking test, delayed-worker S3 conditional-write test, GuardDuty/S3/Data API integration test, exact-download integration test, or outstanding-retry HMAC rotation test; deep content validation and operational canaries remain. |
 | AWS-06 | Substantially addressed in source | Tenant RSA-3072 KMS signing, domain-separated canonical audit receipts, immutable append procedures, promotion receipt persistence, and replay-safe reuse of the first randomized RSA-PSS signature are implemented. Promotion receipts are KMS-verified before database commit and again on retry/read. Promotion completion atomically projects the exact signed database receipt into a tenant-API-inaccessible recovery partition; recovery re-canonicalizes it and calls KMS `Verify` before accepting an exact-version replica. Promotion retry verifies the authoritative database row and recovery projection before accepting prior completion. Applied legal-hold audit receipts are also KMS-verified before the worker commits them to Aurora; only then does it publish the audit-bound recovery projection, and the durable outbox remains eligible until Aurora separately acknowledges that publication. | General product routes do not yet emit these receipts; no live key-policy/CloudTrail/export verification or independent checkpoint drill exists. Exercise the post-audit/pre-recovery-publication retry and acknowledgement window against live Aurora/DynamoDB. KMS signing proves key use, not an uncompromised caller. |
 | AWS-07 | Addressed in source; deployment gate remains | Exact non-empty S3 `VersionId` is bound to the two-person `REQUESTED` → `APPROVED` → `APPLYING` → `APPLIED` state machine, a durable application-attempt identity and observed prior S3 status, S3 legal-hold write/readback, approval digest, expected-revision CAS, and exact receipt; no delete or governance-bypass permission is granted. An S3 or database partial failure remains durably `APPLYING` for an identical retry. Stale unapproved requests transition only to `EXPIRED`, with a durable KMS-signed expiry-audit outbox. For applied work, the KMS-signed append-only audit receipt commits before the audit-bound recovery ledger is published, and a separate Aurora acknowledgement is the only event that clears the recovery-publication outbox. Bounded database backoff prevents a poison `APPROVED` or `APPLYING` row from starving later work, and CDK alarms on failures, ages, and expiries. | No legal-hold UI/operating drill, alert-delivery proof, live Object Lock/recovery-ledger test, or deployed reconciliation evidence exists. Keep the feature unavailable until those gates pass. |
-| AWS-08 | Open | Existing encrypted SNS/CloudWatch paths remain. | Alert email/subscription can still be omitted or unconfirmed; require and canary-test an owned on-call destination. |
-| AWS-09 | Open | The control plane is now a recovery-capable DynamoDB global table with PITR/deletion protection. | Application-level immutable audit/alerts for registry/lifecycle mutation and the original DynamoDB data-event visibility gap still require a reviewed solution. |
+| AWS-08 | Addressed in source; delivery proof open | Production cannot disable recovery, and the production recovery stack refuses synthesis without a validated operations alert email. The same address is wired to encrypted operations/recovery SNS topics, budgets, cost anomalies, and alarm actions. | CloudFormation cannot prove that the email subscription was confirmed, delivered, acknowledged, or integrated with the approved on-call process. Run deployment and recurring delivery canaries before production use. |
+| AWS-09 | Addressed in source; deployment proof open | The multi-region, file-validation-enabled CloudTrail now selects `ALL` data events for the exact authoritative control-table ARN in addition to exact tenant S3 object events, and writes to the retained KMS-encrypted Object-Locked audit bucket. | Synthesis tests prove the selector is present, not that CloudTrail delivered complete records or that unexpected-principal alarms and forensic queries work. Validate both authorized and denied writes in staging. |
 | AWS-10 | Substantially addressed in source; drills open | Recovery now includes a recovery-region global-table replica, exact-prefix S3 CRR/RTC with Object Lock/KMS, deterministic S3 Batch backfill for existing `NONE`/`FAILED` versions, bounded exact source/replica verification, failure-triggered repair, and Aurora AWS Backup/Vault Lock copies. Initial and repair scans remain bounded S3 version walks; every generation verifies immutable checksum, receipt, KMS, retention, and metadata facts even when a post-cutoff legal-hold projection makes only the mutable hold assertion deferrable. Each generation finishes with a bounded destination inventory and cannot report `VERIFIED` while any pre-cutoff destination delete marker or exact version absent from the source exists. The destination evidence prefix explicitly denies both object and exact-version deletion. Verified periodic generations use a strongly consistent immutable promotion/legal-hold change ledger, an explicit 900-second writer safety lag, exact KMS-verified promotion receipts, separate mutable recovery-state and authoritative recovery partitions, and stale/missing freshness alarms. The reconciler's narrowly scoped source and destination KMS permissions include the data-key operation required for checksum-mode HEAD of SSE-KMS objects. | Same-account design does not survive account compromise; no deployment, backfill, existing-table migration, restore/cutover, audit-bucket replication, or demonstrated RPO/RTO. Existing `AWS::DynamoDB::Table` stacks require retain/remove/convert/import—not a direct update. |
 | AWS-11 | Substantially addressed in source | GitHub actions are SHA-pinned, advanced CodeQL uses an explicit manual arm64 Swift build plus separate JavaScript/TypeScript and Actions jobs, and the production release workflow requires a clean approved commit, ephemeral Keychain, hardened Developer ID signing, Apple acceptance, stapling/Gatekeeper checks, bounded artifacts, and attestations. Release identity configuration and production build both validate canonical base64 for a 65-byte uncompressed P-256 point, a unique key ID, canonical ordered timestamps, and a key validity window that includes the build time. Direct CDK and AWS SDK dependencies are exact-version pinned in `infra/aws/cdk/package.json` and `pnpm-lock.yaml`; the reviewed TypeScript runtime Lambdas use `NodejsFunction` with `externalModules: []`, producing self-contained bundles rather than relying on the Lambda runtime's SDK. | Switch the repository from default to advanced CodeQL, require all three analysis checks, and successfully run the protected production-release workflow; configure protected Apple/repository settings; verify Lambda SBOM/provenance and deployed hashes; exercise failure diagnostics in AWS. No Apple submission, production release, or live Lambda deployment has run. |
 
@@ -229,27 +242,38 @@ These are code-confirmed controls, not claims of deployed effectiveness:
 - WAF rejects unknown hosts and oversized request bodies, applies AWS managed rules and per-IP rate limits, and redacts authorization/cookie headers in retained blocked-request logs.
 - Cognito disables self-sign-up, requires MFA, uses 14-character complex passwords, enables token revocation, hides user-existence errors, and creates separate public web/native clients without client secrets.
 - The Mac primitives use authorization code plus S256 PKCE, high-entropy state/nonce/verifier values, exact callback matching, canonical public HTTPS endpoints, one-shot state, and a `WhenUnlockedThisDeviceOnly` Keychain item for the refresh token. Access and ID tokens are designed to remain in memory.
-- CloudTrail is multi-region, includes global service events and file validation, sends logs to a KMS-encrypted Object-Locked bucket, and records exact S3 data events for tenant ingest/evidence buckets.
+- CloudTrail is multi-region, includes global service events and file validation,
+  sends logs to a KMS-encrypted Object-Locked bucket, records exact S3 data
+  events for tenant ingest/evidence buckets, and selects `ALL` data events for
+  the exact authoritative DynamoDB control-table ARN.
 
 ## 2. System Overview and Trust Boundaries
 
-Sections 2–6 preserve the original review-time architecture, findings, and
-attack chains as historical evidence. Where those sections say an adapter,
-route, legal hold, signature, or recovery control was absent, that statement is
-the dated baseline—not the current branch. Sections 7–11 and the remediation
-addendum describe the current source state. Production closure still requires
-the addendum's live validation.
+Sections 2–4 and 7–11 describe the current source state and current residual
+risks. The detailed findings and attack chains in Sections 5–6 preserve the
+original review evidence with explicit current-source corrections. Where that
+historical evidence says an adapter, route, legal hold, signature, or recovery
+control was absent, the statement is the dated baseline—not the current branch.
+Production closure still requires the addendum's live validation.
 
 ### Intended architecture
 
 1. Route 53 assigns one explicit hostname per tenant, such as `acme.<owned-domain>`; wildcard tenant DNS is not created.
 2. AWS WAF filters hostnames, large bodies, common attacks, bad IP reputation, and per-IP request rate before Amplify SSR.
-3. Cognito authenticates humans through a shared user pool and a tenant-specific public app client. The intended server adapter validates the access token and resolves a tenant membership.
+3. Cognito authenticates humans through a shared user pool and a tenant-specific
+   public app client. The source-defined server adapter strictly verifies the
+   raw access token and resolves an active tenant membership before RBAC.
 4. DynamoDB is the shared control plane for exact hostname-to-tenant routing, tenant provisioning state, and upload/promotion coordination.
 5. The shared Amplify SSR role and worker role assume a per-tenant IAM data role after authorization.
 6. Aurora PostgreSQL stores each tenant in a separate database. A separate NOLOGIN owner owns the database boundary; the application role is LOGIN, non-owner, NOSUPERUSER, NOCREATEROLE, NOCREATEDB, NOREPLICATION, and NOBYPASSRLS. Forced RLS and a one-row database identity provide a second tenant check.
-7. Uploads enter a tenant quarantine bucket through a future exact presigned PUT. GuardDuty scans the exact version. A Lambda validates the authoritative intent and scan receipt before copying to an Object-Locked evidence bucket.
-8. CloudTrail, CloudWatch, SQS DLQs, SNS, budgets, and cost-anomaly detection provide infrastructure observability.
+7. Uploads enter a tenant quarantine bucket through an exact presigned PUT issued
+   by the tenant API source. GuardDuty scans the exact version. A Lambda validates
+   the authoritative intent and scan receipt before copying to an Object-Locked
+   evidence bucket.
+8. CloudTrail, CloudWatch, SQS DLQs, SNS, budgets, and cost-anomaly detection
+   provide infrastructure observability. Source enforces an operations-alert
+   address for production and exact control-table data events; deployment must
+   still prove subscription confirmation, delivery, and usable forensic records.
 9. The Mac application will use Cognito OAuth/PKCE and a hosted API. The current local capture and loopback console remain independent and local-only.
 
 ### Principal trust boundaries
@@ -280,38 +304,50 @@ the addendum's live validation.
 - A malicious file supplier attempting parser exploitation, malware delivery, content-type confusion, checksum mismatch, decompression abuse, or scan/promotion races.
 - A compromised shared SSR process, job worker, Lambda execution role, or CI dependency attempting to pivot across every tenant.
 - A malicious or compromised AWS administrator attempting to bypass governance retention, alter logs, replace release artifacts, or exfiltrate database/evidence data.
-- An operator making a plausible configuration mistake: using the placeholder domain, enabling the clean rule early, omitting alert recipients, assigning the wrong tenant role, or deploying the legacy runtime.
+- An operator making a plausible configuration mistake: using a non-production
+  configuration, leaving the required SNS subscription unconfirmed, assigning
+  the wrong tenant role, or deploying the legacy runtime.
 
 ### Likely attack paths
 
 1. **Cross-tenant web access:** reach tenant B through tenant A's session or host header, then exploit global legacy tables/bucket keys or a missing tenant predicate.
-2. **Identity forgery:** submit a decoded but unsigned JWT, wrong Cognito client token, stale token, or a client-supplied `signatureVerified: true` object to an incomplete adapter.
+2. **Identity forgery regression:** bypass or miswire the source verifier, submit
+   a decoded but unsigned JWT, wrong Cognito client token, stale token, or
+   deserialize a client-supplied `signatureVerified: true` object as an internal
+   principal.
 3. **Shared-role pivot:** obtain shared SSR/worker credentials and call `sts:AssumeRole` for every `sp-*-data` tenant role.
 4. **Evidence substitution:** upload different bytes/version after intent creation, spoof a queue event, reuse a clean event, alter content type/size, or redirect the final S3 key.
-5. **Audit forgery:** use the general runtime database credential to insert arbitrary audit/receipt rows containing syntactically plausible but unverified signature strings.
+5. **Audit forgery regression:** bypass or miswire the purpose-specific KMS
+   signing workers, relax database execute-only roles, or fail open when
+   verifying a canonical receipt so fabricated compliance events are accepted.
 6. **Separation-of-duties bypass:** directly mutate membership, approval, retention, or support-grant rows through a vulnerable route or SQL injection.
-7. **Persistence/destruction:** compromise an AWS administrator or deployment role, bypass GOVERNANCE retention, change KMS/bucket policy, or deploy a malicious Lambda/release.
-8. **Operational evasion:** exploit missing alert subscribers or unlogged DynamoDB writes so tenant mappings or upload intents change without timely detection.
+7. **Persistence/destruction:** compromise an AWS administrator or deployment
+   role, deploy a non-production retention/recovery profile to a customer,
+   change KMS/bucket/replication policy, or replace a Lambda/release. The
+   same-account replica does not contain a full account compromise.
+8. **Operational evasion:** leave the required alert subscription unconfirmed,
+   remove or misdeploy the exact DynamoDB selector, or break downstream delivery
+   so tenant mappings or upload intents change without timely detection.
 
 ## 4. Attack Surface Inventory
 
-The inventory below is the original review snapshot. The new per-tenant API,
-upload-intent route, KMS receipt path, two-person hold states, global control
-table, and recovery backfill are summarized in the addendum; they have not been
-deployed.
+The inventory below reflects the current source after the remediation addenda.
+It identifies implemented boundaries separately from the remaining product and
+operational gaps. None of these rows establishes deployment or live control
+effectiveness.
 
 | Surface | Entry points | Attacker-controlled inputs | Present controls | Material gaps |
 |---|---|---|---|---|
-| Tenant web edge | root and explicit tenant hostnames through WAF/Amplify | Host, URL, headers, body, cookies, IP | exact-host WAF, managed rules, 64 KiB body bound, IP rate rule | no hosted API implementation; no authenticated user/tenant rate limit |
-| Cognito | `auth.<domain>`, tenant app clients, `/auth/callback` | credentials, MFA attempts, OAuth request/callback | required MFA, no self-signup, public-client code flow, revocation | server JWT/JWKS verifier and Mac token exchange are absent; Cognito domain is not associated with this WAF |
+| Tenant web edge | root and explicit tenant hostnames through WAF/API Gateway/Amplify | Host, URL, headers, body, cookies, IP | exact-host WAF, managed rules, 64 KiB body bound, IP rate rule, a small source-composed tenant API with route scopes | no deployed customer edge or approved UI release; most customer routes are not migrated; no general authenticated user/tenant rate limit |
+| Cognito | `auth.<domain>`, tenant app clients, `/auth/callback` | credentials, MFA attempts, OAuth request/callback | required MFA, no self-signup, public-client code flow, revocation, strict server RS256/JWKS and issuer/client/token-use/lifetime checks, active membership and RBAC | Mac token exchange, refresh/revocation, signed discovery, and live Cognito testing remain absent; Cognito domain is not associated with this WAF |
 | Mac OAuth callback | custom URL callback | callback URL/query, code/error/state | exact callback, PKCE, random state/nonce, one-shot transaction | custom scheme UI registration and token/JWKS validation absent; signed discovery absent |
-| Tenant registry | DynamoDB `TENANT#...` and `DOMAIN#...` | deployment context and future onboarding API | strict ID/slug/domain validation; transactional registration/provision status | no onboarding API authorization; DynamoDB data events omitted from trail |
+| Tenant registry | DynamoDB `TENANT#...`, `DOMAIN#...`, and activation records | deployment context and future onboarding API | strict ID/slug/domain validation; transactional registration/provision status; execution-bound, short-lived `CUSTOMER_ENABLED` approval; exact-table CloudTrail data events | no general onboarding or membership-administration API; activation IAM/write path and data-event delivery have not been validated live |
 | PostgreSQL | RDS Data API, tenant database secret | SQL parameters, session tenant setting, business mutations | separate DBs, forced RLS, identity trigger, non-owner runtime, timeouts | broad within-tenant mutation grants; business actor is not DB-bound |
-| Quarantine upload | future presigned S3 PUT | bytes, type, size, checksum, key, timing | exact prefix/IAM KMS context, versioning, lifecycle, GuardDuty | issuer/presigner not implemented; clean rule disabled |
+| Quarantine upload | tenant-API-issued exact presigned S3 PUT | bytes, type, size, checksum, timing | server-owned key/retention, exact prefix/IAM KMS context, atomic reservations, durable PostgreSQL projection/repair, versioning, lifecycle, enabled GuardDuty clean rule | no live Cognito/STS/DynamoDB/Aurora/GuardDuty/S3 integration, contention, or failure-convergence proof |
 | Malware promotion | EventBridge -> SQS -> Lambda | event envelope and referenced S3 object | AWS identity fields, exact plan/bucket/key/version, live tag/head/checksum, CAS | event schema not validated against a live account; limited diagnostic logging |
-| Evidence storage | S3 GET/HEAD and future delete/hold flows | key/version requests | private bucket, exact prefix, KMS, Object Lock, versions | S3 legal hold adapter absent; governance default; no replication |
-| Jobs | shared and tenant SQS/DLQ | future job envelope and retries | bounded pure transitions, leases, idempotency, DLQs, alarms | worker adapter and persisted CAS not implemented |
-| Audit/monitoring | DB audit chain, CloudTrail, WAF/Step Functions/Lambda logs | event details, AWS API activity | canonical hashing, forced append order, Object-Locked trail | KMS business signature adapter absent; runtime may insert; DDB data events missing; subscribers optional |
+| Evidence storage | S3 GET/HEAD and exact-version hold/replication flows | key/version requests | private bucket, exact prefix, KMS, Object Lock, versions, two-person exact-version legal-hold worker/readback, same-account cross-region replication/backfill/reconciliation | no live hold, replica, restore/cutover, or cross-account isolation proof |
+| Jobs | shared and tenant SQS/DLQ | job envelopes and retries | bounded transitions, persistent leases/fences/CAS, purpose-specific worker adapters, durable outboxes, idempotency, DLQs, alarms | no deployed redrive/failure-convergence evidence and no universal repository for future product-job types |
+| Audit/monitoring | KMS-signed DB receipts, CloudTrail, WAF/Step Functions/Lambda logs | event details, AWS API activity | domain-separated KMS signing/verifying workers, forced append order, exact S3 and authoritative-table data events, Object-Locked trail, production alert-address enforcement | general product mutations are not all signed; no independent checkpoint or live subscription/delivery/forensic-query proof |
 | Release channel | private S3 origin + public CloudFront hostname | release object paths and deployment artifacts | OAC, TLS 1.2+, versioning, access logs, response headers, WAF | artifact signature/provenance enforcement is outside this stack |
 
 ## 5. Prioritized Findings
@@ -331,7 +367,13 @@ deployed.
 - **Validation:** Run a two-tenant adversarial matrix against every endpoint. Reuse tenant A IDs, cookies, access tokens, presigned URLs, job IDs, S3 keys, and host headers against tenant B. Each response must be an indistinguishable 404/403 and must produce no cross-tenant AWS API call. Verify the direct Amplify hostname and spoofed `X-Forwarded-Host` are blocked.
 - **CWE/OWASP:** CWE-639 (Authorization Bypass Through User-Controlled Key), CWE-862 (Missing Authorization), OWASP ASVS V4, OWASP API1:2023 Broken Object Level Authorization.
 
-### AWS-02 — Cryptographic JWT verification and the hosted OAuth network flow are absent
+### AWS-02 — Historical baseline: cryptographic JWT verification and the hosted OAuth network flow were absent
+
+> **Current-source correction (2026-09-01):** The hosted server path now has a
+> strict Cognito RS256/JWKS verifier, exact issuer/client/token-use/lifetime
+> checks, active membership resolution, RBAC, and route-specific scopes. The Mac
+> callback/token/refresh/revocation flow and live Cognito validation remain open;
+> the historical evidence below describes the original baseline.
 
 - **Severity:** High
 - **Confidence:** High
@@ -376,7 +418,13 @@ deployed.
 - **Validation:** Connect as the runtime role and prove direct `UPDATE memberships`, direct evidence approval, direct support-grant insertion, and direct hold release are denied. Then test each stored procedure with collector/auditor/reviewer/admin roles, suspended memberships, creator-as-reviewer, stale revisions, forged actor settings, and concurrent requests.
 - **CWE/OWASP:** CWE-862 (Missing Authorization), CWE-863 (Incorrect Authorization), CWE-285 (Improper Authorization), OWASP API5:2023 Broken Function Level Authorization.
 
-### AWS-05 — The secure upload issuer is absent and clean-object promotion is disabled
+### AWS-05 — Historical baseline: the secure upload issuer was absent and clean-object promotion was disabled
+
+> **Current-source correction (2026-09-01):** The tenant API upload issuer,
+> exact presigner, atomic DynamoDB reservations, durable PostgreSQL projection
+> and repair worker, enabled GuardDuty clean rule, and exact promotion worker are
+> implemented in source. None has been exercised against live AWS/PostgreSQL;
+> the historical evidence below describes the original baseline.
 
 - **Severity:** High
 - **Confidence:** High
@@ -391,7 +439,14 @@ deployed.
 - **Validation:** Test wrong tenant/resource IDs, path traversal/encoding, unsupported MIME, multipart and oversize uploads, missing/wrong checksum, KMS/header substitution, expired/replayed URLs, alternate object versions, spoofed EventBridge/SQS bodies, changed ETag, absent GuardDuty tag, threat/unsupported/denied scans, duplicate delivery, concurrency, copy-success/database-failure retry, and DLQ redrive. Use the standard harmless EICAR test file only in an isolated non-production tenant.
 - **CWE/OWASP:** CWE-434 (Unrestricted Upload of File with Dangerous Type), CWE-367 (TOCTOU Race Condition), CWE-345 (Insufficient Verification of Data Authenticity), OWASP ASVS V12, OWASP API6:2023 Unrestricted Access to Sensitive Business Flows.
 
-### AWS-06 — Business audit and receipt signatures are placeholders rather than KMS-verifiable attestations
+### AWS-06 — Historical baseline: business audit and receipt signatures were placeholders rather than KMS-verifiable attestations
+
+> **Current-source correction (2026-09-01):** Tenant RSA-3072 KMS
+> signing/verification, domain-separated canonical promotion, API-audit,
+> legal-hold, rejection, and recovery receipts, durable signing outboxes, and
+> verification workers are implemented in source. General product mutations and
+> deployed KMS/IAM/CloudTrail validation remain open; the historical evidence
+> below describes the original baseline.
 
 - **Severity:** High
 - **Confidence:** High
@@ -406,7 +461,13 @@ deployed.
 - **Validation:** Attempt arbitrary/empty/wrong-key signatures, modified details, sequence gaps, duplicate sequence/hash, concurrent append, signer replay, KMS disabled/revoked key, key rotation, outbox retry, and compromised runtime direct insert. Independently verify every event and receipt from genesis with the public KMS key and compare checkpoints to CloudTrail/Object-Locked copies.
 - **CWE/OWASP:** CWE-345 (Insufficient Verification of Data Authenticity), CWE-117 (Improper Output Neutralization for Logs), CWE-778 (Insufficient Logging), OWASP ASVS V7.
 
-### AWS-07 — Database legal holds are not enforced with S3 Object Lock legal holds
+### AWS-07 — Historical baseline: database legal holds were not enforced with S3 Object Lock legal holds
+
+> **Current-source correction (2026-09-01):** Exact-version two-person legal
+> holds now use durable `REQUESTED` → `APPROVED` → `APPLYING` → `APPLIED`
+> transitions, S3 legal-hold write/readback, KMS-signed audit, and recovery
+> projection workers. No live S3/KMS/Aurora drill or released UI exists; the
+> historical evidence below describes the original baseline.
 
 - **Severity:** High
 - **Confidence:** High
@@ -421,7 +482,13 @@ deployed.
 - **Validation:** Test exact-version binding, duplicate/replayed hold commands, stale revisions, creator attempting self-release, S3 timeout after DB commit, DB timeout after S3 success, reconciliation drift, expired time retention with active legal hold, and compromised deletion worker. Confirm S3 itself denies deletion while hold is ON.
 - **CWE/OWASP:** CWE-284 (Improper Access Control), CWE-672 (Operation on a Resource After Expiration or Release), OWASP ASVS V8.
 
-### AWS-08 — Security alert delivery is optional and can silently have no recipient
+### AWS-08 — Historical baseline: security alert delivery was optional and could silently have no recipient
+
+> **Current-source correction (2026-09-01):** Production cannot disable
+> recovery, and production synthesis rejects a missing or invalid operations
+> alert address. CloudFormation still cannot prove SNS confirmation, delivery,
+> acknowledgment, or on-call integration; the historical evidence below
+> describes the original baseline.
 
 - **Severity:** Medium
 - **Confidence:** High
@@ -436,7 +503,13 @@ deployed.
 - **Validation:** Synthesis must fail for production with no destination. Test invalid/unconfirmed/disabled subscriptions, alarm actions, KMS access, malware alerts, DLQ alarms, root-use alarm, budget forecast/actual thresholds, and an end-to-end canary page.
 - **CWE/OWASP:** CWE-778 (Insufficient Logging), CWE-223 (Omission of Security-Relevant Information), OWASP ASVS V7.
 
-### AWS-09 — Immutable CloudTrail omits DynamoDB control-plane data events
+### AWS-09 — Historical baseline: immutable CloudTrail omitted DynamoDB control-plane data events
+
+> **Current-source correction (2026-09-01):** The multi-region trail now
+> selects `ALL` data events for the exact authoritative DynamoDB control-table
+> ARN as well as exact tenant S3 object events. Live delivery, digest validation,
+> unexpected-principal alarms, and forensic queries remain unproven; the
+> historical evidence below describes the original baseline.
 
 - **Severity:** Medium
 - **Confidence:** High
@@ -451,7 +524,14 @@ deployed.
 - **Validation:** Perform one expected and one deliberately unauthorized registry/intent write in staging. Confirm both appear in CloudTrail with principal, request ID, table ARN, key metadata permitted by AWS, log-file digest validation, and delivery to the immutable bucket. Confirm the unexpected-principal alarm fires.
 - **CWE/OWASP:** CWE-778 (Insufficient Logging), CWE-223 (Omission of Security-Relevant Information), OWASP ASVS V7.
 
-### AWS-10 — Governance retention, short metadata backup retention, and no cross-region recovery leave administrator/region risks
+### AWS-10 — Historical baseline: governance retention, short metadata backup retention, and no cross-region recovery left administrator/region risks
+
+> **Current-source correction (2026-09-01):** Production recovery now requires
+> COMPLIANCE Object Lock, a recovery-region global-table replica, exact-prefix
+> S3 CRR/RTC with deterministic backfill and reconciliation, and Aurora AWS
+> Backup/Vault Lock copies. These remain same-account source controls with no
+> deployment, restore/cutover drill, demonstrated RPO/RTO, or audit-bucket
+> replication; the historical evidence below describes the original baseline.
 
 - **Severity:** Medium
 - **Confidence:** High
@@ -484,9 +564,10 @@ deployed.
 ## 6. Exploitation Chains or Combined-Risk Scenarios
 
 > **Historical baseline:** the chains in this section explain why the original
-> findings were serious. Chains C and D are no longer accurate descriptions of
-> the current source controls: strict JWT/membership adapters, split database
-> roles, KMS receipts, and the exact-version legal-hold worker now exist. They
+> findings were serious. Chains B, C, and D are no longer accurate descriptions
+> of the current source controls: exact DynamoDB data events, production alert
+> enforcement, strict JWT/membership adapters, split database roles, KMS
+> receipts, and exact-version legal-hold and recovery workers now exist. They
 > remain useful regression scenarios and are not evidence of a deployed fix.
 
 ### Chain A — Premature AWS launch to cross-tenant compromise
@@ -503,7 +584,9 @@ deployed.
 1. A future SSR parser/dependency vulnerability yields the `AmplifyComputeRole` credentials.
 2. The role reads the shared tenant registry and assumes every wildcard-matched tenant role.
 3. It reads exact tenant evidence versions and uses each tenant database credential through the Data API.
-4. Missing DynamoDB data-event logging and optional alert delivery reduce timely detection.
+4. A deployment regression removes or mis-scopes the exact DynamoDB selector,
+   or the required SNS subscription remains unconfirmed, reducing timely
+   detection despite the source fail-closed configuration.
 
 **Result:** AWS-03 + AWS-08 + AWS-09 turn one shared runtime compromise into broad multi-customer exfiltration with weaker forensic evidence.
 
@@ -521,7 +604,8 @@ deployed.
 1. An operator records a legal hold in PostgreSQL.
 2. Time-based S3 retention expires; the S3 legal-hold bit was never enabled.
 3. A compromised admin or future cleanup worker deletes the exact version.
-4. Optional/missing alerts and incomplete control-plane data events delay discovery.
+4. The source legal-hold worker is bypassed or misdeployed, while an unconfirmed
+   alert subscription or broken CloudTrail delivery delays discovery.
 
 **Result:** AWS-07 + AWS-08/AWS-09 create evidence spoliation while the database continues to claim a hold.
 
@@ -571,7 +655,11 @@ deployed.
   projection, monotonic promotion fencing, conditional immutable S3 creation,
   and signed promotion reconciliation exist in source but have not been tested
   against live Cognito, STS, DynamoDB, Aurora, GuardDuty, S3 Object Lock, or KMS.
-- No persisted job repository/compare-and-swap worker adapter exists.
+- Purpose-specific promotion, legal-hold, recovery, rejected-evidence,
+  upload-projection repair, API-audit signing, and tenant-provisioning workers
+  use persisted leases/fences/CAS, durable outboxes, idempotency, and DLQs in
+  source. A universal repository for future product-job types and live
+  redrive/failure-convergence evidence remain absent.
 - KMS signing/verifying and append-only receipts exist for promotion and legal
   holds. General product mutations, independent audit checkpoints, and
   fail-closed export verification remain incomplete.
@@ -610,8 +698,9 @@ deployed.
 5. Prove the legal-hold `REQUESTED` → `APPROVED` → `APPLYING` → `APPLIED`
    lifecycle, signed-audit-before-recovery ordering, expiry, retry, alarm, and
    exact-version S3 behavior in live integration tests before exposing it.
-6. Connect at least one confirmed on-call destination and add immutable audit for
-   security-critical control-table mutations.
+6. Connect and exercise at least one confirmed on-call destination, then deploy
+   and validate the existing exact authoritative-table CloudTrail selector with
+   authorized and denied security-critical mutations.
 
 ### P1 — Before production pilot
 

@@ -29,7 +29,30 @@ Set `GITHUB_ORG` to the one organization operators may inventory. Set `GITHUB_TO
 
 Do not grant write, administration, workflow, issue, or secret permissions. Rotate the credential using the platform secret manager; never put it in the browser, Mac app, repository, or D1.
 
-Apply every migration in journal order through `drizzle/0023_independent_image_safety.sql` before enabling the current application, and run `npm run db:verify` as a deployment preflight. Migration 0012 creates the SBOM job domain; later migrations add the membership, retry-authorization, occurrence/lifecycle, audited mutation, immutable receipt, native provenance/quarantine, and independent screenshot-safety controls used by the surrounding evidence and package workflow. The preflight exercises the populated upgrade path rather than only an empty database. If a GitHub App installation token is used, Scopeproof does not mint or refresh it; an external secret-rotation process must replace the expiring token in Sites. The console labels managed access **Not configured** until both variables are present; one-time access remains available.
+Apply every migration in journal order through
+`drizzle/0027_lonely_guardian.sql` before enabling the current
+application, and run `npm run db:verify` as a deployment preflight. Migration
+0012 creates the SBOM job domain; migrations through 0023 add membership,
+retry authorization, occurrence/lifecycle, audited mutation, immutable receipt,
+native provenance/quarantine, and independent screenshot-safety controls used
+by the surrounding evidence and package workflow. Migration 0024 adds versioned
+control catalogs, explicit assessment-scope fields, durable review/finding
+records, and hold-release request facts used by the two-person flow. Migration
+0025 adds append-only checkpoint-delivery attempts with one immutable delivered
+result and safe failed-attempt history. Migration 0026 adds per-record
+key-rotation retry,
+action-required, and recovery state so a poisoned encrypted record cannot
+hot-loop or hide unrelated maintenance. Migration 0027 adds atomic leased
+checkpoint-delivery retry state, bounded backoff, stale-claim recovery, and a
+ten-attempt operator-action boundary. The populated preflight preserves
+same-digest legacy evidence from different systems, verifies legacy device and
+occurrence backfills, checks catalog/scope/review/hold structures, proves
+checkpoint-attempt immutability and single-delivery constraints, exercises the
+key-rotation retry lifecycle, rejects malformed state, and runs SQLite integrity
+checking. If a GitHub App installation token is used, Scopeproof does not mint or
+refresh it; an external secret-rotation process must replace the expiring token
+in Sites. The console labels managed access **Not configured** until both
+variables are present; one-time access remains available.
 
 ### Hosted one-time repository
 

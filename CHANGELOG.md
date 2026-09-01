@@ -15,6 +15,12 @@
 - Added a digest-bound two-administrator hosted retention-hold release. A different administrator must approve the exact immutable hold facts within 24 hours, and replacing the hold cancels the pending request.
 - Added focus trapping/restoration and keyboard-safe dialog behavior to the hosted console.
 - Added D1 migration `0024_big_chamber.sql` for control catalogs, explicit scope, review events, findings/finding events, optimistic review tokens, and hold-release requests.
+- Unified assessor preflight and build eligibility in one occurrence-authoritative SQL policy. Only a newer approved, unexpired, fully scanned/provenance-valid recollection for the same framework, source, system, environment, assessment period, and collector clears a partial blocker. Final publication rechecks the complete assessment and reconciles ambiguous database responses before any candidate object can be deleted.
+- Replaced the one-page assessment selector with an active-workspace bootstrap plus explicit cursor paging for older records, preventing hidden active scopes without issuing an unbounded first-load request.
+- Added append-only audit-checkpoint delivery attempts in migration `0025_pink_malice.sql`. Failed or unconfigured same-head checkpoints retry the exact immutable signed envelope with digest idempotency; one signed receipt binding can win and checkpoint-verification caches invalidate immediately.
+- Isolated scheduled maintenance failure domains so retention, jobs, SBOMs, collectors, key rotation, checkpoints, and operational health cannot starve one another. Migration `0026_omniscient_scarlet_witch.sql` adds per-record key-rotation backoff, action-required state, recovery auditing, and poison-record isolation.
+- Added atomic audit-checkpoint retry claims in migration `0027_lonely_guardian.sql`. Concurrent schedulers can no longer bypass backoff or consume the retry budget together; stale claims are recoverable, delivery is capped at ten attempts, and terminal `action_required` state fails readiness until an operator repairs the witness path and a later audit head is checkpointed.
+- Added enforced web lint and TypeScript checks to CI, corrected collector scope typing, removed secret-bearing exception text from operational logs/audit failure records, replaced credential-shaped test literals with runtime-generated fixtures, and updated the transitive `browserslist` lock to 4.28.8 to clear the High-severity memory-exhaustion/crash advisories.
 
 #### AWS runtime and infrastructure source
 
@@ -37,6 +43,7 @@
 - Added a Keychain-backed tenant-bound capture-commit journal. Startup either validates and commits a complete image/manifest/lifecycle transaction or removes a partial transaction; conflicting or rollback state fails closed.
 - Centralized trust-bearing file reads through bounded, contained, regular-file validation and rejects symbolic links, hard links, oversized sidecars, unsafe roots, and digest mismatches. Legacy unsigned artifacts remain browsing-only.
 - Hardened local expiry cleanup. A `.s3.json` receipt is no longer sufficient: Scopeproof performs live exact-version S3 `HEAD` and Object Lock retention checks for every receipt object and verifies tenant prefix, account, version, ETag, checksum, SSE-KMS/DSSE-KMS settings, KMS key, and future COMPLIANCE retention before relying on S3 as a durable copy.
+- Hardened signed update ZIP handling before extraction with central/local directory and data-descriptor consistency checks, streamed raw-deflate/stored-byte and CRC verification, path/file-type/overlap rejection, actual per-file and aggregate expansion/ratio limits, available-disk checks, post-extraction regular-file validation, bounded command output, cancellation, and execution deadlines.
 
 #### Documentation and deployment state
 

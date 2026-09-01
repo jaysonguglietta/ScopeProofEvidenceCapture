@@ -61,8 +61,12 @@ let auditVerificationCache: { key: string; maximumEvents: number; expiresAt: num
 export async function verifyAuditChain(maximumEvents = 10_000): Promise<AuditChainVerification> {
   const env = getEnv();
   const head = await env.DB.prepare("SELECT sequence, event_hash FROM audit_events ORDER BY sequence DESC LIMIT 1").first<{ sequence: number; event_hash: string }>();
-  const checkpoint = await env.DB.prepare("SELECT sequence, event_hash, checkpoint_sha256, external_status, external_receipt_sha256 FROM audit_checkpoints ORDER BY sequence DESC LIMIT 1").first<{ sequence: number; event_hash: string; checkpoint_sha256: string; external_status: string; external_receipt_sha256: string | null }>();
-  const cacheKey = `${Number(head?.sequence || 0)}:${head?.event_hash || "GENESIS"}:${Number(checkpoint?.sequence || 0)}:${checkpoint?.event_hash || "NONE"}:${checkpoint?.checkpoint_sha256 || "NONE"}:${checkpoint?.external_status || "NONE"}:${checkpoint?.external_receipt_sha256 || "NONE"}`;
+  const checkpoint = await env.DB.prepare(`SELECT c.sequence, c.event_hash, c.checkpoint_sha256, c.external_status, c.external_receipt_sha256,
+    d.id AS delivery_attempt_id, d.external_receipt_sha256 AS delivery_attempt_receipt_sha256
+    FROM audit_checkpoints c
+    LEFT JOIN audit_checkpoint_delivery_attempts d ON d.checkpoint_id = c.id AND d.status = 'delivered'
+    ORDER BY c.sequence DESC LIMIT 1`).first<{ sequence: number; event_hash: string; checkpoint_sha256: string; external_status: string; external_receipt_sha256: string | null; delivery_attempt_id: string | null; delivery_attempt_receipt_sha256: string | null }>();
+  const cacheKey = `${Number(head?.sequence || 0)}:${head?.event_hash || "GENESIS"}:${Number(checkpoint?.sequence || 0)}:${checkpoint?.event_hash || "NONE"}:${checkpoint?.checkpoint_sha256 || "NONE"}:${checkpoint?.external_status || "NONE"}:${checkpoint?.external_receipt_sha256 || "NONE"}:${checkpoint?.delivery_attempt_id || "NONE"}:${checkpoint?.delivery_attempt_receipt_sha256 || "NONE"}`;
   if (auditVerificationCache?.key === cacheKey && auditVerificationCache.maximumEvents === maximumEvents && auditVerificationCache.expiresAt > Date.now()) return auditVerificationCache.result;
   const finish = (result: AuditChainVerification): AuditChainVerification => {
     auditVerificationCache = { key: cacheKey, maximumEvents, expiresAt: Date.now() + AUDIT_VERIFICATION_CACHE_TTL_MS, result };

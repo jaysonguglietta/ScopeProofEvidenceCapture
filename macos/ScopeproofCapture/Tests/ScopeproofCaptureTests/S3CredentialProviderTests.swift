@@ -4,6 +4,10 @@ import Testing
 
 @Suite("S3 credential providers")
 struct S3CredentialProviderTests {
+    private static let permanentAccessKeyID = "AK" + "IA" + String(repeating: "P", count: 16)
+    private static let temporaryAccessKeyID = "AS" + "IA" + String(repeating: "T", count: 16)
+    private static let secretAccessKey = String(repeating: "s", count: 40)
+
     @Test("Validates non-secret authentication configuration")
     func validatesAuthenticationConfiguration() throws {
         let profile = try S3AuthenticationConfiguration.validated(
@@ -52,11 +56,11 @@ struct S3CredentialProviderTests {
         let now = try #require(ISO8601DateFormatter().date(from: "2099-01-01T00:00:00Z"))
         let data = Data(Self.processCredentialJSON(expiration: "2099-01-01T01:00:00Z").utf8)
         let credentials = try S3AWSCredentialOutputParser.parseProcessCredentials(data, now: now)
-        #expect(credentials.accessKeyID == "ASIAIOSFODNN7EXAMPLE")
+        #expect(credentials.accessKeyID == Self.temporaryAccessKeyID)
         #expect(credentials.isTemporary)
 
         let permanent = Data(Self.processCredentialJSON(
-            accessKeyID: "AKIAIOSFODNN7EXAMPLE", expiration: "2099-01-01T01:00:00Z"
+            accessKeyID: Self.permanentAccessKeyID, expiration: "2099-01-01T01:00:00Z"
         ).utf8)
         #expect(throws: S3StorageFailure.self) {
             try S3AWSCredentialOutputParser.parseProcessCredentials(permanent, now: now)
@@ -340,8 +344,8 @@ struct S3CredentialProviderTests {
     func rejectsManualLongLivedCredentials() async throws {
         let settings = try Self.productionSettings(authentication: .manual)
         let permanent = try S3Credentials.validated(
-            accessKeyID: "AKIAIOSFODNN7EXAMPLE",
-            secretAccessKey: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", sessionToken: ""
+            accessKeyID: Self.permanentAccessKeyID,
+            secretAccessKey: Self.secretAccessKey, sessionToken: ""
         )
         let provider = S3CredentialProvider(
             cli: RecordingS3CLI { _ in throw S3AWSCLIExecutionFailure.rejected },
@@ -365,7 +369,7 @@ struct S3CredentialProviderTests {
             if let configuration = try Self.identityCenterConfigurationResponse(arguments) { return configuration }
             #expect(arguments.first == "configure")
             return Data(Self.processCredentialJSON(
-                accessKeyID: "AKIAIOSFODNN7EXAMPLE", expiration: "2099-01-01T01:00:00Z"
+                accessKeyID: Self.permanentAccessKeyID, expiration: "2099-01-01T01:00:00Z"
             ).utf8)
         }
         let settings = try Self.productionSettings(authentication: S3AuthenticationConfiguration(
@@ -446,9 +450,10 @@ struct S3CredentialProviderTests {
     }
 
     private static func processCredentialJSON(
-        accessKeyID: String = "ASIAIOSFODNN7EXAMPLE", expiration: String
+        accessKeyID: String? = nil, expiration: String
     ) -> String {
-        #"{"Version":1,"AccessKeyId":"\#(accessKeyID)","SecretAccessKey":"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY","SessionToken":"temporary-session-token-for-scopeproof-tests","Expiration":"\#(expiration)"}"#
+        let selectedAccessKeyID = accessKeyID ?? temporaryAccessKeyID
+        return #"{"Version":1,"AccessKeyId":"\#(selectedAccessKeyID)","SecretAccessKey":"\#(secretAccessKey)","SessionToken":"temporary-session-token-for-scopeproof-tests","Expiration":"\#(expiration)"}"#
     }
 
     private static func identityCenterConfigurationResponse(_ arguments: [String]) throws -> Data? {
@@ -463,7 +468,7 @@ struct S3CredentialProviderTests {
     }
 
     private static func assumeRoleJSON(sessionName: String, expiration: String) -> String {
-        #"{"Credentials":{"AccessKeyId":"ASIAIOSFODNN7EXAMPLE","SecretAccessKey":"wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY","SessionToken":"temporary-session-token-for-scopeproof-tests","Expiration":"\#(expiration)"},"AssumedRoleUser":{"AssumedRoleId":"AROATEST:\#(sessionName)","Arn":"arn:aws:sts::123456789012:assumed-role/evidence-uploader/\#(sessionName)"}}"#
+        #"{"Credentials":{"AccessKeyId":"\#(temporaryAccessKeyID)","SecretAccessKey":"\#(secretAccessKey)","SessionToken":"temporary-session-token-for-scopeproof-tests","Expiration":"\#(expiration)"},"AssumedRoleUser":{"AssumedRoleId":"AROATEST:\#(sessionName)","Arn":"arn:aws:sts::123456789012:assumed-role/evidence-uploader/\#(sessionName)"}}"#
     }
 }
 

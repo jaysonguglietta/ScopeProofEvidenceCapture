@@ -12,6 +12,7 @@
     "test": "npm run build && node --test tests/rendered-html.test.mjs && node --experimental-strip-types --test tests/*.test.ts",
     "test:cloudformation": "node --test infra/aws/cloudformation/tests/templates.test.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
+    "typecheck": "tsc --noEmit --incremental false",
     "db:generate": "drizzle-kit generate",
     "db:verify": "./Scripts/verify_migrations.sh"
   },

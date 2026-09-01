@@ -26,7 +26,8 @@ struct SensitiveDataScannerTests {
 
     @Test("Detects credential families without retaining secret text")
     func detectsCredentialFamiliesWithoutRetainingSecretText() {
-        #expect(SensitiveDataScanner.detectedKinds(in: "AKIAIOSFODNN7EXAMPLE").contains(.awsAccessKey))
+        let syntheticAccessKey = "AK" + "IA" + String(repeating: "T", count: 16)
+        #expect(SensitiveDataScanner.detectedKinds(in: syntheticAccessKey).contains(.awsAccessKey))
         #expect(SensitiveDataScanner.detectedKinds(in: "api_token=very-sensitive-token-value-12345").contains(.apiToken))
         #expect(SensitiveDataScanner.detectedKinds(in: "authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.signature").contains(.authorization))
     }

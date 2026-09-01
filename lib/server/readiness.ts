@@ -4,7 +4,7 @@ import { getLatestAuditCheckpoint, validateAuditCheckpointConfiguration, verifyL
 import { validateConfiguredKeyMaterial, validatePackageSigningKeyPair } from "./crypto";
 import { getEnv } from "./env";
 import { validateSecurityMonitoringConfiguration } from "./external-trust-config";
-import { keyRotationBacklog, validateRetainedKeyReferences } from "./key-operations";
+import { keyRotationBacklog, keyRotationRetrySummary, validateRetainedKeyReferences } from "./key-operations";
 import { validateEvidenceSafetyScannerConfiguration } from "./image-safety";
 import { validateTrustedTimestampConfiguration } from "./timestamp";
 
@@ -76,10 +76,24 @@ export async function productionReadiness(): Promise<{ ready: boolean; checkedAt
   try {
     const references = await validateRetainedKeyReferences();
     checks.push({ id: "retained_keys", status: references.valid ? "pass" : "fail", summary: references.valid ? "Every retained encrypted or signed record has a retained key." : "Retained records reference unavailable keys.", details: references.missing });
-    const backlog = await keyRotationBacklog();
-    checks.push({ id: "key_rotation", status: backlog === 0 ? "pass" : "warn", summary: backlog === 0 ? "Stored ciphertext uses the active encryption keys." : `${backlog} stored records remain queued for key rotation.`, details: { backlog } });
   } catch (error) {
     checks.push({ id: "retained_keys", status: "fail", summary: "Key configuration could not be validated.", details: error instanceof Error ? error.message : String(error) });
+  }
+
+  try {
+    const backlog = await keyRotationBacklog();
+    const retries = await keyRotationRetrySummary();
+    const status: ReadinessCheck["status"] = retries.actionRequired > 0 ? "fail" : backlog > 0 || retries.retrying > 0 ? "warn" : "pass";
+    const summary = retries.actionRequired > 0
+      ? `${retries.actionRequired} key-rotation record${retries.actionRequired === 1 ? " requires" : "s require"} operator action.`
+      : backlog > 0
+        ? `${backlog} stored records remain queued for key rotation.`
+        : retries.retrying > 0
+          ? `${retries.retrying} key-rotation failure${retries.retrying === 1 ? " is" : "s are"} waiting for a bounded retry.`
+          : "Stored ciphertext uses the active encryption keys and no unresolved retry remains.";
+    checks.push({ id: "key_rotation", status, summary, details: { backlog, retries } });
+  } catch (error) {
+    checks.push({ id: "key_rotation", status: "fail", summary: "Key-rotation backlog and retry state could not be validated.", details: error instanceof Error ? error.message : String(error) });
   }
 
   try {

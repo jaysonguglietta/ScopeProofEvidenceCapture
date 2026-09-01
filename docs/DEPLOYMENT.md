@@ -68,7 +68,25 @@ npm run db:generate
 
 Inspect generated SQL for destructive operations, unintended nullability changes, missing indexes, and table rebuilds. Apply migrations in journal order. Never edit a migration already applied to production; add a new forward migration.
 
-The current application requires every migration through `drizzle/0023_independent_image_safety.sql`. Migrations 0016–0019 add rotation leases, occurrence-owned lifecycle state, active-record de-duplication, and audited compare-and-swap guards. Migrations 0020–0022 add per-device P-256 provenance keys, monotonic chain leases/heads, immutable checkpoint receipts, immutable native-manifest links, and quarantine fields for older/unbound native evidence. Migration 0023 adds the independent server screenshot-safety receipt fields.
+The current application requires every migration through
+`drizzle/0027_lonely_guardian.sql`. Migrations 0016–0019 add rotation
+leases, occurrence-owned lifecycle state, active-record de-duplication, and
+audited compare-and-swap guards. Migrations 0020–0022 add per-device P-256
+provenance keys, monotonic chain leases/heads, immutable checkpoint receipts,
+immutable native-manifest links, and quarantine fields for older/unbound native
+evidence. Migration 0023 adds the independent server screenshot-safety receipt
+fields. Migration 0024 adds the versioned control catalog and explicit assessment
+scope fields, durable review/finding event records, and hold-release request
+facts used by the two-person flow, including the captured hold owner, reason,
+and expiry.
+Migration 0025 adds immutable checkpoint-delivery attempt history, permits only
+one delivered result per checkpoint, uniquely binds a delivered receipt object,
+and preserves failed attempts that the application uses for safe same-head retry
+forensics. Migration 0026 adds durable per-record key-rotation attempts with
+positive attempt counts, retry/action-required/resolved state-shape constraints,
+and an index the application uses for bounded due work and backoff. Migration
+0027 adds atomic, leased audit-checkpoint delivery retry state with bounded
+backoff, stale-claim recovery, and terminal operator action.
 
 Before applying migrations to a hosted environment or deploying application code, run the populated upgrade-path preflight:
 
@@ -76,7 +94,20 @@ Before applying migrations to a hosted environment or deploying application code
 npm run db:verify
 ```
 
-The preflight replays the complete journal through 0023 against a database containing legacy devices and duplicate evidence, runs `PRAGMA integrity_check`, and asserts the native-chain, immutable-checkpoint, quarantine, and independent-image-safety columns/triggers. Do not deploy if it fails. Back up D1 first, apply the same ordered files once, and verify the recorded migration journal before enabling traffic.
+The preflight replays the complete journal through 0027 against a populated
+database containing a legacy device and same-digest evidence in two different
+systems with a null legacy assessment scope. It runs `PRAGMA integrity_check`
+and proves that the populated upgrade preserves both artifacts and creates their
+occurrences; initializes legacy token/chain state; installs the native-chain,
+quarantine, independent-image-safety, catalog/scope, review/finding, and hold
+columns/tables; leaves transactional audit guards empty; and retains immutable
+checkpoint/native-link triggers. It also exercises the new invariants: checkpoint
+delivery attempts reject malformed rows, update/delete, and duplicate delivered
+results; key-rotation state accepts the
+retrying → action-required → resolved lifecycle and rejects non-positive or
+shape-inconsistent retry state. Do not deploy if it fails. Back up D1 first,
+apply the same ordered files once, and verify the recorded migration journal
+before enabling traffic.
 
 ## Roles
 

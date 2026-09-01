@@ -1,6 +1,7 @@
 import type { AuthenticatedUser } from "./auth";
 import { executeAuditedBatch } from "./audit";
 import { getEnv } from "./env";
+import { classifyErrorForLogging } from "./safe-error";
 
 export async function purgeExpiredEvidence(now: Date, actor: AuthenticatedUser): Promise<void> {
   const env = getEnv();
@@ -22,9 +23,9 @@ export async function purgeExpiredEvidence(now: Date, actor: AuthenticatedUser):
     try {
       for (const key of [...new Set([item.r2_key, item.rotation_pending_r2_key, item.rotation_previous_r2_key].filter((value): value is string => Boolean(value)))]) await env.EVIDENCE_BUCKET.delete(key);
     } catch (error) {
-      const message = error instanceof Error ? error.message.slice(0, 500) : "Object deletion failed";
-      await executeAuditedBatch(actor, "evidence.purge_failed", "evidence", item.id, { expiredAt: item.expires_at, error: message }, [
-        env.DB.prepare("UPDATE evidence_artifacts SET purge_attempts = purge_attempts + 1, purge_error = ? WHERE id = ? AND status != 'purged'").bind(message, item.id),
+      const errorClass = classifyErrorForLogging(error);
+      await executeAuditedBatch(actor, "evidence.purge_failed", "evidence", item.id, { expiredAt: item.expires_at, errorClass }, [
+        env.DB.prepare("UPDATE evidence_artifacts SET purge_attempts = purge_attempts + 1, purge_error = ? WHERE id = ? AND status != 'purged'").bind(`Object deletion failed (${errorClass}).`, item.id),
       ]);
       continue;
     }
@@ -49,9 +50,9 @@ export async function purgeExpiredEvidence(now: Date, actor: AuthenticatedUser):
     if (!claim.meta.changes) continue;
     try { for (const key of [...new Set([item.r2_key, item.rotation_pending_r2_key, item.rotation_previous_r2_key].filter((value): value is string => Boolean(value)))]) await env.EVIDENCE_BUCKET.delete(key); }
     catch (error) {
-      const message = error instanceof Error ? error.message.slice(0, 500) : "Object deletion failed";
-      await executeAuditedBatch(actor, "package.purge_failed", "export_package", item.id, { error: message }, [
-        env.DB.prepare("UPDATE export_packages SET error_message = ?, rotation_lease_id = NULL, rotation_lease_expires_at = NULL WHERE id = ? AND status = 'ready' AND rotation_lease_id = ?").bind(`Purge failed: ${message}`, item.id, purgeLease),
+      const errorClass = classifyErrorForLogging(error);
+      await executeAuditedBatch(actor, "package.purge_failed", "export_package", item.id, { errorClass }, [
+        env.DB.prepare("UPDATE export_packages SET error_message = ?, rotation_lease_id = NULL, rotation_lease_expires_at = NULL WHERE id = ? AND status = 'ready' AND rotation_lease_id = ?").bind(`Object deletion failed (${errorClass}).`, item.id, purgeLease),
       ]);
       continue;
     }

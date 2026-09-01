@@ -23,14 +23,27 @@ export async function publishOperationalHealth(now = new Date()): Promise<void> 
     (SELECT COUNT(*) FROM jira_upload_operations WHERE status = 'unknown') AS jira_unknown,
     (SELECT COUNT(*) FROM export_packages WHERE status = 'failed' AND completed_at >= ?) AS package_failed,
     (SELECT COUNT(*) FROM audit_events WHERE action IN ('evidence.purge_failed','package.purge_failed') AND occurred_at >= ?) AS purge_failed`).bind(since, since, since).first<HealthCounts>();
-  const checkpoint = await env.DB.prepare("SELECT sequence, created_at, external_status FROM audit_checkpoints ORDER BY sequence DESC LIMIT 1").first<{ sequence: number; created_at: string; external_status: string }>();
+  const checkpoint = await env.DB.prepare(`SELECT c.sequence, c.created_at,
+      CASE
+        WHEN c.external_status = 'delivered' OR EXISTS (
+          SELECT 1 FROM audit_checkpoint_delivery_attempts delivered
+          WHERE delivered.checkpoint_id = c.id AND delivered.status = 'delivered'
+        ) THEN 'delivered'
+        WHEN EXISTS (
+          SELECT 1 FROM audit_checkpoint_delivery_attempts failed
+          WHERE failed.checkpoint_id = c.id AND failed.status = 'failed'
+        ) THEN 'failed'
+        ELSE c.external_status
+      END AS effective_external_status
+    FROM audit_checkpoints c ORDER BY c.sequence DESC LIMIT 1`)
+    .first<{ sequence: number; created_at: string; effective_external_status: string }>();
   const payload = stableJson({
     schemaVersion: 1,
     type: "scopeproof.operational_health",
     observedAt: now.toISOString(),
     windowStartedAt: since,
     counts: counts || { collector_action_needed: 0, job_failed: 0, jira_unknown: 0, package_failed: 0, purge_failed: 0 },
-    latestAuditCheckpoint: checkpoint ? { sequence: checkpoint.sequence, createdAt: checkpoint.created_at, externalStatus: checkpoint.external_status } : null,
+    latestAuditCheckpoint: checkpoint ? { sequence: checkpoint.sequence, createdAt: checkpoint.created_at, externalStatus: checkpoint.effective_external_status } : null,
   });
   const keyId = activeAuditKeyId();
   const signature = await hmac(payload, keyId);

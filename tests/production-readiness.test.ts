@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
+import {
+  PACKAGE_ELIGIBILITY_COUNTS_SQL,
+  PACKAGE_ELIGIBILITY_PUBLISH_FENCE_SQL,
+  packageEligibilityBindings,
+  packageEligibilityPublishFenceBindings,
+} from "../lib/server/package-eligibility.ts";
 import { parseGitHubRepositoryUrl, validateOneTimeGitHubToken } from "../lib/server/sbom-input.ts";
 import { decodeXmlText } from "../lib/server/xml.ts";
 
@@ -48,11 +55,91 @@ test("assessment boundaries survive deduplication, UI selection, and lifecycle c
   assert.match(assessments, /Closed assessments are immutable/);
 });
 
-test("superseded partial coverage does not permanently block export", async () => {
+test("package preflight and build share one eligibility policy", async () => {
   const packages = await read("lib/server/packages.ts");
-  assert.match(packages, /newer\.coverage_status != 'partial'/);
-  assert.match(packages, /newer\.captured_at > e\.captured_at/);
-  assert.match(packages, /e\.status IN \('needs_review','expiring'\)/);
+  assert.equal(packages.match(/packageEligibilityCounts\(assessmentId,/g)?.length, 2);
+});
+
+test("only a newer usable complete recollection clears a partial-coverage blocker", () => {
+  const db = new DatabaseSync(":memory:");
+  db.exec(`CREATE TABLE evidence_artifacts (
+    id TEXT PRIMARY KEY, assessment_id TEXT NOT NULL, control_id TEXT NOT NULL, source TEXT NOT NULL, system TEXT NOT NULL,
+    framework TEXT NOT NULL DEFAULT 'PCI DSS 4.0.1', environment TEXT DEFAULT 'production',
+    assessment_period TEXT DEFAULT '2026', collector_id TEXT DEFAULT 'collector-a',
+    coverage_status TEXT NOT NULL, captured_at TEXT NOT NULL, status TEXT NOT NULL, expires_at TEXT NOT NULL,
+    type TEXT NOT NULL DEFAULT 'report', sha256 TEXT NOT NULL DEFAULT 'digest', device_id TEXT, manifest_sha256 TEXT,
+    chain_event_hash TEXT, server_safety_scan_sha256 TEXT, server_safety_scan_policy TEXT,
+    server_safety_scan_completed_at TEXT, server_safety_scanner_origin TEXT, server_safety_receipt_sha256 TEXT
+  );
+  CREATE TABLE evidence_occurrences (
+    id TEXT PRIMARY KEY, artifact_id TEXT NOT NULL, captured_at TEXT NOT NULL, received_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL, status TEXT NOT NULL, coverage_status TEXT NOT NULL
+  );
+  CREATE TABLE native_evidence_manifests (artifact_id TEXT, device_id TEXT, image_sha256 TEXT, manifest_sha256 TEXT, chain_sequence INTEGER, chain_event_hash TEXT, provenance_key_id TEXT);
+  CREATE TABLE capture_devices (id TEXT PRIMARY KEY, provenance_key_id TEXT, chain_sequence INTEGER);`);
+  const insertArtifactRow = db.prepare(`INSERT INTO evidence_artifacts
+    (id, assessment_id, control_id, source, system, coverage_status, captured_at, status, expires_at)
+    VALUES (?, ?, '6.3.2', 'github', 'production', ?, ?, ?, ?)`);
+  const insertOccurrence = db.prepare(`INSERT INTO evidence_occurrences
+    (id, artifact_id, captured_at, received_at, expires_at, status, coverage_status)
+    VALUES (?, ?, ?, ?, ?, ?, ?)`);
+  const future = "2030-01-01T00:00:00.000Z";
+  const past = "2020-01-01T00:00:00.000Z";
+  const at = "2026-09-01T00:00:00.000Z";
+  const insert = (id: string, assessment: string, coverage: string, occurrenceCapturedAt: string, status: string, expiresAt: string, artifactCapturedAt = occurrenceCapturedAt) => {
+    insertArtifactRow.run(id, assessment, coverage, artifactCapturedAt, status, expiresAt);
+    insertOccurrence.run(`${id}_occurrence`, id, occurrenceCapturedAt, occurrenceCapturedAt, expiresAt, status, coverage);
+  };
+  const addPartial = (assessment: string, capturedAt = "2026-01-01T00:00:00.000Z") => insert(`${assessment}_partial`, assessment, "partial", capturedAt, "needs_review", future);
+  addPartial("asm_replaced");
+  insert("complete", "asm_replaced", "complete", "2026-02-01T00:00:00.000Z", "approved", future);
+  for (const status of ["needs_review", "rejected", "returned", "superseded"] as const) {
+    const assessment = `asm_${status}`;
+    addPartial(assessment);
+    insert(`${assessment}_replacement`, assessment, "complete", "2026-02-01T00:00:00.000Z", status, future);
+  }
+  addPartial("asm_expiring");
+  insert("asm_expiring_replacement", "asm_expiring", "complete", "2026-02-01T00:00:00.000Z", "needs_review", future);
+  db.prepare("UPDATE evidence_artifacts SET status = 'expiring' WHERE id = 'asm_expiring_replacement'").run();
+  addPartial("asm_expired");
+  insert("expired_replacement", "asm_expired", "complete", "2026-02-01T00:00:00.000Z", "approved", past);
+  addPartial("asm_unreplaced");
+  addPartial("asm_unscanned");
+  insert("unscanned_replacement", "asm_unscanned", "complete", "2026-02-01T00:00:00.000Z", "approved", future);
+  db.prepare("UPDATE evidence_artifacts SET type = 'screenshot' WHERE id = 'unscanned_replacement'").run();
+  addPartial("asm_unproven");
+  insert("unproven_replacement", "asm_unproven", "complete", "2026-02-01T00:00:00.000Z", "approved", future);
+  db.prepare("UPDATE evidence_artifacts SET device_id = 'device-a', manifest_sha256 = 'manifest', chain_event_hash = 'chain' WHERE id = 'unproven_replacement'").run();
+  for (const [column, value] of [["environment", "staging"], ["assessment_period", "2027"], ["collector_id", "collector-b"]] as const) {
+    const assessment = `asm_mismatch_${column}`;
+    addPartial(assessment);
+    const replacementId = `${assessment}_replacement`;
+    insert(replacementId, assessment, "complete", "2026-02-01T00:00:00.000Z", "approved", future);
+    db.prepare(`UPDATE evidence_artifacts SET ${column} = ? WHERE id = ?`).run(value, replacementId);
+  }
+  addPartial("asm_occurrence_recency", "2026-02-01T00:00:00.000Z");
+  insert("occurrence_replacement", "asm_occurrence_recency", "complete", "2026-03-01T00:00:00.000Z", "approved", future, "2025-01-01T00:00:00.000Z");
+  const counts = (assessment: string) => db.prepare(PACKAGE_ELIGIBILITY_COUNTS_SQL)
+    .get(...packageEligibilityBindings(assessment, at)) as { total: number; partial: number; eligible: number; pending_safety: number; pending_native: number };
+  const replaced = counts("asm_replaced") as { total: number; eligible: number; pending_safety: number; pending_native: number; partial: number };
+  assert.equal(replaced.total, 2);
+  assert.equal(replaced.eligible, 1);
+  assert.equal(replaced.pending_safety, 0);
+  assert.equal(replaced.pending_native, 0);
+  assert.equal(replaced.partial, 0);
+  for (const assessment of ["asm_needs_review", "asm_expiring", "asm_rejected", "asm_returned", "asm_superseded", "asm_expired", "asm_unreplaced", "asm_unscanned", "asm_unproven", "asm_mismatch_environment", "asm_mismatch_assessment_period", "asm_mismatch_collector_id"]) {
+    assert.equal(counts(assessment).partial, 1, assessment);
+  }
+  assert.equal(counts("asm_unscanned").pending_safety, 1);
+  assert.equal(counts("asm_unproven").pending_native, 1);
+  assert.equal(counts("asm_occurrence_recency").partial, 0, "latest occurrence time, not the deduplicated artifact's original capture time, controls recollection recency");
+
+  const publishFence = (assessment: string, total: number, eligible: number) => Number((db.prepare(`SELECT ${PACKAGE_ELIGIBILITY_PUBLISH_FENCE_SQL} AS allowed`)
+    .get(...packageEligibilityPublishFenceBindings(assessment, at, total, eligible) as Array<string | number>) as { allowed: number }).allowed);
+  assert.equal(publishFence("asm_replaced", replaced.total, replaced.eligible), 1);
+  db.prepare("UPDATE evidence_occurrences SET status = 'needs_review' WHERE artifact_id = 'complete'").run();
+  assert.equal(publishFence("asm_replaced", replaced.total, replaced.eligible), 0, "a post-selection eligibility change must fail the final publication fence");
+  db.close();
 });
 
 test("assessor exports are assessment-scoped and never silently truncated", async () => {
@@ -88,6 +175,35 @@ test("key rotation uses copy-switch-delete and refuses missing retained keys", a
   assert.match(operations, /EVIDENCE_BUCKET\.delete\(row\.r2_key\)/);
   assert.match(operations, /validateRetainedKeyReferences/);
   assert.match(operations, /Jira OAuth token key .* is unavailable during rotation/);
+});
+
+test("maintenance failures are isolated and poisoned rotations durably back off", async () => {
+  const [jobs, operations, migration] = await Promise.all([
+    read("lib/server/jobs.ts"),
+    read("lib/server/key-operations.ts"),
+    read("drizzle/0026_omniscient_scarlet_witch.sql"),
+  ]);
+  assert.match(jobs, /const isolate = async/);
+  for (const stage of ["evidence_retention", "rate_limit_retention", "collection_retries", "sbom_jobs", "scheduled_collectors", "key_rotation", "audit_checkpoint", "operational_health"]) {
+    assert.match(jobs, new RegExp(`isolate\\("${stage}"`));
+  }
+  assert.ok(jobs.indexOf('isolate("audit_checkpoint"') < jobs.indexOf('isolate("operational_health"'));
+  assert.match(jobs, /isolatedFailures \+= 1/);
+  assert.match(jobs, /throw new AggregateError\(\[\]/);
+  assert.ok(jobs.indexOf('isolate("operational_health"') < jobs.indexOf("throw new AggregateError"));
+  assert.match(operations, /rotateIsolated/);
+  assert.match(operations, /ROTATION_ACTION_REQUIRED_AFTER = 5/);
+  assert.match(operations, /key\.rotation_retry_scheduled/);
+  assert.match(operations, /key\.rotation_action_required/);
+  assert.match(operations, /key\.rotation_recovered/);
+  assert.match(operations, /NOT EXISTS \(SELECT 1 FROM key_rotation_attempts/);
+  assert.match(operations, /authoritativeObjectRotationDisposition/);
+  assert.match(operations, /jiraRotationReachedActiveState/);
+  assert.match(operations, /keyRotationRetrySummary/);
+  assert.match(migration, /PRIMARY KEY\(`resource_type`, `resource_id`\)/);
+  assert.match(migration, /key_rotation_attempt_state_shape/);
+  assert.match(migration, /key_rotation_resource_type_allowlist/);
+  assert.match(migration, /key_rotation_error_code_allowlist/);
 });
 
 test("audit checkpoints are independently signed, stored, and host allowlisted", async () => {

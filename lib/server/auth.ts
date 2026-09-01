@@ -1,6 +1,7 @@
 import { activeAuditKeyId, hmac, randomId, sha256, stableJson } from "./crypto";
 import { getEnv } from "./env";
 import { validateBootstrapAdministratorAllowlist, validateTrustedApplicationOrigins } from "./identity-config";
+import { classifyErrorForLogging } from "./safe-error";
 
 export { validateBootstrapAdministratorAllowlist, validateTrustedApplicationOrigins } from "./identity-config";
 
@@ -139,6 +140,6 @@ export function requireSameOrigin(request: Request): void {
 export function jsonError(error: unknown): Response {
   if (error instanceof Response) return error;
   const requestId = crypto.randomUUID();
-  console.error("scopeproof_api_error", { requestId, error: error instanceof Error ? error.message : String(error) });
+  console.error("scopeproof_api_error", { requestId, errorClass: classifyErrorForLogging(error) });
   return Response.json({ error: "Request failed", requestId }, { status: 500 });
 }
