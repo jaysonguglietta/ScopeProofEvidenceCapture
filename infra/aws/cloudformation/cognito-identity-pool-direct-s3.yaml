@@ -1,0 +1,545 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Secondary direct-S3 option: authenticated-only Cognito identity pool backed by
+  a dedicated per-tenant user pool and public authorization-code client. No
+  unauthenticated identities, shared user directory, or static keys.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Dedicated tenant authentication
+        Parameters:
+          - UserPoolName
+          - UserPoolClientName
+          - UserPoolDomainPrefix
+          - CallbackUrls
+          - LogoutUrls
+          - IdentityPoolName
+      - Label:
+          default: Exact evidence boundary
+        Parameters:
+          - EvidenceBucketName
+          - IngestBucketName
+          - KmsKeyArn
+          - TenantId
+          - EnableQuarantineUpload
+    ParameterLabels:
+      EnableQuarantineUpload:
+        default: Permit one-part SSE-KMS uploads to quarantine
+      CallbackUrls:
+        default: Exact OAuth callback URL allowlist
+      LogoutUrls:
+        default: Exact post-logout URL allowlist
+      UserPoolDomainPrefix:
+        default: Globally unique dedicated-tenant Cognito domain prefix
+
+Parameters:
+  UserPoolName:
+    Type: String
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: "^[A-Za-z0-9][A-Za-z0-9 _.-]{0,127}$"
+    Description: Use a name dedicated to this TenantId; users are administrator-created only.
+  UserPoolClientName:
+    Type: String
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: "^[A-Za-z0-9][A-Za-z0-9 _.-]{0,127}$"
+  UserPoolDomainPrefix:
+    Type: String
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+    ConstraintDescription: >-
+      Use a globally unique lowercase Cognito domain prefix with no leading or
+      trailing hyphen.
+  CallbackUrls:
+    Type: CommaDelimitedList
+    Description: Exact HTTPS or native loopback OAuth callback URLs. Do not use wildcards.
+  LogoutUrls:
+    Type: CommaDelimitedList
+    Description: Exact post-logout URL allowlist. Do not use wildcards.
+  IdentityPoolName:
+    Type: String
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: "^[A-Za-z0-9_-]+$"
+    Description: Use a tenant-specific name.
+  EvidenceBucketName:
+    Type: String
+    MinLength: 3
+    MaxLength: 63
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+  IngestBucketName:
+    Type: String
+    Default: ""
+    MaxLength: 63
+    AllowedPattern: "^$|^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    Description: Required only when quarantine upload is enabled.
+  KmsKeyArn:
+    Type: String
+    AllowedPattern: "^arn:(aws|aws-us-gov|aws-cn):kms:[a-z0-9-]+:[0-9]{12}:key/([0-9a-fA-F-]{36}|mrk-[0-9a-fA-F]{32})$"
+  TenantId:
+    Type: String
+    AllowedPattern: "^ten_[a-f0-9]{32}$"
+  EnableQuarantineUpload:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+
+Rules:
+  RequireIngestBucketForUpload:
+    RuleCondition:
+      Fn::Equals:
+        - Ref: EnableQuarantineUpload
+        - "true"
+    Assertions:
+      - Assert:
+          Fn::Not:
+            - Fn::Equals:
+                - Ref: IngestBucketName
+                - ""
+        AssertDescription: IngestBucketName is required when quarantine upload is enabled.
+
+Conditions:
+  IsChinaPartition:
+    Fn::Equals:
+      - Ref: AWS::Partition
+      - aws-cn
+  AllowQuarantineUpload:
+    Fn::Equals:
+      - Ref: EnableQuarantineUpload
+      - "true"
+
+Resources:
+  DedicatedTenantUserPool:
+    Type: AWS::Cognito::UserPool
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      UserPoolName:
+        Ref: UserPoolName
+      UserPoolTier: ESSENTIALS
+      DeletionProtection: ACTIVE
+      UsernameAttributes:
+        - email
+      UsernameConfiguration:
+        CaseSensitive: false
+      AutoVerifiedAttributes:
+        - email
+      MfaConfiguration: "ON"
+      EnabledMfas:
+        - SOFTWARE_TOKEN_MFA
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 14
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+          TemporaryPasswordValidityDays: 3
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+      VerificationMessageTemplate:
+        DefaultEmailOption: CONFIRM_WITH_CODE
+      UserAttributeUpdateSettings:
+        AttributesRequireVerificationBeforeUpdate:
+          - email
+      UserPoolTags:
+        Application: scopeproof
+        TenantId:
+          Ref: TenantId
+        IsolationMode: dedicated-user-pool
+
+  DedicatedTenantPublicOAuthClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName:
+        Ref: UserPoolClientName
+      UserPoolId:
+        Ref: DedicatedTenantUserPool
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthScopes:
+        - openid
+        - email
+        - profile
+      CallbackURLs:
+        Ref: CallbackUrls
+      LogoutURLs:
+        Ref: LogoutUrls
+      SupportedIdentityProviders:
+        - COGNITO
+      ExplicitAuthFlows: []
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      AuthSessionValidity: 3
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 7
+      RefreshTokenRotation:
+        Feature: ENABLED
+        RetryGracePeriodSeconds: 30
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+
+  DedicatedTenantUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain:
+        Ref: UserPoolDomainPrefix
+      ManagedLoginVersion: 2
+      UserPoolId:
+        Ref: DedicatedTenantUserPool
+
+  DedicatedTenantManagedLoginBranding:
+    Type: AWS::Cognito::ManagedLoginBranding
+    DependsOn:
+      - DedicatedTenantUserPoolDomain
+    Properties:
+      ClientId:
+        Ref: DedicatedTenantPublicOAuthClient
+      UserPoolId:
+        Ref: DedicatedTenantUserPool
+      UseCognitoProvidedValues: true
+
+  AuthenticatedIdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName:
+        Ref: IdentityPoolName
+      AllowUnauthenticatedIdentities: false
+      AllowClassicFlow: false
+      IdentityPoolTags:
+        - Key: Application
+          Value: scopeproof
+        - Key: TenantId
+          Value:
+            Ref: TenantId
+        - Key: IsolationMode
+          Value: dedicated-user-pool
+      CognitoIdentityProviders:
+        - ClientId:
+            Ref: DedicatedTenantPublicOAuthClient
+          ProviderName:
+            Fn::GetAtt:
+              - DedicatedTenantUserPool
+              - ProviderName
+          ServerSideTokenCheck: true
+
+  AuthenticatedEvidenceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: >-
+        Temporary authenticated Cognito sessions scoped to one tenant evidence
+        prefix; direct S3 is secondary to backend presigning.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: CognitoAuthenticatedIdentitiesOnly
+            Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action:
+              - sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                cognito-identity.amazonaws.com:aud:
+                  Ref: AuthenticatedIdentityPool
+              ForAnyValue:StringLike:
+                cognito-identity.amazonaws.com:amr: authenticated
+      Tags:
+        - Key: Application
+          Value: scopeproof
+        - Key: TenantId
+          Value:
+            Ref: TenantId
+      Policies:
+        - PolicyName: exact-tenant-evidence-boundary
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ListExactEvidencePrefix
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::${EvidenceBucketName}
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - Fn::Sub: tenants/${TenantId}/controls/*/evidence/*
+              - Sid: ReadExactEvidencePrefix
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::${EvidenceBucketName}/tenants/${TenantId}/controls/*/evidence/*
+              - Sid: DenyObjectReadsOutsideExactEvidencePrefix
+                Effect: Deny
+                Action:
+                  - s3:GetObject*
+                NotResource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::${EvidenceBucketName}/tenants/${TenantId}/controls/*/evidence/*
+              - Sid: DenyListWithoutPrefix
+                Effect: Deny
+                Action:
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::*
+                Condition:
+                  "Null":
+                    s3:prefix: "true"
+              - Sid: DenyListOutsideExactEvidencePrefix
+                Effect: Deny
+                Action:
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::*
+                Condition:
+                  StringNotLike:
+                    s3:prefix:
+                      - Fn::Sub: tenants/${TenantId}/controls/*/evidence/*
+              - Sid: DecryptEvidenceThroughS3Only
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource:
+                  - Ref: KmsKeyArn
+                Condition:
+                  StringEquals:
+                    kms:ViaService:
+                      Fn::Sub: s3.${AWS::Region}.${AWS::URLSuffix}
+                    kms:EncryptionContext:scopeproofTenantId:
+                      Ref: TenantId
+                    kms:EncryptionContext:scopeproofPurpose: immutable-evidence
+              - Fn::If:
+                  - AllowQuarantineUpload
+                  - Sid: WriteExactQuarantinePrefix
+                    Effect: Allow
+                    Action:
+                      - s3:PutObject
+                    Resource:
+                      - Fn::Sub: arn:${AWS::Partition}:s3:::${IngestBucketName}/tenants/${TenantId}/controls/*/quarantine/*
+                    Condition:
+                      StringEquals:
+                        s3:x-amz-server-side-encryption: aws:kms
+                        s3:x-amz-server-side-encryption-aws-kms-key-id:
+                          Ref: KmsKeyArn
+                  - Ref: AWS::NoValue
+              - Fn::If:
+                  - AllowQuarantineUpload
+                  - Sid: GenerateQuarantineDataKeyThroughS3Only
+                    Effect: Allow
+                    Action:
+                      - kms:GenerateDataKey
+                    Resource:
+                      - Ref: KmsKeyArn
+                    Condition:
+                      StringEquals:
+                        kms:ViaService:
+                          Fn::Sub: s3.${AWS::Region}.${AWS::URLSuffix}
+                        kms:EncryptionContext:scopeproofTenantId:
+                          Ref: TenantId
+                        kms:EncryptionContext:scopeproofPurpose: quarantine
+                  - Ref: AWS::NoValue
+              - Sid: DenyS3OverInsecureTransport
+                Effect: Deny
+                Action:
+                  - s3:*
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::${EvidenceBucketName}
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::${EvidenceBucketName}/*
+                Condition:
+                  Bool:
+                    aws:SecureTransport: "false"
+              - Sid: DenyEvidenceDestructiveActions
+                Effect: Deny
+                Action:
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                  - s3:BypassGovernanceRetention
+                  - s3:PutObjectAcl
+                  - s3:PutObjectLegalHold
+                  - s3:PutObjectRetention
+                  - s3:RestoreObject
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::${EvidenceBucketName}/tenants/${TenantId}/controls/*/evidence/*
+              - Sid: DenyEvidenceWrites
+                Effect: Deny
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::${EvidenceBucketName}/tenants/${TenantId}/controls/*/evidence/*
+              - Fn::If:
+                  - AllowQuarantineUpload
+                  - Sid: DenyQuarantineOverInsecureTransport
+                    Effect: Deny
+                    Action:
+                      - s3:*
+                    Resource:
+                      - Fn::Sub: arn:${AWS::Partition}:s3:::${IngestBucketName}
+                      - Fn::Sub: arn:${AWS::Partition}:s3:::${IngestBucketName}/*
+                    Condition:
+                      Bool:
+                        aws:SecureTransport: "false"
+                  - Ref: AWS::NoValue
+              - Fn::If:
+                  - AllowQuarantineUpload
+                  - Sid: DenyQuarantineDestructiveActions
+                    Effect: Deny
+                    Action:
+                      - s3:DeleteObject
+                      - s3:DeleteObjectVersion
+                      - s3:BypassGovernanceRetention
+                      - s3:PutObjectAcl
+                      - s3:PutObjectLegalHold
+                      - s3:PutObjectRetention
+                      - s3:RestoreObject
+                    Resource:
+                      - Fn::Sub: arn:${AWS::Partition}:s3:::${IngestBucketName}/tenants/${TenantId}/controls/*/quarantine/*
+                  - Ref: AWS::NoValue
+              - Fn::If:
+                  - AllowQuarantineUpload
+                  - Sid: DenyQuarantinePutWithoutSseKms
+                    Effect: Deny
+                    Action:
+                      - s3:PutObject
+                    Resource:
+                      - Fn::Sub: arn:${AWS::Partition}:s3:::${IngestBucketName}/tenants/${TenantId}/controls/*/quarantine/*
+                    Condition:
+                      StringNotEquals:
+                        s3:x-amz-server-side-encryption: aws:kms
+                  - Ref: AWS::NoValue
+              - Fn::If:
+                  - AllowQuarantineUpload
+                  - Sid: DenyQuarantinePutWithWrongKmsKey
+                    Effect: Deny
+                    Action:
+                      - s3:PutObject
+                    Resource:
+                      - Fn::Sub: arn:${AWS::Partition}:s3:::${IngestBucketName}/tenants/${TenantId}/controls/*/quarantine/*
+                    Condition:
+                      StringNotEquals:
+                        s3:x-amz-server-side-encryption-aws-kms-key-id:
+                          Ref: KmsKeyArn
+                  - Ref: AWS::NoValue
+              - Sid: DenyKmsOutsideRegionalS3
+                Effect: Deny
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kms:GenerateDataKeyWithoutPlaintext
+                Resource:
+                  - Ref: KmsKeyArn
+                Condition:
+                  StringNotEquals:
+                    kms:ViaService:
+                      Fn::Sub: s3.${AWS::Region}.${AWS::URLSuffix}
+              - Sid: DenyKmsUseOutsideConfiguredKey
+                Effect: Deny
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kms:GenerateDataKeyWithoutPlaintext
+                NotResource:
+                  - Ref: KmsKeyArn
+              - Sid: DenyWrongTenantEncryptionContext
+                Effect: Deny
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                  - kms:GenerateDataKeyWithoutPlaintext
+                Resource:
+                  - Ref: KmsKeyArn
+                Condition:
+                  StringNotEquals:
+                    kms:EncryptionContext:scopeproofTenantId:
+                      Ref: TenantId
+              - Sid: DenyWrongEvidencePurposeEncryptionContext
+                Effect: Deny
+                Action:
+                  - kms:Decrypt
+                Resource:
+                  - Ref: KmsKeyArn
+                Condition:
+                  StringNotEquals:
+                    kms:EncryptionContext:scopeproofPurpose: immutable-evidence
+              - Sid: DenyWrongQuarantinePurposeEncryptionContext
+                Effect: Deny
+                Action:
+                  - kms:GenerateDataKey
+                  - kms:GenerateDataKeyWithoutPlaintext
+                Resource:
+                  - Ref: KmsKeyArn
+                Condition:
+                  StringNotEquals:
+                    kms:EncryptionContext:scopeproofPurpose: quarantine
+
+  IdentityPoolRoleAttachment:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId:
+        Ref: AuthenticatedIdentityPool
+      Roles:
+        authenticated:
+          Fn::GetAtt:
+            - AuthenticatedEvidenceRole
+            - Arn
+
+Outputs:
+  DedicatedTenantUserPoolId:
+    Description: Retained, deletion-protected user directory dedicated to this TenantId.
+    Value:
+      Ref: DedicatedTenantUserPool
+  DedicatedTenantPublicClientId:
+    Description: Public authorization-code client with no client secret or direct auth flow.
+    Value:
+      Ref: DedicatedTenantPublicOAuthClient
+  DedicatedTenantIssuerUrl:
+    Value:
+      Fn::Sub: https://cognito-idp.${AWS::Region}.${AWS::URLSuffix}/${DedicatedTenantUserPool}
+  DedicatedTenantManagedLoginBaseUrl:
+    Value:
+      Fn::If:
+        - IsChinaPartition
+        - Fn::Sub: https://${UserPoolDomainPrefix}.auth.${AWS::Region}.amazoncognito.com.cn
+        - Fn::Sub: https://${UserPoolDomainPrefix}.auth.${AWS::Region}.amazoncognito.com
+  IdentityPoolId:
+    Value:
+      Ref: AuthenticatedIdentityPool
+  AuthenticatedRoleArn:
+    Value:
+      Fn::GetAtt:
+        - AuthenticatedEvidenceRole
+        - Arn
+  UnauthenticatedIdentitiesEnabled:
+    Value: "false"
+  RequiredEvidenceEncryptionContextJson:
+    Value:
+      Fn::Sub: '{"scopeproofPurpose":"immutable-evidence","scopeproofTenantId":"${TenantId}"}'
+  RequiredQuarantineEncryptionContextBase64:
+    Condition: AllowQuarantineUpload
+    Value:
+      Fn::Base64:
+        Fn::Sub: '{"scopeproofPurpose":"quarantine","scopeproofTenantId":"${TenantId}"}'

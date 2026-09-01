@@ -10,11 +10,15 @@ Obtain the following from the evidence owner:
 - the separate ZIP SHA-256 checksum;
 - the package signing-key fingerprint through a different trusted channel;
 - the assessment scope, period, systems, and framework version;
+- the exact control-catalog identifier/version/digest and selected control list;
+- the package preflight result and disposition of any excluded evidence or open findings;
 - the Jira/workpaper references used for evidence coordination, when applicable.
 
 Treat the package as sensitive. Store it only in an approved assessment workspace with access logging and appropriate retention.
 
 ## Local macOS package contents
+
+Browser-window evidence places a live right-side macOS menu-bar pixel strip across the top of the reviewed PNG so the system-displayed date/time and status context remain visible. Full-display evidence includes the real menu bar in the captured display. Treat these pixels and the adjacent local clock reading as corroborating endpoint context, not an independent trusted timestamp: an endpoint administrator can change the clock or displayed content. Use the immutable manifest capture time, signed Scopeproof server receipt, and a verified RFC 3161 attestation when independent time assurance is required.
 
 | Path | Purpose |
 | --- | --- |
@@ -32,12 +36,12 @@ Hosted exports contain `00-READ-ME.txt`, `01-Evidence-Index.csv`, `02-Jira-Hando
 
 1. Calculate SHA-256 for the ZIP before extraction and compare it with the separately delivered checksum.
 2. Extract into a protected working directory. Do not execute or preview unexpected active content.
-3. Review the Read Me and evidence index. Confirm the framework, period, systems, preparer, package ID, and approved-only inclusion policy match the engagement.
+3. Review the Read Me and evidence index. Confirm the framework, catalog version, explicit controls/systems, period, preparer, package ID, and approved-only inclusion policy match the engagement. The bundled PCI DSS 4.0.1 Scopeproof operations catalog is intentionally limited; it is not evidence that every PCI DSS requirement was in scope.
 4. Recalculate SHA-256 for every administrative and evidence file listed in the signed package manifest.
 5. Canonicalize the manifest payload exactly as stated in the included verification guide and verify its ECDSA P-256/SHA-256 signature using the embedded public key.
 6. Compare the public-key SHA-256 fingerprint with the value obtained through the separate trusted channel.
 7. For each screenshot, compare its digest with `screenshotSha256` and the adjacent capture manifest.
-8. Verify every lifecycle event chain starts at `GENESIS`, each `previousHash` points to the prior event, and the final status is **Approved**.
+8. Verify every lifecycle event chain starts at `GENESIS`, each `previousHash` points to the prior event, the current signed events bind the artifact digest and authenticated reviewer subject/method/time, and the final status is **Approved**. Local Keychain rollback heads cannot be reconstructed from package files alone; obtain endpoint validation evidence when rollback resistance is material to the engagement.
 9. Confirm each Jira issue reference, when present, belongs to the assessment and agrees with the visible screenshot banner and evidence index.
 10. Record validation results, discrepancies, exceptions, and follow-up requests in the assessor workpapers.
 
@@ -52,6 +56,10 @@ After integrity validation, determine whether each artifact is sufficient and ap
 - Redactions do not conceal information necessary to evaluate the control.
 - The evidence is current, not duplicated, and not superseded.
 - Cross-framework mappings are independently validated rather than accepted as authoritative.
+- The control appears in the assessment's exact versioned catalog and explicit selected-control list.
+- The collector/uploader is not the reviewer, and any material finding has a durable disposition by an authorized role.
+
+Hosted package creation performs a fail-closed preflight and repeats its eligibility checks before publication. A successful package should contain no partial-coverage item, screenshot missing independent server-safety metadata, or native item missing finalized provenance. It also refuses silent truncation above 100 eligible artifacts. Treat that as an application control, not a substitute for comparing the signed package selection with the approved engagement scope and review/finding records.
 
 ## Repository SBOM review
 
@@ -70,6 +78,6 @@ The SBOM is a static inventory of supported pinned lockfiles. It does not prove 
 
 ## Exceptions
 
-Reject or request replacement evidence when a hash or signature fails, a lifecycle chain is invalid, files referenced by the manifest are missing, the item is not Approved, the screenshot is ambiguous, the timestamp is unsuitable, the ticket association is incorrect, or required control details are hidden by redaction.
+Reject or request replacement evidence when a hash or signature fails, a lifecycle chain is invalid, files referenced by the manifest are missing, the item is not Approved, the screenshot is ambiguous, the timestamp is unsuitable, the ticket association is incorrect, assessment scope/catalog does not match, a material finding lacks an authorized disposition, or required control details are hidden by redaction.
 
 Preserve the original package and checksum when escalating an exception. Do not repair, rename, or rewrite evidence files and then represent them as the original package.

@@ -9,6 +9,9 @@ final class CaptureMetadataCoordinator: NSObject, NSTextFieldDelegate, NSComboBo
     let jiraIssueField: NSTextField?
     let previewLabel: NSTextField
     let mappingLabel: NSTextField?
+    let catalogStatusLabel: NSTextField?
+    let updateControlsButton: NSButton?
+    private let onUpdateControls: (@MainActor () -> String?)?
 
     init(
         frameworkPopup: NSPopUpButton,
@@ -18,7 +21,10 @@ final class CaptureMetadataCoordinator: NSObject, NSTextFieldDelegate, NSComboBo
         jiraIssueField: NSTextField? = nil,
         previewLabel: NSTextField,
         preferredControlID: String,
-        mappingLabel: NSTextField? = nil
+        mappingLabel: NSTextField? = nil,
+        catalogStatusLabel: NSTextField? = nil,
+        updateControlsButton: NSButton? = nil,
+        onUpdateControls: (@MainActor () -> String?)? = nil
     ) {
         self.frameworkPopup = frameworkPopup
         self.controlCombo = controlCombo
@@ -27,6 +33,9 @@ final class CaptureMetadataCoordinator: NSObject, NSTextFieldDelegate, NSComboBo
         self.jiraIssueField = jiraIssueField
         self.previewLabel = previewLabel
         self.mappingLabel = mappingLabel
+        self.catalogStatusLabel = catalogStatusLabel
+        self.updateControlsButton = updateControlsButton
+        self.onUpdateControls = onUpdateControls
         super.init()
         frameworkPopup.target = self
         frameworkPopup.action = #selector(frameworkChanged)
@@ -34,6 +43,8 @@ final class CaptureMetadataCoordinator: NSObject, NSTextFieldDelegate, NSComboBo
         filenameField.delegate = self
         periodField.delegate = self
         jiraIssueField?.delegate = self
+        updateControlsButton?.target = self
+        updateControlsButton?.action = #selector(updateControls)
         populateControls(preferredControlID: preferredControlID)
         updatePreview()
     }
@@ -43,6 +54,15 @@ final class CaptureMetadataCoordinator: NSObject, NSTextFieldDelegate, NSComboBo
     var controlTitle: String { ComplianceCatalog.controlTitle(frameworkName: frameworkName, controlID: controlID) ?? "" }
 
     @objc private func frameworkChanged() {
+        populateControls(preferredControlID: "")
+        updatePreview()
+    }
+
+    @objc private func updateControls() {
+        guard let selectedFramework = onUpdateControls?() else { return }
+        frameworkPopup.removeAllItems()
+        frameworkPopup.addItems(withTitles: ComplianceCatalog.frameworks.map(\.name))
+        frameworkPopup.selectItem(withTitle: selectedFramework)
         populateControls(preferredControlID: "")
         updatePreview()
     }
@@ -78,5 +98,10 @@ final class CaptureMetadataCoordinator: NSObject, NSTextFieldDelegate, NSComboBo
         mappingLabel?.stringValue = mappings.isEmpty
             ? "No curated cross-framework mappings for this control."
             : mappings.map { "\(ComplianceCatalog.framework(named: $0.framework).fileCode) \($0.controlID)" }.joined(separator: "  ·  ")
+        let framework = ComplianceCatalog.framework(named: frameworkName)
+        let version = framework.version ?? ComplianceCatalog.catalogVersion
+        let source = framework.source ?? "Built in"
+        catalogStatusLabel?.stringValue = "Version \(version)  ·  \(framework.controls.count) controls  ·  \(source)"
+        catalogStatusLabel?.toolTip = "This version and source are recorded with new evidence. Confirm imported catalogs against the framework publisher or your approved GRC source."
     }
 }

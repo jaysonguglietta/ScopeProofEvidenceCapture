@@ -1,6 +1,12 @@
 import { base64ToBytes, bytesToBase64, sha256, stableJson } from "./crypto";
 import { getEnv } from "./env";
+import {
+  trustedTimestampTsaEndpoint,
+  trustedTimestampVerifierEndpoint,
+} from "./external-trust-config";
 import { boundedFetch } from "./outbound";
+
+export { validateTrustedTimestampConfiguration } from "./external-trust-config";
 
 function derLength(length: number): Uint8Array {
   if (length < 0x80) return Uint8Array.of(length);
@@ -58,15 +64,6 @@ export type VerifiedTimestampAttestation = {
   serialNumber: string;
 };
 
-function verifierEndpoint(): URL {
-  const env = getEnv();
-  if (!env.RFC3161_VERIFIER_URL || !env.RFC3161_VERIFIER_ALLOWED_HOSTS) throw new Error("RFC 3161 verifier is not configured.");
-  const url = new URL(env.RFC3161_VERIFIER_URL);
-  const hosts = new Set(env.RFC3161_VERIFIER_ALLOWED_HOSTS.split(",").map((value) => value.trim().toLowerCase()).filter(Boolean));
-  if (url.protocol !== "https:" || url.username || url.password || url.hash || !hosts.has(url.hostname.toLowerCase())) throw new Error("RFC 3161 verifier must use an explicitly allowed HTTPS host.");
-  return url;
-}
-
 function validateAttestationShape(value: unknown): value is VerifiedTimestampAttestation & { signatureBase64: string } {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const item = value as Record<string, unknown>;
@@ -97,15 +94,14 @@ async function verifyAttestation(value: VerifiedTimestampAttestation & { signatu
 export async function requestTrustedTimestamp(digestSha256: string): Promise<{ authority: string; format: string; tokenBase64: string; verification: VerifiedTimestampAttestation & { signatureBase64: string } } | null> {
   const env = getEnv();
   if (!env.RFC3161_TSA_URL) return null;
-  const tsaUrl = new URL(env.RFC3161_TSA_URL);
-  if (tsaUrl.protocol !== "https:" || tsaUrl.username || tsaUrl.password || tsaUrl.hash) throw new Error("RFC3161_TSA_URL must use HTTPS without credentials or fragments.");
+  const tsaUrl = trustedTimestampTsaEndpoint(env);
   const request = timestampRequest(digestSha256);
   const response = await boundedFetch(tsaUrl, { method: "POST", headers: { "content-type": "application/timestamp-query", accept: "application/timestamp-reply" }, body: arrayBuffer(request.body) }, { label: "RFC 3161 TSA", allowedOrigins: [tsaUrl.origin], maximumBytes: 256 * 1024, timeoutMs: 30_000 });
   if (!response.ok) throw new Error(`Timestamp authority returned HTTP ${response.status}.`);
   const token = new Uint8Array(await response.arrayBuffer());
   if (token.length < 16 || token.length > 256 * 1024) throw new Error("Timestamp authority returned an invalid-size RFC 3161 response.");
   const tokenSha256 = await sha256(token);
-  const verifierUrl = verifierEndpoint();
+  const verifierUrl = trustedTimestampVerifierEndpoint(env);
   if (!env.RFC3161_VERIFIER_TOKEN) throw new Error("RFC 3161 verifier token is not configured.");
   const verificationResponse = await boundedFetch(verifierUrl, {
     method: "POST", headers: { authorization: `Bearer ${env.RFC3161_VERIFIER_TOKEN}`, "content-type": "application/json", accept: "application/json" },

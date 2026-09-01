@@ -1,0 +1,11 @@
+misconfigurations:
+  - id: AVD-AWS-0015
+    paths:
+      - "infra/aws/scopeproof-s3-observability.yaml"
+    statement: >-
+      Trivy 0.70 does not resolve the CloudFormation !Ref intrinsic on
+      EvidenceTrail.Properties.KMSKeyId. TrailLogKey is a retained, rotating
+      customer-managed AWS::KMS::Key and the template binds that exact key to
+      both the CloudTrail trail and its S3 log bucket. CloudFormation contract
+      tests must continue to assert all three bindings.
+    expired_at: 2026-11-30

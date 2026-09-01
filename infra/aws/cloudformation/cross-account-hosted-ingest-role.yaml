@@ -1,0 +1,223 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Cross-account, write-only hosted ingest role bound to one source role and a
+  required unique external ID. Writes are limited to one tenant quarantine prefix.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Trusted hosted service
+        Parameters:
+          - SourceAccountId
+          - SourcePrincipalArn
+          - ExternalId
+      - Label:
+          default: Exact ingest destination
+        Parameters:
+          - IngestBucketName
+          - KmsKeyArn
+          - TenantId
+    ParameterLabels:
+      ExternalId:
+        default: Unique customer external ID (not a password)
+      SourcePrincipalArn:
+        default: Exact external AWS IAM role ARN
+
+Parameters:
+  SourceAccountId:
+    Type: String
+    AllowedPattern: "^[0-9]{12}$"
+  SourcePrincipalArn:
+    Type: String
+    AllowedPattern: "^arn:(aws|aws-us-gov|aws-cn):iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]{1,512}$"
+    Description: Exact role used by the hosted service; IAM users are rejected.
+  ExternalId:
+    Type: String
+    MinLength: 32
+    MaxLength: 1224
+    AllowedPattern: "^[A-Za-z0-9+=,.@:/_-]{32,1224}$"
+    Description: >-
+      A unique, unguessable-per-customer identifier supplied by the hosted service.
+      AWS external IDs are authorization identifiers, not stored secrets.
+  IngestBucketName:
+    Type: String
+    MinLength: 3
+    MaxLength: 63
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+  KmsKeyArn:
+    Type: String
+    AllowedPattern: "^arn:(aws|aws-us-gov|aws-cn):kms:[a-z0-9-]+:[0-9]{12}:key/([0-9a-fA-F-]{36}|mrk-[0-9a-fA-F]{32})$"
+  TenantId:
+    Type: String
+    AllowedPattern: "^ten_[a-f0-9]{32}$"
+Resources:
+  HostedIngestRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /scopeproof/
+      Description: Cross-account one-tenant write-only Scopeproof quarantine ingest.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ExactHostedRoleWithExternalId
+            Effect: Allow
+            Principal:
+              AWS:
+                Fn::Sub: arn:${AWS::Partition}:iam::${SourceAccountId}:root
+            Action:
+              - sts:AssumeRole
+            Condition:
+              ArnEquals:
+                aws:PrincipalArn:
+                  Ref: SourcePrincipalArn
+              StringEquals:
+                sts:ExternalId:
+                  Ref: ExternalId
+      Tags:
+        - Key: Application
+          Value: scopeproof
+        - Key: TenantId
+          Value:
+            Ref: TenantId
+        - Key: AccessMode
+          Value: write-only-quarantine
+      Policies:
+        - PolicyName: exact-quarantine-ingest-boundary
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: PutExactQuarantinePrefixWithSseKms
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::${IngestBucketName}/tenants/${TenantId}/controls/*/quarantine/*
+                Condition:
+                  StringEquals:
+                    s3:x-amz-server-side-encryption: aws:kms
+                    s3:x-amz-server-side-encryption-aws-kms-key-id:
+                      Ref: KmsKeyArn
+              - Sid: GenerateQuarantineDataKeyThroughS3Only
+                Effect: Allow
+                Action:
+                  - kms:GenerateDataKey
+                Resource:
+                  - Ref: KmsKeyArn
+                Condition:
+                  StringEquals:
+                    kms:ViaService:
+                      Fn::Sub: s3.${AWS::Region}.${AWS::URLSuffix}
+                    kms:EncryptionContext:scopeproofTenantId:
+                      Ref: TenantId
+                    kms:EncryptionContext:scopeproofPurpose: quarantine
+              - Sid: DenyS3OverInsecureTransport
+                Effect: Deny
+                Action:
+                  - s3:*
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::${IngestBucketName}
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::${IngestBucketName}/*
+                Condition:
+                  Bool:
+                    aws:SecureTransport: "false"
+              - Sid: DenyAnyObjectPutOutsideExactQuarantinePrefix
+                Effect: Deny
+                Action:
+                  - s3:PutObject
+                NotResource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::${IngestBucketName}/tenants/${TenantId}/controls/*/quarantine/*
+              - Sid: DenyS3ReadsListingsAndDestructiveActions
+                Effect: Deny
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:ListAllMyBuckets
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                  - s3:BypassGovernanceRetention
+                  - s3:PutObjectAcl
+                  - s3:PutObjectLegalHold
+                  - s3:PutObjectRetention
+                  - s3:RestoreObject
+                Resource:
+                  - "*"
+              - Sid: DenyQuarantinePutWithoutSseKms
+                Effect: Deny
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::${IngestBucketName}/tenants/${TenantId}/controls/*/quarantine/*
+                Condition:
+                  StringNotEquals:
+                    s3:x-amz-server-side-encryption: aws:kms
+              - Sid: DenyQuarantinePutWithWrongKmsKey
+                Effect: Deny
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::${IngestBucketName}/tenants/${TenantId}/controls/*/quarantine/*
+                Condition:
+                  StringNotEquals:
+                    s3:x-amz-server-side-encryption-aws-kms-key-id:
+                      Ref: KmsKeyArn
+              - Sid: DenyKmsOutsideRegionalS3
+                Effect: Deny
+                Action:
+                  - kms:GenerateDataKey
+                  - kms:GenerateDataKeyWithoutPlaintext
+                Resource:
+                  - Ref: KmsKeyArn
+                Condition:
+                  StringNotEquals:
+                    kms:ViaService:
+                      Fn::Sub: s3.${AWS::Region}.${AWS::URLSuffix}
+              - Sid: DenyKmsUseOutsideConfiguredKey
+                Effect: Deny
+                Action:
+                  - kms:GenerateDataKey
+                  - kms:GenerateDataKeyWithoutPlaintext
+                NotResource:
+                  - Ref: KmsKeyArn
+              - Sid: DenyWrongTenantEncryptionContext
+                Effect: Deny
+                Action:
+                  - kms:GenerateDataKey
+                  - kms:GenerateDataKeyWithoutPlaintext
+                Resource:
+                  - Ref: KmsKeyArn
+                Condition:
+                  StringNotEquals:
+                    kms:EncryptionContext:scopeproofTenantId:
+                      Ref: TenantId
+              - Sid: DenyWrongPurposeEncryptionContext
+                Effect: Deny
+                Action:
+                  - kms:GenerateDataKey
+                  - kms:GenerateDataKeyWithoutPlaintext
+                Resource:
+                  - Ref: KmsKeyArn
+                Condition:
+                  StringNotEquals:
+                    kms:EncryptionContext:scopeproofPurpose: quarantine
+
+Outputs:
+  HostedIngestRoleArn:
+    Value:
+      Fn::GetAtt:
+        - HostedIngestRole
+        - Arn
+  TrustedSourceRoleArn:
+    Value:
+      Ref: SourcePrincipalArn
+  MaximumRoleSessionSeconds:
+    Value: "3600"
+  RequiredEncryptionContextJson:
+    Value:
+      Fn::Sub: '{"scopeproofPurpose":"quarantine","scopeproofTenantId":"${TenantId}"}'
+  RequiredEncryptionContextBase64:
+    Value:
+      Fn::Base64:
+        Fn::Sub: '{"scopeproofPurpose":"quarantine","scopeproofTenantId":"${TenantId}"}'

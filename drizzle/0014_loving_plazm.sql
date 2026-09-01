@@ -1,0 +1,2 @@
+DROP INDEX `idx_user_invitations_email_pending`;--> statement-breakpoint
+CREATE UNIQUE INDEX `idx_user_invitations_email_pending` ON `user_invitations` (`email`) WHERE "user_invitations"."status" = 'pending';

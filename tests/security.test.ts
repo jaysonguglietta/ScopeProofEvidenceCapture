@@ -1,10 +1,28 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import { redactText } from "../lib/server/redaction.ts";
+import { redactJson, redactText } from "../lib/server/redaction.ts";
 import { csvCell } from "../lib/server/csv.ts";
 import { configuredMacRelease, releaseSigningPayload } from "../lib/server/releases.ts";
+import { classifyErrorForLogging } from "../lib/server/safe-error.ts";
 import type { ScopeproofEnv } from "../lib/server/env.ts";
+
+test("classifies operational failures without logging exception contents", () => {
+  const marker = "JIRA_OAUTH_ACTIVE_KEY_ID=must-not-appear";
+  const cases: Array<[unknown, string]> = [
+    [new Error(marker), "error"],
+    [new TypeError(marker), "type_error"],
+    [new SyntaxError(marker), "syntax_error"],
+    [new RangeError(marker), "range_error"],
+    [new Response(marker, { status: 503 }), "http_5xx"],
+    [{ message: marker }, "non_error"],
+  ];
+  for (const [error, expected] of cases) {
+    const classification = classifyErrorForLogging(error);
+    assert.equal(classification, expected);
+    assert.equal(classification.includes(marker), false);
+  }
+});
 
 test("neutralizes spreadsheet formulas in every server CSV cell", () => {
   for (const value of ["=1+1", "+cmd|' /C calc'!A0", "-42", "@SUM(A1:A2)", " \t=HYPERLINK(\"https://evil\")", "\u0000@payload"]) {
@@ -15,7 +33,7 @@ test("neutralizes spreadsheet formulas in every server CSV cell", () => {
 
 test("strictly validates signed release envelopes and approved download hosts", () => {
   const now = new Date("2026-08-11T12:00:00Z");
-  const manifest = { schemaVersion: 1 as const, version: "2.0.0", sequence: 20, downloadUrl: "https://downloads.example.test/Scopeproof-Capture.zip", sha256: "a".repeat(64), byteSize: 1024, publishedAt: "2026-08-11T11:00:00.000Z", expiresAt: "2026-09-01T12:00:00.000Z", minimumSystemVersion: "14.0", teamIdentifier: "ABCDE12345", designatedRequirement: 'identifier "com.scopeproof.capture" and anchor apple generic', keyId: "release-2026", notes: "Security release" };
+  const manifest = { schemaVersion: 1 as const, version: "2.0.0", sequence: 20, downloadUrl: "https://downloads.example.test/macos/2.0.0/Scopeproof-Capture-2.0.0.zip", sha256: "a".repeat(64), byteSize: 1024, publishedAt: "2026-08-11T11:00:00.000Z", expiresAt: "2026-09-01T12:00:00.000Z", minimumSystemVersion: "14.0", teamIdentifier: "ABCDE12345", designatedRequirement: 'identifier "com.scopeproof.capture" and anchor apple generic', keyId: "release-2026", notes: "Security release" };
   const env = { MACOS_RELEASE_MANIFEST_JSON: JSON.stringify(manifest), MACOS_RELEASE_SIGNATURE_DER_BASE64: "A".repeat(96), MACOS_RELEASE_ALLOWED_HOSTS: "downloads.example.test" } as ScopeproofEnv;
   assert.deepEqual(configuredMacRelease(env, now).manifest, manifest);
   assert.match(releaseSigningPayload(manifest), /^scopeproof-update-manifest-v1\n1\n2\.0\.0\n20\n/);
@@ -23,7 +41,7 @@ test("strictly validates signed release envelopes and approved download hosts", 
 });
 
 test("production hardening bounds abuse, claims jobs atomically, and enforces retention", async () => {
-  const [rateLimit, jobs, collectors, outbound, retention, evidence, packages, migration, backend, updater, releaseRoute] = await Promise.all([
+  const [rateLimit, jobs, collectors, outbound, retention, evidence, packages, eligibility, migration, backend, updater, releaseRoute] = await Promise.all([
     readFile(new URL("../lib/server/rate-limit.ts", import.meta.url), "utf8"),
     readFile(new URL("../lib/server/jobs.ts", import.meta.url), "utf8"),
     readFile(new URL("../lib/server/collectors.ts", import.meta.url), "utf8"),
@@ -31,6 +49,7 @@ test("production hardening bounds abuse, claims jobs atomically, and enforces re
     readFile(new URL("../lib/server/retention.ts", import.meta.url), "utf8"),
     readFile(new URL("../lib/server/evidence.ts", import.meta.url), "utf8"),
     readFile(new URL("../lib/server/packages.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/server/package-eligibility.ts", import.meta.url), "utf8"),
     readFile(new URL("../drizzle/0009_chubby_martin_li.sql", import.meta.url), "utf8"),
     readFile(new URL("../macos/ScopeproofCapture/Sources/ScopeproofCapture/BackendTrust.swift", import.meta.url), "utf8"),
     readFile(new URL("../macos/ScopeproofCapture/Sources/ScopeproofCapture/UpdateService.swift", import.meta.url), "utf8"),
@@ -42,10 +61,10 @@ test("production hardening bounds abuse, claims jobs atomically, and enforces re
   assert.match(outbound, /allowedOrigins/); assert.match(outbound, /maximumBytes/); assert.match(outbound, /redirect: "error"/);
   assert.match(retention, /retention\.purge_started/); assert.match(retention, /evidence\.purged/); assert.match(retention, /retention_holds/);
   assert.match(evidence, /This evidence has expired/); assert.match(evidence, /Expired evidence cannot be approved/);
-  assert.match(packages, /status = 'approved' AND expires_at > \?/); assert.match(packages, /csvCell/);
+  assert.match(eligibility, /o\.status = 'approved' AND o\.expires_at > \?/); assert.match(packages, /csvCell/);
   for (const table of ["rate_limit_buckets", "retention_holds"]) assert.ok(migration.includes(`CREATE TABLE \`${table}\``));
   assert.match(backend, /productionOrigins/); assert.match(backend, /completionHandler\(nil\)/); assert.match(backend, /sameOrigin/);
-  assert.match(updater, /isValidSignature/); assert.match(updater, /codesign/); assert.match(updater, /TeamIdentifier/); assert.match(updater, /stapler/); assert.match(updater, /highestUpdateSequence/);
+  assert.match(updater, /isValidSignature/); assert.match(updater, /UpdateArchiveValidator/); assert.match(updater, /maximumTotalUncompressedBytes/); assert.match(updater, /requireAvailableExtractionCapacity/); assert.match(updater, /codesign/); assert.match(updater, /TeamIdentifier/); assert.match(updater, /stapler/); assert.match(updater, /previousRelease/);
   assert.match(releaseRoute, /configuredMacRelease/);
 });
 
@@ -57,14 +76,36 @@ test("redacts Luhn-valid PANs while preserving invalid numeric identifiers", () 
 });
 
 test("redacts high-confidence credentials and private keys", () => {
+  const syntheticAccessKey = "AK" + "IA" + "T".repeat(16);
   const result = redactText([
-    "aws=AKIAIOSFODNN7EXAMPLE",
+    `aws=${syntheticAccessKey}`,
     "authorization: Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signaturevalue",
     "api_token=very-sensitive-token-value-12345",
     "-----BEGIN PRIVATE KEY-----\nabc123\n-----END PRIVATE KEY-----",
   ].join("\n"));
   assert.ok(result.total >= 4);
-  assert.doesNotMatch(result.value, /AKIAIOSFODNN7EXAMPLE|very-sensitive-token-value|BEGIN PRIVATE KEY/);
+  assert.equal(result.value.includes(syntheticAccessKey), false);
+  assert.doesNotMatch(result.value, /very-sensitive-token-value|BEGIN PRIVATE KEY/);
+});
+
+test("redacts secrets bound to quoted JSON, XML, and YAML keys", () => {
+  const json = redactJson({ api_key: "abcdefghijklmnop1234", nested: { password: "short" }, safe: "retained" });
+  assert.deepEqual(json.value, { api_key: "[REDACTED]", nested: { password: "[REDACTED]" }, safe: "retained" });
+  assert.equal(json.total, 2);
+  const text = redactText([
+    '"client_secret": "abcdefghijklmnop1234"',
+    "'refresh_token': abcdefghijklmnop1234",
+    "<api_key>abcdefghijklmnop1234</api_key>",
+    'password="abcdefghijklmnop1234"',
+  ].join("\n"));
+  assert.equal(text.total, 4);
+  assert.doesNotMatch(text.value, /abcdefghijklmnop1234/);
+});
+
+test("structured redaction rejects pathological depth", () => {
+  let value: unknown = "leaf";
+  for (let index = 0; index < 70; index += 1) value = { nested: value };
+  assert.throws(() => redactJson(value), /complexity limit/);
 });
 
 test("migration makes audit events append-only at the database layer", async () => {
@@ -104,10 +145,13 @@ test("native upload route derives metadata from a signed manifest and strictly d
 });
 
 test("screenshot pipelines scan the exact persisted pixels and fail closed", async () => {
-  const [capture, scanner, collectors, evidence, nativeRoute, migration] = await Promise.all([
+  const [capture, scanner, sourceUrl, collectors, imageSafety, imageSafetyConfig, evidence, nativeRoute, migration] = await Promise.all([
     readFile(new URL("../macos/ScopeproofCapture/Sources/ScopeproofCapture/CaptureService.swift", import.meta.url), "utf8"),
     readFile(new URL("../macos/ScopeproofCapture/Sources/ScopeproofCapture/SensitiveDataScanner.swift", import.meta.url), "utf8"),
+    readFile(new URL("../macos/ScopeproofCapture/Sources/ScopeproofCapture/EvidenceSourceURL.swift", import.meta.url), "utf8"),
     readFile(new URL("../lib/server/collectors.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/server/image-safety.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/server/image-safety-config.ts", import.meta.url), "utf8"),
     readFile(new URL("../lib/server/evidence.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/api/native/evidence/route.ts", import.meta.url), "utf8"),
     readFile(new URL("../drizzle/0008_real_nebula.sql", import.meta.url), "utf8"),
@@ -117,15 +161,59 @@ test("screenshot pipelines scan the exact persisted pixels and fail closed", asy
   assert.match(capture, /let exactScan = try requiredSafetyScan\(exactImage\)/);
   assert.ok(capture.indexOf("let exactScan") < capture.indexOf("imageData.write(to: imageURL"));
   assert.match(capture, /safetyScanSha256: digest/);
-  assert.match(capture, /components\.query = nil/);
+  assert.match(capture, /LIVE MAC MENU BAR PIXELS INCLUDED/);
+  assert.match(capture, /menuBarFormatter\.string\(from: now\)/);
+  assert.match(capture, /liveMenuBarImage/);
+  assert.match(capture, /configuration\.sourceRect = sourceRect/);
+  assert.match(capture, /displayBounds\.width - sourceWidth/);
+  assert.match(capture, /evidenceImageWithMenuBar/);
+  assert.match(capture, /captureDate: pixels\.capturedAt/);
+  assert.match(capture, /let liveMenuBar = try await liveMenuBarPixels/);
+  assert.ok(capture.indexOf("let composite = try scrollingComposite") < capture.indexOf("let liveMenuBar = try await liveMenuBarPixels"));
+  assert.match(capture, /SOURCE ORIGIN/);
+  assert.match(sourceUrl, /components\.user = nil/);
+  assert.match(sourceUrl, /components\.password = nil/);
+  assert.match(sourceUrl, /components\.path = ""/);
+  assert.match(sourceUrl, /components\.query = nil/);
+  assert.match(sourceUrl, /components\.fragment = nil/);
   assert.match(scanner, /vision-ocr-sensitive-patterns-v1/);
   assert.doesNotMatch(collectors, /\/content`/);
   assert.match(collectors, /scanExactBrowserPixels/);
-  assert.match(collectors, /result\.sha256 !== digest/);
-  assert.match(collectors, /BROWSER_OCR_ALLOWED_HOSTS/);
+  assert.match(imageSafety, /result\.sha256 !== digest/);
+  assert.match(imageSafetyConfig, /BROWSER_OCR_ALLOWED_HOSTS/);
+  assert.match(imageSafety, /SENSITIVE_CONTENT/);
   assert.match(evidence, /Safety scan digest does not match the evidence artifact/);
   assert.match(nativeRoute, /manifest\.safetyScanSha256 !== imageDigest/);
+  assert.match(nativeRoute, /scanExactEvidencePixels\(image, getEnv\(\)\)/);
+  assert.match(nativeRoute, /serverSafetyScan,/);
   for (const column of ["safety_scan_sha256", "safety_scan_policy", "safety_scan_completed_at"]) assert.ok(migration.includes(column));
+});
+
+test("native control catalog updates are visible, bounded, normalized, and provenance-recorded", async () => {
+  const [app, coordinator, catalog] = await Promise.all([
+    readFile(new URL("../macos/ScopeproofCapture/Sources/ScopeproofCapture/AppDelegate.swift", import.meta.url), "utf8"),
+    readFile(new URL("../macos/ScopeproofCapture/Sources/ScopeproofCapture/CaptureMetadataCoordinator.swift", import.meta.url), "utf8"),
+    readFile(new URL("../macos/ScopeproofCapture/Sources/ScopeproofCapture/ComplianceCatalog.swift", import.meta.url), "utf8"),
+  ]);
+  assert.match(app, /Update Controls…/);
+  assert.match(app, /catalogStatusLabel:/);
+  assert.match(coordinator, /Version .* controls/);
+  assert.match(catalog, /fileSize <= 5 \* 1024 \* 1024/);
+  assert.match(catalog, /Set\(normalizedIDs\)\.count == normalizedIDs\.count/);
+  assert.match(catalog, /SHA256\.hash\(data: data\)/);
+  assert.match(catalog, /SHA-256/);
+});
+
+test("native settings remain usable in a bounded tabbed dialog", async () => {
+  const app = await readFile(new URL("../macos/ScopeproofCapture/Sources/ScopeproofCapture/AppDelegate.swift", import.meta.url), "utf8");
+  assert.match(app, /NSTabView\(frame: NSRect\(x: 0, y: 0, width: 580, height: 245\)\)/);
+  assert.match(app, /captureTab\.label = "Capture & Local"/);
+  assert.match(app, /jiraTab\.label = "Jira"/);
+  assert.match(app, /Open Local Console when Scopeproof launches/);
+  assert.match(app, /preferences\.openLocalConsoleAtLaunch = openLocal\.state == \.on/);
+  assert.match(app, /hostedConnectionAvailable \? "Check for Updates…" : "Open GitHub Releases…"/);
+  assert.match(app, /retryHosted\.isEnabled = hostedConnectionAvailable/);
+  assert.match(app, /Scopeproof is running in local-only mode/);
 });
 
 test("assessor metadata migration and package preserve framework organization", async () => {
@@ -173,8 +261,11 @@ test("Jira Cloud OAuth and attachment upload enforce trust boundaries", async ()
   assert.match(concurrencyMigration, /CREATE TABLE `jira_upload_operations`/);
   assert.match(concurrencyMigration, /ADD `token_version` integer/);
   assert.match(concurrencyMigration, /ADD `refresh_lease_id` text/);
-  assert.match(jiraSource, /https:\/\/auth\.atlassian\.com\/authorize/);
-  assert.match(jiraSource, /https:\/\/api\.atlassian\.com/);
+  const jiraStringLiterals = new Set(
+    Array.from(jiraSource.matchAll(/"([^"\r\n]*)"/g), (match) => match[1]),
+  );
+  assert.equal(jiraStringLiterals.has("https://auth.atlassian.com/authorize"), true);
+  assert.equal(jiraStringLiterals.has("https://api.atlassian.com"), true);
   assert.match(jiraSource, /JIRA_OAUTH_TOKEN_ENCRYPTION_KEY/);
   assert.match(jiraSource, /stateHash = await sha256\(state\)/);
   assert.match(jiraSource, /host\.endsWith\("\.atlassian\.net"\)/);
@@ -242,7 +333,7 @@ test("security mutations are atomic with audit events and timestamps require pin
     readFile(new URL("../macos/ScopeproofCapture/Sources/ScopeproofCapture/KeychainStore.swift", import.meta.url), "utf8"),
   ]);
   assert.match(audit, /executeAuditedBatch/);
-  assert.match(audit, /env\.DB\.batch\(\[/);
+  assert.match(audit, /env\.DB\.batch\(statements\)/);
   assert.match(audit, /scopeproof_audited_batch_failure/);
   for (const source of [evidence, devices, jobs, jira, users, collectors, packages]) assert.match(source, /executeAuditedBatch/);
   assert.doesNotMatch(jira, /await appendAuditEvent/);
@@ -257,7 +348,9 @@ test("security mutations are atomic with audit events and timestamps require pin
   assert.match(lifecycle, /var status: EvidenceReviewStatus \{ events\.last\?\.status/);
   assert.match(lifecycle, /artifactSha256/);
   assert.match(lifecycle, /policyVersion/);
-  assert.match(exporter, /verify\(entry\.lifecycle, artifactSha256:/);
+  assert.match(exporter, /ValidatedEvidenceArtifact\.load\([\s\S]*entry, requireLifecycle: true, trustedAnchor: captureAnchorOverride/);
+  assert.doesNotMatch(exporter, /loadForLegacyBrowsing/);
+  assert.match(exporter, /guard let lifecycle = artifact\.lifecycle, lifecycle\.status == \.approved/);
   assert.match(keychain, /SecAccessControlCreateWithFlags/);
   assert.match(keychain, /userPresence/);
 });

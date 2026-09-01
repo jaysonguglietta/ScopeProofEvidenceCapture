@@ -7,8 +7,27 @@ struct CaptureReviewDecision {
     let reviewerNote: String
 }
 
+enum CaptureReviewPresentation {
+    static let waitingStatus = "Waiting for evidence review…"
+
+    @MainActor
+    static func configure(_ window: NSWindow) {
+        window.level = .modalPanel
+        window.collectionBehavior.insert(.moveToActiveSpace)
+        window.hidesOnDeactivate = false
+        window.tabbingMode = .disallowed
+    }
+
+    @MainActor
+    static func present(_ window: NSWindow) {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        window.orderFrontRegardless()
+    }
+}
+
 @MainActor
-final class CaptureReviewController: NSObject {
+final class CaptureReviewController: NSObject, NSWindowDelegate {
     private var window: NSWindow?
     private var decision: CaptureReviewDecision?
     private var canvas: RedactionCanvasView?
@@ -27,6 +46,8 @@ final class CaptureReviewController: NSObject {
         window.minSize = NSSize(width: 760, height: 600)
         window.isReleasedWhenClosed = false
         window.center()
+        window.delegate = self
+        CaptureReviewPresentation.configure(window)
 
         let content = NSView()
         window.contentView = content
@@ -103,8 +124,7 @@ final class CaptureReviewController: NSObject {
             actions.widthAnchor.constraint(equalTo: stack.widthAnchor),
         ])
         self.window = window
-        NSApplication.shared.activate(ignoringOtherApps: true)
-        window.makeKeyAndOrderFront(nil)
+        CaptureReviewPresentation.present(window)
         NSApplication.shared.runModal(for: window)
         window.orderOut(nil)
         self.window = nil
@@ -121,6 +141,10 @@ final class CaptureReviewController: NSObject {
     @objc private func undoRedaction() { canvas?.undo() }
     @objc private func clearRedactions() { canvas?.clear() }
     @objc private func discardCapture() { decision = nil; NSApplication.shared.stopModal() }
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        discardCapture()
+        return false
+    }
     @objc private func saveCapture() {
         guard let canvas, let output = canvas.renderRedactedImage() else { NSSound.beep(); return }
         decision = CaptureReviewDecision(image: output, manualRedactions: canvas.redactionCount, reviewerNote: noteField?.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")

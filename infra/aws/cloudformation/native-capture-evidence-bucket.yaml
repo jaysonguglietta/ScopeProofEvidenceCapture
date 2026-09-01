@@ -1,0 +1,212 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Creates one production-compliance, private S3 evidence bucket for the native
+  Scopeproof Capture macOS workflow. COMPLIANCE Object Lock is mandatory.
+  Governance retention is intentionally unsupported here because privileged
+  users can bypass or shorten it. Bucket administration remains in
+  CloudFormation; no IAM user, access key, operator setup role, or KMS key is
+  created.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Evidence destination
+        Parameters:
+          - EvidenceBucketName
+          - EvidencePrefix
+          - KmsKeyId
+          - EncryptionMode
+      - Label:
+          default: Immutable retention
+        Parameters:
+          - RetentionDays
+    ParameterLabels:
+      EvidencePrefix:
+        default: Exact nonempty Scopeproof object prefix
+      KmsKeyId:
+        default: Existing customer-managed KMS key ID
+
+Parameters:
+  EvidenceBucketName:
+    Type: String
+    MinLength: 3
+    MaxLength: 63
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    ConstraintDescription: Supply a globally unique, DNS-compatible S3 bucket name.
+  EvidencePrefix:
+    Type: String
+    MinLength: 1
+    MaxLength: 240
+    AllowedPattern: '^(?!.*\.\.)(?!.*//)(?!.*(?:^|/)\.(?:/|$))[A-Za-z0-9](?:[A-Za-z0-9._/-]{0,238}[A-Za-z0-9._-])?$'
+    ConstraintDescription: >-
+      Use a relative prefix with no leading/trailing slash, empty segment,
+      traversal segment, or backslash.
+  KmsKeyId:
+    Type: String
+    AllowedPattern: "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|mrk-[0-9a-fA-F]{32})$"
+    ConstraintDescription: >-
+      Supply the immutable key ID of an existing customer-managed symmetric KMS
+      key. The template derives its ARN from the stack partition, Region, and
+      account; aliases, cross-account keys, and AWS-managed keys are not accepted.
+  EncryptionMode:
+    Type: String
+    Default: SSE_KMS
+    AllowedValues:
+      - SSE_KMS
+      - DSSE_KMS
+  RetentionDays:
+    Type: Number
+    Default: 365
+    MinValue: 1
+    MaxValue: 3650
+
+Conditions:
+  UseSseKms:
+    Fn::Equals:
+      - Ref: EncryptionMode
+      - SSE_KMS
+
+Resources:
+  NativeEvidenceBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName:
+        Ref: EvidenceBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled:
+              Fn::If:
+                - UseSseKms
+                - true
+                - Ref: AWS::NoValue
+            ServerSideEncryptionByDefault:
+              KMSMasterKeyID:
+                Fn::Sub: arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/${KmsKeyId}
+              SSEAlgorithm:
+                Fn::If:
+                  - UseSseKms
+                  - aws:kms
+                  - aws:kms:dsse
+      ObjectLockConfiguration:
+        ObjectLockEnabled: Enabled
+        Rule:
+          DefaultRetention:
+            Days:
+              Ref: RetentionDays
+            Mode:
+              COMPLIANCE
+      ObjectLockEnabled: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Application
+          Value: scopeproof-capture
+        - Key: DataClassification
+          Value: compliance-evidence
+        - Key: EvidencePrefix
+          Value:
+            Ref: EvidencePrefix
+        - Key: SecurityProfile
+          Value: production-compliance
+      VersioningConfiguration:
+        Status: Enabled
+
+  NativeEvidenceBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Bucket:
+        Ref: NativeEvidenceBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ScopeproofDenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - Fn::GetAtt:
+                  - NativeEvidenceBucket
+                  - Arn
+              - Fn::Sub: ${NativeEvidenceBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+          - Sid: ScopeproofDenyBucketDeletion
+            Effect: Deny
+            Principal: "*"
+            Action: s3:DeleteBucket
+            Resource:
+              Fn::GetAtt:
+                - NativeEvidenceBucket
+                - Arn
+          - Sid: ScopeproofDenyEvidenceDeletion
+            Effect: Deny
+            Principal: "*"
+            Action:
+              - s3:DeleteObject
+              - s3:DeleteObjectVersion
+              - s3:BypassGovernanceRetention
+            Resource:
+              Fn::Sub: ${NativeEvidenceBucket.Arn}/${EvidencePrefix}/*
+          - Sid: ScopeproofDenyWrongEncryption
+            Effect: Deny
+            Principal: "*"
+            Action: s3:PutObject
+            Resource:
+              Fn::Sub: ${NativeEvidenceBucket.Arn}/${EvidencePrefix}/*
+            Condition:
+              StringNotEquals:
+                s3:x-amz-server-side-encryption:
+                  Fn::If:
+                    - UseSseKms
+                    - aws:kms
+                    - aws:kms:dsse
+          - Sid: ScopeproofDenyWrongKMSKey
+            Effect: Deny
+            Principal: "*"
+            Action: s3:PutObject
+            Resource:
+              Fn::Sub: ${NativeEvidenceBucket.Arn}/${EvidencePrefix}/*
+            Condition:
+              StringNotEquals:
+                s3:x-amz-server-side-encryption-aws-kms-key-id:
+                  Fn::Sub: arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/${KmsKeyId}
+Outputs:
+  EvidenceBucketName:
+    Description: Enter this exact value in the native Scopeproof S3 Bucket field.
+    Value:
+      Ref: NativeEvidenceBucket
+  EvidenceBucketArn:
+    Value:
+      Fn::GetAtt:
+        - NativeEvidenceBucket
+        - Arn
+  EvidencePrefix:
+    Description: Enter this exact value in the native Scopeproof Object prefix field.
+    Value:
+      Ref: EvidencePrefix
+  KmsKeyArn:
+    Description: Enter this exact value in the native Scopeproof KMS key ARN field.
+    Value:
+      Fn::Sub: arn:${AWS::Partition}:kms:${AWS::Region}:${AWS::AccountId}:key/${KmsKeyId}
+  EncryptionMode:
+    Description: Select the matching encryption mode in the native application.
+    Value:
+      Ref: EncryptionMode
+  ObjectLockMode:
+    Description: Fixed production setting. Governance is non-production only and is not supported by this template.
+    Value: COMPLIANCE
+  RetentionDays:
+    Value:
+      Ref: RetentionDays

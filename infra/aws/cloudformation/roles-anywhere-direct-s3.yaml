@@ -1,0 +1,281 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Enterprise read-only direct-S3 option using an existing IAM Roles Anywhere
+  trust anchor, an exact certificate subject CN, and 15-minute sessions.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Existing PKI trust
+        Parameters:
+          - TrustAnchorArn
+          - CertificateSubjectCommonName
+          - ProfileName
+          - EnableProfile
+      - Label:
+          default: Exact evidence boundary
+        Parameters:
+          - EvidenceBucketName
+          - KmsKeyArn
+          - TenantId
+    ParameterLabels:
+      CertificateSubjectCommonName:
+        default: Exact allowed X.509 subject CN
+      EnableProfile:
+        default: Enable credential vending after PKI validation
+
+Parameters:
+  TrustAnchorArn:
+    Type: String
+    AllowedPattern: "^arn:(aws|aws-us-gov|aws-cn):rolesanywhere:[a-z0-9-]+:[0-9]{12}:trust-anchor/[0-9a-fA-F-]{36}$"
+    Description: Existing enabled trust anchor in this stack account and Region.
+  CertificateSubjectCommonName:
+    Type: String
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: "^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,63}$"
+    Description: >-
+      Deploy one narrowly scoped role/profile for this exact end-entity
+      certificate subject CN. Certificate lifecycle and revocation remain external.
+  ProfileName:
+    Type: String
+    MinLength: 1
+    MaxLength: 255
+    AllowedPattern: "^[A-Za-z0-9_-]+$"
+    Description: Use a tenant- and workload-specific name.
+  EnableProfile:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Keep false until CA, CRL, key custody, and certificate issuance are validated.
+  EvidenceBucketName:
+    Type: String
+    MinLength: 3
+    MaxLength: 63
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+  KmsKeyArn:
+    Type: String
+    AllowedPattern: "^arn:(aws|aws-us-gov|aws-cn):kms:[a-z0-9-]+:[0-9]{12}:key/([0-9a-fA-F-]{36}|mrk-[0-9a-fA-F]{32})$"
+  TenantId:
+    Type: String
+    AllowedPattern: "^ten_[a-f0-9]{32}$"
+Conditions:
+  ProfileIsEnabled:
+    Fn::Equals:
+      - Ref: EnableProfile
+      - "true"
+
+Resources:
+  RolesAnywhereEvidenceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /scopeproof/
+      Description: Exact-certificate, tenant-scoped, read-only evidence role.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ExactTrustAnchorAndCertificateSubject
+            Effect: Allow
+            Principal:
+              Service: rolesanywhere.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:SetSourceIdentity
+              - sts:TagSession
+            Condition:
+              ArnEquals:
+                aws:SourceArn:
+                  Ref: TrustAnchorArn
+              StringEquals:
+                aws:SourceAccount:
+                  Ref: AWS::AccountId
+                aws:PrincipalTag/x509Subject/CN:
+                  Ref: CertificateSubjectCommonName
+      Tags:
+        - Key: Application
+          Value: scopeproof
+        - Key: TenantId
+          Value:
+            Ref: TenantId
+        - Key: AccessMode
+          Value: read-only-evidence
+      Policies:
+        - PolicyName: exact-tenant-evidence-read-boundary
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ListExactEvidencePrefix
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::${EvidenceBucketName}
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - Fn::Sub: tenants/${TenantId}/controls/*/evidence/*
+              - Sid: ReadExactEvidencePrefix
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::${EvidenceBucketName}/tenants/${TenantId}/controls/*/evidence/*
+              - Sid: DenyObjectReadsOutsideExactEvidencePrefix
+                Effect: Deny
+                Action:
+                  - s3:GetObject*
+                NotResource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::${EvidenceBucketName}/tenants/${TenantId}/controls/*/evidence/*
+              - Sid: DenyListWithoutPrefix
+                Effect: Deny
+                Action:
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::*
+                Condition:
+                  "Null":
+                    s3:prefix: "true"
+              - Sid: DenyListOutsideExactEvidencePrefix
+                Effect: Deny
+                Action:
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::*
+                Condition:
+                  StringNotLike:
+                    s3:prefix:
+                      - Fn::Sub: tenants/${TenantId}/controls/*/evidence/*
+              - Sid: DecryptEvidenceThroughS3Only
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource:
+                  - Ref: KmsKeyArn
+                Condition:
+                  StringEquals:
+                    kms:ViaService:
+                      Fn::Sub: s3.${AWS::Region}.${AWS::URLSuffix}
+                    kms:EncryptionContext:scopeproofTenantId:
+                      Ref: TenantId
+                    kms:EncryptionContext:scopeproofPurpose: immutable-evidence
+              - Sid: DenyS3OverInsecureTransport
+                Effect: Deny
+                Action:
+                  - s3:*
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::${EvidenceBucketName}
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::${EvidenceBucketName}/*
+                Condition:
+                  Bool:
+                    aws:SecureTransport: "false"
+              - Sid: DenyAllObjectWritesAndMutations
+                Effect: Deny
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                  - s3:BypassGovernanceRetention
+                  - s3:PutObjectAcl
+                  - s3:PutObjectLegalHold
+                  - s3:PutObjectRetention
+                  - s3:RestoreObject
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::*/*
+              - Sid: DenyKmsOutsideRegionalS3
+                Effect: Deny
+                Action:
+                  - kms:Decrypt
+                Resource:
+                  - Ref: KmsKeyArn
+                Condition:
+                  StringNotEquals:
+                    kms:ViaService:
+                      Fn::Sub: s3.${AWS::Region}.${AWS::URLSuffix}
+              - Sid: DenyKmsUseOutsideConfiguredKey
+                Effect: Deny
+                Action:
+                  - kms:Decrypt
+                NotResource:
+                  - Ref: KmsKeyArn
+              - Sid: DenyWrongTenantEncryptionContext
+                Effect: Deny
+                Action:
+                  - kms:Decrypt
+                Resource:
+                  - Ref: KmsKeyArn
+                Condition:
+                  StringNotEquals:
+                    kms:EncryptionContext:scopeproofTenantId:
+                      Ref: TenantId
+              - Sid: DenyWrongPurposeEncryptionContext
+                Effect: Deny
+                Action:
+                  - kms:Decrypt
+                Resource:
+                  - Ref: KmsKeyArn
+                Condition:
+                  StringNotEquals:
+                    kms:EncryptionContext:scopeproofPurpose: immutable-evidence
+
+  EvidenceProfile:
+    Type: AWS::RolesAnywhere::Profile
+    Properties:
+      Name:
+        Ref: ProfileName
+      AcceptRoleSessionName: false
+      AttributeMappings:
+        - CertificateField: x509Subject
+          MappingRules:
+            - Specifier: CN
+      DurationSeconds: 900
+      Enabled:
+        Fn::If:
+          - ProfileIsEnabled
+          - true
+          - false
+      RequireInstanceProperties: false
+      RoleArns:
+        - Fn::GetAtt:
+            - RolesAnywhereEvidenceRole
+            - Arn
+      SessionPolicy:
+        Fn::Sub: >-
+          {"Version":"2012-10-17","Statement":[{"Sid":"ListExactEvidencePrefix","Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:${AWS::Partition}:s3:::${EvidenceBucketName}","Condition":{"StringLike":{"s3:prefix":"tenants/${TenantId}/controls/*/evidence/*"}}},{"Sid":"ReadExactEvidencePrefix","Effect":"Allow","Action":["s3:GetObject","s3:GetObjectVersion"],"Resource":"arn:${AWS::Partition}:s3:::${EvidenceBucketName}/tenants/${TenantId}/controls/*/evidence/*"},{"Sid":"DecryptEvidenceThroughS3Only","Effect":"Allow","Action":"kms:Decrypt","Resource":"${KmsKeyArn}","Condition":{"StringEquals":{"kms:ViaService":"s3.${AWS::Region}.${AWS::URLSuffix}","kms:EncryptionContext:scopeproofTenantId":"${TenantId}","kms:EncryptionContext:scopeproofPurpose":"immutable-evidence"}}}]}
+      Tags:
+        - Key: Application
+          Value: scopeproof
+        - Key: TenantId
+          Value:
+            Ref: TenantId
+
+Outputs:
+  RolesAnywhereRoleArn:
+    Value:
+      Fn::GetAtt:
+        - RolesAnywhereEvidenceRole
+        - Arn
+  RolesAnywhereProfileArn:
+    Value:
+      Fn::GetAtt:
+        - EvidenceProfile
+        - ProfileArn
+  RolesAnywhereProfileId:
+    Value:
+      Fn::GetAtt:
+        - EvidenceProfile
+        - ProfileId
+  TrustAnchorArn:
+    Value:
+      Ref: TrustAnchorArn
+  SessionDurationSeconds:
+    Value: "900"
+  ProfileEnabled:
+    Value:
+      Ref: EnableProfile

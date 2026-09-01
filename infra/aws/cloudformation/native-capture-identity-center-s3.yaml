@@ -1,0 +1,434 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  IAM Identity Center permission sets for the native Scopeproof Capture macOS
+  direct-S3 workflow. Creates a one-hour upload/verifier permission set for an
+  existing, separately provisioned evidence bucket. Creates no bucket, KMS key,
+  IAM user, access key, or bucket-administration identity.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: IAM Identity Center daily access
+        Parameters:
+          - IdentityCenterInstanceArn
+          - DailyPermissionSetName
+          - CreateDailyAccountAssignment
+          - DailyPrincipalType
+          - DailyPrincipalId
+      - Label:
+          default: Exact native Capture destination
+        Parameters:
+          - BucketOwnerAccountId
+          - EvidenceBucketName
+          - EvidencePrefix
+          - KmsKeyId
+          - EncryptionMode
+      - Label:
+          default: Optional native inventory and downloads
+        Parameters:
+          - EnableVersionInventory
+          - EnableValidatedDownloads
+    ParameterLabels:
+      EvidencePrefix:
+        default: Exact nonempty Scopeproof object prefix
+      EnableVersionInventory:
+        default: Permit prefix-scoped immutable-version inventory
+      EnableValidatedDownloads:
+        default: Permit selected exact-version download and KMS decrypt
+
+Parameters:
+  IdentityCenterInstanceArn:
+    Type: String
+    AllowedPattern: "^arn:(aws|aws-us-gov):sso:::instance/(sso)?ins-[A-Za-z0-9-.]{16}$"
+    ConstraintDescription: >-
+      Supply the IAM Identity Center instance ARN for the standard or AWS GovCloud
+      partition. The native app does not support the AWS China partition.
+  DailyPermissionSetName:
+    Type: String
+    Default: ScopeproofCaptureDaily
+    MinLength: 1
+    MaxLength: 32
+    AllowedPattern: "^[A-Za-z0-9+=,.@_-]+$"
+    Description: Use a destination-specific name when an account has more than one Capture bucket.
+  BucketOwnerAccountId:
+    Type: String
+    AllowedPattern: "^[0-9]{12}$"
+    Description: >-
+      Exact AWS account that owns the bucket and receives the permission-set assignment.
+      Scopeproof sends this account as the expected S3 bucket owner.
+  EvidenceBucketName:
+    Type: String
+    MinLength: 3
+    MaxLength: 63
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    Description: Exact existing bucket name, or the exact globally unique name approved for setup.
+  EvidencePrefix:
+    Type: String
+    MinLength: 1
+    MaxLength: 240
+    AllowedPattern: '^(?!.*\.\.)(?!.*//)(?!.*(?:^|/)\.(?:/|$))[A-Za-z0-9](?:[A-Za-z0-9._/-]{0,238}[A-Za-z0-9._-])?$'
+    ConstraintDescription: >-
+      Use a relative 1-240 character prefix with no leading/trailing slash,
+      empty segment, traversal segment, or backslash. Enter this exact value in Scopeproof.
+  KmsKeyId:
+    Type: String
+    AllowedPattern: "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}|mrk-[0-9a-fA-F]{32})$"
+    ConstraintDescription: >-
+      Supply the exact customer-managed KMS key ID. The permission set derives
+      the ARN from the AWS partition, stack Region, and BucketOwnerAccountId;
+      aliases, cross-account keys, and AWS-managed keys are not accepted.
+  EncryptionMode:
+    Type: String
+    Default: SSE_KMS
+    AllowedValues:
+      - SSE_KMS
+      - DSSE_KMS
+    Description: Must match the native app and the bucket default encryption configuration.
+  EnableVersionInventory:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+  EnableValidatedDownloads:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+  CreateDailyAccountAssignment:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+  DailyPrincipalType:
+    Type: String
+    Default: GROUP
+    AllowedValues:
+      - GROUP
+      - USER
+  DailyPrincipalId:
+    Type: String
+    Default: ""
+    MaxLength: 128
+    AllowedPattern: "^$|^[A-Za-z0-9-]{10,128}$"
+    Description: Identity Store group or user ID; prefer a dedicated operator group.
+Rules:
+  RequireDailyPrincipalForAssignment:
+    RuleCondition:
+      Fn::Equals:
+        - Ref: CreateDailyAccountAssignment
+        - "true"
+    Assertions:
+      - Assert:
+          Fn::Not:
+            - Fn::Equals:
+                - Ref: DailyPrincipalId
+                - ""
+        AssertDescription: DailyPrincipalId is required when creating the daily assignment.
+  RequireInventoryForDownloads:
+    RuleCondition:
+      Fn::Equals:
+        - Ref: EnableValidatedDownloads
+        - "true"
+    Assertions:
+      - Assert:
+          Fn::Equals:
+            - Ref: EnableVersionInventory
+            - "true"
+        AssertDescription: EnableVersionInventory must be true when validated downloads are enabled.
+Conditions:
+  UseSseKms:
+    Fn::Equals:
+      - Ref: EncryptionMode
+      - SSE_KMS
+  AllowVersionInventory:
+    Fn::Equals:
+      - Ref: EnableVersionInventory
+      - "true"
+  AllowValidatedDownloads:
+    Fn::Equals:
+      - Ref: EnableValidatedDownloads
+      - "true"
+  CreateDailyAssignment:
+    Fn::Equals:
+      - Ref: CreateDailyAccountAssignment
+      - "true"
+
+Resources:
+  NativeCaptureDailyPermissionSet:
+    Type: AWS::SSO::PermissionSet
+    Properties:
+      InstanceArn:
+        Ref: IdentityCenterInstanceArn
+      Name:
+        Ref: DailyPermissionSetName
+      Description: Scopeproof native Capture exact-prefix upload, posture verification, and optional version access.
+      SessionDuration: PT1H
+      Tags:
+        - Key: Application
+          Value: scopeproof-capture
+        - Key: EvidenceBucket
+          Value:
+            Ref: EvidenceBucketName
+        - Key: EvidencePrefix
+          Value:
+            Ref: EvidencePrefix
+      InlinePolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ReadExactBucketPosture
+            Effect: Allow
+            Action:
+              - s3:GetBucketPublicAccessBlock
+              - s3:GetBucketVersioning
+              - s3:GetBucketOwnershipControls
+              - s3:GetEncryptionConfiguration
+              - s3:GetBucketObjectLockConfiguration
+              - s3:GetBucketPolicy
+              - s3:GetLifecycleConfiguration
+              - s3:GetReplicationConfiguration
+            Resource:
+              - Fn::Sub: arn:${AWS::Partition}:s3:::${EvidenceBucketName}
+          - Sid: VerifyExactNativePrefix
+            Effect: Allow
+            Action:
+              - s3:ListBucket
+            Resource:
+              - Fn::Sub: arn:${AWS::Partition}:s3:::${EvidenceBucketName}
+            Condition:
+              StringLike:
+                s3:prefix:
+                  - Fn::Sub: ${EvidencePrefix}/
+                  - Fn::Sub: ${EvidencePrefix}/*
+          - Sid: WriteExactNativePrefix
+            Effect: Allow
+            Action:
+              - s3:PutObject
+            Resource:
+              - Fn::Sub: arn:${AWS::Partition}:s3:::${EvidenceBucketName}/${EvidencePrefix}/*
+            Condition:
+              StringEquals:
+                s3:x-amz-server-side-encryption:
+                  Fn::If:
+                    - UseSseKms
+                    - aws:kms
+                    - aws:kms:dsse
+                s3:x-amz-server-side-encryption-aws-kms-key-id:
+                  Fn::Sub: arn:${AWS::Partition}:kms:${AWS::Region}:${BucketOwnerAccountId}:key/${KmsKeyId}
+          - Sid: DescribeExactNativeKmsKey
+            Effect: Allow
+            Action:
+              - kms:DescribeKey
+            Resource:
+              - Fn::Sub: arn:${AWS::Partition}:kms:${AWS::Region}:${BucketOwnerAccountId}:key/${KmsKeyId}
+          - Fn::If:
+              - UseSseKms
+              - Sid: GenerateNativeDataKeyWithBucketKeyContext
+                Effect: Allow
+                Action:
+                  - kms:GenerateDataKey
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:kms:${AWS::Region}:${BucketOwnerAccountId}:key/${KmsKeyId}
+                Condition:
+                  StringEquals:
+                    kms:CallerAccount:
+                      Ref: BucketOwnerAccountId
+                    kms:ViaService:
+                      Fn::Sub: s3.${AWS::Region}.${AWS::URLSuffix}
+                    kms:EncryptionContext:aws:s3:arn:
+                      Fn::Sub: arn:${AWS::Partition}:s3:::${EvidenceBucketName}
+              - Sid: GenerateNativeDataKeyWithObjectContext
+                Effect: Allow
+                Action:
+                  - kms:GenerateDataKey
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:kms:${AWS::Region}:${BucketOwnerAccountId}:key/${KmsKeyId}
+                Condition:
+                  StringEquals:
+                    kms:CallerAccount:
+                      Ref: BucketOwnerAccountId
+                    kms:ViaService:
+                      Fn::Sub: s3.${AWS::Region}.${AWS::URLSuffix}
+                  ArnLike:
+                    kms:EncryptionContext:aws:s3:arn:
+                      Fn::Sub: arn:${AWS::Partition}:s3:::${EvidenceBucketName}/${EvidencePrefix}/*
+          - Fn::If:
+              - AllowVersionInventory
+              - Sid: ListExactNativeVersions
+                Effect: Allow
+                Action:
+                  - s3:ListBucketVersions
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::${EvidenceBucketName}
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - Fn::Sub: ${EvidencePrefix}/
+                      - Fn::Sub: ${EvidencePrefix}/*
+              - Ref: AWS::NoValue
+          - Fn::If:
+              - AllowValidatedDownloads
+              - Sid: ReadExactNativeVersion
+                Effect: Allow
+                Action:
+                  - s3:GetObjectVersion
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::${EvidenceBucketName}/${EvidencePrefix}/*
+              - Ref: AWS::NoValue
+          - Fn::If:
+              - AllowValidatedDownloads
+              - Fn::If:
+                  - UseSseKms
+                  - Sid: DecryptNativeVersionWithBucketKeyContext
+                    Effect: Allow
+                    Action:
+                      - kms:Decrypt
+                    Resource:
+                      - Fn::Sub: arn:${AWS::Partition}:kms:${AWS::Region}:${BucketOwnerAccountId}:key/${KmsKeyId}
+                    Condition:
+                      StringEquals:
+                        kms:CallerAccount:
+                          Ref: BucketOwnerAccountId
+                        kms:ViaService:
+                          Fn::Sub: s3.${AWS::Region}.${AWS::URLSuffix}
+                        kms:EncryptionContext:aws:s3:arn:
+                          Fn::Sub: arn:${AWS::Partition}:s3:::${EvidenceBucketName}
+                  - Sid: DecryptNativeVersionWithObjectContext
+                    Effect: Allow
+                    Action:
+                      - kms:Decrypt
+                    Resource:
+                      - Fn::Sub: arn:${AWS::Partition}:kms:${AWS::Region}:${BucketOwnerAccountId}:key/${KmsKeyId}
+                    Condition:
+                      StringEquals:
+                        kms:CallerAccount:
+                          Ref: BucketOwnerAccountId
+                        kms:ViaService:
+                          Fn::Sub: s3.${AWS::Region}.${AWS::URLSuffix}
+                      ArnLike:
+                        kms:EncryptionContext:aws:s3:arn:
+                          Fn::Sub: arn:${AWS::Partition}:s3:::${EvidenceBucketName}/${EvidencePrefix}/*
+              - Ref: AWS::NoValue
+          - Sid: DenyNativeS3OverInsecureTransport
+            Effect: Deny
+            Action:
+              - s3:*
+            Resource:
+              - Fn::Sub: arn:${AWS::Partition}:s3:::${EvidenceBucketName}
+              - Fn::Sub: arn:${AWS::Partition}:s3:::${EvidenceBucketName}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+          - Sid: DenyNativeDestructiveObjectActions
+            Effect: Deny
+            Action:
+              - s3:DeleteObject
+              - s3:DeleteObjectVersion
+              - s3:BypassGovernanceRetention
+              - s3:PutObjectAcl
+              - s3:PutObjectLegalHold
+              - s3:PutObjectRetention
+              - s3:RestoreObject
+            Resource:
+              - Fn::Sub: arn:${AWS::Partition}:s3:::${EvidenceBucketName}/${EvidencePrefix}/*
+          - Sid: DenyNativePutWithoutSelectedEncryption
+            Effect: Deny
+            Action:
+              - s3:PutObject
+            Resource:
+              - Fn::Sub: arn:${AWS::Partition}:s3:::${EvidenceBucketName}/${EvidencePrefix}/*
+            Condition:
+              StringNotEquals:
+                s3:x-amz-server-side-encryption:
+                  Fn::If:
+                    - UseSseKms
+                    - aws:kms
+                    - aws:kms:dsse
+          - Sid: DenyNativePutWithWrongKmsKey
+            Effect: Deny
+            Action:
+              - s3:PutObject
+            Resource:
+              - Fn::Sub: arn:${AWS::Partition}:s3:::${EvidenceBucketName}/${EvidencePrefix}/*
+            Condition:
+              StringNotEquals:
+                s3:x-amz-server-side-encryption-aws-kms-key-id:
+                  Fn::Sub: arn:${AWS::Partition}:kms:${AWS::Region}:${BucketOwnerAccountId}:key/${KmsKeyId}
+          - Sid: DenyNativeKmsOutsideRegionalS3
+            Effect: Deny
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:GenerateDataKeyWithoutPlaintext
+            Resource:
+              - Fn::Sub: arn:${AWS::Partition}:kms:${AWS::Region}:${BucketOwnerAccountId}:key/${KmsKeyId}
+            Condition:
+              StringNotEquals:
+                kms:ViaService:
+                  Fn::Sub: s3.${AWS::Region}.${AWS::URLSuffix}
+          - Sid: DenyNativeKmsUseOutsideConfiguredKey
+            Effect: Deny
+            Action:
+              - kms:DescribeKey
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:GenerateDataKeyWithoutPlaintext
+            NotResource:
+              - Fn::Sub: arn:${AWS::Partition}:kms:${AWS::Region}:${BucketOwnerAccountId}:key/${KmsKeyId}
+
+  DailyAccountAssignment:
+    Type: AWS::SSO::Assignment
+    Condition: CreateDailyAssignment
+    Properties:
+      InstanceArn:
+        Ref: IdentityCenterInstanceArn
+      PermissionSetArn:
+        Fn::GetAtt:
+          - NativeCaptureDailyPermissionSet
+          - PermissionSetArn
+      PrincipalId:
+        Ref: DailyPrincipalId
+      PrincipalType:
+        Ref: DailyPrincipalType
+      TargetId:
+        Ref: BucketOwnerAccountId
+      TargetType: AWS_ACCOUNT
+
+Outputs:
+  DailyPermissionSetArn:
+    Description: Assign this permission set to the approved native Capture operator group.
+    Value:
+      Fn::GetAtt:
+        - NativeCaptureDailyPermissionSet
+        - PermissionSetArn
+  DailyAccountAssignmentId:
+    Condition: CreateDailyAssignment
+    Value:
+      Ref: DailyAccountAssignment
+  NativeObjectPrefix:
+    Description: Enter this exact value in the macOS Scopeproof S3 Object prefix field.
+    Value:
+      Ref: EvidencePrefix
+  NativeObjectResourceArn:
+    Value:
+      Fn::Sub: arn:${AWS::Partition}:s3:::${EvidenceBucketName}/${EvidencePrefix}/*
+  KmsKeyArn:
+    Description: Enter this ownership- and Region-bound ARN in the native app.
+    Value:
+      Fn::Sub: arn:${AWS::Partition}:kms:${AWS::Region}:${BucketOwnerAccountId}:key/${KmsKeyId}
+  S3EncryptionHeaderValue:
+    Description: Must match the native app encryption selection and bucket policy.
+    Value:
+      Fn::If:
+        - UseSseKms
+        - aws:kms
+        - aws:kms:dsse
+  VersionInventoryEnabled:
+    Value:
+      Ref: EnableVersionInventory
+  ValidatedDownloadsEnabled:
+    Value:
+      Ref: EnableValidatedDownloads

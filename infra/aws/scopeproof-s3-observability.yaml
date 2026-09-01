@@ -1,0 +1,358 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Scopeproof S3 evidence data-event logging and security-change alerts. Deploy this
+  in the AWS account that owns the evidence bucket. CloudTrail logs use a separate,
+  immutable bucket so evidence activity cannot erase its own audit history.
+
+Parameters:
+  EvidenceBucketName:
+    Type: String
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+  EvidencePrefix:
+    Type: String
+    Default: scopeproof-evidence
+    AllowedPattern: "^(?!.*\\.\\.)(?!.*//)[A-Za-z0-9](?:[A-Za-z0-9._/-]{0,238}[A-Za-z0-9])?$"
+  EvidenceKMSKeyArn:
+    Type: String
+    AllowedPattern: "^arn:(aws|aws-us-gov):kms:[a-z0-9-]+:[0-9]{12}:key/[0-9A-Za-z-]{1,128}$"
+    Description: Exact customer-managed KMS key ARN configured in Scopeproof.
+  TrailLogBucketName:
+    Type: String
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    Description: A globally unique bucket name used only for Scopeproof CloudTrail logs.
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Optional email address. AWS requires confirmation before notifications begin.
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Resources:
+  TrailLogKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: Dedicated customer-managed key for immutable Scopeproof CloudTrail logs.
+      EnableKeyRotation: true
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableAccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: kms:*
+            Resource: "*"
+          - Sid: AllowCloudTrailKeyInspection
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: kms:DescribeKey
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/scopeproof-s3-evidence"
+          - Sid: AllowCloudTrailLogEncryption
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: kms:GenerateDataKey*
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/scopeproof-s3-evidence"
+              StringLike:
+                kms:EncryptionContext:aws:cloudtrail:arn: !Sub "arn:${AWS::Partition}:cloudtrail:*:${AWS::AccountId}:trail/*"
+
+  TrailLogBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref TrailLogBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt TrailLogKey.Arn
+            BucketKeyEnabled: true
+      ObjectLockEnabled: true
+      ObjectLockConfiguration:
+        ObjectLockEnabled: Enabled
+        Rule:
+          DefaultRetention:
+            Mode: COMPLIANCE
+            Days: 365
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  TrailLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Bucket: !Ref TrailLogBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt TrailLogBucket.Arn
+              - !Sub "${TrailLogBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+          - Sid: DenyAuditLogDestruction
+            Effect: Deny
+            Principal: "*"
+            Action:
+              - s3:DeleteObject
+              - s3:DeleteObjectVersion
+              - s3:BypassGovernanceRetention
+            Resource: !Sub "${TrailLogBucket.Arn}/*"
+          - Sid: DenyAuditBucketDestruction
+            Effect: Deny
+            Principal: "*"
+            Action:
+              - s3:DeleteBucket
+              - s3:DeleteBucketPolicy
+            Resource: !GetAtt TrailLogBucket.Arn
+          - Sid: CloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt TrailLogBucket.Arn
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/scopeproof-s3-evidence"
+          - Sid: CloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${TrailLogBucket.Arn}/scopeproof-cloudtrail/AWSLogs/${AWS::AccountId}/*"
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/scopeproof-s3-evidence"
+                s3:x-amz-acl: bucket-owner-full-control
+
+  EvidenceTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: TrailLogBucketPolicy
+    Properties:
+      TrailName: scopeproof-s3-evidence
+      S3BucketName: !Ref TrailLogBucket
+      S3KeyPrefix: scopeproof-cloudtrail
+      EnableLogFileValidation: true
+      IncludeGlobalServiceEvents: true
+      IsLogging: true
+      IsMultiRegionTrail: true
+      KMSKeyId: !Ref TrailLogKey
+      EventSelectors:
+        - IncludeManagementEvents: true
+          ReadWriteType: All
+          DataResources:
+            - Type: AWS::S3::Object
+              Values:
+                - !Sub "arn:${AWS::Partition}:s3:::${EvidenceBucketName}/${EvidencePrefix}/"
+
+  SecurityAlertKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: Dedicated encryption key for Scopeproof EventBridge security alerts.
+      EnableKeyRotation: true
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableAccountAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: kms:*
+            Resource: "*"
+          - Sid: AllowEventBridgeEncryptedPublishing
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: "*"
+
+  SecurityAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: scopeproof-s3-security-alerts
+      KmsMasterKeyId: !GetAtt SecurityAlertKey.Arn
+
+  SecurityAlertSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+      TopicArn: !Ref SecurityAlertTopic
+
+  SecurityAlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref SecurityAlertTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowEventBridgePublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref SecurityAlertTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnEquals:
+                aws:SourceArn:
+                  - !GetAtt S3SecurityChangeRule.Arn
+                  - !GetAtt S3AccountPublicAccessChangeRule.Arn
+                  - !GetAtt KMSSecurityChangeRule.Arn
+                  - !GetAtt CloudTrailSecurityChangeRule.Arn
+
+  S3SecurityChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: scopeproof-s3-security-changes
+      Description: Alerts on evidence deletion and bucket-control changes.
+      State: ENABLED
+      EventPattern:
+        source: [aws.s3]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventSource: [s3.amazonaws.com]
+          eventName:
+            - DeleteObject
+            - DeleteObjects
+            - PutBucketPolicy
+            - DeleteBucketPolicy
+            - PutBucketPublicAccessBlock
+            - DeleteBucketPublicAccessBlock
+            - PutBucketVersioning
+            - PutObjectLockConfiguration
+            - PutBucketEncryption
+            - DeleteBucketEncryption
+            - PutBucketReplication
+            - DeleteBucketReplication
+            - PutBucketLifecycleConfiguration
+            - PutBucketLifecycle
+          requestParameters:
+            bucketName:
+              - !Ref EvidenceBucketName
+              - !Ref TrailLogBucketName
+      Targets:
+        - Arn: !Ref SecurityAlertTopic
+          Id: ScopeproofSecurityTopic
+
+  S3AccountPublicAccessChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: scopeproof-s3-account-public-access-changes
+      Description: Alerts on account-level S3 Block Public Access changes.
+      State: ENABLED
+      EventPattern:
+        source: [aws.s3]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventSource: [s3.amazonaws.com]
+          eventName: [PutPublicAccessBlock, DeletePublicAccessBlock]
+      Targets:
+        - Arn: !Ref SecurityAlertTopic
+          Id: ScopeproofAccountSecurityTopic
+
+  KMSSecurityChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: scopeproof-kms-security-changes
+      Description: Alerts on security-relevant KMS key, policy, grant, alias, and multi-Region changes in this account.
+      State: ENABLED
+      EventPattern:
+        source: [aws.kms]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventSource: [kms.amazonaws.com]
+          eventName:
+            - CancelKeyDeletion
+            - CreateKey
+            - CreateAlias
+            - CreateGrant
+            - DeleteImportedKeyMaterial
+            - DeleteAlias
+            - DisableKey
+            - DisableKeyRotation
+            - EnableKey
+            - EnableKeyRotation
+            - ImportKeyMaterial
+            - PutKeyPolicy
+            - ReplicateKey
+            - RetireGrant
+            - RevokeGrant
+            - RotateKeyOnDemand
+            - ScheduleKeyDeletion
+            - TagResource
+            - UntagResource
+            - UpdateAlias
+            - UpdateKeyDescription
+            - UpdatePrimaryRegion
+      Targets:
+        - Arn: !Ref SecurityAlertTopic
+          Id: ScopeproofKMSSecurityTopic
+
+  CloudTrailSecurityChangeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: scopeproof-cloudtrail-security-changes
+      Description: Alerts when CloudTrail logging, selectors, or the evidence trail are changed in this account.
+      State: ENABLED
+      EventPattern:
+        source: [aws.cloudtrail]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventSource: [cloudtrail.amazonaws.com]
+          eventName:
+            - DeleteTrail
+            - PutEventSelectors
+            - PutInsightSelectors
+            - StartLogging
+            - StopLogging
+            - UpdateTrail
+      Targets:
+        - Arn: !Ref SecurityAlertTopic
+          Id: ScopeproofCloudTrailSecurityTopic
+
+Outputs:
+  CloudTrailArn:
+    Value: !GetAtt EvidenceTrail.Arn
+  AuditLogBucketArn:
+    Value: !GetAtt TrailLogBucket.Arn
+  SecurityAlertTopicArn:
+    Value: !Ref SecurityAlertTopic
+  SecurityAlertKeyArn:
+    Value: !GetAtt SecurityAlertKey.Arn
+  MonitoredEvidenceKMSKeyArn:
+    Description: Evidence key supplied for the deployment record; KMS tamper alerts intentionally cover the whole account.
+    Value: !Ref EvidenceKMSKeyArn

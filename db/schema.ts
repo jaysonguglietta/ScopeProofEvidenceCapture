@@ -1,20 +1,52 @@
 import { sql } from "drizzle-orm";
-import { index, integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+import { check, index, integer, primaryKey, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
 export const users = sqliteTable("users", {
   id: text("id").primaryKey(),
   email: text("email").notNull(),
   displayName: text("display_name").notNull(),
   role: text("role", { enum: ["admin", "compliance_lead", "reviewer", "auditor"] }).notNull().default("auditor"),
+  status: text("status", { enum: ["active", "suspended", "revoked"] }).notNull().default("active"),
+  invitedBy: text("invited_by"),
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
   lastSeenAt: text("last_seen_at").notNull().default(sql`CURRENT_TIMESTAMP`),
 }, (table) => [uniqueIndex("idx_users_email").on(table.email)]);
+
+export const userInvitations = sqliteTable("user_invitations", {
+  id: text("id").primaryKey(),
+  email: text("email").notNull(),
+  role: text("role", { enum: ["admin", "compliance_lead", "reviewer", "auditor"] }).notNull().default("auditor"),
+  status: text("status", { enum: ["pending", "accepted", "revoked", "expired"] }).notNull().default("pending"),
+  invitedBy: text("invited_by").notNull(),
+  expiresAt: text("expires_at").notNull(),
+  acceptedUserId: text("accepted_user_id"),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  acceptedAt: text("accepted_at"),
+  revokedAt: text("revoked_at"),
+}, (table) => [
+  uniqueIndex("idx_user_invitations_email_pending").on(table.email).where(sql`${table.status} = 'pending'`),
+  index("idx_user_invitations_status_expiry").on(table.status, table.expiresAt),
+]);
 
 export const securityInvariants = sqliteTable("security_invariants", {
   key: text("key").primaryKey(),
   value: text("value").notNull(),
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
 });
+
+export const controlCatalogs = sqliteTable("control_catalogs", {
+  id: text("id").primaryKey(),
+  framework: text("framework").notNull(),
+  version: text("version").notNull(),
+  title: text("title").notNull(),
+  controlsJson: text("controls_json").notNull(),
+  digestSha256: text("digest_sha256").notNull(),
+  status: text("status", { enum: ["active", "retired"] }).notNull().default("active"),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [
+  uniqueIndex("idx_control_catalog_framework_version").on(table.framework, table.version),
+  uniqueIndex("idx_control_catalog_digest").on(table.digestSha256),
+]);
 
 export const assessments = sqliteTable("assessments", {
   id: text("id").primaryKey(),
@@ -24,6 +56,8 @@ export const assessments = sqliteTable("assessments", {
   periodEnd: text("period_end").notNull(),
   systemsJson: text("systems_json").notNull().default("[]"),
   controlsJson: text("controls_json").notNull().default("[]"),
+  catalogId: text("catalog_id"),
+  scopeMode: text("scope_mode", { enum: ["explicit"] }).notNull().default("explicit"),
   ownerId: text("owner_id").notNull(),
   status: text("status", { enum: ["draft", "active", "closed"] }).notNull().default("draft"),
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
@@ -39,9 +73,26 @@ export const captureDevices = sqliteTable("capture_devices", {
   status: text("status", { enum: ["active", "revoked"] }).notNull().default("active"),
   appVersion: text("app_version"),
   lastSeenAt: text("last_seen_at"),
+  tokenIssuedAt: text("token_issued_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  tokenExpiresAt: text("token_expires_at").notNull().default(sql`datetime('now', '+30 days')`),
+  tokenLastRotatedAt: text("token_last_rotated_at"),
+  provenanceKeyId: text("provenance_key_id"),
+  provenancePublicKey: text("provenance_public_key"),
+  chainSequence: integer("chain_sequence").notNull().default(0),
+  chainEventHash: text("chain_event_hash").notNull().default("GENESIS"),
+  chainPendingLeaseId: text("chain_pending_lease_id"),
+  chainPendingSequence: integer("chain_pending_sequence"),
+  chainPendingPreviousHash: text("chain_pending_previous_hash"),
+  chainPendingEventHash: text("chain_pending_event_hash"),
+  chainPendingEvidenceId: text("chain_pending_evidence_id"),
+  chainPendingExpiresAt: text("chain_pending_expires_at"),
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
   revokedAt: text("revoked_at"),
-}, (table) => [uniqueIndex("idx_capture_devices_token_hash").on(table.tokenHash), index("idx_capture_devices_owner_status").on(table.ownerId, table.status)]);
+}, (table) => [
+  uniqueIndex("idx_capture_devices_token_hash").on(table.tokenHash),
+  uniqueIndex("idx_capture_devices_provenance_key").on(table.provenanceKeyId),
+  index("idx_capture_devices_owner_status").on(table.ownerId, table.status),
+]);
 
 export const captureSessions = sqliteTable("capture_sessions", {
   id: text("id").primaryKey(),
@@ -164,7 +215,7 @@ export const evidenceArtifacts = sqliteTable("evidence_artifacts", {
   encryptionKeyId: text("encryption_key_id").notNull().default("legacy-v1"),
   capturedAt: text("captured_at").notNull(),
   expiresAt: text("expires_at").notNull(),
-  status: text("status", { enum: ["needs_review", "approved", "expiring", "rejected", "expired", "purged"] }).notNull().default("needs_review"),
+  status: text("status", { enum: ["needs_review", "approved", "expiring", "rejected", "returned", "superseded", "expired", "purged"] }).notNull().default("needs_review"),
   redactionCount: integer("redaction_count").notNull().default(0),
   manualRedactions: integer("manual_redactions").notNull().default(0),
   redactionSummaryJson: text("redaction_summary_json").notNull().default("[]"),
@@ -176,6 +227,11 @@ export const evidenceArtifacts = sqliteTable("evidence_artifacts", {
   safetyScanSha256: text("safety_scan_sha256"),
   safetyScanPolicy: text("safety_scan_policy"),
   safetyScanCompletedAt: text("safety_scan_completed_at"),
+  serverSafetyScanSha256: text("server_safety_scan_sha256"),
+  serverSafetyScanPolicy: text("server_safety_scan_policy"),
+  serverSafetyScanCompletedAt: text("server_safety_scan_completed_at"),
+  serverSafetyScannerOrigin: text("server_safety_scanner_origin"),
+  serverSafetyReceiptSha256: text("server_safety_receipt_sha256"),
   createdBy: text("created_by").notNull(),
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
   approvedBy: text("approved_by"),
@@ -183,11 +239,30 @@ export const evidenceArtifacts = sqliteTable("evidence_artifacts", {
   purgedAt: text("purged_at"),
   purgeAttempts: integer("purge_attempts").notNull().default(0),
   purgeError: text("purge_error"),
+  rotationLeaseId: text("rotation_lease_id"),
+  rotationLeaseExpiresAt: text("rotation_lease_expires_at"),
+  rotationPendingR2Key: text("rotation_pending_r2_key"),
+  rotationPreviousR2Key: text("rotation_previous_r2_key"),
   assessmentId: text("assessment_id"),
   coverageStatus: text("coverage_status", { enum: ["complete", "partial", "not_applicable"] }).notNull().default("not_applicable"),
   coverageJson: text("coverage_json").notNull().default("{}"),
 }, (table) => [
-  uniqueIndex("idx_evidence_sha_source_control_assessment").on(table.sha256, table.source, table.controlId, table.assessmentId),
+  uniqueIndex("idx_evidence_dedupe_nnn").on(table.sha256, table.source, table.controlId, table.framework, table.system)
+    .where(sql`${table.assessmentId} IS NULL AND ${table.environment} IS NULL AND ${table.assessmentPeriod} IS NULL AND ${table.status} NOT IN ('expired', 'purged')`),
+  uniqueIndex("idx_evidence_dedupe_ann").on(table.sha256, table.source, table.controlId, table.framework, table.system, table.assessmentId)
+    .where(sql`${table.assessmentId} IS NOT NULL AND ${table.environment} IS NULL AND ${table.assessmentPeriod} IS NULL AND ${table.status} NOT IN ('expired', 'purged')`),
+  uniqueIndex("idx_evidence_dedupe_nen").on(table.sha256, table.source, table.controlId, table.framework, table.system, table.environment)
+    .where(sql`${table.assessmentId} IS NULL AND ${table.environment} IS NOT NULL AND ${table.assessmentPeriod} IS NULL AND ${table.status} NOT IN ('expired', 'purged')`),
+  uniqueIndex("idx_evidence_dedupe_nnp").on(table.sha256, table.source, table.controlId, table.framework, table.system, table.assessmentPeriod)
+    .where(sql`${table.assessmentId} IS NULL AND ${table.environment} IS NULL AND ${table.assessmentPeriod} IS NOT NULL AND ${table.status} NOT IN ('expired', 'purged')`),
+  uniqueIndex("idx_evidence_dedupe_aen").on(table.sha256, table.source, table.controlId, table.framework, table.system, table.assessmentId, table.environment)
+    .where(sql`${table.assessmentId} IS NOT NULL AND ${table.environment} IS NOT NULL AND ${table.assessmentPeriod} IS NULL AND ${table.status} NOT IN ('expired', 'purged')`),
+  uniqueIndex("idx_evidence_dedupe_anp").on(table.sha256, table.source, table.controlId, table.framework, table.system, table.assessmentId, table.assessmentPeriod)
+    .where(sql`${table.assessmentId} IS NOT NULL AND ${table.environment} IS NULL AND ${table.assessmentPeriod} IS NOT NULL AND ${table.status} NOT IN ('expired', 'purged')`),
+  uniqueIndex("idx_evidence_dedupe_nep").on(table.sha256, table.source, table.controlId, table.framework, table.system, table.environment, table.assessmentPeriod)
+    .where(sql`${table.assessmentId} IS NULL AND ${table.environment} IS NOT NULL AND ${table.assessmentPeriod} IS NOT NULL AND ${table.status} NOT IN ('expired', 'purged')`),
+  uniqueIndex("idx_evidence_dedupe_aep").on(table.sha256, table.source, table.controlId, table.framework, table.system, table.assessmentId, table.environment, table.assessmentPeriod)
+    .where(sql`${table.assessmentId} IS NOT NULL AND ${table.environment} IS NOT NULL AND ${table.assessmentPeriod} IS NOT NULL AND ${table.status} NOT IN ('expired', 'purged')`),
   index("idx_evidence_status_created").on(table.status, table.createdAt),
   index("idx_evidence_control_captured").on(table.controlId, table.capturedAt),
   index("idx_evidence_framework_control").on(table.framework, table.controlId),
@@ -198,6 +273,79 @@ export const evidenceArtifacts = sqliteTable("evidence_artifacts", {
   index("idx_evidence_assessment_status").on(table.assessmentId, table.status),
 ]);
 
+export const evidenceOccurrences = sqliteTable("evidence_occurrences", {
+  id: text("id").primaryKey(),
+  artifactId: text("artifact_id").notNull(),
+  jobId: text("job_id"),
+  sessionId: text("session_id"),
+  deviceId: text("device_id"),
+  capturedAt: text("captured_at").notNull(),
+  receivedAt: text("received_at").notNull(),
+  createdBy: text("created_by").notNull(),
+  expiresAt: text("expires_at").notNull(),
+  status: text("status", { enum: ["needs_review", "approved", "rejected", "returned", "superseded", "expired"] }).notNull().default("needs_review"),
+  coverageStatus: text("coverage_status", { enum: ["complete", "partial", "not_applicable"] }).notNull().default("not_applicable"),
+  coverageJson: text("coverage_json").notNull().default("{}"),
+  approvedBy: text("approved_by"),
+  approvedAt: text("approved_at"),
+  lastReviewEventId: text("last_review_event_id"),
+  provenanceJson: text("provenance_json").notNull().default("{}"),
+}, (table) => [
+  uniqueIndex("idx_evidence_occurrences_job_artifact").on(table.jobId, table.artifactId),
+  index("idx_evidence_occurrences_artifact_received").on(table.artifactId, table.receivedAt),
+  index("idx_evidence_occurrences_device_captured").on(table.deviceId, table.capturedAt),
+]);
+
+export const evidenceReviewEvents = sqliteTable("evidence_review_events", {
+  id: text("id").primaryKey(),
+  evidenceId: text("evidence_id").notNull(),
+  occurrenceId: text("occurrence_id").notNull(),
+  action: text("action", { enum: ["approved", "rejected", "returned", "reopened", "superseded"] }).notNull(),
+  previousStatus: text("previous_status").notNull(),
+  resultingStatus: text("resulting_status").notNull(),
+  rationale: text("rationale").notNull(),
+  expectedSha256: text("expected_sha256").notNull(),
+  replacementEvidenceId: text("replacement_evidence_id"),
+  actorId: text("actor_id").notNull(),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [
+  index("idx_review_events_evidence_created").on(table.evidenceId, table.createdAt),
+  index("idx_review_events_actor_created").on(table.actorId, table.createdAt),
+]);
+
+export const findings = sqliteTable("findings", {
+  id: text("id").primaryKey(),
+  assessmentId: text("assessment_id").notNull(),
+  controlId: text("control_id"),
+  evidenceId: text("evidence_id"),
+  jobId: text("job_id"),
+  title: text("title").notNull(),
+  description: text("description").notNull(),
+  severity: text("severity", { enum: ["critical", "high", "medium", "low"] }).notNull(),
+  status: text("status", { enum: ["open", "in_progress", "accepted", "resolved", "closed"] }).notNull().default("open"),
+  ownerId: text("owner_id"),
+  dueAt: text("due_at"),
+  resolution: text("resolution"),
+  createdBy: text("created_by").notNull(),
+  resolvedBy: text("resolved_by"),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  resolvedAt: text("resolved_at"),
+}, (table) => [
+  index("idx_findings_assessment_status_created").on(table.assessmentId, table.status, table.createdAt),
+  index("idx_findings_owner_status").on(table.ownerId, table.status),
+  index("idx_findings_evidence").on(table.evidenceId),
+]);
+
+export const findingEvents = sqliteTable("finding_events", {
+  id: text("id").primaryKey(),
+  findingId: text("finding_id").notNull(),
+  action: text("action").notNull(),
+  actorId: text("actor_id").notNull(),
+  detailsJson: text("details_json").notNull().default("{}"),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [index("idx_finding_events_finding_created").on(table.findingId, table.createdAt)]);
+
 export const retentionHolds = sqliteTable("retention_holds", {
   evidenceId: text("evidence_id").primaryKey(),
   ownerId: text("owner_id").notNull(),
@@ -206,6 +354,27 @@ export const retentionHolds = sqliteTable("retention_holds", {
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
   updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
 }, (table) => [index("idx_retention_holds_expiry").on(table.expiresAt)]);
+
+export const retentionHoldReleaseRequests = sqliteTable("retention_hold_release_requests", {
+  id: text("id").primaryKey(),
+  evidenceId: text("evidence_id").notNull(),
+  requestedBy: text("requested_by").notNull(),
+  reason: text("reason").notNull(),
+  requestDigest: text("request_digest").notNull(),
+  holdOwnerId: text("hold_owner_id").notNull(),
+  holdReason: text("hold_reason").notNull(),
+  holdExpiresAt: text("hold_expires_at").notNull(),
+  status: text("status", { enum: ["pending", "approved", "cancelled", "expired"] }).notNull().default("pending"),
+  requestedAt: text("requested_at").notNull(),
+  expiresAt: text("expires_at").notNull(),
+  approvedBy: text("approved_by"),
+  approvedAt: text("approved_at"),
+  releasedAt: text("released_at"),
+}, (table) => [
+  uniqueIndex("idx_hold_release_pending_evidence").on(table.evidenceId).where(sql`${table.status} = 'pending'`),
+  uniqueIndex("idx_hold_release_digest").on(table.requestDigest),
+  index("idx_hold_release_status_expiry").on(table.status, table.expiresAt),
+]);
 
 export const rateLimitBuckets = sqliteTable("rate_limit_buckets", {
   keyHash: text("key_hash").primaryKey(),
@@ -222,9 +391,13 @@ export const nativeEvidenceManifests = sqliteTable("native_evidence_manifests", 
   manifestSha256: text("manifest_sha256").notNull(),
   imageSha256: text("image_sha256").notNull(),
   jiraIssueKey: text("jira_issue_key"),
+  chainSequence: integer("chain_sequence"),
+  chainEventHash: text("chain_event_hash"),
+  provenanceKeyId: text("provenance_key_id"),
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
 }, (table) => [
   uniqueIndex("idx_native_manifest_device_local").on(table.deviceId, table.localEvidenceId),
+  uniqueIndex("idx_native_manifest_device_sequence").on(table.deviceId, table.chainSequence),
   index("idx_native_manifest_artifact").on(table.artifactId),
 ]);
 
@@ -244,6 +417,17 @@ export const auditEvents = sqliteTable("audit_events", {
   hmacKeyId: text("hmac_key_id").notNull().default("legacy-v1"),
 }, (table) => [uniqueIndex("idx_audit_id").on(table.id), uniqueIndex("idx_audit_event_hash").on(table.eventHash), index("idx_audit_resource").on(table.resourceType, table.resourceId), index("idx_audit_occurred").on(table.occurredAt)]);
 
+// Transient rows let executeAuditedBatch fail the whole SQLite batch when a
+// compare-and-swap mutation changes data but its postcondition is not true.
+// Successful requests delete their guard before commit, so this table should
+// remain empty outside an in-flight transaction.
+export const auditBatchGuards = sqliteTable("audit_batch_guards", {
+  id: text("id").primaryKey(),
+  baselineChanges: integer("baseline_changes").notNull(),
+  mutationChanges: integer("mutation_changes").notNull().default(0),
+  valid: integer("valid").notNull().default(1),
+}, (table) => [check("audit_batch_guards_valid", sql`${table.valid} = 1`)]);
+
 export const exportPackages = sqliteTable("export_packages", {
   id: text("id").primaryKey(),
   requestedBy: text("requested_by").notNull(),
@@ -254,6 +438,10 @@ export const exportPackages = sqliteTable("export_packages", {
   evidenceCount: integer("evidence_count").notNull().default(0),
   byteSize: integer("byte_size").notNull().default(0),
   errorMessage: text("error_message"),
+  rotationLeaseId: text("rotation_lease_id"),
+  rotationLeaseExpiresAt: text("rotation_lease_expires_at"),
+  rotationPendingR2Key: text("rotation_pending_r2_key"),
+  rotationPreviousR2Key: text("rotation_previous_r2_key"),
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
   completedAt: text("completed_at"),
   expiresAt: text("expires_at"),
@@ -327,8 +515,124 @@ export const auditCheckpoints = sqliteTable("audit_checkpoints", {
   r2Key: text("r2_key").notNull(),
   externalStatus: text("external_status", { enum: ["delivered", "not_configured", "failed"] }).notNull(),
   externalReceipt: text("external_receipt"),
+  externalReceiptSha256: text("external_receipt_sha256"),
+  externalReceiptSignature: text("external_receipt_signature"),
+  externalReceiptR2Key: text("external_receipt_r2_key"),
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
 }, (table) => [uniqueIndex("idx_audit_checkpoints_sequence").on(table.sequence), uniqueIndex("idx_audit_checkpoints_sha").on(table.checkpointSha256)]);
+
+export const auditCheckpointDeliveryAttempts = sqliteTable("audit_checkpoint_delivery_attempts", {
+  id: text("id").primaryKey(),
+  checkpointId: text("checkpoint_id").notNull(),
+  checkpointSha256: text("checkpoint_sha256").notNull(),
+  sequence: integer("sequence").notNull(),
+  endpointOrigin: text("endpoint_origin").notNull(),
+  attemptedAt: text("attempted_at").notNull(),
+  status: text("status", { enum: ["delivered", "failed"] }).notNull(),
+  externalReceipt: text("external_receipt"),
+  externalReceiptSha256: text("external_receipt_sha256"),
+  externalReceiptSignature: text("external_receipt_signature"),
+  externalReceiptR2Key: text("external_receipt_r2_key"),
+  failureCode: text("failure_code"),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [
+  index("idx_checkpoint_delivery_attempts_checkpoint_created").on(table.checkpointId, table.createdAt),
+  uniqueIndex("idx_checkpoint_delivery_attempts_delivered").on(table.checkpointId).where(sql`${table.status} = 'delivered'`),
+  uniqueIndex("idx_checkpoint_delivery_attempts_r2_key").on(table.externalReceiptR2Key).where(sql`${table.externalReceiptR2Key} IS NOT NULL`),
+  check("checkpoint_delivery_attempt_shape", sql`
+    (${table.status} = 'delivered'
+      AND ${table.externalReceipt} IS NOT NULL
+      AND ${table.externalReceiptSha256} IS NOT NULL
+      AND ${table.externalReceiptSignature} IS NOT NULL
+      AND ${table.externalReceiptR2Key} IS NOT NULL
+      AND ${table.failureCode} IS NULL)
+    OR
+    (${table.status} = 'failed'
+      AND ${table.externalReceipt} IS NULL
+      AND ${table.externalReceiptSha256} IS NULL
+      AND ${table.externalReceiptSignature} IS NULL
+      AND ${table.externalReceiptR2Key} IS NULL
+      AND ${table.failureCode} IS NOT NULL)
+  `),
+]);
+
+export const auditCheckpointDeliveryRetryState = sqliteTable("audit_checkpoint_delivery_retry_state", {
+  checkpointId: text("checkpoint_id").primaryKey(),
+  checkpointSha256: text("checkpoint_sha256").notNull(),
+  status: text("status", { enum: ["retrying", "claimed", "action_required", "delivered"] }).notNull(),
+  attemptCount: integer("attempt_count").notNull().default(0),
+  nextAttemptAt: text("next_attempt_at"),
+  leaseId: text("lease_id"),
+  leaseExpiresAt: text("lease_expires_at"),
+  endpointOrigin: text("endpoint_origin"),
+  lastAttemptId: text("last_attempt_id"),
+  lastAttemptAt: text("last_attempt_at"),
+  lastFailureCode: text("last_failure_code"),
+  deliveredAttemptId: text("delivered_attempt_id"),
+  createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+  updatedAt: text("updated_at").notNull().default(sql`CURRENT_TIMESTAMP`),
+}, (table) => [
+  index("idx_checkpoint_delivery_retry_status_next").on(table.status, table.nextAttemptAt),
+  index("idx_checkpoint_delivery_retry_claim_expiry").on(table.status, table.leaseExpiresAt),
+  uniqueIndex("idx_checkpoint_delivery_retry_delivered_attempt").on(table.deliveredAttemptId)
+    .where(sql`${table.deliveredAttemptId} IS NOT NULL`),
+  check("checkpoint_delivery_retry_attempt_count_bounded", sql`${table.attemptCount} BETWEEN 0 AND 10`),
+  check("checkpoint_delivery_retry_failure_code_allowlist", sql`${table.lastFailureCode} IS NULL OR ${table.lastFailureCode} IN (
+    'AUDIT_HEAD_CHANGED', 'CHECKPOINT_CORE_INVALID', 'DELIVERY_REQUEST_FAILED', 'ENDPOINT_HTTP_ERROR',
+    'EXTERNAL_RECEIPT_INVALID', 'RECEIPT_BINDING_FAILED', 'RECEIPT_STORAGE_FAILED',
+    'DELIVERY_COMMIT_PRECONDITION_FAILED', 'DELIVERY_CLAIM_EXPIRED'
+  )`),
+  check("checkpoint_delivery_retry_state_shape", sql`
+    (${table.status} = 'retrying'
+      AND ${table.attemptCount} BETWEEN 0 AND 9
+      AND ${table.nextAttemptAt} IS NOT NULL
+      AND ${table.leaseId} IS NULL AND ${table.leaseExpiresAt} IS NULL AND ${table.endpointOrigin} IS NULL
+      AND ${table.deliveredAttemptId} IS NULL
+      AND ((${table.attemptCount} = 0 AND ${table.lastAttemptId} IS NULL AND ${table.lastAttemptAt} IS NULL AND ${table.lastFailureCode} IS NULL)
+        OR (${table.attemptCount} > 0 AND ${table.lastAttemptId} IS NOT NULL AND ${table.lastAttemptAt} IS NOT NULL AND ${table.lastFailureCode} IS NOT NULL)))
+    OR (${table.status} = 'claimed'
+      AND ${table.attemptCount} BETWEEN 1 AND 10
+      AND ${table.nextAttemptAt} IS NOT NULL
+      AND ${table.leaseId} IS NOT NULL AND ${table.leaseExpiresAt} IS NOT NULL AND ${table.endpointOrigin} IS NOT NULL
+      AND ${table.lastAttemptId} IS NOT NULL AND ${table.lastAttemptAt} IS NOT NULL
+      AND ${table.deliveredAttemptId} IS NULL)
+    OR (${table.status} = 'action_required'
+      AND ${table.attemptCount} = 10
+      AND ${table.nextAttemptAt} IS NULL
+      AND ${table.leaseId} IS NULL AND ${table.leaseExpiresAt} IS NULL AND ${table.endpointOrigin} IS NULL
+      AND ${table.lastAttemptId} IS NOT NULL AND ${table.lastAttemptAt} IS NOT NULL AND ${table.lastFailureCode} IS NOT NULL
+      AND ${table.deliveredAttemptId} IS NULL)
+    OR (${table.status} = 'delivered'
+      AND ${table.nextAttemptAt} IS NULL
+      AND ${table.leaseId} IS NULL AND ${table.leaseExpiresAt} IS NULL AND ${table.endpointOrigin} IS NULL
+      AND ${table.lastFailureCode} IS NULL
+      AND ((${table.deliveredAttemptId} IS NULL AND ${table.lastAttemptId} IS NULL AND ${table.lastAttemptAt} IS NULL)
+        OR (${table.deliveredAttemptId} IS NOT NULL AND ${table.deliveredAttemptId} = ${table.lastAttemptId} AND ${table.lastAttemptAt} IS NOT NULL)))
+  `),
+]);
+
+export const keyRotationAttempts = sqliteTable("key_rotation_attempts", {
+  resourceType: text("resource_type", { enum: ["evidence", "package", "jira_connection"] }).notNull(),
+  resourceId: text("resource_id").notNull(),
+  attemptCount: integer("attempt_count").notNull(),
+  status: text("status", { enum: ["retrying", "action_required", "resolved"] }).notNull(),
+  nextAttemptAt: text("next_attempt_at"),
+  lastErrorCode: text("last_error_code").notNull(),
+  firstFailedAt: text("first_failed_at").notNull(),
+  lastAttemptAt: text("last_attempt_at").notNull(),
+  lastAttemptId: text("last_attempt_id").notNull(),
+  resolvedAt: text("resolved_at"),
+}, (table) => [
+  primaryKey({ columns: [table.resourceType, table.resourceId] }),
+  index("idx_key_rotation_attempts_status_next").on(table.status, table.nextAttemptAt),
+  check("key_rotation_attempt_count_bounded", sql`${table.attemptCount} BETWEEN 1 AND 1000000`),
+  check("key_rotation_resource_type_allowlist", sql`${table.resourceType} IN ('evidence', 'package', 'jira_connection')`),
+  check("key_rotation_error_code_allowlist", sql`${table.lastErrorCode} IN ('CRYPTOGRAPHIC_FAILURE', 'MISSING_METADATA', 'MISSING_OBJECT', 'RETAINED_KEY_UNAVAILABLE', 'STORAGE_OR_DATABASE_FAILURE')`),
+  check("key_rotation_attempt_state_shape", sql`
+    (${table.status} IN ('retrying', 'action_required') AND ${table.nextAttemptAt} IS NOT NULL AND ${table.resolvedAt} IS NULL)
+    OR (${table.status} = 'resolved' AND ${table.nextAttemptAt} IS NULL AND ${table.resolvedAt} IS NOT NULL)
+  `),
+]);
 
 export const jiraUploadOperations = sqliteTable("jira_upload_operations", {
   id: text("id").primaryKey(),

@@ -1,0 +1,316 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Scopeproof Cognito managed-login authorization-code client for the preferred
+  backend-issued presigned-request evidence path. Creates no AWS credentials.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Naming
+        Parameters:
+          - EnvironmentName
+          - UserPoolName
+          - UserPoolClientName
+          - UserPoolDomainPrefix
+      - Label:
+          default: OAuth redirect allowlists
+        Parameters:
+          - CallbackUrls
+          - LogoutUrls
+      - Label:
+          default: Email delivery
+        Parameters:
+          - EmailSendingAccount
+          - SesSourceArn
+          - FromEmailAddress
+    ParameterLabels:
+      CallbackUrls:
+        default: Exact OAuth callback URL allowlist
+      LogoutUrls:
+        default: Exact post-logout URL allowlist
+      UserPoolDomainPrefix:
+        default: Globally unique Cognito domain prefix
+      EmailSendingAccount:
+        default: Cognito or verified Amazon SES sender
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: production
+    AllowedPattern: "^[a-z][a-z0-9-]{1,31}$"
+    ConstraintDescription: Use 2-32 lowercase letters, digits, or hyphens.
+  UserPoolName:
+    Type: String
+    Default: scopeproof-production-users
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: "^[A-Za-z0-9][A-Za-z0-9 _.-]{0,127}$"
+  UserPoolClientName:
+    Type: String
+    Default: scopeproof-macos-public-client
+    MinLength: 1
+    MaxLength: 128
+    AllowedPattern: "^[A-Za-z0-9][A-Za-z0-9 _.-]{0,127}$"
+  UserPoolDomainPrefix:
+    Type: String
+    MinLength: 1
+    MaxLength: 63
+    AllowedPattern: "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+    ConstraintDescription: >-
+      Use a globally unique lowercase Cognito domain prefix with no leading or
+      trailing hyphen.
+  CallbackUrls:
+    Type: CommaDelimitedList
+    Description: >-
+      Exact HTTPS or native loopback callback URLs. Do not use wildcards.
+  LogoutUrls:
+    Type: CommaDelimitedList
+    Description: Exact post-logout URLs. Do not use wildcards.
+  EmailSendingAccount:
+    Type: String
+    Default: COGNITO_DEFAULT
+    AllowedValues:
+      - COGNITO_DEFAULT
+      - DEVELOPER
+    Description: >-
+      Use DEVELOPER with a verified SES identity for production-volume email.
+  SesSourceArn:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^arn:(aws|aws-us-gov|aws-cn):ses:[a-z0-9-]+:[0-9]{12}:identity/.+$"
+    Description: Required when EmailSendingAccount is DEVELOPER.
+  FromEmailAddress:
+    Type: String
+    Default: ""
+    MaxLength: 320
+    AllowedPattern: "^$|^[^\\s<>]+@[^\\s<>]+$"
+    Description: Optional verified From address when using Amazon SES.
+
+Rules:
+  RequireSesIdentityForDeveloperMode:
+    RuleCondition:
+      Fn::Equals:
+        - Ref: EmailSendingAccount
+        - DEVELOPER
+    Assertions:
+      - Assert:
+          Fn::Not:
+            - Fn::Equals:
+                - Ref: SesSourceArn
+                - ""
+        AssertDescription: SesSourceArn is required in DEVELOPER mode.
+
+Conditions:
+  IsChinaPartition:
+    Fn::Equals:
+      - Ref: AWS::Partition
+      - aws-cn
+  UseSes:
+    Fn::Equals:
+      - Ref: EmailSendingAccount
+      - DEVELOPER
+  HasFromAddress:
+    Fn::Not:
+      - Fn::Equals:
+          - Ref: FromEmailAddress
+          - ""
+  UseSesAndHasFromAddress:
+    Fn::And:
+      - Condition: UseSes
+      - Condition: HasFromAddress
+
+Resources:
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      UserPoolName:
+        Ref: UserPoolName
+      UserPoolTier: ESSENTIALS
+      DeletionProtection: ACTIVE
+      UsernameAttributes:
+        - email
+      UsernameConfiguration:
+        CaseSensitive: false
+      AutoVerifiedAttributes:
+        - email
+      MfaConfiguration: "ON"
+      EnabledMfas:
+        - SOFTWARE_TOKEN_MFA
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 14
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+          TemporaryPasswordValidityDays: 3
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+      VerificationMessageTemplate:
+        DefaultEmailOption: CONFIRM_WITH_CODE
+      UserAttributeUpdateSettings:
+        AttributesRequireVerificationBeforeUpdate:
+          - email
+      EmailConfiguration:
+        EmailSendingAccount:
+          Fn::If:
+            - UseSes
+            - DEVELOPER
+            - COGNITO_DEFAULT
+        SourceArn:
+          Fn::If:
+            - UseSes
+            - Ref: SesSourceArn
+            - Ref: AWS::NoValue
+        From:
+          Fn::If:
+            - UseSesAndHasFromAddress
+            - Ref: FromEmailAddress
+            - Ref: AWS::NoValue
+      UserPoolTags:
+        Application: scopeproof
+        Environment:
+          Ref: EnvironmentName
+        DataClassification: authentication
+
+  PublicOAuthClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn:
+      - ScopeproofResourceServer
+    Properties:
+      ClientName:
+        Ref: UserPoolClientName
+      UserPoolId:
+        Ref: UserPool
+      GenerateSecret: false
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthScopes:
+        - openid
+        - email
+        - profile
+        - scopeproof/evidence.read
+        - scopeproof/evidence.collect
+      CallbackURLs:
+        Ref: CallbackUrls
+      LogoutURLs:
+        Ref: LogoutUrls
+      SupportedIdentityProviders:
+        - COGNITO
+      ExplicitAuthFlows: []
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      AuthSessionValidity: 3
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 7
+      RefreshTokenRotation:
+        Feature: ENABLED
+        RetryGracePeriodSeconds: 30
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+
+  ScopeproofResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      Identifier: scopeproof
+      Name: Scopeproof tenant API
+      UserPoolId:
+        Ref: UserPool
+      Scopes:
+        - ScopeName: evidence.read
+          ScopeDescription: Read tenant evidence metadata and request exact-version downloads
+        - ScopeName: evidence.collect
+          ScopeDescription: Create exact, short-lived evidence upload intents
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain:
+        Ref: UserPoolDomainPrefix
+      ManagedLoginVersion: 2
+      UserPoolId:
+        Ref: UserPool
+
+  DefaultManagedLoginBranding:
+    Type: AWS::Cognito::ManagedLoginBranding
+    DependsOn:
+      - UserPoolDomain
+    Properties:
+      ClientId:
+        Ref: PublicOAuthClient
+      UserPoolId:
+        Ref: UserPool
+      UseCognitoProvidedValues: true
+
+Outputs:
+  UserPoolId:
+    Description: Cognito user pool ID used as the JWT issuer component.
+    Value:
+      Ref: UserPool
+  PublicClientId:
+    Description: Public OAuth client ID. This client deliberately has no secret.
+    Value:
+      Ref: PublicOAuthClient
+  CognitoDomainPrefix:
+    Value:
+      Ref: UserPoolDomainPrefix
+  ManagedLoginBaseUrl:
+    Description: Cognito-owned managed-login origin.
+    Value:
+      Fn::If:
+        - IsChinaPartition
+        - Fn::Sub: https://${UserPoolDomainPrefix}.auth.${AWS::Region}.amazoncognito.com.cn
+        - Fn::Sub: https://${UserPoolDomainPrefix}.auth.${AWS::Region}.amazoncognito.com
+  IssuerUrl:
+    Description: Exact JWT issuer the backend must allowlist and validate.
+    Value:
+      Fn::Sub: https://cognito-idp.${AWS::Region}.${AWS::URLSuffix}/${UserPool}
+  JwksUrl:
+    Description: JWKS endpoint for JWT signature verification and key rotation.
+    Value:
+      Fn::Sub: https://cognito-idp.${AWS::Region}.${AWS::URLSuffix}/${UserPool}/.well-known/jwks.json
+  ExpectedAudience:
+    Description: Exact app-client audience/client_id the backend must validate.
+    Value:
+      Ref: PublicOAuthClient
+  EvidenceReadScope:
+    Value: scopeproof/evidence.read
+  EvidenceCollectScope:
+    Value: scopeproof/evidence.collect
+  HostedAuthorizeUrl:
+    Description: >-
+      The desktop client must add response_type=code, client_id, redirect_uri,
+      scope, state, nonce, code_challenge, and code_challenge_method=S256.
+    Value:
+      Fn::If:
+        - IsChinaPartition
+        - Fn::Sub: https://${UserPoolDomainPrefix}.auth.${AWS::Region}.amazoncognito.com.cn/oauth2/authorize
+        - Fn::Sub: https://${UserPoolDomainPrefix}.auth.${AWS::Region}.amazoncognito.com/oauth2/authorize
+  HostedTokenUrl:
+    Value:
+      Fn::If:
+        - IsChinaPartition
+        - Fn::Sub: https://${UserPoolDomainPrefix}.auth.${AWS::Region}.amazoncognito.com.cn/oauth2/token
+        - Fn::Sub: https://${UserPoolDomainPrefix}.auth.${AWS::Region}.amazoncognito.com/oauth2/token
+  HostedRevokeUrl:
+    Value:
+      Fn::If:
+        - IsChinaPartition
+        - Fn::Sub: https://${UserPoolDomainPrefix}.auth.${AWS::Region}.amazoncognito.com.cn/oauth2/revoke
+        - Fn::Sub: https://${UserPoolDomainPrefix}.auth.${AWS::Region}.amazoncognito.com/oauth2/revoke

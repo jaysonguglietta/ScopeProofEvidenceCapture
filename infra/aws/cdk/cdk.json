@@ -1,0 +1,15 @@
+{
+  "app": "node -r ts-node/register bin/scopeproof.ts",
+  "context": {
+    "@aws-cdk/core:defaultCrossStackReferences": "strong",
+    "@aws-cdk/aws-route53-targets:userPoolDomainNameMethodWithoutCustomResource": true,
+    "rootDomain": "",
+    "branchName": "main",
+    "deploymentEnvironment": "",
+    "createHostedZone": false,
+    "recovery": {
+      "mode": "disabled"
+    },
+    "tenants": []
+  }
+}

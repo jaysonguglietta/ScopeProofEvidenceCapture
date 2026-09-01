@@ -19,6 +19,7 @@ struct LocalEvidenceRecord: Codable, Sendable {
     let reviewNotes: String
     let tags: [String]
     let jiraIssueKey: String?
+    let sourceURL: String?
     let safetyStatus: String
     let sha256: String
     let uploaded: Bool
@@ -55,8 +56,11 @@ final class LocalEvidenceIndex: @unchecked Sendable {
     private let lock = NSLock()
     private var database: OpaquePointer?
     private let auditKey: SymmetricKey
+    private let auditSigningKeyID: String
+    private let auditTrustScope: String
+    private let anchorAuditToKeychain: Bool
 
-    init(databaseURL: URL, auditKeyData: Data) throws {
+    init(databaseURL: URL, auditKeyData: Data, anchorAuditToKeychain: Bool = false) throws {
         try FileManager.default.createDirectory(
             at: databaseURL.deletingLastPathComponent(),
             withIntermediateDirectories: true,
@@ -71,6 +75,9 @@ final class LocalEvidenceIndex: @unchecked Sendable {
         }
         database = handle
         auditKey = SymmetricKey(data: auditKeyData)
+        auditSigningKeyID = SHA256.hash(data: auditKeyData).map { String(format: "%02x", $0) }.joined()
+        auditTrustScope = databaseURL.standardizedFileURL.path
+        self.anchorAuditToKeychain = anchorAuditToKeychain
         sqlite3_busy_timeout(handle, 2_500)
         do {
             try execute("PRAGMA journal_mode = WAL")
@@ -100,25 +107,34 @@ final class LocalEvidenceIndex: @unchecked Sendable {
                     INSERT INTO evidence_index (
                       evidence_id, captured_at, local_timestamp, compliance_area, control_id, control_title,
                       title, system_name, environment, assessment_period, owner, reviewer, review_status,
-                      review_notes, tags_json, jira_issue_key, safety_status, sha256, uploaded,
+                      review_notes, tags_json, jira_issue_key, source_url, safety_status, sha256, uploaded,
                       lifecycle_valid, manifest_path, image_path, indexed_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """
                 for entry in entries {
+                    guard let artifact = try? ValidatedEvidenceArtifact.loadForLegacyBrowsing(
+                        entry, requireLifecycle: false
+                    ) else { continue }
+                    let manifest = artifact.manifest
                     let lifecycle = entry.lifecycle
-                    let valid = EvidenceLifecycleStore.verify(lifecycle, artifactSha256: entry.manifest.sha256)
-                    let tags = lifecycle.tags.isEmpty ? (entry.manifest.tags ?? []) : lifecycle.tags
+                    let valid = artifact.provenanceVerified && EvidenceLifecycleStore.verify(
+                        lifecycle, artifactSha256: manifest.sha256,
+                        provenanceKeyID: manifest.provenance?.keyID
+                    )
+                    let tags = lifecycle.tags.isEmpty ? (manifest.tags ?? []) : lifecycle.tags
                     let tagsJSON = String(data: try JSONEncoder().encode(tags), encoding: .utf8) ?? "[]"
                     try withStatementUnlocked(sql) { statement in
                         let values: [SQLiteValue] = [
-                            .text(entry.manifest.evidenceID), .text(entry.manifest.capturedAt), .text(entry.manifest.localTimestamp),
-                            .text(entry.manifest.complianceArea ?? "PCI DSS 4.0.1"), .text(entry.manifest.controlID),
-                            .text(entry.manifest.controlTitle ?? ""), .text(entry.manifest.title), .text(entry.manifest.system),
-                            .text(entry.manifest.environment), .text(entry.manifest.assessmentPeriod),
-                            .text(lifecycle.owner.isEmpty ? (entry.manifest.evidenceOwner ?? "") : lifecycle.owner),
+                            .text(manifest.evidenceID), .text(manifest.capturedAt), .text(manifest.localTimestamp),
+                            .text(manifest.complianceArea ?? "PCI DSS 4.0.1"), .text(manifest.controlID),
+                            .text(manifest.controlTitle ?? ""), .text(manifest.title), .text(manifest.system),
+                            .text(manifest.environment), .text(manifest.assessmentPeriod),
+                            .text(lifecycle.owner.isEmpty ? (manifest.evidenceOwner ?? "") : lifecycle.owner),
                             .text(lifecycle.reviewer), .text(lifecycle.status.rawValue), .text(lifecycle.reviewNotes),
-                            .text(tagsJSON), entry.manifest.jiraIssueKey.map(SQLiteValue.text) ?? .null,
-                            .text(entry.manifest.safetyStatus), .text(entry.manifest.sha256), .integer(entry.isUploaded ? 1 : 0),
+                            .text(tagsJSON), manifest.jiraIssueKey.map(SQLiteValue.text) ?? .null,
+                            manifest.sourceURL.map(SQLiteValue.text) ?? .null,
+                            .text(artifact.provenanceVerified ? manifest.safetyStatus : "Legacy unsigned · browsing only"),
+                            .text(manifest.sha256), .integer(entry.isUploaded && artifact.provenanceVerified ? 1 : 0),
                             .integer(valid ? 1 : 0), .text(entry.manifestURL.path), .text(entry.imageURL.path),
                             .text(ISO8601DateFormatter().string(from: Date())),
                         ]
@@ -142,9 +158,9 @@ final class LocalEvidenceIndex: @unchecked Sendable {
             let sql = """
                 SELECT evidence_id, captured_at, local_timestamp, compliance_area, control_id, control_title,
                        title, system_name, environment, assessment_period, owner, reviewer, review_status,
-                       review_notes, tags_json, jira_issue_key, safety_status, sha256, uploaded, lifecycle_valid
+                       review_notes, tags_json, jira_issue_key, source_url, safety_status, sha256, uploaded, lifecycle_valid
                 FROM evidence_index
-                WHERE (? = '' OR lower(title || ' ' || system_name || ' ' || owner || ' ' || tags_json || ' ' || evidence_id || ' ' || coalesce(jira_issue_key, '')) LIKE ?)
+                WHERE (? = '' OR lower(title || ' ' || system_name || ' ' || owner || ' ' || tags_json || ' ' || evidence_id || ' ' || coalesce(jira_issue_key, '') || ' ' || coalesce(source_url, '')) LIKE ?)
                   AND (? = '' OR compliance_area = ?)
                   AND (? = '' OR control_id = ?)
                   AND (? = '' OR review_status = ?)
@@ -155,7 +171,7 @@ final class LocalEvidenceIndex: @unchecked Sendable {
                 try bind([
                     .text(cleanSearch), .text(like), .text(query.complianceArea), .text(query.complianceArea),
                     .text(query.controlID), .text(query.controlID), .text(query.reviewStatus), .text(query.reviewStatus),
-                    .integer(Int64(max(1, min(limit, 1_000)))),
+                    .integer(Int64(max(1, min(limit, 5_000)))),
                 ], to: statement)
                 var records: [LocalEvidenceRecord] = []
                 while sqlite3_step(statement) == SQLITE_ROW {
@@ -168,8 +184,9 @@ final class LocalEvidenceIndex: @unchecked Sendable {
                         assessmentPeriod: columnText(statement, 9), owner: columnText(statement, 10), reviewer: columnText(statement, 11),
                         reviewStatus: columnText(statement, 12), reviewNotes: columnText(statement, 13), tags: tags,
                         jiraIssueKey: sqlite3_column_type(statement, 15) == SQLITE_NULL ? nil : columnText(statement, 15),
-                        safetyStatus: columnText(statement, 16), sha256: columnText(statement, 17),
-                        uploaded: sqlite3_column_int(statement, 18) == 1, lifecycleValid: sqlite3_column_int(statement, 19) == 1
+                        sourceURL: sqlite3_column_type(statement, 16) == SQLITE_NULL ? nil : columnText(statement, 16),
+                        safetyStatus: columnText(statement, 17), sha256: columnText(statement, 18),
+                        uploaded: sqlite3_column_int(statement, 19) == 1, lifecycleValid: sqlite3_column_int(statement, 20) == 1
                     ))
                 }
                 return records
@@ -211,9 +228,25 @@ final class LocalEvidenceIndex: @unchecked Sendable {
             let payload = [previousHash, occurredAt, action, resourceID, detailsJSON].map { "\($0.utf8.count):\($0)" }.joined(separator: "|")
             let eventHash = SHA256.hash(data: Data(payload.utf8)).map { String(format: "%02x", $0) }.joined()
             let signature = Data(HMAC<SHA256>.authenticationCode(for: Data(eventHash.utf8), using: auditKey)).base64EncodedString()
-            try withStatementUnlocked("INSERT INTO local_audit_events (occurred_at, action, resource_id, details_json, previous_hash, event_hash, signature) VALUES (?, ?, ?, ?, ?, ?, ?)") { statement in
-                try bind([.text(occurredAt), .text(action), .text(resourceID), .text(detailsJSON), .text(previousHash), .text(eventHash), .text(signature)], to: statement)
-                guard sqlite3_step(statement) == SQLITE_DONE else { throw databaseErrorUnlocked() }
+            let nextSequence: Int = try withStatementUnlocked("SELECT count(*) + 1 FROM local_audit_events") { statement in
+                guard sqlite3_step(statement) == SQLITE_ROW else { throw databaseErrorUnlocked() }
+                return Int(sqlite3_column_int64(statement, 0))
+            }
+            let advance = anchorAuditToKeychain ? try KeychainStore.prepareLocalTrustAdvance(
+                domain: .audit, scope: auditTrustScope, previousHash: previousHash,
+                sequence: nextSequence, eventHash: eventHash, signingKeyID: auditSigningKeyID
+            ) : nil
+            do {
+                try withStatementUnlocked("INSERT INTO local_audit_events (occurred_at, action, resource_id, details_json, previous_hash, event_hash, signature) VALUES (?, ?, ?, ?, ?, ?, ?)") { statement in
+                    try bind([.text(occurredAt), .text(action), .text(resourceID), .text(detailsJSON), .text(previousHash), .text(eventHash), .text(signature)], to: statement)
+                    guard sqlite3_step(statement) == SQLITE_DONE else { throw databaseErrorUnlocked() }
+                }
+            } catch {
+                if let advance { KeychainStore.cancelLocalTrustAdvance(advance, scope: auditTrustScope) }
+                throw error
+            }
+            if let advance {
+                try KeychainStore.commitLocalTrustAdvance(advance, scope: auditTrustScope)
             }
         }
     }
@@ -244,6 +277,7 @@ final class LocalEvidenceIndex: @unchecked Sendable {
               review_notes TEXT NOT NULL,
               tags_json TEXT NOT NULL,
               jira_issue_key TEXT,
+              source_url TEXT,
               safety_status TEXT NOT NULL,
               sha256 TEXT NOT NULL,
               uploaded INTEGER NOT NULL CHECK (uploaded IN (0, 1)),
@@ -253,6 +287,7 @@ final class LocalEvidenceIndex: @unchecked Sendable {
               indexed_at TEXT NOT NULL
             )
             """)
+        try? execute("ALTER TABLE evidence_index ADD COLUMN source_url TEXT")
         try execute("CREATE INDEX IF NOT EXISTS idx_evidence_framework_control ON evidence_index(compliance_area, control_id, captured_at DESC)")
         try execute("CREATE INDEX IF NOT EXISTS idx_evidence_review_status ON evidence_index(review_status, captured_at DESC)")
         try execute("""
@@ -272,6 +307,8 @@ final class LocalEvidenceIndex: @unchecked Sendable {
     }
 
     private func verifyAuditChainUnlocked() throws {
+        var finalSequence = 0
+        var finalHash = "GENESIS"
         try withStatementUnlocked("SELECT sequence, occurred_at, action, resource_id, details_json, previous_hash, event_hash, signature FROM local_audit_events ORDER BY sequence") { statement in
             var expectedSequence: Int64 = 1
             var previousHash = "GENESIS"
@@ -293,8 +330,31 @@ final class LocalEvidenceIndex: @unchecked Sendable {
                 }
                 expectedSequence += 1
                 previousHash = eventHash
+                finalSequence = Int(sequence)
+                finalHash = eventHash
             }
         }
+        guard anchorAuditToKeychain else { return }
+        if finalSequence == 0 {
+            guard try KeychainStore.localTrustHead(domain: .audit, scope: auditTrustScope) == nil,
+                  try KeychainStore.pendingLocalTrustAdvance(domain: .audit, scope: auditTrustScope) == nil else {
+                throw LocalEvidenceIndexFailure.database("The Keychain audit head exists but the local audit database is empty.")
+            }
+            return
+        }
+        if try KeychainStore.recoverLocalTrustAdvance(
+            domain: .audit, scope: auditTrustScope, sequence: finalSequence,
+            eventHash: finalHash, signingKeyID: auditSigningKeyID
+        ) { return }
+        if try KeychainStore.localTrustHead(domain: .audit, scope: auditTrustScope) == nil,
+           try KeychainStore.pendingLocalTrustAdvance(domain: .audit, scope: auditTrustScope) == nil {
+            try KeychainStore.adoptLocalTrustHeadForMigration(
+                domain: .audit, scope: auditTrustScope, sequence: finalSequence,
+                eventHash: finalHash, signingKeyID: auditSigningKeyID
+            )
+            return
+        }
+        throw LocalEvidenceIndexFailure.database("The local audit database is behind or diverges from its Keychain rollback head.")
     }
 
     private func constantTimeEqual(_ left: String, _ right: String) -> Bool {

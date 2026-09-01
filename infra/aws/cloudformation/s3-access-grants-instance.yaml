@@ -1,0 +1,86 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Optional regional S3 Access Grants instance. Deploy at most once per AWS
+  account and Region, and only when no instance already exists.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Regional singleton
+        Parameters:
+          - AssociateIdentityCenter
+          - IdentityCenterInstanceArn
+          - EnvironmentName
+    ParameterLabels:
+      AssociateIdentityCenter:
+        default: Associate a corporate IAM Identity Center directory
+
+Parameters:
+  AssociateIdentityCenter:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+  IdentityCenterInstanceArn:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^arn:(aws|aws-us-gov|aws-cn):sso:::instance/(sso)?ins-[A-Za-z0-9-.]{16}$"
+  EnvironmentName:
+    Type: String
+    Default: production
+    AllowedPattern: "^[a-z][a-z0-9-]{1,31}$"
+
+Rules:
+  RequireIdentityCenterArnWhenAssociating:
+    RuleCondition:
+      Fn::Equals:
+        - Ref: AssociateIdentityCenter
+        - "true"
+    Assertions:
+      - Assert:
+          Fn::Not:
+            - Fn::Equals:
+                - Ref: IdentityCenterInstanceArn
+                - ""
+        AssertDescription: IdentityCenterInstanceArn is required when association is enabled.
+
+Conditions:
+  UseIdentityCenter:
+    Fn::Equals:
+      - Ref: AssociateIdentityCenter
+      - "true"
+
+Resources:
+  RegionalAccessGrantsInstance:
+    Type: AWS::S3::AccessGrantsInstance
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      IdentityCenterArn:
+        Fn::If:
+          - UseIdentityCenter
+          - Ref: IdentityCenterInstanceArn
+          - Ref: AWS::NoValue
+      Tags:
+        - Key: Application
+          Value: scopeproof
+        - Key: Environment
+          Value:
+            Ref: EnvironmentName
+
+Outputs:
+  AccessGrantsInstanceArn:
+    Value:
+      Fn::GetAtt:
+        - RegionalAccessGrantsInstance
+        - AccessGrantsInstanceArn
+  AccessGrantsInstanceId:
+    Value:
+      Fn::GetAtt:
+        - RegionalAccessGrantsInstance
+        - AccessGrantsInstanceId
+  IdentityCenterAssociated:
+    Value:
+      Ref: AssociateIdentityCenter

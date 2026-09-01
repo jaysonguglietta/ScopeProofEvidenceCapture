@@ -1,5 +1,37 @@
 import Foundation
 
+struct TenantWorkspaceBinding: Codable, Equatable, Hashable, Sendable {
+    static let localDefault = TenantWorkspaceBinding(tenantID: "local", workspaceID: "default")
+
+    let tenantID: String
+    let workspaceID: String
+
+    init(tenantID: String, workspaceID: String) {
+        self.tenantID = tenantID
+        self.workspaceID = workspaceID
+    }
+
+    static func validated(tenantID: String, workspaceID: String) -> TenantWorkspaceBinding? {
+        let tenant = tenantID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let workspace = workspaceID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let pattern = #"^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$"#
+        guard tenant.range(of: pattern, options: .regularExpression) != nil,
+              workspace.range(of: pattern, options: .regularExpression) != nil else { return nil }
+        return TenantWorkspaceBinding(tenantID: tenant, workspaceID: workspace)
+    }
+
+    var isLocalDefault: Bool { self == .localDefault }
+
+    func scopedEvidenceRoot(base: URL) -> URL {
+        guard !isLocalDefault else { return base }
+        return base
+            .appendingPathComponent("tenants", isDirectory: true)
+            .appendingPathComponent(tenantID, isDirectory: true)
+            .appendingPathComponent("workspaces", isDirectory: true)
+            .appendingPathComponent(workspaceID, isDirectory: true)
+    }
+}
+
 struct BrowserChoice: Equatable, Sendable {
     let name: String
     let bundleIdentifier: String?
@@ -30,9 +62,12 @@ struct CaptureContext: Codable, Sendable {
     var tags: [String]? = nil
     var expectedEvidence: String? = nil
     var jiraIssueKey: String? = nil
+    var sourceURL: String? = nil
+    var tenantID: String? = nil
+    var workspaceID: String? = nil
 
     var isValid: Bool {
-        !sessionID.isEmpty && !sessionName.isEmpty && !resolvedComplianceArea.isEmpty && !controlID.isEmpty && !resolvedCustomFileName.isEmpty && !title.isEmpty && !system.isEmpty && !environment.isEmpty && !assessmentPeriod.isEmpty
+        !sessionID.isEmpty && !sessionName.isEmpty && !resolvedComplianceArea.isEmpty && !controlID.isEmpty && !resolvedCustomFileName.isEmpty && !title.isEmpty && !system.isEmpty && !environment.isEmpty && !assessmentPeriod.isEmpty && resolvedTenantBinding != nil
     }
 
     var resolvedComplianceArea: String { complianceArea?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty ?? "PCI DSS 4.0.1" }
@@ -43,7 +78,14 @@ struct CaptureContext: Codable, Sendable {
         Array(Set((tags ?? []).map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }.filter { !$0.isEmpty })).sorted()
     }
 
-    static func new() -> CaptureContext {
+    var resolvedTenantBinding: TenantWorkspaceBinding? {
+        TenantWorkspaceBinding.validated(
+            tenantID: tenantID ?? TenantWorkspaceBinding.localDefault.tenantID,
+            workspaceID: workspaceID ?? TenantWorkspaceBinding.localDefault.workspaceID
+        )
+    }
+
+    static func new(binding: TenantWorkspaceBinding = .localDefault) -> CaptureContext {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy 'Q'Q"
         return CaptureContext(
@@ -61,7 +103,10 @@ struct CaptureContext: Codable, Sendable {
             evidenceOwner: NSFullUserName(),
             tags: [],
             expectedEvidence: "",
-            jiraIssueKey: ""
+            jiraIssueKey: "",
+            sourceURL: "",
+            tenantID: binding.tenantID,
+            workspaceID: binding.workspaceID
         )
     }
 }
@@ -93,6 +138,8 @@ final class CapturePreferences {
         static let presets = "capture.presets"
         static let jiraHandoff = "capture.jiraHandoff"
         static let openLocalConsoleAtLaunch = "capture.openLocalConsoleAtLaunch"
+        static let s3Storage = "capture.s3Storage"
+        static let tenantBinding = "capture.tenantBinding"
     }
 
     var browser: BrowserChoice {
@@ -114,7 +161,7 @@ final class CapturePreferences {
     var targets: [String] {
         get {
             let saved = defaults.stringArray(forKey: Key.targets) ?? []
-            return saved.isEmpty ? ["https://scopeproof-pci.jayson-guglietta.chatgpt.site"] : saved
+            return saved
         }
         set { defaults.set(Array(newValue.prefix(12)), forKey: Key.targets) }
     }
@@ -129,7 +176,7 @@ final class CapturePreferences {
 
     var serverURL: URL? {
         get {
-            if defaults.object(forKey: Key.serverURL) == nil { return URL(string: "https://scopeproof-pci.jayson-guglietta.chatgpt.site") }
+            if defaults.object(forKey: Key.serverURL) == nil { return nil }
             return defaults.string(forKey: Key.serverURL).flatMap(URL.init(string:))
         }
         set { defaults.set(newValue?.absoluteString ?? "", forKey: Key.serverURL) }
@@ -177,6 +224,26 @@ final class CapturePreferences {
             return value
         }
         set { defaults.set(try? JSONEncoder().encode(newValue), forKey: Key.jiraHandoff) }
+    }
+
+    var s3Storage: S3StorageSettings {
+        get {
+            guard let data = defaults.data(forKey: Key.s3Storage), let value = try? JSONDecoder().decode(S3StorageSettings.self, from: data) else { return .defaults }
+            return value
+        }
+        set { defaults.set(try? JSONEncoder().encode(newValue), forKey: Key.s3Storage) }
+    }
+
+    var tenantBinding: TenantWorkspaceBinding {
+        get {
+            guard let data = defaults.data(forKey: Key.tenantBinding),
+                  let decoded = try? JSONDecoder().decode(TenantWorkspaceBinding.self, from: data),
+                  let validated = TenantWorkspaceBinding.validated(
+                    tenantID: decoded.tenantID, workspaceID: decoded.workspaceID
+                  ) else { return .localDefault }
+            return validated
+        }
+        set { defaults.set(try? JSONEncoder().encode(newValue), forKey: Key.tenantBinding) }
     }
 
     func savePreset(name: String, context: CaptureContext) {

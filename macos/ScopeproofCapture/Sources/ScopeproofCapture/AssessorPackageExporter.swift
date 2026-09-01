@@ -10,12 +10,14 @@ struct AssessorPackageResult: Sendable {
 
 enum AssessorPackageFailure: LocalizedError {
     case noApprovedEvidence
+    case captureChainInvalid
     case integrityMismatch(String)
     case packageToolFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .noApprovedEvidence: return "No approved evidence matches the selected package scope. Approve evidence in Search Evidence before exporting."
+        case .captureChainInvalid: return "The complete local capture chain is missing, reordered, or no longer matches its Keychain anchor. No assessor package was created. Restore the complete evidence history or investigate the integrity event before exporting."
         case .integrityMismatch(let evidenceID): return "Evidence \(evidenceID) failed integrity validation and was not exported. Restore the original artifact or recapture it."
         case .packageToolFailed(let detail): return "The assessor package could not be created. \(detail)"
         }
@@ -23,7 +25,23 @@ enum AssessorPackageFailure: LocalizedError {
 }
 
 enum AssessorPackageExporter {
-    static func export(entries: [CaptureHistoryEntry], to destination: URL, preparedBy: String, packageName: String, jiraSettings: JiraHandoffSettings = .defaults, signingKeyOverride: P256.Signing.PrivateKey? = nil) throws -> AssessorPackageResult {
+    static func export(
+        entries: [CaptureHistoryEntry], completeHistory: [CaptureHistoryEntry],
+        to destination: URL, preparedBy: String,
+        packageName: String, jiraSettings: JiraHandoffSettings = .defaults,
+        signingKeyOverride: P256.Signing.PrivateKey? = nil,
+        captureAnchorOverride: LocalCaptureChainAnchor? = nil
+    ) throws -> AssessorPackageResult {
+        let completeManifestPaths = Set(completeHistory.map { $0.manifestURL.standardizedFileURL.path })
+        let selectionBelongsToHistory = entries.allSatisfy {
+            completeManifestPaths.contains($0.manifestURL.standardizedFileURL.path)
+        }
+        let chainValid = captureAnchorOverride.map {
+            CaptureHistory.captureChainIntegrity(completeHistory, anchor: $0)
+        } ?? CaptureHistory.captureChainIntegrity(completeHistory)
+        guard selectionBelongsToHistory, chainValid else {
+            throw AssessorPackageFailure.captureChainInvalid
+        }
         let approved = entries.filter { $0.lifecycle.status.isPackageEligible }
         guard !approved.isEmpty else { throw AssessorPackageFailure.noApprovedEvidence }
         let fileManager = FileManager.default
@@ -38,54 +56,68 @@ enum AssessorPackageExporter {
 
         var artifactIndex: [[String: Any]] = []
         var csvRows = [["Evidence ID", "Framework", "Control", "Control title", "Jira issue", "Jira URL", "Evidence title", "System", "Environment", "Assessment period", "Captured at", "Owner", "Status", "Tags", "Redactions", "SHA-256", "File"].map(CSVSerializer.cell).joined(separator: ",")]
+        var validatedManifests: [CaptureManifest] = []
         for entry in approved {
-            let imageData = try Data(contentsOf: entry.imageURL, options: [.mappedIfSafe])
-            guard sha256(imageData) == entry.manifest.sha256, EvidenceLifecycleStore.verify(entry.lifecycle, artifactSha256: entry.manifest.sha256), entry.lifecycle.status == .approved else { throw AssessorPackageFailure.integrityMismatch(entry.manifest.evidenceID) }
-            let framework = ComplianceCatalog.framework(named: entry.manifest.complianceArea)
+            let artifact: ValidatedEvidenceArtifact
+            let files: [ValidatedEvidenceFile]
+            do {
+                artifact = try ValidatedEvidenceArtifact.load(
+                    entry, requireLifecycle: true, trustedAnchor: captureAnchorOverride
+                )
+                files = try ValidatedEvidenceArtifact.exportFiles(
+                    for: entry, trustedAnchor: captureAnchorOverride
+                )
+            } catch {
+                throw AssessorPackageFailure.integrityMismatch(entry.manifest.evidenceID)
+            }
+            guard let lifecycle = artifact.lifecycle, lifecycle.status == .approved else {
+                throw AssessorPackageFailure.integrityMismatch(entry.manifest.evidenceID)
+            }
+            let manifest = artifact.manifest
+            validatedManifests.append(manifest)
+            let framework = ComplianceCatalog.framework(named: manifest.complianceArea)
             let evidenceFolder = packageRoot.appendingPathComponent("Evidence", isDirectory: true)
                 .appendingPathComponent(framework.folderName, isDirectory: true)
-                .appendingPathComponent(ComplianceCatalog.safePathComponent(entry.manifest.controlID), isDirectory: true)
+                .appendingPathComponent(ComplianceCatalog.safePathComponent(manifest.controlID), isDirectory: true)
             try fileManager.createDirectory(at: evidenceFolder, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-            let files = [entry.imageURL, entry.manifestURL, EvidenceLifecycleStore.url(for: entry.manifestURL), entry.receiptURL, entry.jiraReceiptURL]
-                .filter { fileManager.fileExists(atPath: $0.path) }
             var packagedFiles: [[String: String]] = []
             for source in files {
-                let target = evidenceFolder.appendingPathComponent(source.lastPathComponent)
-                try fileManager.copyItem(at: source, to: target)
+                let target = evidenceFolder.appendingPathComponent(source.sourceURL.lastPathComponent)
+                try source.data.write(to: target, options: [.atomic, .completeFileProtection])
+                try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: target.path)
                 let relative = target.path.replacingOccurrences(of: packageRoot.path + "/", with: "")
-                packagedFiles.append(["path": relative, "sha256": sha256(try Data(contentsOf: target, options: [.mappedIfSafe]))])
+                packagedFiles.append(["path": relative, "sha256": sha256(source.data)])
             }
-            let lifecycle = entry.lifecycle
-            let frameworkName = entry.manifest.complianceArea ?? "PCI DSS 4.0.1"
+            let frameworkName = manifest.complianceArea ?? "PCI DSS 4.0.1"
             artifactIndex.append([
-                "evidenceId": entry.manifest.evidenceID, "framework": frameworkName, "catalogVersion": entry.manifest.catalogVersion ?? "legacy",
-                "controlId": entry.manifest.controlID, "controlTitle": entry.manifest.controlTitle ?? "", "title": entry.manifest.title,
-                "jiraIssueKey": entry.manifest.jiraIssueKey ?? "", "jiraIssueURL": entry.manifest.jiraIssueURL ?? "",
-                "system": entry.manifest.system, "environment": entry.manifest.environment, "assessmentPeriod": entry.manifest.assessmentPeriod,
-                "capturedAt": entry.manifest.capturedAt, "owner": lifecycle.owner, "reviewer": lifecycle.reviewer, "status": lifecycle.status.rawValue,
-                "tags": lifecycle.tags, "redactions": entry.manifest.redactedRegions + (entry.manifest.manualRedactions ?? 0),
-                "screenshotSha256": entry.manifest.sha256, "captureChainEventHash": entry.manifest.chainEventHash,
-                "lifecycleChainValid": true, "mappedControls": entry.manifest.mappedControls?.map { ["framework": $0.framework, "controlId": $0.controlID, "relationship": $0.relationship] } ?? [],
+                "evidenceId": manifest.evidenceID, "framework": frameworkName, "catalogVersion": manifest.catalogVersion ?? "legacy",
+                "controlId": manifest.controlID, "controlTitle": manifest.controlTitle ?? "", "title": manifest.title,
+                "jiraIssueKey": manifest.jiraIssueKey ?? "", "jiraIssueURL": manifest.jiraIssueURL ?? "",
+                "system": manifest.system, "environment": manifest.environment, "assessmentPeriod": manifest.assessmentPeriod,
+                "capturedAt": manifest.capturedAt, "owner": lifecycle.owner, "reviewer": lifecycle.reviewer, "status": lifecycle.status.rawValue,
+                "tags": lifecycle.tags, "redactions": manifest.redactedRegions + (manifest.manualRedactions ?? 0),
+                "screenshotSha256": manifest.sha256, "captureChainEventHash": manifest.chainEventHash,
+                "lifecycleChainValid": true, "mappedControls": manifest.mappedControls?.map { ["framework": $0.framework, "controlId": $0.controlID, "relationship": $0.relationship] } ?? [],
                 "files": packagedFiles,
             ])
-            let relativeImage = "Evidence/\(framework.folderName)/\(ComplianceCatalog.safePathComponent(entry.manifest.controlID))/\(entry.imageURL.lastPathComponent)"
+            let relativeImage = "Evidence/\(framework.folderName)/\(ComplianceCatalog.safePathComponent(manifest.controlID))/\(manifest.screenshotFilename)"
             csvRows.append([
-                entry.manifest.evidenceID, frameworkName, entry.manifest.controlID, entry.manifest.controlTitle ?? "", entry.manifest.jiraIssueKey ?? "", entry.manifest.jiraIssueURL ?? "", entry.manifest.title,
-                entry.manifest.system, entry.manifest.environment, entry.manifest.assessmentPeriod, entry.manifest.capturedAt, lifecycle.owner,
-                lifecycle.status.rawValue, lifecycle.tags.joined(separator: "; "), String(entry.manifest.redactedRegions + (entry.manifest.manualRedactions ?? 0)), entry.manifest.sha256, relativeImage,
+                manifest.evidenceID, frameworkName, manifest.controlID, manifest.controlTitle ?? "", manifest.jiraIssueKey ?? "", manifest.jiraIssueURL ?? "", manifest.title,
+                manifest.system, manifest.environment, manifest.assessmentPeriod, manifest.capturedAt, lifecycle.owner,
+                lifecycle.status.rawValue, lifecycle.tags.joined(separator: "; "), String(manifest.redactedRegions + (manifest.manualRedactions ?? 0)), manifest.sha256, relativeImage,
             ].map(CSVSerializer.cell).joined(separator: ","))
         }
 
-        let frameworks = Array(Set(approved.map { $0.manifest.complianceArea ?? "PCI DSS 4.0.1" })).sorted()
-        let periods = Array(Set(approved.map { $0.manifest.assessmentPeriod })).sorted()
+        let frameworks = Array(Set(validatedManifests.map { $0.complianceArea ?? "PCI DSS 4.0.1" })).sorted()
+        let periods = Array(Set(validatedManifests.map(\.assessmentPeriod))).sorted()
         var coverageRows = [["Framework", "Catalog version", "Control", "Control title", "Approved evidence", "Coverage"].map(CSVSerializer.cell).joined(separator: ",")]
         for frameworkName in frameworks {
             let framework = ComplianceCatalog.framework(named: frameworkName)
-            let capturedControlIDs = Set(approved.filter { ($0.manifest.complianceArea ?? "PCI DSS 4.0.1") == frameworkName }.map { $0.manifest.controlID })
+            let capturedControlIDs = Set(validatedManifests.filter { ($0.complianceArea ?? "PCI DSS 4.0.1") == frameworkName }.map(\.controlID))
             var controls = framework.controls
             for customID in capturedControlIDs where !controls.contains(where: { $0.id == customID }) { controls.append(ComplianceControl(id: customID, title: "Custom or imported control")) }
             for control in controls {
-                let count = approved.filter { ($0.manifest.complianceArea ?? "PCI DSS 4.0.1") == frameworkName && $0.manifest.controlID == control.id }.count
+                let count = validatedManifests.filter { ($0.complianceArea ?? "PCI DSS 4.0.1") == frameworkName && $0.controlID == control.id }.count
                 coverageRows.append([frameworkName, framework.version ?? ComplianceCatalog.catalogVersion, control.id, control.title, String(count), count > 0 ? "Covered by package" : "No approved evidence in package"].map(CSVSerializer.cell).joined(separator: ","))
             }
         }
@@ -104,7 +136,7 @@ enum AssessorPackageExporter {
         1. Open 01-Control-Coverage.csv to identify covered controls and visible evidence gaps.
         2. Open 02-Evidence-Index.csv to browse approved evidence by framework and control.
         3. Open Evidence/<framework>/<control>/ to review the PNG and adjacent metadata.
-        4. Each PNG has an immutable capture manifest (.json), review lifecycle (.review.json), and—when uploaded—a signed server receipt (.receipt.json).
+        4. Each PNG has an immutable capture manifest (.json), review lifecycle (.review.json), and—when available—a hosted receipt (.receipt.json), Jira receipt (.jira.json), or credential-free S3 receipt (.s3.json).
         5. Follow 04-Verification.txt to validate file hashes and the package signature.
         6. When present, follow 05-Jira-Handoff.txt before attaching files to a Jira issue.
 

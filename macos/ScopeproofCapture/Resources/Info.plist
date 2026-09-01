@@ -2,20 +2,23 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+  <key>ScopeproofHostedAPIOrigins</key><array/>
   <key>ScopeproofUpdatePublicKeys</key><array/>
   <key>ScopeproofUpdateTeamIdentifier</key><string></string>
   <key>ScopeproofUpdateDesignatedRequirement</key><string></string>
+  <key>ScopeproofUpdateDownloadOrigin</key><string></string>
   <key>CFBundleDisplayName</key><string>Scopeproof Capture</string>
   <key>CFBundleExecutable</key><string>ScopeproofCapture</string>
   <key>CFBundleIdentifier</key><string>com.scopeproof.capture</string>
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>Scopeproof Capture</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.5.1</string>
-  <key>CFBundleVersion</key><string>12</string>
+  <key>CFBundleShortVersionString</key><string>1.10.0</string>
+  <key>CFBundleVersion</key><string>24</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><true/>
   <key>NSScreenCaptureUsageDescription</key><string>Scopeproof Capture needs Screen Recording access to create explicit compliance evidence screenshots requested from the menu bar.</string>
+  <key>NSAppleEventsUsageDescription</key><string>Scopeproof Capture reads the active browser tab URL only when you request a capture so the verified address can be included in compliance evidence.</string>
   <key>NSUserNotificationAlertStyle</key><string>alert</string>
 </dict>
 </plist>
