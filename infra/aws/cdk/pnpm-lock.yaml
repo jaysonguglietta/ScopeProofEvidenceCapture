@@ -24,8 +24,8 @@ importers:
         specifier: 3.1119.0
         version: 3.1119.0
       '@aws-sdk/client-route-53':
-        specifier: 3.1119.0
-        version: 3.1119.0
+        specifier: 3.1121.0
+        version: 3.1121.0
       '@aws-sdk/client-s3':
         specifier: 3.1119.0
         version: 3.1119.0
@@ -106,8 +106,8 @@ packages:
     resolution: {integrity: sha512-tUSvgh9ePwbq2klqT1UjTJsvwC9mqkEzQGgkjQQHG4InpuWQaluQlK/u3Z74pneFBDHXBq9PeeFJhFlOy8PjtA==}
     engines: {node: '>=20.0.0'}
 
-  '@aws-sdk/client-route-53@3.1119.0':
-    resolution: {integrity: sha512-fmKm0X3vU+T+lNBIjATyCatDqVzwalj1CMarciHfWa6qpvim28E9HfZ1CRXBnVYIPcBfYOlRGg0UFr4cn8ucpg==}
+  '@aws-sdk/client-route-53@3.1121.0':
+    resolution: {integrity: sha512-W8bDyghNaIOuvfUPwUuTg3dUCzxD5fqtxCf7G2yEOxXICIbM0e7jal2pULHdE8hsj5YnrZxdeuFArlJdHzGksw==}
     engines: {node: '>=20.0.0'}
 
   '@aws-sdk/client-s3-control@3.1119.0':
@@ -603,7 +603,7 @@ snapshots:
       '@smithy/types': 4.17.2
       tslib: 2.8.1
 
-  '@aws-sdk/client-route-53@3.1119.0':
+  '@aws-sdk/client-route-53@3.1121.0':
     dependencies:
       '@aws-sdk/core': 3.977.9
       '@aws-sdk/credential-provider-node': 3.972.81
