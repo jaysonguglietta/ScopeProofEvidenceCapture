@@ -6,6 +6,7 @@ enum UploadFailure: LocalizedError {
     case invalidServer
     case rejected(String)
     case invalidResponse
+    case invalidEvidence
 
     var errorDescription: String? {
         switch self {
@@ -13,19 +14,23 @@ enum UploadFailure: LocalizedError {
         case .invalidServer: return "The configured Scopeproof server URL is invalid."
         case .rejected(let message): return "Scopeproof rejected the upload: \(message)"
         case .invalidResponse: return "Scopeproof returned an invalid upload response."
+        case .invalidEvidence: return "The local evidence failed bounded file, PNG, manifest, or digest validation and was not uploaded."
         }
     }
 }
 
 actor UploadService {
-    private var appVersion: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.8.1" }
+    private var appVersion: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.9.0" }
 
     func upload(_ capture: CaptureResult, serverURL: URL?) async throws -> URL {
         guard let serverURL = BackendTrust.normalizedOrigin(serverURL) else { throw UploadFailure.invalidServer }
         guard let token = KeychainStore.readToken(for: serverURL), !token.isEmpty else { throw UploadFailure.notConfigured }
-        let image = try Data(contentsOf: capture.imageURL)
-        let manifest = try Data(contentsOf: capture.manifestURL)
-        let manifestModel = try JSONDecoder().decode(CaptureManifest.self, from: manifest)
+        let artifact: ValidatedEvidenceArtifact
+        do { artifact = try ValidatedEvidenceArtifact.load(capture) }
+        catch { throw UploadFailure.invalidEvidence }
+        let image = artifact.imageData
+        let manifest = artifact.manifestData
+        let manifestModel = artifact.manifest
         let boundary = "ScopeproofBoundary\(UUID().uuidString.replacingOccurrences(of: "-", with: ""))"
         var request = URLRequest(url: serverURL.appendingPathComponent("api/native/evidence"))
         request.httpMethod = "POST"

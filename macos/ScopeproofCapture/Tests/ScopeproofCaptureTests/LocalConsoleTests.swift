@@ -43,4 +43,43 @@ struct LocalConsoleTests {
         #expect(LocalConsoleAssets.javascript.contains("/api/library"))
         #expect(!LocalConsoleAssets.javascript.localizedCaseInsensitiveContains("secretAccessKey"))
     }
+
+    @Test("Uses one-time launch nonces and rotates bounded browser sessions")
+    func rotatesLocalConsoleSessions() throws {
+        var tokens = ["launch-one", "session-one", "launch-two", "session-two", "launch-three", "session-three"]
+        var state = LocalConsoleSessionState(tokenGenerator: { tokens.removeFirst() })
+        let start = Date(timeIntervalSince1970: 1_787_900_000)
+
+        let firstLaunch = state.beginOpen(now: start)
+        #expect(firstLaunch == "launch-one")
+        let wrongLaunch = state.consumeLaunchNonce("wrong", now: start)
+        #expect(wrongLaunch == nil)
+        let firstConsumed = state.consumeLaunchNonce(firstLaunch, now: start)
+        let firstSession = try #require(firstConsumed)
+        #expect(firstSession == "session-one")
+        let replay = state.consumeLaunchNonce(firstLaunch, now: start)
+        #expect(replay == nil)
+        let firstAuthorized = state.authorize(firstSession, now: start.addingTimeInterval(10))
+        #expect(firstAuthorized)
+
+        let secondLaunch = state.beginOpen(now: start.addingTimeInterval(20))
+        let oldAuthorized = state.authorize(firstSession, now: start.addingTimeInterval(21))
+        #expect(!oldAuthorized)
+        let secondConsumed = state.consumeLaunchNonce(secondLaunch, now: start.addingTimeInterval(21))
+        let secondSession = try #require(secondConsumed)
+        let secondAuthorized = state.authorize(secondSession, now: start.addingTimeInterval(22))
+        #expect(secondAuthorized)
+        let idleExpired = state.authorize(
+            secondSession,
+            now: start.addingTimeInterval(22 + LocalConsoleSessionState.idleLifetime + 1)
+        )
+        #expect(!idleExpired)
+
+        let thirdLaunch = state.beginOpen(now: start.addingTimeInterval(100))
+        let expiredLaunch = state.consumeLaunchNonce(
+            thirdLaunch,
+            now: start.addingTimeInterval(100 + LocalConsoleSessionState.launchLifetime + 1)
+        )
+        #expect(expiredLaunch == nil)
+    }
 }

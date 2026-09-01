@@ -48,6 +48,18 @@ export interface ApiProblem {
 const requestIdPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/;
 const methodPattern = /^(?:GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS)$/;
 const pathPattern = /^\/(?:[A-Za-z0-9._~!$&'()*+,;=:@/-]{0,2047})$/;
+const permissionScopes: Readonly<Record<TenantPermission, string>> = Object.freeze({
+  "tenant:manage": "scopeproof/tenant.manage",
+  "evidence:read": "scopeproof/evidence.read",
+  "evidence:collect": "scopeproof/evidence.collect",
+  "evidence:approve": "scopeproof/evidence.approve",
+  "evidence:export": "scopeproof/evidence.export",
+  "device:manage": "scopeproof/device.manage",
+  "integration:manage": "scopeproof/integration.manage",
+  "retention:manage": "scopeproof/retention.manage",
+  "audit:read": "scopeproof/audit.read",
+  "jobs:manage": "scopeproof/jobs.manage",
+});
 
 function validRequestPath(path: string): boolean {
   if (!pathPattern.test(path)) return false;
@@ -89,6 +101,10 @@ export async function authorizeApiGatewayRequest(
   const resolved = await dependencies.tenants.resolve(authority);
   const token = exactBearerToken(headers.get("authorization"));
   const identity = await dependencies.jwt.verify(token);
+  const requiredScope = permissionScopes[permission];
+  if (!requiredScope || !identity.scopes.includes(requiredScope)) {
+    throw new TenantSecurityError("OAUTH_SCOPE_REQUIRED", "The access token does not authorize this operation.", 403);
+  }
   const { actor } = await authorizeVerifiedTenantIdentity({ resolved, identity, memberships: dependencies.memberships, permission });
   return Object.freeze({ requestId, method, path, actor, identity });
 }

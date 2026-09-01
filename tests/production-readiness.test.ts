@@ -40,7 +40,7 @@ test("assessment boundaries survive deduplication, UI selection, and lifecycle c
   const consoleSource = await read("app/evidence-console.tsx");
   const assessments = await read("lib/server/assessments.ts");
   const migration = await read("drizzle/0010_tearful_goblin_queen.sql");
-  assert.match(evidence, /control_id = \? AND assessment_id = \?/);
+  assert.match(evidence, /control_id = \? AND framework = \? AND system = \? AND environment IS \? AND assessment_period IS \? AND assessment_id IS \?/);
   assert.match(migration, /idx_evidence_sha_source_control_assessment/);
   assert.match(consoleSource, /item\.assessmentId === selectedAssessmentId/);
   assert.match(consoleSource, /method: "PATCH"/);
@@ -58,7 +58,7 @@ test("superseded partial coverage does not permanently block export", async () =
 test("assessor exports are assessment-scoped and never silently truncated", async () => {
   const packages = await read("lib/server/packages.ts");
   const migration = await read("drizzle/0010_tearful_goblin_queen.sql");
-  assert.match(packages, /WHERE assessment_id = \?/);
+  assert.match(packages, /WHERE e\.assessment_id = \?/);
   assert.match(packages, /truncation: "forbidden"/);
   assert.match(packages, /exceeding the 100-artifact package limit/);
   assert.doesNotMatch(packages, /assessment_id = \?[\s\S]{0,200}LIMIT 100/);
@@ -92,10 +92,12 @@ test("key rotation uses copy-switch-delete and refuses missing retained keys", a
 
 test("audit checkpoints are independently signed, stored, and host allowlisted", async () => {
   const checkpoints = await read("lib/server/checkpoints.ts");
+  const trustConfiguration = await read("lib/server/external-trust-config.ts");
   const jobs = await read("lib/server/jobs.ts");
   assert.match(checkpoints, /signPackage\(canonical\)/);
   assert.match(checkpoints, /audit-checkpoints\/\$\{month\}/);
-  assert.match(checkpoints, /AUDIT_CHECKPOINT_ALLOWED_HOSTS/);
+  assert.match(trustConfiguration, /AUDIT_CHECKPOINT_ALLOWED_HOSTS/);
+  assert.match(trustConfiguration, /AUDIT_CHECKPOINT_TOKEN is malformed/);
   assert.match(checkpoints, /allowedOrigins: \[url\.origin\]/);
   assert.match(jobs, /createAuditCheckpoint\(now\)/);
 });
@@ -104,6 +106,7 @@ test("release and operations controls are executable and fail closed", async () 
   const workflow = await read(".github/workflows/security.yml");
   const productionRelease = await read(".github/workflows/macos-production-release.yml");
   const monitoring = await read("lib/server/monitoring.ts");
+  const trustConfiguration = await read("lib/server/external-trust-config.ts");
   const operations = await read("docs/PRODUCTION_OPERATIONS.md");
   assert.doesNotMatch(workflow, /uses: actions\/(checkout|setup-node|upload-artifact)@v\d/);
   assert.match(workflow, /working-directory: macos\/ScopeproofCapture/);
@@ -111,7 +114,8 @@ test("release and operations controls are executable and fail closed", async () 
   assert.doesNotMatch(workflow, /attestations:\s*write|id-token:\s*write/);
   assert.match(productionRelease, /actions\/attest@[a-f0-9]{40}/);
   assert.match(productionRelease, /environment: production-release/);
-  assert.match(monitoring, /SECURITY_EVENT_ALLOWED_HOSTS/);
+  assert.match(trustConfiguration, /SECURITY_EVENT_ALLOWED_HOSTS/);
+  assert.match(trustConfiguration, /SECURITY_EVENT_TOKEN is missing or malformed/);
   assert.match(monitoring, /x-scopeproof-signature/);
   assert.match(operations, /Quarterly recovery drill/);
   assert.match(operations, /single-tenant/);
@@ -188,7 +192,9 @@ test("SBOM evidence is reviewable, downloadable, comparable, and documented for 
   assert.match(consoleSource, /SPDX 2\.3 JSON/);
   assert.match(consoleSource, /Since prior/);
   assert.match(consoleSource, /\/api\/evidence\/\$\{encodeURIComponent\(item\.evidence_id\)\}/);
-  assert.match(packageSource, /FROM evidence_artifacts WHERE assessment_id = \? AND status = 'approved'/);
+  assert.match(packageSource, /FROM evidence_artifacts e JOIN evidence_occurrences o/);
+  assert.match(packageSource, /o\.status = 'approved'/);
+  assert.match(packageSource, /n\.chain_sequence IS NOT NULL AND n\.chain_sequence > 0/);
   assert.match(guide, /does not clone a repository or execute repository code/);
   assert.match(guide, /Metadata: read/);
   assert.match(guide, /Contents: read/);
@@ -202,6 +208,7 @@ test("SBOM evidence is reviewable, downloadable, comparable, and documented for 
 
 test("native S3 evidence storage is destination-bound, integrity-checked, encrypted, and Keychain-backed", async () => {
   const s3 = await read("macos/ScopeproofCapture/Sources/ScopeproofCapture/S3StorageService.swift");
+  const artifactLoader = await read("macos/ScopeproofCapture/Sources/ScopeproofCapture/ValidatedEvidenceArtifact.swift");
   const s3Models = await read("macos/ScopeproofCapture/Sources/ScopeproofCapture/S3SecurityModels.swift");
   const keychain = await read("macos/ScopeproofCapture/Sources/ScopeproofCapture/KeychainStore.swift");
   const preferences = await read("macos/ScopeproofCapture/Sources/ScopeproofCapture/Preferences.swift");
@@ -218,8 +225,10 @@ test("native S3 evidence storage is destination-bound, integrity-checked, encryp
   assert.match(s3, /x-amz-version-id/);
   assert.match(s3, /x-amz-expected-bucket-owner/);
   assert.match(s3, /ListObjectVersions|listObjectVersionsEndpoint/);
-  assert.match(s3, /Self\.sha256\(image\) == manifest\.sha256/);
-  assert.match(s3, /image\.count <= 50 \* 1024 \* 1024/);
+  assert.match(s3, /ValidatedEvidenceArtifact\.load\(capture\)/);
+  assert.match(artifactLoader, /sha256\(imageData\) == manifest\.sha256/);
+  assert.match(artifactLoader, /maximumImageBytes = 50 \* 1024 \* 1024/);
+  assert.match(artifactLoader, /O_NOFOLLOW/);
   assert.doesNotMatch(s3, /Process|NSTask|aws s3|AWS_SECRET_ACCESS_KEY/);
   assert.match(keychain, /aws-s3-evidence-credentials-v1/);
   assert.match(keychain, /aws-s3-verified-destination-v1/);
@@ -265,13 +274,15 @@ test("native Local Console merges local and S3 screenshots without moving AWS tr
   const server = await read("macos/ScopeproofCapture/Sources/ScopeproofCapture/LocalConsoleServer.swift");
   const library = await read("macos/ScopeproofCapture/Sources/ScopeproofCapture/EvidenceLibrary.swift");
   const assets = await read("macos/ScopeproofCapture/Sources/ScopeproofCapture/LocalConsoleAssets.swift");
-  assert.match(server, /KeychainStore\.readS3Credentials\(\)/);
+  assert.match(server, /credentialProvider\.credentials\(for: settings, binding: binding\)/);
   assert.match(server, /binding\.matches\(settings\)/);
   assert.match(server, /screenshot\.size <= 40 \* 1024 \* 1024/);
   assert.match(server, /s3Service\.downloadObject/);
   assert.match(server, /screenshot\.manifestObject/);
   assert.match(server, /manifestDownload\.sha256/);
-  assert.match(server, /imageDownload\.sha256 == manifest\.sha256/);
+  assert.match(server, /ValidatedEvidenceArtifact\.readBoundedRegularFile/);
+  assert.match(server, /ValidatedEvidenceArtifact\.validateDownloaded/);
+  assert.match(server, /imageDownload\.sha256 == artifact\.manifest\.sha256/);
   assert.match(server, /removeItem\(at: previewDirectory\)/);
   assert.match(library, /components\.count == 4/);
   assert.match(library, /\^EV-\[A-Z0-9\]\+\$/);

@@ -28,6 +28,13 @@ test("collectors cannot control retention or future-date capture", () => {
     /clock skew/,
   );
   assert.throws(
+    () => deriveServerManagedUploadRetention({
+      ...base,
+      capturedAt: "2026-07-28T15:59:59.999Z",
+    }),
+    /30-day collection window/,
+  );
+  assert.throws(
     () => deriveServerManagedUploadRetention({ ...base, retentionDays: 3_651 }),
     /retention period/,
   );

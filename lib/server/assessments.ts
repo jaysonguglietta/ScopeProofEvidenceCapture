@@ -58,8 +58,10 @@ export async function updateAssessment(actor: AuthenticatedUser, input: Record<s
     throw new Response(JSON.stringify({ error: "An active assessment may be narrowed, but not expanded. Create a new assessment for broader scope." }), { status: 409, headers: { "content-type": "application/json" } });
   }
   const updatedAt = new Date().toISOString();
-  await executeAuditedBatch(actor, status === "closed" ? "assessment.closed" : "assessment.scope_narrowed", "assessment", id, { previousStatus: current.status, status, systems, controls }, [
-    getEnv().DB.prepare("UPDATE assessments SET systems_json = ?, controls_json = ?, status = ?, updated_at = ? WHERE id = ? AND status != 'closed'").bind(stableJson(systems), stableJson(controls), status, updatedAt, id),
-  ]);
+  const [result] = await executeAuditedBatch(actor, status === "closed" ? "assessment.closed" : "assessment.scope_narrowed", "assessment", id, { previousStatus: current.status, status, systems, controls, previousUpdatedAt: current.updated_at, updatedAt }, [
+    getEnv().DB.prepare("UPDATE assessments SET systems_json = ?, controls_json = ?, status = ?, updated_at = ? WHERE id = ? AND status = ? AND updated_at = ?")
+      .bind(stableJson(systems), stableJson(controls), status, updatedAt, id, current.status, current.updated_at),
+  ], { sql: "EXISTS (SELECT 1 FROM assessments WHERE id = ? AND status = ? AND updated_at = ?)", bindings: [id, status, updatedAt] });
+  if (!result.meta.changes) throw new Response(JSON.stringify({ error: "Assessment changed concurrently. Reload it before updating scope." }), { status: 409, headers: { "content-type": "application/json" } });
   return { ...current, systems, controls, status, updated_at: updatedAt };
 }

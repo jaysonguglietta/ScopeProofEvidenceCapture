@@ -1,6 +1,7 @@
 import { jsonError, requireApiPermission, requireApiUser, requireSameOrigin } from "../../../lib/server/auth";
 import { listEvidence, storeEvidence, type ArtifactType } from "../../../lib/server/evidence";
 import { enforceRateLimit, requireBoundedContentLength } from "../../../lib/server/rate-limit";
+import { SAFE_MANUAL_EVIDENCE_TYPES } from "../../../lib/server/evidence-response";
 
 export async function GET(request: Request) {
   try { const user = await requireApiUser(request); await enforceRateLimit(request, user.id, "evidence:list", 120, 60); return Response.json({ evidence: await listEvidence() }); }
@@ -26,8 +27,9 @@ export async function POST(request: Request) {
     let bytes = new TextEncoder().encode(String(form.get("code") || description));
     if (attachment instanceof File && attachment.size) {
       if (attachment.size > 10 * 1024 * 1024) return Response.json({ error: "Evidence files are limited to 10 MB." }, { status: 413 });
-      if (!/^(text\/|application\/(json|xml|yaml|x-yaml))/.test(attachment.type)) return Response.json({ error: "Manual binary evidence is blocked because it cannot be reliably scanned. Use the browser collector for screenshots." }, { status: 415 });
-      contentType = attachment.type || "text/plain";
+      const requestedType = attachment.type.trim().toLowerCase();
+      if (!SAFE_MANUAL_EVIDENCE_TYPES.has(requestedType)) return Response.json({ error: "Only plain text, CSV, Markdown, JSON, XML, or YAML evidence can be manually uploaded. Active browser content and binary files are blocked." }, { status: 415 });
+      contentType = requestedType;
       bytes = new Uint8Array(await attachment.arrayBuffer());
     }
     if (!/^asm_[a-f0-9]{32}$/.test(assessmentId)) return Response.json({ error: "Select an open assessment for this evidence." }, { status: 400 });

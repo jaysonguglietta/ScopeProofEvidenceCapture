@@ -1,19 +1,29 @@
 import Foundation
 
 enum BackendTrust {
-    private static let productionOrigins: Set<String> = [
-        "https://scopeproof-pci.jayson-guglietta.chatgpt.site",
-    ]
+    private static var productionOrigins: Set<String> {
+        let configured = Bundle.main.object(forInfoDictionaryKey: "ScopeproofHostedAPIOrigins") as? [String] ?? []
+        return Set(configured.compactMap { value -> String? in
+            guard value == value.trimmingCharacters(in: .whitespacesAndNewlines),
+                  let url = URL(string: value),
+                  url.scheme?.lowercased() == "https", url.port == nil,
+                  url.user == nil, url.password == nil, url.query == nil, url.fragment == nil,
+                  url.path.isEmpty || url.path == "/",
+                  let host = url.host?.lowercased(), !host.isEmpty,
+                  let canonical = URL(string: "https://\(host)") else { return nil }
+            return canonical.absoluteString
+        })
+    }
 
-    static func normalizedOrigin(_ candidate: URL?) -> URL? {
+    static func normalizedOrigin(_ candidate: URL?, approvedProductionOrigins: Set<String>? = nil) -> URL? {
         guard let candidate,
               candidate.user == nil, candidate.password == nil,
               candidate.query == nil, candidate.fragment == nil,
               candidate.path.isEmpty || candidate.path == "/" else { return nil }
-        return origin(of: candidate)
+        return origin(of: candidate, approvedProductionOrigins: approvedProductionOrigins ?? productionOrigins)
     }
 
-    private static func origin(of candidate: URL?) -> URL? {
+    private static func origin(of candidate: URL?, approvedProductionOrigins: Set<String>) -> URL? {
         guard let candidate, candidate.user == nil, candidate.password == nil,
               let scheme = candidate.scheme?.lowercased(), let host = candidate.host?.lowercased() else { return nil }
         var components = URLComponents()
@@ -21,15 +31,16 @@ enum BackendTrust {
         components.host = host
         components.port = candidate.port
         guard let origin = components.url else { return nil }
-        if scheme == "https", productionOrigins.contains(origin.absoluteString) { return origin }
+        if scheme == "https", approvedProductionOrigins.contains(origin.absoluteString) { return origin }
         #if DEBUG
         if scheme == "http", ["localhost", "127.0.0.1", "::1"].contains(host) { return origin }
         #endif
         return nil
     }
 
-    static func sameOrigin(_ left: URL?, _ right: URL) -> Bool {
-        origin(of: left)?.absoluteString == right.absoluteString
+    static func sameOrigin(_ left: URL?, _ right: URL, approvedProductionOrigins: Set<String>? = nil) -> Bool {
+        guard let trustedAudience = normalizedOrigin(right, approvedProductionOrigins: approvedProductionOrigins) else { return false }
+        return origin(of: left, approvedProductionOrigins: [trustedAudience.absoluteString])?.absoluteString == trustedAudience.absoluteString
     }
 }
 

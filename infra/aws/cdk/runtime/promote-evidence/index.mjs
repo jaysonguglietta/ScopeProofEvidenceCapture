@@ -349,7 +349,8 @@ async function promoteRecord(record) {
       !sourceObject.Body || sourceObject.VersionId !== versionId ||
       sourceObject.ContentLength !== intent.expectedSize ||
       sourceObject.ChecksumSHA256 !== expectedBase64 ||
-      normalizeEtag(sourceObject.ETag) !== normalizeEtag(head.ETag)
+      normalizeEtag(sourceObject.ETag) !== normalizeEtag(head.ETag) ||
+      !metadataMatchesIntent(sourceObject.Metadata, intent)
     ) {
       throw new Error("The exact quarantine stream changed before conditional promotion.");
     }
@@ -738,6 +739,10 @@ function validateHeadAgainstIntent(head, intent, eventEtag) {
   const actual = Buffer.from(head.ChecksumSHA256, "base64").toString("hex");
   if (actual !== intent.expectedSha256) throw new Error("Evidence SHA-256 does not match the intent.");
   if (normalizeEtag(eventEtag) !== normalizeEtag(head.ETag)) throw new Error("GuardDuty scanned a different ETag.");
+  if (!metadataMatchesIntent(head.Metadata, intent)) throw new Error("Evidence metadata does not match the signed upload intent.");
+  if (head.ServerSideEncryption !== "aws:kms" || head.SSEKMSKeyId !== intent.quarantineKmsKeyArn) {
+    throw new Error("Evidence encryption does not match the signed upload intent.");
+  }
   if (!(head.LastModified instanceof Date) || !Number.isFinite(head.LastModified.getTime())) {
     throw new Error("S3 did not return the exact upload modification time.");
   }
@@ -750,6 +755,21 @@ function validateHeadAgainstIntent(head, intent, eventEtag) {
     throw new Error("The exact S3 version was not uploaded inside the signed intent window.");
   }
   return head.LastModified.toISOString();
+}
+
+function metadataMatchesIntent(metadata, intent) {
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return false;
+  const expected = {
+    "control-id": intent.controlId,
+    "evidence-id": intent.resourceId,
+    "expected-sha256": intent.expectedSha256,
+    "tenant-id": config.tenantId,
+    "upload-intent-id": intent.id,
+    "upload-nonce-digest": intent.nonceDigest,
+  };
+  const keys = Object.keys(metadata).sort();
+  const expectedKeys = Object.keys(expected).sort();
+  return keys.length === expectedKeys.length && keys.every((key, index) => key === expectedKeys[index] && metadata[key] === expected[key]);
 }
 
 async function claimIssuedIntent(input) {

@@ -1,20 +1,25 @@
 import type { RedactionFinding, RedactionKind } from "./redaction";
+import { stableJson } from "./canonical-json.ts";
 
 const redactionKinds = new Set<RedactionKind>(["pan", "aws_access_key", "github_token", "api_token", "jwt", "private_key", "authorization"]);
 const digestPattern = /^[a-f0-9]{64}$/;
 const evidenceIdPattern = /^EV-[A-Z0-9]{10,32}$/;
 const jiraIssuePattern = /^[A-Z][A-Z0-9_]{1,31}-[1-9][0-9]*$/;
+const MAXIMUM_FUTURE_CAPTURE_SKEW_MS = 5 * 60_000;
+const MAXIMUM_NATIVE_CAPTURE_AGE_MS = 30 * 24 * 60 * 60_000;
+const encoder = new TextEncoder();
 const allowedManifestKeys = new Set([
   "schemaVersion", "evidenceID", "capturedAt", "localTimestamp", "timezone", "sourceURL", "sourceHost", "browser", "windowTitle",
   "screenshotFilename", "sha256", "pixelWidth", "pixelHeight", "captureMethod", "timestampAuthority", "safetyStatus",
   "redactionFindings", "redactedRegions", "safetyScanSha256", "safetyScanPolicy", "safetyScanCompletedAt", "sessionID", "sessionName", "controlID", "title", "system", "environment",
   "assessmentPeriod", "description", "complianceArea", "controlTitle", "customFileName", "catalogVersion", "evidenceOwner", "tags",
   "expectedEvidence", "mappedControls", "manualRedactions", "reviewerNote", "jiraIssueKey", "jiraIssueURL", "chainPreviousHash", "chainEventHash",
+  "chainSequence", "provenance",
 ]);
 
 export type NativeControlMapping = { framework: string; controlID: string; relationship: string };
 export type NativeCaptureManifest = {
-  schemaVersion: 6;
+  schemaVersion: 7;
   evidenceID: string;
   capturedAt: string;
   sourceURL: string;
@@ -48,9 +53,24 @@ export type NativeCaptureManifest = {
   jiraIssueURL: string;
   chainPreviousHash: string;
   chainEventHash: string;
+  chainSequence: number;
+  provenance: { algorithm: "ECDSA-P256-SHA256"; keyID: string; publicKeyX963Base64: string; valueDERBase64: string };
+  provenancePayload: string;
 };
 
 export class NativeManifestError extends Error {}
+
+function strictBase64(value: string): Uint8Array {
+  if (!value || value.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) throw new NativeManifestError("Manifest provenance key or signature is not canonical base64.");
+  let binary: string;
+  try { binary = atob(value); } catch { throw new NativeManifestError("Manifest provenance key or signature is invalid base64."); }
+  return Uint8Array.from(binary, (character) => character.charCodeAt(0));
+}
+
+async function hexSha256(bytes: Uint8Array): Promise<string> {
+  const digest = await crypto.subtle.digest("SHA-256", bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer);
+  return [...new Uint8Array(digest)].map((value) => value.toString(16).padStart(2, "0")).join("");
+}
 
 function record(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== "object" || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) return null;
@@ -119,6 +139,17 @@ function parseMappings(source: Record<string, unknown>): NativeControlMapping[] 
   });
 }
 
+function parseProvenance(source: Record<string, unknown>): NativeCaptureManifest["provenance"] {
+  const value = record(source.provenance);
+  if (!value || Object.keys(value).some((key) => !["algorithm", "keyID", "publicKeyX963Base64", "valueDERBase64"].includes(key))) throw new NativeManifestError("Manifest provenance signature is invalid.");
+  const algorithm = text(value, "algorithm", 32, true);
+  const keyID = text(value, "keyID", 64, true).toLowerCase();
+  const publicKeyX963Base64 = text(value, "publicKeyX963Base64", 128, true);
+  const valueDERBase64 = text(value, "valueDERBase64", 128, true);
+  if (algorithm !== "ECDSA-P256-SHA256" || !digestPattern.test(keyID)) throw new NativeManifestError("Manifest provenance signature is invalid.");
+  return { algorithm, keyID, publicKeyX963Base64, valueDERBase64 };
+}
+
 function cleanJiraUrl(value: string, issueKey: string): boolean {
   if (!value) return !issueKey;
   try {
@@ -132,13 +163,11 @@ function cleanSourceUrl(value: string, sourceHost: string): boolean {
   if (!value) return !sourceHost;
   try {
     const url = new URL(value);
-    if (!["http:", "https:"].includes(url.protocol) || !url.hostname || url.username || url.password || url.href.length > 2_048) return false;
+    if (!["http:", "https:"].includes(url.protocol) || !url.hostname || url.username || url.password || url.port || url.href.length > 2_048) return false;
     if (url.hostname.toLowerCase() !== sourceHost.toLowerCase()) return false;
-    const sensitiveName = /(?:access[_-]?token|api[_-]?(?:key|token)|assertion|auth(?:orization)?|client[_-]?secret|code|credential|id[_-]?token|jwt|key|password|passwd|pwd|relaystate|samlresponse|secret|session(?:id)?|sid|sig(?:nature)?|token)$/i;
-    for (const [name, queryValue] of url.searchParams) {
-      if (sensitiveName.test(name) && queryValue !== "REDACTED") return false;
-    }
-    return true;
+    // Native evidence provenance is origin-only. A compromised client must not
+    // be able to smuggle path, query, or fragment data across this boundary.
+    return (url.pathname === "/" || url.pathname === "") && !url.search && !url.hash && (value === url.origin || value === `${url.origin}/`);
   } catch { return false; }
 }
 
@@ -147,12 +176,15 @@ export function parseNativeManifest(bytes: Uint8Array): NativeCaptureManifest {
   try { parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); } catch { throw new NativeManifestError("Manifest must be valid UTF-8 JSON."); }
   const source = record(parsed);
   if (!source || Object.keys(source).some((key) => !allowedManifestKeys.has(key))) throw new NativeManifestError("Manifest schema contains unsupported fields.");
-  if (source.schemaVersion !== 6) throw new NativeManifestError("Manifest schema version is not supported. Upgrade Scopeproof Capture before uploading evidence.");
+  if (source.schemaVersion !== 7) throw new NativeManifestError("Only signed schema-7 evidence can be uploaded. Recapture legacy evidence with the current Scopeproof Capture application.");
   const evidenceID = text(source, "evidenceID", 35, true);
   if (!evidenceIdPattern.test(evidenceID)) throw new NativeManifestError("Manifest evidence ID is invalid.");
   const capturedAt = text(source, "capturedAt", 64, true);
   const capturedMillis = Date.parse(capturedAt);
-  if (!Number.isFinite(capturedMillis) || Math.abs(Date.now() - capturedMillis) > 366 * 24 * 60 * 60_000) throw new NativeManifestError("Manifest capture time is invalid.");
+  const captureAge = Date.now() - capturedMillis;
+  if (!Number.isFinite(capturedMillis) || captureAge < -MAXIMUM_FUTURE_CAPTURE_SKEW_MS || captureAge > MAXIMUM_NATIVE_CAPTURE_AGE_MS) {
+    throw new NativeManifestError("Manifest capture time is outside the accepted upload window.");
+  }
   const sha256 = text(source, "sha256", 64, true).toLowerCase();
   if (!digestPattern.test(sha256)) throw new NativeManifestError("Manifest image digest is invalid.");
   const safetyScanSha256 = text(source, "safetyScanSha256", 64, true).toLowerCase();
@@ -174,8 +206,14 @@ export function parseNativeManifest(bytes: Uint8Array): NativeCaptureManifest {
   const chainPreviousHash = text(source, "chainPreviousHash", 128, true);
   const chainEventHash = text(source, "chainEventHash", 128, true);
   if ((chainPreviousHash !== "GENESIS" && !digestPattern.test(chainPreviousHash)) || !digestPattern.test(chainEventHash)) throw new NativeManifestError("Manifest capture-chain hashes are invalid.");
+  const chainSequence = integer(source, "chainSequence", 1, 2_147_483_647);
+  const provenance = parseProvenance(source);
+  const unsignedManifest = { ...source };
+  delete unsignedManifest.provenance;
+  let provenancePayload: string;
+  try { provenancePayload = stableJson(unsignedManifest); } catch { throw new NativeManifestError("Manifest provenance payload is not canonicalizable JSON."); }
   return {
-    schemaVersion: 6,
+    schemaVersion: 7,
     evidenceID,
     capturedAt,
     sourceURL,
@@ -209,19 +247,81 @@ export function parseNativeManifest(bytes: Uint8Array): NativeCaptureManifest {
     jiraIssueURL,
     chainPreviousHash,
     chainEventHash,
+    chainSequence,
+    provenance,
+    provenancePayload,
   };
+}
+
+function derEcdsaToP1363(der: Uint8Array): Uint8Array {
+  if (der.length < 8 || der.length > 72 || der[0] !== 0x30 || der[1] !== der.length - 2) throw new NativeManifestError("Manifest provenance signature encoding is invalid.");
+  let offset = 2;
+  const readInteger = (): Uint8Array => {
+    if (der[offset] !== 0x02) throw new NativeManifestError("Manifest provenance signature encoding is invalid.");
+    const length = der[offset + 1];
+    offset += 2;
+    if (!length || length > 33 || offset + length > der.length) throw new NativeManifestError("Manifest provenance signature encoding is invalid.");
+    let value = der.subarray(offset, offset + length);
+    offset += length;
+    if (value.length === 33) {
+      // DER uses one leading zero when the unsigned scalar's high bit is set.
+      // After removing that sign byte the high bit is expected, not invalid.
+      if (value[0] !== 0 || (value[1] & 0x80) === 0) throw new NativeManifestError("Manifest provenance signature encoding is invalid.");
+      value = value.subarray(1);
+    } else if (value[0] === 0 || (value[0] & 0x80) !== 0) {
+      // Reject redundant zeroes, negative INTEGERs, and missing sign padding.
+      throw new NativeManifestError("Manifest provenance signature encoding is invalid.");
+    }
+    if (value.length > 32 || value.every((byte) => byte === 0)) throw new NativeManifestError("Manifest provenance signature encoding is invalid.");
+    const padded = new Uint8Array(32);
+    padded.set(value, 32 - value.length);
+    return padded;
+  };
+  const r = readInteger();
+  const s = readInteger();
+  if (offset !== der.length) throw new NativeManifestError("Manifest provenance signature encoding is invalid.");
+  const signature = new Uint8Array(64);
+  signature.set(r, 0);
+  signature.set(s, 32);
+  return signature;
+}
+
+export async function verifyNativeManifestProvenance(manifest: NativeCaptureManifest): Promise<boolean> {
+  try {
+    const publicKeyBytes = strictBase64(manifest.provenance.publicKeyX963Base64);
+    if (publicKeyBytes.length !== 65 || publicKeyBytes[0] !== 0x04 || await hexSha256(publicKeyBytes) !== manifest.provenance.keyID) return false;
+    const publicKey = await crypto.subtle.importKey("raw", publicKeyBytes.buffer as ArrayBuffer, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+    const der = strictBase64(manifest.provenance.valueDERBase64);
+    const signature = derEcdsaToP1363(der);
+    const domain = "scopeproof-local-capture-manifest-v1";
+    const payload = encoder.encode(manifest.provenancePayload);
+    const prefix = encoder.encode(`${encoder.encode(domain).byteLength}:${domain}\n${payload.byteLength}:`);
+    const signed = new Uint8Array(prefix.byteLength + payload.byteLength);
+    signed.set(prefix, 0);
+    signed.set(payload, prefix.byteLength);
+    return await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, publicKey, signature.buffer as ArrayBuffer, signed.buffer as ArrayBuffer);
+  } catch {
+    return false;
+  }
 }
 
 function u32(bytes: Uint8Array, offset: number): number {
   return ((bytes[offset] * 0x1000000) + (bytes[offset + 1] << 16) + (bytes[offset + 2] << 8) + bytes[offset + 3]) >>> 0;
 }
 
+const CRC32_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let value = 0; value < table.length; value += 1) {
+    let crc = value;
+    for (let bit = 0; bit < 8; bit += 1) crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
+    table[value] = crc >>> 0;
+  }
+  return table;
+})();
+
 function crc32(bytes: Uint8Array): number {
   let crc = 0xffffffff;
-  for (const byte of bytes) {
-    crc ^= byte;
-    for (let bit = 0; bit < 8; bit += 1) crc = (crc >>> 1) ^ ((crc & 1) ? 0xedb88320 : 0);
-  }
+  for (const byte of bytes) crc = (crc >>> 8) ^ CRC32_TABLE[(crc ^ byte) & 0xff];
   return (crc ^ 0xffffffff) >>> 0;
 }
 
@@ -238,8 +338,13 @@ export async function validatePng(bytes: Uint8Array): Promise<{ width: number; h
   let sawData = false;
   let endedData = false;
   let sawEnd = false;
+  let chunkCount = 0;
+  let ancillaryBytes = 0;
+  let compressedLength = 0;
   const idat: Uint8Array[] = [];
   while (offset < bytes.length) {
+    chunkCount += 1;
+    if (chunkCount > 4_096) throw new NativeManifestError("PNG contains too many chunks.");
     if (bytes.length - offset < 12) throw new NativeManifestError("PNG chunk framing is truncated.");
     const length = u32(bytes, offset);
     if (length > 15 * 1024 * 1024 || length + 12 > bytes.length - offset) throw new NativeManifestError("PNG chunk length is invalid.");
@@ -267,6 +372,8 @@ export async function validatePng(bytes: Uint8Array): Promise<{ width: number; h
     } else if (type === "IDAT") {
       if (!sawHeader || sawEnd || endedData || (colorType === 3 && !sawPalette)) throw new NativeManifestError("PNG image data is out of order.");
       sawData = true;
+      compressedLength += data.byteLength;
+      if (compressedLength > 15 * 1024 * 1024) throw new NativeManifestError("PNG compressed image data exceeds the capture limit.");
       idat.push(data);
     } else if (type === "IEND") {
       if (!sawData || sawEnd || length !== 0) throw new NativeManifestError("PNG end marker is invalid.");
@@ -276,36 +383,41 @@ export async function validatePng(bytes: Uint8Array): Promise<{ width: number; h
       break;
     } else if ((typeBytes[0] & 0x20) === 0) {
       throw new NativeManifestError("PNG contains an unsupported critical chunk.");
+    } else {
+      ancillaryBytes += data.byteLength;
+      if (ancillaryBytes > 1024 * 1024) throw new NativeManifestError("PNG ancillary metadata exceeds the capture limit.");
     }
     if (sawData && type !== "IDAT" && type !== "IEND") endedData = true;
     offset += length + 12;
   }
   if (!sawHeader || !sawData || !sawEnd) throw new NativeManifestError("PNG is incomplete.");
-  const compressedLength = idat.reduce((sum, chunk) => sum + chunk.length, 0);
-  const compressed = new Uint8Array(compressedLength);
-  let cursor = 0;
-  for (const chunk of idat) { compressed.set(chunk, cursor); cursor += chunk.length; }
   const rowBytes = Math.ceil(width * bitsPerPixel / 8);
   const expectedInflated = (rowBytes + 1) * height;
-  if (expectedInflated > 70 * 1024 * 1024) throw new NativeManifestError("PNG decoded size exceeds the capture limit.");
-  let inflated: Uint8Array;
+  if (expectedInflated > 64 * 1024 * 1024) throw new NativeManifestError("PNG decoded size exceeds the capture limit.");
+  let inflatedLength = 0;
+  let nextFilterOffset = 0;
   try {
-    const stream = new Blob([compressed]).stream().pipeThrough(new DecompressionStream("deflate"));
-    const chunks: Uint8Array[] = [];
-    let total = 0;
+    const compressedStream = new ReadableStream<BufferSource>({
+      start(controller) {
+        for (const chunk of idat) controller.enqueue(chunk as Uint8Array<ArrayBuffer>);
+        controller.close();
+      },
+    });
+    const stream = compressedStream.pipeThrough(new DecompressionStream("deflate"));
     for await (const chunk of stream as unknown as AsyncIterable<Uint8Array>) {
-      total += chunk.byteLength;
-      if (total > expectedInflated) throw new NativeManifestError("PNG expands beyond its declared dimensions.");
-      chunks.push(chunk);
+      const chunkStart = inflatedLength;
+      inflatedLength += chunk.byteLength;
+      if (inflatedLength > expectedInflated) throw new NativeManifestError("PNG expands beyond its declared dimensions.");
+      while (nextFilterOffset < inflatedLength) {
+        const index = nextFilterOffset - chunkStart;
+        if (index < 0 || index >= chunk.byteLength || chunk[index] > 4) throw new NativeManifestError("PNG uses an invalid scanline filter.");
+        nextFilterOffset += rowBytes + 1;
+      }
     }
-    inflated = new Uint8Array(total);
-    cursor = 0;
-    for (const chunk of chunks) { inflated.set(chunk, cursor); cursor += chunk.length; }
   } catch (error) {
     if (error instanceof NativeManifestError) throw error;
     throw new NativeManifestError("PNG image data cannot be decoded.");
   }
-  if (inflated.length !== expectedInflated) throw new NativeManifestError("PNG decoded size does not match its dimensions.");
-  for (let row = 0; row < height; row += 1) if (inflated[row * (rowBytes + 1)] > 4) throw new NativeManifestError("PNG uses an invalid scanline filter.");
+  if (inflatedLength !== expectedInflated || nextFilterOffset !== expectedInflated) throw new NativeManifestError("PNG decoded size does not match its dimensions.");
   return { width, height };
 }

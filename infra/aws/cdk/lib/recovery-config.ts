@@ -33,9 +33,9 @@ export interface RecoveryConfigurationOptions {
 }
 
 export function validateDeploymentEnvironment(value: unknown): DeploymentEnvironment {
-  const environment = String(value ?? "dev").trim().toLowerCase();
+  const environment = String(value ?? "").trim().toLowerCase();
   if (!new Set(["dev", "stage", "prod"]).has(environment)) {
-    throw new Error("deploymentEnvironment must be dev, stage, or prod.");
+    throw new Error("deploymentEnvironment must be explicitly set to dev, stage, or prod.");
   }
   return environment as DeploymentEnvironment;
 }

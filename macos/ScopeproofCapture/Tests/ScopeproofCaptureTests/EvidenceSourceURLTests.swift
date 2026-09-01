@@ -4,11 +4,13 @@ import Testing
 
 @Suite("Evidence source URL")
 struct EvidenceSourceURLTests {
-    @Test("Preserves the complete non-sensitive URL")
-    func preservesCompleteURL() throws {
+    @Test("Persists only the source origin while preserving one-time navigation")
+    func separatesNavigationFromProvenance() throws {
         let source = "https://Admin.Example.com/security/settings/policy?view=effective&region=us-east-1#access-controls"
         let sanitized = try #require(EvidenceSourceURL.sanitized(source))
-        #expect(sanitized.absoluteString == "https://admin.example.com/security/settings/policy?view=effective&region=us-east-1#access-controls")
+        #expect(sanitized.absoluteString == "https://admin.example.com")
+        #expect(EvidenceSourceURL.navigationURL(source)?.absoluteString == "https://admin.example.com/security/settings/policy?view=effective&region=us-east-1#access-controls")
+        #expect(EvidenceSourceURL.savedTarget(source)?.absoluteString == "https://admin.example.com/security/settings/policy")
     }
 
     @Test("Removes credentials and redacts sensitive URL values")
@@ -17,9 +19,7 @@ struct EvidenceSourceURLTests {
         let sanitized = try #require(EvidenceSourceURL.sanitized(source))
         #expect(sanitized.user == nil)
         #expect(sanitized.password == nil)
-        #expect(sanitized.absoluteString.contains("view=full"))
-        #expect(sanitized.absoluteString.contains("access_token=REDACTED"))
-        #expect(sanitized.absoluteString.contains("apiKey=REDACTED"))
+        #expect(sanitized.absoluteString == "https://admin.example.com")
         #expect(!sanitized.absoluteString.contains("synthetic-secret-value"))
         #expect(!sanitized.absoluteString.contains("AKIAIOSFODNN7EXAMPLE"))
     }
@@ -48,7 +48,7 @@ struct EvidenceSourceURLTests {
             "https://operator:password@Admin.Example.com/settings?view=full&access_token=secret-value"
         }
         let url = try #require(detected)
-        #expect(url.absoluteString == "https://admin.example.com/settings?view=full&access_token=REDACTED")
+        #expect(url.absoluteString == "https://admin.example.com")
         #expect(BrowserPageURL.detectedURL(for: "Firefox") { _ in "https://example.com" } == nil)
     }
 }

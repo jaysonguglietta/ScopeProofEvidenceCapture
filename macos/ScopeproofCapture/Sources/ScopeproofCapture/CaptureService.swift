@@ -62,6 +62,8 @@ struct CaptureManifest: Codable, Sendable {
     let jiraIssueURL: String?
     let chainPreviousHash: String
     let chainEventHash: String
+    let chainSequence: Int?
+    var provenance: LocalProvenanceSignature?
 }
 
 struct BrowserWindow: Sendable {
@@ -85,6 +87,7 @@ enum CaptureFailure: LocalizedError {
     case screenshotFailed(String)
     case scrollingCaptureFailed(String)
     case safetyScanFailed(String)
+    case provenanceFailed(String)
     case imageProcessingFailed
     case cancelled
 
@@ -97,6 +100,7 @@ enum CaptureFailure: LocalizedError {
         case .screenshotFailed(let detail): return "macOS could not capture the browser window. \(detail)"
         case .scrollingCaptureFailed(let detail): return "The scrolling evidence capture could not be completed. No evidence was saved. \(detail)"
         case .safetyScanFailed(let detail): return "The required final-image safety scan did not complete. No evidence was saved. \(detail)"
+        case .provenanceFailed(let detail): return "The evidence could not be bound to the device signing identity and rollback anchor. No evidence was saved. \(detail)"
         case .imageProcessingFailed: return "The screenshot was captured but the protected evidence files could not be created."
         case .cancelled: return "The capture was discarded during review."
         }
@@ -156,7 +160,7 @@ final class CaptureService {
     }
 
     func openAndCapture(urlString: String, browser: BrowserChoice, delay: Int, context: CaptureContext, completion: @escaping CaptureCompletion) {
-        guard let url = EvidenceSourceURL.sanitized(urlString) else {
+        guard let url = EvidenceSourceURL.navigationURL(urlString) else {
             completion(.failure(.invalidURL)); return
         }
         guard requestScreenRecordingPermissionIfNeeded() else { completion(.failure(.permissionRequired)); return }
@@ -478,6 +482,15 @@ final class CaptureService {
         let baseName = "\(framework.fileCode)_\(controlFile)\(jiraFile)_\(customFile)_\(filenameFormatter.string(from: now))_\(evidenceID)"
         let imageURL = evidenceDirectory.appendingPathComponent(baseName).appendingPathExtension("png")
         let manifestURL = evidenceDirectory.appendingPathComponent(baseName).appendingPathExtension("json")
+        let lifecycleURL = EvidenceLifecycleStore.url(for: manifestURL)
+        var captureCommitted = false
+        defer {
+            if !captureCommitted {
+                for url in [imageURL, manifestURL, lifecycleURL] where fileManager.fileExists(atPath: url.path) {
+                    try? fileManager.removeItem(at: url)
+                }
+            }
+        }
         let localTimestamp = localFormatter.string(from: now)
         let menuBarTimestamp = menuBarFormatter.string(from: now)
         let menuBarTimeZone = TimeZone.current.abbreviation().map {
@@ -492,7 +505,7 @@ final class CaptureService {
         let liveMenuBarLabel = includesLiveMenuBar
             ? "LIVE MAC MENU BAR PIXELS INCLUDED \(menuBarScan == nil ? "IN CAPTURE" : "ABOVE")  •  CLOCK READING \(menuBarTimestamp)  •  \(menuBarTimeZone)"
             : "MAC CLOCK READING  \(menuBarTimestamp)  •  \(menuBarTimeZone)"
-        let stamp = "SCOPEPROOF EVIDENCE  •  CAPTURED \(localTimestamp)  •  \(evidenceID)\n\(liveMenuBarLabel)\n\(framework.name.uppercased())  •  CONTROL \(controlLabel)\(jiraLabel)\nEVIDENCE \(context.title)  •  OWNER \(ownerLabel)\n\(context.system) / \(context.environment)  •  \(context.assessmentPeriod)  •  SOURCE \(browser) — \(safeWindowTitle)\nFULL URL  \(sourceLabel)"
+        let stamp = "SCOPEPROOF EVIDENCE  •  CAPTURED \(localTimestamp)  •  \(evidenceID)\n\(liveMenuBarLabel)\n\(framework.name.uppercased())  •  CONTROL \(controlLabel)\(jiraLabel)\nEVIDENCE \(context.title)  •  OWNER \(ownerLabel)\n\(context.system) / \(context.environment)  •  \(context.assessmentPeriod)  •  SOURCE \(browser) — \(safeWindowTitle)\nSOURCE ORIGIN  \(sourceLabel)"
         let stamped = try stampedImage(source: initialScan.image, stamp: stamp)
         let evidencePixels = try menuBarScan.map { try evidenceImageWithMenuBar(menuBar: $0.image, evidence: stamped) } ?? stamped
         let stampedScan = try requiredSafetyScan(evidencePixels)
@@ -508,12 +521,18 @@ final class CaptureService {
         try imageData.write(to: imageURL, options: [.atomic, .completeFileProtection])
         try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: imageURL.path)
         let dimensions = (width: review.image.width, height: review.image.height)
-        let previousHash = preferences.chainHead
+        let existingAnchor: LocalCaptureChainAnchor?
+        do { existingAnchor = try KeychainStore.captureChainAnchor() }
+        catch { throw CaptureFailure.provenanceFailed(error.localizedDescription) }
+        // Schema 7 begins a signed, device-anchored epoch. An unsigned legacy
+        // preference cannot be promoted into that chain's root of trust.
+        let previousHash = existingAnchor?.eventHash ?? "GENESIS"
+        let chainSequence = (existingAnchor?.sequence ?? 0) + 1
         let eventHash = sha256(Data("\(previousHash)|\(digest)|\(evidenceID)|\(capturedAt)|\(context.sessionID)".utf8))
         let safetyStatus = automaticRedactions + review.manualRedactions > 0 ? "redacted" : "passed"
         let mappings = ComplianceCatalog.mappings(frameworkName: framework.name, controlID: context.controlID)
-        let manifest = CaptureManifest(
-            schemaVersion: 6, evidenceID: evidenceID, capturedAt: capturedAt, localTimestamp: localTimestamp, timezone: TimeZone.current.identifier,
+        var manifest = CaptureManifest(
+            schemaVersion: 7, evidenceID: evidenceID, capturedAt: capturedAt, localTimestamp: localTimestamp, timezone: TimeZone.current.identifier,
             sourceURL: recordedSourceURL?.absoluteString, sourceHost: recordedSourceURL?.host, browser: browser, windowTitle: windowTitle, screenshotFilename: imageURL.lastPathComponent,
             sha256: digest, pixelWidth: dimensions.width, pixelHeight: dimensions.height, captureMethod: method,
             timestampAuthority: includesLiveMenuBar
@@ -527,8 +546,11 @@ final class CaptureService {
             catalogVersion: framework.version ?? ComplianceCatalog.catalogVersion, evidenceOwner: context.resolvedEvidenceOwner, tags: context.resolvedTags,
             expectedEvidence: context.expectedEvidence, mappedControls: mappings, manualRedactions: review.manualRedactions, reviewerNote: review.reviewerNote,
             jiraIssueKey: jiraIssueKey.isEmpty ? nil : jiraIssueKey, jiraIssueURL: preferences.jiraHandoff.issueURL(for: jiraIssueKey)?.absoluteString,
-            chainPreviousHash: previousHash, chainEventHash: eventHash
+            chainPreviousHash: previousHash, chainEventHash: eventHash,
+            chainSequence: chainSequence, provenance: nil
         )
+        do { manifest.provenance = try LocalProvenance.signManifest(manifest) }
+        catch { throw CaptureFailure.provenanceFailed(error.localizedDescription) }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         try encoder.encode(manifest).write(to: manifestURL, options: [.atomic, .completeFileProtection])
@@ -537,7 +559,16 @@ final class CaptureService {
             manifest: manifest,
             manifestURL: manifestURL,
             imageURL: imageURL,
-            receiptURL: manifestURL.deletingPathExtension().appendingPathExtension("receipt.json")
+            receiptURL: manifestURL.deletingPathExtension().appendingPathExtension("receipt.json"),
+            evidenceRoot: outputDirectory
+        )
+        guard let signingKeyID = manifest.provenance?.keyID else {
+            throw CaptureFailure.provenanceFailed("The capture signing identity was unavailable.")
+        }
+        let prospectiveAnchor = LocalCaptureChainAnchor(
+            schemaVersion: LocalCaptureChainAnchor.currentSchemaVersion,
+            sequence: chainSequence, eventHash: eventHash,
+            signingKeyID: signingKeyID, anchoredAt: capturedAt
         )
         try EvidenceLifecycleStore.update(
             entry: historyEntry,
@@ -545,9 +576,19 @@ final class CaptureService {
             owner: context.resolvedEvidenceOwner,
             reviewer: context.resolvedEvidenceOwner,
             notes: review.reviewerNote,
-            tags: context.resolvedTags
+            tags: context.resolvedTags,
+            trustedAnchor: prospectiveAnchor
         )
+        do {
+            _ = try KeychainStore.advanceCaptureChain(
+                previousHash: previousHash, sequence: chainSequence, eventHash: eventHash,
+                signingKeyID: signingKeyID, now: now
+            )
+        } catch {
+            throw CaptureFailure.provenanceFailed(error.localizedDescription)
+        }
         preferences.chainHead = eventHash
+        captureCommitted = true
         return CaptureResult(imageURL: imageURL, manifestURL: manifestURL, evidenceID: evidenceID, context: context, capturedAt: capturedAt, safetyStatus: safetyStatus, findings: automaticFindings, sha256: digest, chainPreviousHash: previousHash, chainEventHash: eventHash)
     }
 

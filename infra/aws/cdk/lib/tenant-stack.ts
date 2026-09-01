@@ -34,9 +34,12 @@ import * as sqs from "aws-cdk-lib/aws-sqs";
 import * as wafv2 from "aws-cdk-lib/aws-wafv2";
 import { Construct } from "constructs";
 import {
+  defaultTenantLambdaConcurrencyBudget,
   tenantDatabaseIdentifiers,
   tenantEvidenceControlRoleName,
   TenantDefinition,
+  validateTenantDeploymentSecurity,
+  validateTenantLambdaConcurrencyBudget,
 } from "./config";
 import { primaryEvidenceBucketName, RecoveryConfiguration } from "./recovery-config";
 import { configureEvidenceRecovery } from "./recovery-support";
@@ -46,7 +49,7 @@ export interface TenantStackProps extends StackProps {
   readonly rootDomain: string;
   readonly tenant: TenantDefinition;
   readonly shared: SharedPlatformStack;
-  readonly recovery?: RecoveryConfiguration;
+  readonly recovery: RecoveryConfiguration;
 }
 
 export class TenantStack extends Stack {
@@ -64,11 +67,19 @@ export class TenantStack extends Stack {
     const retentionDays = tenant.retentionDays ?? 365;
     const databaseIdentifiers = tenantDatabaseIdentifiers(tenant);
     const databaseIdentifier = databaseIdentifiers.databaseName;
+    const auditSignerDatabaseUsername = databaseIdentifiers.auditSignerUsername;
     const databaseUsername = databaseIdentifiers.runtimeUsername;
     const controlDatabaseUsername = databaseIdentifiers.controlUsername;
     const ingestDatabaseUsername = databaseIdentifiers.ingestUsername;
     const legalApiDatabaseUsername = databaseIdentifiers.legalApiUsername;
+    const readDatabaseUsername = databaseIdentifiers.readUsername;
     const databaseOwner = databaseIdentifiers.ownerUsername;
+    const concurrency = validateTenantLambdaConcurrencyBudget(
+      defaultTenantLambdaConcurrencyBudget,
+      props.recovery.deploymentEnvironment,
+    );
+
+    validateTenantDeploymentSecurity(tenant, props.recovery.deploymentEnvironment);
 
     Tags.of(this).add("TenantId", tenant.id);
     Tags.of(this).add("TenantSlug", tenant.slug);
@@ -87,13 +98,40 @@ export class TenantStack extends Stack {
           cognito.OAuthScope.OPENID,
           cognito.OAuthScope.EMAIL,
           cognito.OAuthScope.PROFILE,
+          shared.oauthScopes.evidenceRead,
+          shared.oauthScopes.evidenceCollect,
+          shared.oauthScopes.retentionManage,
         ],
       },
       preventUserExistenceErrors: true,
+      refreshTokenRotationGracePeriod: Duration.seconds(30),
       refreshTokenValidity: Duration.days(7),
       supportedIdentityProviders: [cognito.UserPoolClientIdentityProvider.COGNITO],
       userPool: shared.userPool,
       userPoolClientName: `scopeproof-${tenant.slug}-web`,
+    });
+    const nativeUserPoolClient = new cognito.UserPoolClient(this, "TenantNativeClient", {
+      accessTokenValidity: Duration.minutes(15),
+      enableTokenRevocation: true,
+      generateSecret: false,
+      idTokenValidity: Duration.minutes(15),
+      oAuth: {
+        callbackUrls: ["com.scopeproof.capture://oauth/callback"],
+        flows: { authorizationCodeGrant: true },
+        logoutUrls: ["com.scopeproof.capture://oauth/signed-out"],
+        scopes: [
+          cognito.OAuthScope.OPENID,
+          cognito.OAuthScope.EMAIL,
+          cognito.OAuthScope.PROFILE,
+          shared.oauthScopes.evidenceCollect,
+        ],
+      },
+      preventUserExistenceErrors: true,
+      refreshTokenRotationGracePeriod: Duration.seconds(30),
+      refreshTokenValidity: Duration.days(7),
+      supportedIdentityProviders: [cognito.UserPoolClientIdentityProvider.COGNITO],
+      userPool: shared.userPool,
+      userPoolClientName: `scopeproof-${tenant.slug}-native`,
     });
 
     const tenantKey = new kms.Key(this, "TenantEvidenceKey", {
@@ -142,6 +180,7 @@ export class TenantStack extends Stack {
       removalPolicy: RemovalPolicy.RETAIN,
       versioned: true,
     });
+    this.ingestBucket.policy?.applyRemovalPolicy(RemovalPolicy.RETAIN);
     const retention = tenant.retentionMode === "COMPLIANCE"
       ? s3.ObjectLockRetention.compliance(Duration.days(retentionDays))
       : s3.ObjectLockRetention.governance(Duration.days(retentionDays));
@@ -192,7 +231,8 @@ export class TenantStack extends Stack {
       resources: [immutableEvidenceObjects],
       sid: "DenyNonConditionalEvidenceCreation",
     }));
-    if (props.recovery?.mode === "enabled") {
+    evidenceBucket.policy?.applyRemovalPolicy(RemovalPolicy.RETAIN);
+    if (props.recovery.mode === "enabled") {
       const destination = props.recovery.evidenceDestinations.get(tenant.id);
       if (!destination) throw new Error(`Missing evidence recovery destination for ${tenant.id}.`);
       configureEvidenceRecovery(this, {
@@ -272,8 +312,47 @@ export class TenantStack extends Stack {
       },
       removalPolicy: RemovalPolicy.RETAIN,
     });
+    const readDatabaseSecret = new secretsmanager.Secret(this, "TenantEvidenceReadDatabaseSecret", {
+      description: `Read-only evidence API database credentials for ${tenant.id}`,
+      encryptionKey: tenantSecretKey,
+      generateSecretString: {
+        excludePunctuation: true,
+        generateStringKey: "password",
+        passwordLength: 40,
+        secretStringTemplate: JSON.stringify({
+          database: databaseIdentifier,
+          username: readDatabaseUsername,
+        }),
+      },
+      removalPolicy: RemovalPolicy.RETAIN,
+    });
+    const auditSignerDatabaseSecret = new secretsmanager.Secret(this, "TenantApiAuditSignerDatabaseSecret", {
+      description: `Execute-only public API audit outbox signer credentials for ${tenant.id}`,
+      encryptionKey: tenantSecretKey,
+      generateSecretString: {
+        excludePunctuation: true,
+        generateStringKey: "password",
+        passwordLength: 40,
+        secretStringTemplate: JSON.stringify({
+          database: databaseIdentifier,
+          username: auditSignerDatabaseUsername,
+        }),
+      },
+      removalPolicy: RemovalPolicy.RETAIN,
+    });
     const uploadIdempotencySecret = new secretsmanager.Secret(this, "TenantUploadIdempotencySecret", {
       description: `Server-only HMAC material for retry-safe upload intents in ${tenant.id}`,
+      encryptionKey: tenantSecretKey,
+      generateSecretString: {
+        excludePunctuation: true,
+        generateStringKey: "hmacKey",
+        passwordLength: 64,
+        secretStringTemplate: JSON.stringify({ schemaVersion: 1 }),
+      },
+      removalPolicy: RemovalPolicy.RETAIN,
+    });
+    const evidenceCursorSecret = new secretsmanager.Secret(this, "TenantEvidenceCursorSecret", {
+      description: `Dedicated rotating HMAC material for tenant-bound evidence cursors in ${tenant.id}`,
       encryptionKey: tenantSecretKey,
       generateSecretString: {
         excludePunctuation: true,
@@ -290,6 +369,12 @@ export class TenantStack extends Stack {
       path: "/scopeproof/api/",
       roleName: `sp-${tenant.slug}-api`,
     });
+    const tenantEvidenceReadApiExecutionRole = new iam.Role(this, "TenantEvidenceReadApiExecutionRole", {
+      assumedBy: new iam.ServicePrincipal("lambda.amazonaws.com"),
+      description: `Unprivileged evidence-read API entry role for ${tenant.id}`,
+      path: "/scopeproof/api/",
+      roleName: `sp-${tenant.slug}-read-api`,
+    });
     const tenantLegalHoldApiExecutionRole = new iam.Role(this, "TenantLegalHoldApiExecutionRole", {
       assumedBy: new iam.ServicePrincipal("lambda.amazonaws.com"),
       description: `Authenticated two-person legal-hold API entry role for ${tenant.id}`,
@@ -301,6 +386,12 @@ export class TenantStack extends Stack {
       description: `Bounded legal-hold reconciliation and stale-request expiry entry role for ${tenant.id}`,
       path: "/scopeproof/workers/",
       roleName: `sp-${tenant.slug}-legal-worker`,
+    });
+    const apiAuditSignerExecutionRole = new iam.Role(this, "TenantApiAuditSignerExecutionRole", {
+      assumedBy: new iam.ServicePrincipal("lambda.amazonaws.com"),
+      description: `KMS signer for only leased immutable public API audit rows in ${tenant.id}`,
+      path: "/scopeproof/workers/",
+      roleName: `sp-${tenant.slug}-audit-signer`,
     });
     const tenantLegalHoldWorkflowRole = new iam.Role(this, "TenantLegalHoldWorkflowRole", {
       assumedBy: new iam.ArnPrincipal(tenantLegalHoldApiExecutionRole.roleArn),
@@ -319,6 +410,13 @@ export class TenantStack extends Stack {
       path: "/scopeproof/tenants/",
       roleName: `sp-${tenant.slug}-data`,
     });
+    const tenantEvidenceReadRole = new iam.Role(this, "TenantEvidenceReadRole", {
+      assumedBy: new iam.ArnPrincipal(tenantEvidenceReadApiExecutionRole.roleArn),
+      description: `Exact-version evidence metadata and download boundary for ${tenant.id}`,
+      maxSessionDuration: Duration.hours(1),
+      path: "/scopeproof/tenants/",
+      roleName: `sp-${tenant.slug}-read`,
+    });
     const evidenceControlRole = new iam.Role(this, "TenantEvidenceControlRole", {
       assumedBy: new iam.ArnPrincipal(tenantLegalHoldWorkerExecutionRole.roleArn),
       description: `Dedicated signed-audit and exact-version legal-hold boundary for ${tenant.id}`,
@@ -328,12 +426,6 @@ export class TenantStack extends Stack {
       path: "/scopeproof/tenants/",
       roleName: tenantEvidenceControlRoleName(tenant),
     });
-    const quarantineEncryptionContext = Buffer.from(
-      JSON.stringify({
-        scopeproofPurpose: "quarantine",
-        scopeproofTenantId: tenant.id,
-      }),
-    ).toString("base64");
     tenantDataRole.addToPolicy(
       new iam.PolicyStatement({
         actions: [
@@ -345,6 +437,32 @@ export class TenantStack extends Stack {
         resources: [shared.databaseCluster.clusterArn, databaseSecret.secretArn],
       }),
     );
+    tenantEvidenceReadRole.addToPolicy(new iam.PolicyStatement({
+      actions: [
+        "rds-data:BeginTransaction",
+        "rds-data:CommitTransaction",
+        "rds-data:ExecuteStatement",
+        "rds-data:RollbackTransaction",
+      ],
+      resources: [shared.databaseCluster.clusterArn, readDatabaseSecret.secretArn],
+    }));
+    readDatabaseSecret.grantRead(tenantEvidenceReadRole);
+    evidenceCursorSecret.grantRead(tenantEvidenceReadRole);
+    tenantEvidenceReadRole.addToPolicy(new iam.PolicyStatement({
+      actions: ["s3:GetObjectVersion"],
+      resources: [evidenceBucket.arnForObjects(`tenants/${tenant.id}/controls/*/evidence/*`)],
+    }));
+    tenantEvidenceReadRole.addToPolicy(new iam.PolicyStatement({
+      actions: ["kms:Decrypt"],
+      conditions: {
+        StringEquals: {
+          "kms:EncryptionContext:scopeproofPurpose": "immutable-evidence",
+          "kms:EncryptionContext:scopeproofTenantId": tenant.id,
+          "kms:ViaService": `s3.${this.region}.amazonaws.com`,
+        },
+      },
+      resources: [tenantKey.keyArn],
+    }));
     databaseSecret.grantRead(tenantDataRole);
     uploadIdempotencySecret.grantRead(tenantDataRole);
     tenantDataRole.addToPolicy(new iam.PolicyStatement({
@@ -379,7 +497,6 @@ export class TenantStack extends Stack {
           StringEquals: {
             "s3:x-amz-server-side-encryption": "aws:kms",
             "s3:x-amz-server-side-encryption-aws-kms-key-id": tenantKey.keyArn,
-            "s3:x-amz-server-side-encryption-context": quarantineEncryptionContext,
           },
         },
         resources: [ingestBucket.arnForObjects(`tenants/${tenant.id}/controls/*/quarantine/*`)],
@@ -415,6 +532,20 @@ export class TenantStack extends Stack {
       actions: ["s3:GetObjectLegalHold", "s3:PutObjectLegalHold"],
       resources: [evidenceBucket.arnForObjects(`tenants/${tenant.id}/controls/*/evidence/*`)],
     }));
+    apiAuditSignerExecutionRole.addToPolicy(new iam.PolicyStatement({
+      actions: [
+        "rds-data:BeginTransaction",
+        "rds-data:CommitTransaction",
+        "rds-data:ExecuteStatement",
+        "rds-data:RollbackTransaction",
+      ],
+      resources: [shared.databaseCluster.clusterArn, auditSignerDatabaseSecret.secretArn],
+    }));
+    auditSignerDatabaseSecret.grantRead(apiAuditSignerExecutionRole);
+    apiAuditSignerExecutionRole.addToPolicy(new iam.PolicyStatement({
+      actions: ["kms:Sign", "kms:Verify"],
+      resources: [auditSigningKey.keyArn],
+    }));
 
     tenantApiExecutionRole.addToPolicy(new iam.PolicyStatement({
       actions: ["dynamodb:GetItem"],
@@ -426,6 +557,30 @@ export class TenantStack extends Stack {
       },
       resources: [shared.controlTable.tableArn],
     }));
+    tenantEvidenceReadApiExecutionRole.addToPolicy(new iam.PolicyStatement({
+      actions: ["dynamodb:GetItem"],
+      conditions: {
+        Null: { "dynamodb:LeadingKeys": "false" },
+        "ForAllValues:StringEquals": {
+          "dynamodb:LeadingKeys": [`DOMAIN#${apiHostname}`],
+        },
+      },
+      resources: [shared.controlTable.tableArn],
+    }));
+    tenantEvidenceReadApiExecutionRole.addToPolicy(new iam.PolicyStatement({
+      actions: ["dynamodb:TransactWriteItems"],
+      conditions: {
+        Null: { "dynamodb:LeadingKeys": "false" },
+        "ForAllValues:StringEquals": {
+          "dynamodb:LeadingKeys": [`TENANT#${tenant.id}`],
+        },
+      },
+      resources: [shared.controlTable.tableArn],
+    }));
+    tenantEvidenceReadApiExecutionRole.addToPolicy(new iam.PolicyStatement({
+      actions: ["sts:AssumeRole"],
+      resources: [tenantEvidenceReadRole.roleArn],
+    }));
     tenantApiExecutionRole.addToPolicy(new iam.PolicyStatement({
       actions: ["sts:AssumeRole"],
       resources: [tenantDataRole.roleArn],
@@ -436,6 +591,16 @@ export class TenantStack extends Stack {
         Null: { "dynamodb:LeadingKeys": "false" },
         "ForAllValues:StringEquals": {
           "dynamodb:LeadingKeys": [`DOMAIN#${apiHostname}`],
+        },
+      },
+      resources: [shared.controlTable.tableArn],
+    }));
+    tenantLegalHoldApiExecutionRole.addToPolicy(new iam.PolicyStatement({
+      actions: ["dynamodb:TransactWriteItems"],
+      conditions: {
+        Null: { "dynamodb:LeadingKeys": "false" },
+        "ForAllValues:StringEquals": {
+          "dynamodb:LeadingKeys": [`TENANT#${tenant.id}`],
         },
       },
       resources: [shared.controlTable.tableArn],
@@ -481,7 +646,7 @@ export class TenantStack extends Stack {
       entry: path.join(__dirname, "..", "runtime", "tenant-api", "index.ts"),
       environment: {
         API_HOSTNAME: apiHostname,
-        COGNITO_APP_CLIENT_ID: userPoolClient.userPoolClientId,
+        COGNITO_APP_CLIENT_IDS: JSON.stringify([userPoolClient.userPoolClientId, nativeUserPoolClient.userPoolClientId]),
         COGNITO_ISSUER: `https://${shared.userPool.userPoolProviderName}`,
         CONTROL_TABLE_NAME: shared.controlTable.tableName,
         DATABASE_CLUSTER_ARN: shared.databaseCluster.clusterArn,
@@ -499,8 +664,53 @@ export class TenantStack extends Stack {
       logGroup: tenantApiLogGroup,
       memorySize: 512,
       projectRoot: path.join(__dirname, ".."),
-      reservedConcurrentExecutions: 5,
+      reservedConcurrentExecutions: concurrency.tenantApi,
       role: tenantApiExecutionRole,
+      runtime: lambda.Runtime.NODEJS_22_X,
+      timeout: Duration.seconds(28),
+    });
+
+    const tenantEvidenceReadApiLogGroup = new logs.LogGroup(this, "TenantEvidenceReadApiLogs", {
+      encryptionKey: tenantKey,
+      removalPolicy: RemovalPolicy.RETAIN,
+      retention: logs.RetentionDays.ONE_YEAR,
+    });
+    tenantEvidenceReadApiExecutionRole.addToPolicy(new iam.PolicyStatement({
+      actions: ["logs:CreateLogStream", "logs:PutLogEvents"],
+      resources: [`${tenantEvidenceReadApiLogGroup.logGroupArn}:*`],
+    }));
+    const tenantEvidenceReadApi = new lambdaNodejs.NodejsFunction(this, "TenantEvidenceReadApiFunction", {
+      architecture: lambda.Architecture.ARM_64,
+      bundling: {
+        externalModules: [],
+        minify: true,
+        sourceMap: false,
+        target: "node22",
+      },
+      depsLockFilePath: path.join(__dirname, "..", "pnpm-lock.yaml"),
+      description: `Authenticated exact-version evidence listing and download issuer for ${tenant.id}`,
+      entry: path.join(__dirname, "..", "runtime", "tenant-evidence-read-api", "index.ts"),
+      environment: {
+        API_HOSTNAME: apiHostname,
+        AWS_ACCOUNT_ID_EXPECTED: this.account,
+        COGNITO_APP_CLIENT_IDS: JSON.stringify([userPoolClient.userPoolClientId, nativeUserPoolClient.userPoolClientId]),
+        COGNITO_ISSUER: `https://${shared.userPool.userPoolProviderName}`,
+        CONTROL_TABLE_NAME: shared.controlTable.tableName,
+        DATABASE_CLUSTER_ARN: shared.databaseCluster.clusterArn,
+        DATABASE_NAME: databaseIdentifier,
+        DATABASE_SECRET_ARN: readDatabaseSecret.secretArn,
+        EVIDENCE_BUCKET_NAME: evidenceBucket.bucketName,
+        TENANT_ID: tenant.id,
+        TENANT_READ_ROLE_ARN: tenantEvidenceReadRole.roleArn,
+        EVIDENCE_CURSOR_SECRET_ARN: evidenceCursorSecret.secretArn,
+        WEB_ORIGIN: tenantOrigin,
+      },
+      handler: "handler",
+      logGroup: tenantEvidenceReadApiLogGroup,
+      memorySize: 384,
+      projectRoot: path.join(__dirname, ".."),
+      reservedConcurrentExecutions: concurrency.evidenceReadApi,
+      role: tenantEvidenceReadApiExecutionRole,
       runtime: lambda.Runtime.NODEJS_22_X,
       timeout: Duration.seconds(28),
     });
@@ -527,7 +737,7 @@ export class TenantStack extends Stack {
       entry: path.join(__dirname, "..", "runtime", "tenant-legal-hold-api", "index.ts"),
       environment: {
         API_HOSTNAME: apiHostname,
-        COGNITO_APP_CLIENT_ID: userPoolClient.userPoolClientId,
+        COGNITO_APP_CLIENT_IDS: JSON.stringify([userPoolClient.userPoolClientId, nativeUserPoolClient.userPoolClientId]),
         COGNITO_ISSUER: `https://${shared.userPool.userPoolProviderName}`,
         CONTROL_TABLE_NAME: shared.controlTable.tableName,
         DATABASE_CLUSTER_ARN: shared.databaseCluster.clusterArn,
@@ -542,7 +752,7 @@ export class TenantStack extends Stack {
       logGroup: tenantLegalHoldApiLogGroup,
       memorySize: 384,
       projectRoot: path.join(__dirname, ".."),
-      reservedConcurrentExecutions: 2,
+      reservedConcurrentExecutions: concurrency.legalHoldApi,
       role: tenantLegalHoldApiExecutionRole,
       runtime: lambda.Runtime.NODEJS_22_X,
       timeout: Duration.seconds(28),
@@ -584,7 +794,7 @@ export class TenantStack extends Stack {
       logGroup: legalHoldWorkerLogGroup,
       memorySize: 512,
       projectRoot: path.join(__dirname, ".."),
-      reservedConcurrentExecutions: 1,
+      reservedConcurrentExecutions: concurrency.legalHoldWorker,
       role: tenantLegalHoldWorkerExecutionRole,
       runtime: lambda.Runtime.NODEJS_22_X,
       timeout: Duration.minutes(5),
@@ -649,6 +859,122 @@ export class TenantStack extends Stack {
       alarm.addAlarmAction(new cloudwatchActions.SnsAction(shared.operationsTopic));
     }
 
+    const apiAuditSignerLogGroup = new logs.LogGroup(this, "TenantApiAuditSignerLogs", {
+      encryptionKey: tenantKey,
+      removalPolicy: RemovalPolicy.RETAIN,
+      retention: logs.RetentionDays.ONE_YEAR,
+    });
+    apiAuditSignerExecutionRole.addToPolicy(new iam.PolicyStatement({
+      actions: ["logs:CreateLogStream", "logs:PutLogEvents"],
+      resources: [`${apiAuditSignerLogGroup.logGroupArn}:*`],
+    }));
+    const apiAuditSigner = new lambdaNodejs.NodejsFunction(this, "TenantApiAuditSigner", {
+      architecture: lambda.Architecture.ARM_64,
+      bundling: {
+        externalModules: [],
+        minify: true,
+        sourceMap: false,
+        target: "node22",
+      },
+      depsLockFilePath: path.join(__dirname, "..", "pnpm-lock.yaml"),
+      description: `Bounded KMS signer for immutable public API audit rows in ${tenant.id}`,
+      entry: path.join(__dirname, "..", "runtime", "sign-api-audit-outbox", "index.ts"),
+      environment: {
+        API_AUDIT_BATCH_LIMIT: "10",
+        API_AUDIT_DATABASE_SECRET_ARN: auditSignerDatabaseSecret.secretArn,
+        API_AUDIT_LEASE_SECONDS: "120",
+        AUDIT_SIGNING_KEY_ARN: auditSigningKey.keyArn,
+        DATABASE_CLUSTER_ARN: shared.databaseCluster.clusterArn,
+        DATABASE_NAME: databaseIdentifier,
+        TENANT_ID: tenant.id,
+      },
+      handler: "handler",
+      logGroup: apiAuditSignerLogGroup,
+      memorySize: 256,
+      projectRoot: path.join(__dirname, ".."),
+      reservedConcurrentExecutions: concurrency.apiAuditSigner,
+      role: apiAuditSignerExecutionRole,
+      runtime: lambda.Runtime.NODEJS_22_X,
+      timeout: Duration.minutes(1),
+    });
+    const apiAuditSignerDeadLetterQueue = new sqs.Queue(this, "TenantApiAuditSignerDeadLetterQueue", {
+      enforceSSL: true,
+      encryption: sqs.QueueEncryption.KMS_MANAGED,
+      removalPolicy: RemovalPolicy.RETAIN,
+      retentionPeriod: Duration.days(14),
+    });
+    new events.Rule(this, "TenantApiAuditSignerSchedule", {
+      description: `Signs a bounded batch of immutable public API audit rows for ${tenant.id}`,
+      schedule: events.Schedule.rate(Duration.minutes(1)),
+      targets: [new eventTargets.LambdaFunction(apiAuditSigner, {
+        deadLetterQueue: apiAuditSignerDeadLetterQueue,
+        maxEventAge: Duration.minutes(5),
+        retryAttempts: 2,
+      })],
+    });
+    const apiAuditMetric = (metricName: string, statistic: string) => new cloudwatch.Metric({
+      namespace: "Scopeproof/ApiAudit",
+      metricName,
+      dimensionsMap: { TenantId: tenant.id },
+      period: Duration.minutes(1),
+      statistic,
+    });
+    for (const alarm of [
+      new cloudwatch.Alarm(this, "ApiAuditSignerFailureAlarm", {
+        alarmDescription: `A public API audit row could not be signed for ${tenant.id}.`,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        evaluationPeriods: 1,
+        metric: apiAuditMetric("Failures", "Maximum"),
+        threshold: 1,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+      new cloudwatch.Alarm(this, "ApiAuditDeadLetterAlarm", {
+        alarmDescription: `A public API audit row requires operator remediation for ${tenant.id}.`,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        evaluationPeriods: 1,
+        metric: apiAuditMetric("DeadLetteredCount", "Maximum"),
+        threshold: 1,
+        treatMissingData: cloudwatch.TreatMissingData.BREACHING,
+      }),
+      new cloudwatch.Alarm(this, "ApiAuditBacklogAgeAlarm", {
+        alarmDescription: `A public API audit row has remained unsigned for at least five minutes in ${tenant.id}.`,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        evaluationPeriods: 2,
+        metric: apiAuditMetric("OldestUnsignedAgeSeconds", "Maximum"),
+        threshold: 300,
+        treatMissingData: cloudwatch.TreatMissingData.BREACHING,
+      }),
+      new cloudwatch.Alarm(this, "ApiAuditSignerLambdaErrorAlarm", {
+        alarmDescription: `The public API audit signer Lambda failed for ${tenant.id}.`,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        evaluationPeriods: 1,
+        metric: apiAuditSigner.metricErrors({ period: Duration.minutes(1), statistic: "Sum" }),
+        threshold: 1,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+      new cloudwatch.Alarm(this, "ApiAuditSignerThrottleAlarm", {
+        alarmDescription: `The public API audit signer Lambda was throttled for ${tenant.id}.`,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        evaluationPeriods: 1,
+        metric: apiAuditSigner.metricThrottles({ period: Duration.minutes(1), statistic: "Sum" }),
+        threshold: 1,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+      new cloudwatch.Alarm(this, "ApiAuditSignerInvocationDeadLetterAlarm", {
+        alarmDescription: `The public API audit signer schedule exhausted delivery retries for ${tenant.id}.`,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+        evaluationPeriods: 1,
+        metric: apiAuditSignerDeadLetterQueue.metricApproximateNumberOfMessagesVisible({
+          period: Duration.minutes(1),
+          statistic: "Maximum",
+        }),
+        threshold: 1,
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      }),
+    ]) {
+      alarm.addAlarmAction(new cloudwatchActions.SnsAction(shared.operationsTopic));
+    }
+
     const tenantApiAccessLogs = new logs.LogGroup(this, "TenantApiAccessLogs", {
       encryptionKey: tenantKey,
       removalPolicy: RemovalPolicy.RETAIN,
@@ -705,6 +1031,10 @@ export class TenantStack extends Stack {
       allowTestInvoke: false,
       proxy: true,
     });
+    const evidenceReadIntegration = new apigateway.LambdaIntegration(tenantEvidenceReadApi, {
+      allowTestInvoke: false,
+      proxy: true,
+    });
     const legalHoldIntegration = new apigateway.LambdaIntegration(tenantLegalHoldApi, {
       allowTestInvoke: false,
       proxy: true,
@@ -742,6 +1072,8 @@ export class TenantStack extends Stack {
     const version = api.root.addResource("v1");
     const me = version.addResource("me");
     me.addMethod("GET", integration);
+    const collector = version.addResource("collector");
+    collector.addResource("me").addMethod("GET", integration);
     const uploadIntents = version.addResource("upload-intents");
     const uploadModel = api.addModel("UploadIntentRequestModel", {
       contentType: "application/json",
@@ -753,7 +1085,8 @@ export class TenantStack extends Stack {
         additionalProperties: false,
         required: [
           "assessmentId", "capturedAt", "contentType", "controlId", "description",
-          "deviceId", "evidenceId", "evidenceType", "expectedSha256", "expectedSize", "idempotencyKey",
+          "deviceId", "deviceManifest", "devicePublicKeySpki", "deviceSignature",
+          "evidenceId", "evidenceType", "expectedSha256", "expectedSize", "idempotencyKey",
           "metadata", "source", "systemName", "title",
         ],
         properties: {
@@ -763,6 +1096,34 @@ export class TenantStack extends Stack {
           controlId: { type: apigateway.JsonSchemaType.STRING, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" },
           description: { type: apigateway.JsonSchemaType.STRING, maxLength: 8_000 },
           deviceId: { type: apigateway.JsonSchemaType.STRING, pattern: "^dev_[a-f0-9]{32}$" },
+          deviceManifest: {
+            type: apigateway.JsonSchemaType.OBJECT,
+            additionalProperties: false,
+            required: [
+              "schemaVersion", "tenantId", "userId", "deviceId", "assessmentId", "controlId",
+              "evidenceId", "expectedSha256", "expectedSize", "contentType", "capturedAt",
+              "challenge", "nonce", "sequence", "signedAt",
+            ],
+            properties: {
+              schemaVersion: { type: apigateway.JsonSchemaType.INTEGER, enum: [1] },
+              tenantId: { type: apigateway.JsonSchemaType.STRING, pattern: "^ten_[a-f0-9]{32}$" },
+              userId: { type: apigateway.JsonSchemaType.STRING, pattern: "^usr_[a-f0-9]{32}$" },
+              deviceId: { type: apigateway.JsonSchemaType.STRING, pattern: "^dev_[a-f0-9]{32}$" },
+              assessmentId: { type: apigateway.JsonSchemaType.STRING, pattern: "^asm_[a-f0-9]{32}$" },
+              controlId: { type: apigateway.JsonSchemaType.STRING, pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" },
+              evidenceId: { type: apigateway.JsonSchemaType.STRING, pattern: "^evd_[a-f0-9]{32}$" },
+              expectedSha256: { type: apigateway.JsonSchemaType.STRING, pattern: "^[a-f0-9]{64}$" },
+              expectedSize: { type: apigateway.JsonSchemaType.INTEGER, minimum: 1, maximum: 26_214_400 },
+              contentType: { type: apigateway.JsonSchemaType.STRING, enum: ["image/png", "application/json", "application/spdx+json", "application/vnd.cyclonedx+json", "text/plain", "text/csv"] },
+              capturedAt: { type: apigateway.JsonSchemaType.STRING, minLength: 24, maxLength: 24 },
+              challenge: { type: apigateway.JsonSchemaType.STRING, minLength: 8, maxLength: 200 },
+              nonce: { type: apigateway.JsonSchemaType.STRING, minLength: 16, maxLength: 200 },
+              sequence: { type: apigateway.JsonSchemaType.INTEGER, minimum: 1, maximum: 9_007_199_254_740_991 },
+              signedAt: { type: apigateway.JsonSchemaType.STRING, minLength: 24, maxLength: 24 },
+            },
+          },
+          devicePublicKeySpki: { type: apigateway.JsonSchemaType.STRING, minLength: 108, maxLength: 216 },
+          deviceSignature: { type: apigateway.JsonSchemaType.STRING, pattern: "^[A-Za-z0-9_-]{86}$" },
           evidenceId: { type: apigateway.JsonSchemaType.STRING, pattern: "^evd_[a-f0-9]{32}$" },
           evidenceType: { type: apigateway.JsonSchemaType.STRING, enum: ["SCREENSHOT", "CODE", "CONFIGURATION", "REPORT", "SBOM", "EXPORT"] },
           expectedSha256: { type: apigateway.JsonSchemaType.STRING, pattern: "^[a-f0-9]{64}$" },
@@ -778,6 +1139,55 @@ export class TenantStack extends Stack {
     uploadIntents.addMethod("POST", integration, {
       requestModels: { "application/json": uploadModel },
       requestValidator: new apigateway.RequestValidator(this, "UploadIntentRequestValidator", {
+        restApi: api,
+        validateRequestBody: true,
+        validateRequestParameters: false,
+      }),
+    });
+    const evidence = version.addResource("evidence");
+    const evidenceSearch = evidence.addResource("search");
+    const evidenceSearchModel = api.addModel("EvidenceSearchRequestModel", {
+      contentType: "application/json",
+      modelName: `Scopeproof${tenant.slug.replaceAll("-", "")}EvidenceSearchRequest`,
+      schema: {
+        schema: apigateway.JsonSchemaVersion.DRAFT4,
+        title: "Scopeproof evidence search request",
+        type: apigateway.JsonSchemaType.OBJECT,
+        additionalProperties: false,
+        required: ["cursor", "limit"],
+        properties: {
+          cursor: { type: [apigateway.JsonSchemaType.STRING, apigateway.JsonSchemaType.NULL], minLength: 80, maxLength: 1_500 },
+          limit: { type: apigateway.JsonSchemaType.INTEGER, minimum: 1, maximum: 100 },
+        },
+      },
+    });
+    evidenceSearch.addMethod("POST", evidenceReadIntegration, {
+      requestModels: { "application/json": evidenceSearchModel },
+      requestValidator: new apigateway.RequestValidator(this, "EvidenceSearchRequestValidator", {
+        restApi: api,
+        validateRequestBody: true,
+        validateRequestParameters: false,
+      }),
+    });
+    const evidenceDownloadIntents = version.addResource("evidence-download-intents");
+    const evidenceDownloadModel = api.addModel("EvidenceDownloadIntentRequestModel", {
+      contentType: "application/json",
+      modelName: `Scopeproof${tenant.slug.replaceAll("-", "")}EvidenceDownloadIntentRequest`,
+      schema: {
+        schema: apigateway.JsonSchemaVersion.DRAFT4,
+        title: "Scopeproof exact-version evidence download request",
+        type: apigateway.JsonSchemaType.OBJECT,
+        additionalProperties: false,
+        required: ["evidenceId", "expectedRevision"],
+        properties: {
+          evidenceId: { type: apigateway.JsonSchemaType.STRING, pattern: "^evd_[a-f0-9]{32}$" },
+          expectedRevision: { type: apigateway.JsonSchemaType.INTEGER, minimum: 0, maximum: 2_147_483_647 },
+        },
+      },
+    });
+    evidenceDownloadIntents.addMethod("POST", evidenceReadIntegration, {
+      requestModels: { "application/json": evidenceDownloadModel },
+      requestValidator: new apigateway.RequestValidator(this, "EvidenceDownloadIntentRequestValidator", {
         restApi: api,
         validateRequestBody: true,
         validateRequestParameters: false,
@@ -917,7 +1327,7 @@ export class TenantStack extends Stack {
             const databaseOutput = `${outputDir}/database`;
             return [
               `mkdir -p "${databaseOutput}"`,
-              ...["001_tenant_schema.sql", "002_runtime_role.sql", "003_ingest_role.sql", "004_evidence_control_role.sql", "005_legal_hold_api_role.sql"].map(
+              ...["001_tenant_schema.sql", "002_runtime_role.sql", "003_ingest_role.sql", "004_evidence_control_role.sql", "005_legal_hold_api_role.sql", "006_evidence_access_api.sql", "007_evidence_read_role.sql", "008_api_audit_signer_role.sql"].map(
                 (name) => `cp -p "${inputDir}/../database/${name}" "${databaseOutput}/${name}"`,
               ),
             ];
@@ -934,6 +1344,8 @@ export class TenantStack extends Stack {
       entry: path.join(__dirname, "..", "runtime", "provision-tenant", "index.mjs"),
       environment: {
         ADMIN_SECRET_ARN: databaseAdminSecret.secretArn,
+        API_AUDIT_DATABASE_SECRET_ARN: auditSignerDatabaseSecret.secretArn,
+        API_AUDIT_DATABASE_USERNAME: auditSignerDatabaseUsername,
         API_HOSTNAME: apiHostname,
         AWS_ACCOUNT_ID_EXPECTED: this.account,
         AWS_REGION_EXPECTED: this.region,
@@ -957,6 +1369,8 @@ export class TenantStack extends Stack {
         INGEST_DATABASE_USERNAME: ingestDatabaseUsername,
         LEGAL_API_DATABASE_SECRET_ARN: legalApiDatabaseSecret.secretArn,
         LEGAL_API_DATABASE_USERNAME: legalApiDatabaseUsername,
+        READ_DATABASE_SECRET_ARN: readDatabaseSecret.secretArn,
+        READ_DATABASE_USERNAME: readDatabaseUsername,
         TENANT_CNAME_TARGET: `${shared.branchName}.${shared.amplifyApp.attrDefaultDomain}`,
         RETENTION_DAYS: String(retentionDays),
         RETENTION_MODE: tenant.retentionMode ?? "GOVERNANCE",
@@ -967,7 +1381,7 @@ export class TenantStack extends Stack {
       logGroup: provisionerLogGroup,
       memorySize: 256,
       projectRoot: path.join(__dirname, ".."),
-      reservedConcurrentExecutions: 2,
+      reservedConcurrentExecutions: concurrency.tenantProvisioner,
       runtime: lambda.Runtime.NODEJS_22_X,
       timeout: Duration.minutes(5),
       tracing: lambda.Tracing.ACTIVE,
@@ -1000,6 +1414,8 @@ export class TenantStack extends Stack {
           ingestDatabaseSecret.secretArn,
           controlDatabaseSecret.secretArn,
           legalApiDatabaseSecret.secretArn,
+          readDatabaseSecret.secretArn,
+          auditSignerDatabaseSecret.secretArn,
         ],
       }),
     );
@@ -1028,6 +1444,8 @@ export class TenantStack extends Stack {
     ingestDatabaseSecret.grantRead(provisioner);
     controlDatabaseSecret.grantRead(provisioner);
     legalApiDatabaseSecret.grantRead(provisioner);
+    readDatabaseSecret.grantRead(provisioner);
+    auditSignerDatabaseSecret.grantRead(provisioner);
     provisioner.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ["route53:ChangeResourceRecordSets"],
@@ -1276,7 +1694,7 @@ export class TenantStack extends Stack {
       logGroup: promoterLogGroup,
       memorySize: 512,
       projectRoot: path.join(__dirname, ".."),
-      reservedConcurrentExecutions: 5,
+      reservedConcurrentExecutions: concurrency.evidencePromoter,
       runtime: lambda.Runtime.NODEJS_22_X,
       timeout: Duration.minutes(5),
       tracing: lambda.Tracing.ACTIVE,
@@ -1374,7 +1792,7 @@ export class TenantStack extends Stack {
         tenant,
         hostname,
         apiHostname,
-        userPoolClient.userPoolClientId,
+        [userPoolClient.userPoolClientId, nativeUserPoolClient.userPoolClientId],
         tenantDataRole.roleArn,
         ingestBucket.bucketName,
         evidenceBucket.bucketName,
@@ -1393,7 +1811,7 @@ export class TenantStack extends Stack {
         tenant,
         hostname,
         apiHostname,
-        userPoolClient.userPoolClientId,
+        [userPoolClient.userPoolClientId, nativeUserPoolClient.userPoolClientId],
         tenantDataRole.roleArn,
         ingestBucket.bucketName,
         evidenceBucket.bucketName,
@@ -1417,7 +1835,9 @@ export class TenantStack extends Stack {
     new CfnOutput(this, "TenantApiOrigin", { value: `https://${apiHostname}` });
     new CfnOutput(this, "TenantId", { value: tenant.id });
     new CfnOutput(this, "CognitoAppClientId", { value: userPoolClient.userPoolClientId });
+    new CfnOutput(this, "CognitoNativeAppClientId", { value: nativeUserPoolClient.userPoolClientId });
     new CfnOutput(this, "TenantDataRoleArn", { value: tenantDataRole.roleArn });
+    new CfnOutput(this, "TenantEvidenceReadRoleArn", { value: tenantEvidenceReadRole.roleArn });
     new CfnOutput(this, "IngestBucketName", { value: ingestBucket.bucketName });
     new CfnOutput(this, "EvidenceBucketName", { value: evidenceBucket.bucketName });
     new CfnOutput(this, "EvidenceKeyArn", { value: tenantKey.keyArn });
@@ -1434,6 +1854,11 @@ export class TenantStack extends Stack {
     new CfnOutput(this, "TenantLegalHoldApiDatabaseUsername", { value: legalApiDatabaseUsername });
     new CfnOutput(this, "TenantLegalHoldApiDatabaseSecretArn", { value: legalApiDatabaseSecret.secretArn });
     new CfnOutput(this, "TenantUploadIdempotencySecretArn", { value: uploadIdempotencySecret.secretArn });
+    new CfnOutput(this, "TenantEvidenceReadDatabaseUsername", { value: readDatabaseUsername });
+    new CfnOutput(this, "TenantEvidenceReadDatabaseSecretArn", { value: readDatabaseSecret.secretArn });
+    new CfnOutput(this, "TenantApiAuditSignerDatabaseUsername", { value: auditSignerDatabaseUsername });
+    new CfnOutput(this, "TenantApiAuditSignerDatabaseSecretArn", { value: auditSignerDatabaseSecret.secretArn });
+    new CfnOutput(this, "TenantEvidenceCursorSecretArn", { value: evidenceCursorSecret.secretArn });
     new CfnOutput(this, "TenantProvisioningStateMachineArn", {
       value: this.provisioningStateMachine.stateMachineArn,
     });
@@ -1484,7 +1909,7 @@ function tenantRegistryUpdate(
   tenant: TenantDefinition,
   hostname: string,
   apiHostname: string,
-  appClientId: string,
+  appClientIds: readonly string[],
   roleArn: string,
   ingestBucket: string,
   evidenceBucket: string,
@@ -1498,6 +1923,8 @@ function tenantRegistryUpdate(
   uploadIdempotencySecretArn: string,
   initializeStatus: boolean,
 ): cr.AwsSdkCall {
+  if (appClientIds.length !== 2) throw new Error("Tenant registry requires exact web and native Cognito clients.");
+  const [appClientId, nativeAppClientId] = appClientIds;
   return {
     service: "DynamoDB",
     action: "transactWriteItems",
@@ -1520,6 +1947,7 @@ function tenantRegistryUpdate(
               "#hostname = :hostname",
               "#status = :provisioning",
               "#appClientId = :appClientId",
+              "#appClientIds = :appClientIds",
               "#roleArn = :roleArn",
               "#ingestBucket = :ingestBucket",
               "#evidenceBucket = :evidenceBucket",
@@ -1541,6 +1969,7 @@ function tenantRegistryUpdate(
               "#hostname": "hostname",
               "#status": "status",
               "#appClientId": "appClientId",
+              "#appClientIds": "appClientIds",
               "#roleArn": "tenantDataRoleArn",
               "#ingestBucket": "ingestBucket",
               "#evidenceBucket": "evidenceBucket",
@@ -1562,6 +1991,7 @@ function tenantRegistryUpdate(
               ":hostname": { S: hostname },
               ":provisioning": { S: "PROVISIONING" },
               ":appClientId": { S: appClientId },
+              ":appClientIds": { SS: [appClientId, nativeAppClientId].sort() },
               ":roleArn": { S: roleArn },
               ":ingestBucket": { S: ingestBucket },
               ":evidenceBucket": { S: evidenceBucket },
@@ -1596,6 +2026,7 @@ function tenantRegistryUpdate(
               "#slug = :slug",
               "#displayName = :displayName",
               "#appClientId = :appClientId",
+              "#appClientIds = :appClientIds",
               "#canonical = :canonical",
               "#status = :provisioning",
             ].join(", "),
@@ -1607,17 +2038,19 @@ function tenantRegistryUpdate(
               "#slug": "slug",
               "#displayName": "displayName",
               "#appClientId": "appClientId",
+              "#appClientIds": "appClientIds",
               "#canonical": "canonical",
               "#status": "status",
             },
             ExpressionAttributeValues: {
               ":kind": { S: "TenantDomain" },
-              ":schemaVersion": { N: "1" },
+              ":schemaVersion": { N: "2" },
               ":tenantId": { S: tenant.id },
               ":hostname": { S: hostname },
               ":slug": { S: tenant.slug },
               ":displayName": { S: tenant.displayName },
               ":appClientId": { S: appClientId },
+              ":appClientIds": { SS: [appClientId, nativeAppClientId].sort() },
               ":canonical": { BOOL: true },
               ":provisioning": { S: "PROVISIONING" },
             },
@@ -1642,6 +2075,7 @@ function tenantRegistryUpdate(
               "#slug = :slug",
               "#displayName = :displayName",
               "#appClientId = :appClientId",
+              "#appClientIds = :appClientIds",
               "#canonical = :canonical",
               "#status = :provisioning",
             ].join(", "),
@@ -1653,17 +2087,19 @@ function tenantRegistryUpdate(
               "#slug": "slug",
               "#displayName": "displayName",
               "#appClientId": "appClientId",
+              "#appClientIds": "appClientIds",
               "#canonical": "canonical",
               "#status": "status",
             },
             ExpressionAttributeValues: {
               ":kind": { S: "TenantDomain" },
-              ":schemaVersion": { N: "1" },
+              ":schemaVersion": { N: "2" },
               ":tenantId": { S: tenant.id },
               ":hostname": { S: apiHostname },
               ":slug": { S: tenant.slug },
               ":displayName": { S: tenant.displayName },
               ":appClientId": { S: appClientId },
+              ":appClientIds": { SS: [appClientId, nativeAppClientId].sort() },
               ":canonical": { BOOL: true },
               ":provisioning": { S: "PROVISIONING" },
             },

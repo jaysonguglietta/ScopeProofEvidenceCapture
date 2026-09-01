@@ -17,9 +17,13 @@ import { SharedPlatformStack } from "../lib/shared-platform-stack";
 import { TenantStack } from "../lib/tenant-stack";
 
 const app = new App();
-const rootDomain = validateRootDomain(app.node.tryGetContext("rootDomain") ?? "jsontechology.com");
+const rootDomain = validateRootDomain(app.node.tryGetContext("rootDomain"));
 const branchName = validateBranchName(app.node.tryGetContext("branchName") ?? "main");
 const hostedZoneId = app.node.tryGetContext("hostedZoneId") as string | undefined;
+const createHostedZone = String(app.node.tryGetContext("createHostedZone") ?? "false").trim().toLowerCase() === "true";
+if (Boolean(hostedZoneId) === createHostedZone) {
+  throw new Error("Specify exactly one of hostedZoneId or -c createHostedZone=true after reviewing Route 53 ownership and cost.");
+}
 const alertEmail = validateAlertEmail(app.node.tryGetContext("alertEmail"));
 const monthlyBudgetUsd = validateMonthlyBudgetUsd(app.node.tryGetContext("monthlyBudgetUsd"));
 const tenants = parseTenants(app.node.tryGetContext("tenants"));
@@ -68,6 +72,7 @@ if (recovery.mode === "bootstrap") {
     rootDomain,
     branchName,
     hostedZoneId,
+    createHostedZone,
     tenantSlugs: tenants.map((tenant) => tenant.slug),
     alertEmail,
     monthlyBudgetUsd,
@@ -91,17 +96,15 @@ if (recovery.mode === "bootstrap") {
     tenantStacks.push(stack);
   }
 
-  if (tenantStacks.length > 0) {
-    const observability = new ObservabilityStack(app, "ScopeproofObservability", {
-      env,
-      shared,
-      tenants: tenantStacks,
-      description: "Central, immutable audit trail for Scopeproof tenant data planes",
-    });
-    observability.addStackDependency(shared);
-    for (const tenant of tenantStacks) {
-      observability.addStackDependency(tenant);
-    }
+  const observability = new ObservabilityStack(app, "ScopeproofObservability", {
+    env,
+    shared,
+    tenants: tenantStacks,
+    description: "Central, immutable audit trail for Scopeproof platform and tenant data planes",
+  });
+  observability.addStackDependency(shared);
+  for (const tenant of tenantStacks) {
+    observability.addStackDependency(tenant);
   }
 }
 

@@ -74,13 +74,15 @@ enum EvidenceLibraryBuilder {
     ) -> [String: S3EvidenceReceiptBinding] {
         guard settings.isConfigured, destination.matches(settings) else { return [:] }
         let candidates = entries.compactMap { entry -> S3EvidenceReceiptBinding? in
-            guard let receiptData = try? Data(contentsOf: entry.s3ReceiptURL, options: [.mappedIfSafe]),
-                  receiptData.count <= 2 * 1024 * 1024,
-                  let manifestData = try? Data(contentsOf: entry.manifestURL, options: [.mappedIfSafe]),
-                  manifestData.count <= 2 * 1024 * 1024,
+            let root = entry.evidenceRoot ?? entry.manifestURL.deletingLastPathComponent()
+            guard let artifact = try? ValidatedEvidenceArtifact.load(entry, requireLifecycle: false),
+                  let receiptData = try? ValidatedEvidenceArtifact.readBoundedRegularFile(
+                    at: entry.s3ReceiptURL, within: root,
+                    maximumBytes: ValidatedEvidenceArtifact.maximumSidecarBytes
+                  ),
                   let receipt = try? JSONDecoder().decode(S3UploadReceipt.self, from: receiptData),
-                  receipt.schemaVersion == 2,
-                  receipt.evidenceID == entry.manifest.evidenceID,
+                  [2, 3].contains(receipt.schemaVersion),
+                  receipt.evidenceID == artifact.manifest.evidenceID,
                   receipt.bucket == settings.bucket,
                   receipt.region == settings.region,
                   receipt.awsAccountID == destination.accountID,
@@ -89,18 +91,22 @@ enum EvidenceLibraryBuilder {
                   receipt.kmsKeyARN == settings.kmsKeyARN,
                   receipt.retentionMode == settings.retentionMode.rawValue,
                   receipt.retentionDays == settings.retentionDays,
-                  receipt.screenshotSHA256 == entry.manifest.sha256,
-                  receipt.manifestSHA256 == sha256(manifestData),
+                  receipt.screenshotSHA256 == artifact.manifest.sha256,
+                  receipt.manifestSHA256 == sha256(artifact.manifestData),
                   isSHA256(receipt.screenshotSHA256), isSHA256(receipt.manifestSHA256),
                   receipt.objectKeys.count == 2, Set(receipt.objectKeys).count == 2,
-                  let imageKey = receipt.objectKeys.first(where: { lastPathComponent($0) == entry.manifest.screenshotFilename }),
+                  let imageKey = receipt.objectKeys.first(where: { lastPathComponent($0) == artifact.manifest.screenshotFilename }),
                   let manifestKey = receipt.objectKeys.first(where: { lastPathComponent($0) == entry.manifestURL.lastPathComponent }),
                   imageKey != manifestKey,
                   parentKey(imageKey) == parentKey(manifestKey),
-                  isExpectedLayout(imageKey, evidenceID: entry.manifest.evidenceID, prefix: settings.prefix),
-                  isExpectedLayout(manifestKey, evidenceID: entry.manifest.evidenceID, prefix: settings.prefix),
+                  isExpectedLayout(imageKey, evidenceID: artifact.manifest.evidenceID, prefix: settings.prefix),
+                  isExpectedLayout(manifestKey, evidenceID: artifact.manifest.evidenceID, prefix: settings.prefix),
                   let imageVersion = receipt.versionIDs[imageKey], !imageVersion.isEmpty, imageVersion != "null",
                   let manifestVersion = receipt.versionIDs[manifestKey], !manifestVersion.isEmpty, manifestVersion != "null",
+                  receipt.schemaVersion < 3 || settings.securityProfile != .production || (
+                    receipt.retainUntilByObjectKey?[imageKey]?.isEmpty == false &&
+                    receipt.retainUntilByObjectKey?[manifestKey]?.isEmpty == false
+                  ),
                   let imageETag = receipt.etags[imageKey], !imageETag.isEmpty,
                   let manifestETag = receipt.etags[manifestKey], !manifestETag.isEmpty,
                   checksumHex(receipt.s3ChecksumsSHA256[imageKey]) == receipt.screenshotSHA256,

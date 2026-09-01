@@ -3,6 +3,7 @@
 @MainActor
 final class S3ObjectBrowserController: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate, NSWindowDelegate {
     private let service: S3StorageService
+    private let credentialProvider: S3CredentialProvider
     private var settings: S3StorageSettings = .defaults
     private var binding: S3VerifiedDestination?
     private var window: NSWindow?
@@ -22,10 +23,13 @@ final class S3ObjectBrowserController: NSObject, NSTableViewDataSource, NSTableV
     private let downloadButton = NSButton(title: "Download Selected…", target: nil, action: nil)
     private let revealButton = NSButton(title: "Reveal Download", target: nil, action: nil)
 
-    init(service: S3StorageService) { self.service = service }
+    init(service: S3StorageService, credentialProvider: S3CredentialProvider) {
+        self.service = service
+        self.credentialProvider = credentialProvider
+    }
 
     func show(settings: S3StorageSettings) {
-        guard settings.canUpload, settings.downloadsAllowed, KeychainStore.readS3Credentials() != nil,
+        guard settings.canUpload, settings.downloadsAllowed, S3CredentialProvider.hasConfiguredSource(settings),
               let binding = KeychainStore.readS3VerifiedDestination(), binding.matches(settings) else {
             presentStandaloneError(settings.isConfigured ? S3StorageFailure.verificationRequired : S3StorageFailure.notConfigured)
             return
@@ -162,7 +166,7 @@ final class S3ObjectBrowserController: NSObject, NSTableViewDataSource, NSTableV
 
     private func refresh() {
         guard listTask == nil, downloadTask == nil else { return }
-        guard let credentials = KeychainStore.readS3Credentials(), let binding, binding.matches(settings) else {
+        guard let binding, binding.matches(settings) else {
             presentError(S3StorageFailure.destinationBindingMismatch); return
         }
         operationGeneration += 1
@@ -170,6 +174,7 @@ final class S3ObjectBrowserController: NSObject, NSTableViewDataSource, NSTableV
         setBusy(true, message: "Loading S3 evidence…")
         listTask = Task {
             do {
+                let credentials = try await credentialProvider.credentials(for: settings, binding: binding)
                 let objects = try await service.listObjects(settings: settings, credentials: credentials, binding: binding)
                 guard !Task.isCancelled, operationGeneration == generation else { return }
                 allObjects = objects
@@ -274,7 +279,7 @@ final class S3ObjectBrowserController: NSObject, NSTableViewDataSource, NSTableV
     }
 
     private func startDownload(_ object: S3StoredObject, to destination: URL) {
-        guard let credentials = KeychainStore.readS3Credentials(), let binding, binding.matches(settings) else {
+        guard let binding, binding.matches(settings) else {
             presentError(S3StorageFailure.destinationBindingMismatch); return
         }
         operationGeneration += 1
@@ -282,6 +287,7 @@ final class S3ObjectBrowserController: NSObject, NSTableViewDataSource, NSTableV
         setBusy(true, message: "Downloading \(filename(for: object))…")
         downloadTask = Task {
             do {
+                let credentials = try await credentialProvider.credentials(for: settings, binding: binding)
                 let result = try await service.downloadObject(
                     object, settings: settings, credentials: credentials, binding: binding, to: destination
                 )

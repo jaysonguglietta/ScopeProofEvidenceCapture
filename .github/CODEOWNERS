@@ -1,9 +1,15 @@
 # Production security and release surfaces require explicit owner review.
 /.github/ @jaysonguglietta
 /.openai/ @jaysonguglietta
+/.trivyignore.yaml @jaysonguglietta
 /app/api/ @jaysonguglietta
 /db/ @jaysonguglietta
 /drizzle/ @jaysonguglietta
+/infra/aws/ @jaysonguglietta
+/lib/aws-runtime/ @jaysonguglietta
 /lib/server/ @jaysonguglietta
 /macos/ @jaysonguglietta
+/package.json @jaysonguglietta
+/package-lock.json @jaysonguglietta
 /Scripts/ @jaysonguglietta
+/vendor/ @jaysonguglietta

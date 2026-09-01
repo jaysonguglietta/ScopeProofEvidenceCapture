@@ -120,6 +120,7 @@ CREATE TABLE scopeproof.device_enrollments (
   status text NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('PENDING', 'ACTIVE', 'REVOKED')),
   enrolled_at timestamptz NOT NULL DEFAULT clock_timestamp(),
   last_seen_at timestamptz,
+  last_upload_sequence bigint NOT NULL DEFAULT 0 CHECK (last_upload_sequence >= 0),
   revoked_at timestamptz,
   PRIMARY KEY (tenant_id, id),
   UNIQUE (tenant_id, device_public_key_sha256),
@@ -493,6 +494,74 @@ CREATE TABLE scopeproof.audit_events (
 );
 CREATE INDEX audit_resource ON scopeproof.audit_events (tenant_id, resource_type, resource_id, sequence DESC);
 
+-- Public APIs cannot hold the tenant KMS signing capability. They durably
+-- enqueue a minimal, server-normalized action record here; the isolated audit
+-- signer can later transform it into the immutable signed audit chain. API
+-- roles receive EXECUTE on the writer function only, never table privileges.
+CREATE TABLE scopeproof.api_audit_outbox (
+  tenant_id scopeproof.tenant_identifier NOT NULL,
+  id scopeproof.resource_identifier NOT NULL CHECK (id LIKE 'aob\_%' ESCAPE '\'),
+  occurred_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  actor_user_id scopeproof.resource_identifier NOT NULL CHECK (actor_user_id LIKE 'usr\_%' ESCAPE '\'),
+  membership_id scopeproof.resource_identifier NOT NULL CHECK (membership_id LIKE 'mem\_%' ESCAPE '\'),
+  request_id text NOT NULL CHECK (
+    char_length(request_id) BETWEEN 8 AND 128 AND
+    request_id ~ '^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$'
+  ),
+  action text NOT NULL CHECK (action IN (
+    'evidence.upload_intent_issued',
+    'evidence.search_performed',
+    'evidence.download_intent_issued',
+    'evidence.legal_hold_requested',
+    'evidence.legal_hold_approved'
+  )),
+  resource_type text NOT NULL CHECK (resource_type IN ('evidence', 'evidence_collection', 'legal_hold_operation')),
+  resource_id text NOT NULL CHECK (char_length(resource_id) BETWEEN 8 AND 200),
+  outcome text NOT NULL DEFAULT 'succeeded' CHECK (outcome = 'succeeded'),
+  idempotency_key text NOT NULL CHECK (char_length(idempotency_key) BETWEEN 16 AND 200),
+  details jsonb NOT NULL CHECK (jsonb_typeof(details) = 'object' AND octet_length(details::text) <= 16384),
+  event_digest char(64) NOT NULL CHECK (event_digest ~ '^[0-9a-f]{64}$'),
+  created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  PRIMARY KEY (tenant_id, id),
+  UNIQUE (tenant_id, idempotency_key),
+  UNIQUE (tenant_id, event_digest),
+  FOREIGN KEY (tenant_id, actor_user_id) REFERENCES scopeproof.principals (tenant_id, id) ON DELETE RESTRICT,
+  FOREIGN KEY (tenant_id, membership_id) REFERENCES scopeproof.memberships (tenant_id, id) ON DELETE RESTRICT
+);
+CREATE INDEX api_audit_outbox_pending ON scopeproof.api_audit_outbox (tenant_id, occurred_at, id);
+
+-- Mutable delivery state is deliberately separated from the immutable API
+-- action record. Only SECURITY DEFINER worker procedures may lease, retry, or
+-- complete these rows; API identities receive no access to this table.
+CREATE TABLE scopeproof.api_audit_outbox_work (
+  tenant_id scopeproof.tenant_identifier NOT NULL,
+  outbox_id scopeproof.resource_identifier NOT NULL CHECK (outbox_id LIKE 'aob\_%' ESCAPE '\'),
+  attempt_count integer NOT NULL DEFAULT 0 CHECK (attempt_count BETWEEN 0 AND 8),
+  next_attempt_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+  lease_token text CHECK (
+    lease_token IS NULL OR
+    (char_length(lease_token) BETWEEN 16 AND 128 AND lease_token ~ '^[A-Za-z0-9_-]{16,128}$')
+  ),
+  lease_expires_at timestamptz,
+  last_error_code text CHECK (last_error_code IS NULL OR last_error_code ~ '^[A-Z][A-Z0-9_]{2,63}$'),
+  last_failed_at timestamptz,
+  dead_lettered_at timestamptz,
+  completed_at timestamptz,
+  audit_event_id scopeproof.resource_identifier CHECK (audit_event_id IS NULL OR audit_event_id LIKE 'evt\_%' ESCAPE '\'),
+  audit_event_hash char(64) CHECK (audit_event_hash IS NULL OR audit_event_hash ~ '^[0-9a-f]{64}$'),
+  PRIMARY KEY (tenant_id, outbox_id),
+  FOREIGN KEY (tenant_id, outbox_id) REFERENCES scopeproof.api_audit_outbox (tenant_id, id) ON DELETE RESTRICT,
+  CHECK ((lease_token IS NULL) = (lease_expires_at IS NULL)),
+  CHECK ((last_error_code IS NULL) = (last_failed_at IS NULL)),
+  CHECK ((dead_lettered_at IS NULL) OR (attempt_count = 8 AND completed_at IS NULL)),
+  CHECK ((completed_at IS NULL) = (audit_event_id IS NULL)),
+  CHECK ((completed_at IS NULL) = (audit_event_hash IS NULL)),
+  CHECK (completed_at IS NULL OR (lease_token IS NULL AND dead_lettered_at IS NULL))
+);
+CREATE INDEX api_audit_outbox_work_due
+  ON scopeproof.api_audit_outbox_work (tenant_id, next_attempt_at, outbox_id)
+  WHERE completed_at IS NULL AND dead_lettered_at IS NULL;
+
 CREATE FUNCTION scopeproof.advance_audit_head()
 RETURNS trigger
 LANGUAGE plpgsql
@@ -622,7 +691,9 @@ SECURITY DEFINER
 SET search_path = pg_catalog, scopeproof
 AS $$
 BEGIN
-  IF TG_TABLE_NAME = 'upload_intents' AND
+  IF TG_TABLE_NAME = 'api_audit_outbox' THEN
+    RAISE EXCEPTION 'API audit outbox records are immutable' USING ERRCODE = '42501';
+  ELSIF TG_TABLE_NAME = 'upload_intents' AND
      (to_jsonb(NEW) - ARRAY[
        'status', 'revision', 'consumed_at', 'promotion_fence',
        'promotion_attempt_id', 'promotion_lease_expires_at'
@@ -853,7 +924,8 @@ BEGIN
     'principals', 'memberships', 'tenant_domains', 'device_enrollments',
     'assessments', 'integrations', 'jobs', 'upload_intents',
     'evidence_artifacts', 'ingest_receipts', 'retention_holds', 'legal_hold_operations',
-    'audit_heads', 'audit_events', 'export_receipts', 'support_access_grants'
+    'audit_heads', 'audit_events', 'api_audit_outbox', 'api_audit_outbox_work',
+    'export_receipts', 'support_access_grants'
   ]
   LOOP
     EXECUTE format(
@@ -874,6 +946,10 @@ BEGIN
   END LOOP;
 END;
 $$;
+
+CREATE TRIGGER protect_api_audit_outbox
+BEFORE UPDATE OR DELETE ON scopeproof.api_audit_outbox
+FOR EACH ROW EXECUTE FUNCTION scopeproof.protect_immutable_security_fields();
 
 CREATE TRIGGER append_audit_chain
 BEFORE INSERT ON scopeproof.audit_events
@@ -975,6 +1051,384 @@ END;
 $$;
 
 REVOKE ALL ON FUNCTION scopeproof.resolve_active_membership(text) FROM PUBLIC;
+
+CREATE FUNCTION scopeproof.record_api_audit_event(
+  p_actor_user_id scopeproof.resource_identifier,
+  p_membership_id scopeproof.resource_identifier,
+  p_request_id text,
+  p_action text,
+  p_resource_type text,
+  p_resource_id text,
+  p_idempotency_key text,
+  p_details jsonb
+)
+RETURNS TABLE (
+  outbox_id scopeproof.resource_identifier,
+  was_created boolean,
+  committed_event_digest text
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, scopeproof
+AS $$
+DECLARE
+  active_tenant scopeproof.tenant_identifier := scopeproof.current_tenant_id();
+  actor_role text;
+  expected_digest text;
+  expected_id scopeproof.resource_identifier;
+  existing scopeproof.api_audit_outbox%ROWTYPE;
+BEGIN
+  IF active_tenant IS NULL THEN
+    RAISE EXCEPTION 'tenant context is required' USING ERRCODE = '42501';
+  END IF;
+  IF num_nonnulls(
+       p_actor_user_id, p_membership_id, p_request_id, p_action,
+       p_resource_type, p_resource_id, p_idempotency_key, p_details
+     ) <> 8 OR
+     p_actor_user_id NOT LIKE 'usr\_%' ESCAPE '\' OR
+     p_membership_id NOT LIKE 'mem\_%' ESCAPE '\' OR
+     p_request_id !~ '^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$' OR
+     char_length(p_idempotency_key) NOT BETWEEN 16 AND 200 OR
+     p_idempotency_key ~ '[[:cntrl:]]' OR
+     jsonb_typeof(p_details) <> 'object' OR
+     p_details ?| ARRAY['scopeproofOutboxId', 'scopeproofOutboxDigest', 'scopeproofMembershipId'] OR
+     octet_length(p_details::text) > 16384 THEN
+    RAISE EXCEPTION 'API audit record is invalid' USING ERRCODE = '22023';
+  END IF;
+
+  SELECT membership.role
+    INTO actor_role
+    FROM scopeproof.memberships AS membership
+    JOIN scopeproof.principals AS principal
+      ON principal.tenant_id = membership.tenant_id
+     AND principal.id = membership.principal_id
+   WHERE membership.tenant_id = active_tenant
+     AND membership.id = p_membership_id
+     AND membership.principal_id = p_actor_user_id
+     AND membership.status = 'ACTIVE'
+     AND principal.status = 'ACTIVE';
+
+  IF actor_role IS NULL OR
+     (p_action = 'evidence.upload_intent_issued' AND actor_role NOT IN ('admin', 'compliance_lead', 'collector')) OR
+     (p_action IN ('evidence.search_performed', 'evidence.download_intent_issued') AND
+       actor_role NOT IN ('admin', 'compliance_lead', 'reviewer', 'auditor')) OR
+     (p_action IN ('evidence.legal_hold_requested', 'evidence.legal_hold_approved') AND actor_role <> 'admin') OR
+     p_action NOT IN (
+       'evidence.upload_intent_issued',
+       'evidence.search_performed',
+       'evidence.download_intent_issued',
+       'evidence.legal_hold_requested',
+       'evidence.legal_hold_approved'
+     ) THEN
+    RAISE EXCEPTION 'active membership does not permit this audited operation' USING ERRCODE = '42501';
+  END IF;
+
+  IF (p_action IN ('evidence.upload_intent_issued', 'evidence.download_intent_issued') AND
+       (p_resource_type <> 'evidence' OR p_resource_id !~ '^evd_[a-f0-9]{32}$')) OR
+     (p_action = 'evidence.search_performed' AND
+       (p_resource_type <> 'evidence_collection' OR p_resource_id IS DISTINCT FROM active_tenant::text)) OR
+     (p_action IN ('evidence.legal_hold_requested', 'evidence.legal_hold_approved') AND
+       (p_resource_type <> 'legal_hold_operation' OR p_resource_id !~ '^lho_[a-f0-9]{32}$')) THEN
+    RAISE EXCEPTION 'API audit resource binding is invalid' USING ERRCODE = '22023';
+  END IF;
+
+  expected_digest := encode(sha256(convert_to(
+    'scopeproof-api-audit-outbox-v1' || chr(10) ||
+    active_tenant::text || chr(10) || p_actor_user_id::text || chr(10) ||
+    p_membership_id::text || chr(10) || p_action || chr(10) ||
+    p_resource_type || chr(10) || p_resource_id || chr(10) ||
+    p_idempotency_key || chr(10) || p_details::text,
+    'UTF8'
+  )), 'hex');
+  expected_id := ('aob_' || substr(expected_digest, 1, 32))::scopeproof.resource_identifier;
+
+  SELECT * INTO existing
+    FROM scopeproof.api_audit_outbox
+   WHERE tenant_id = active_tenant AND idempotency_key = p_idempotency_key
+   FOR UPDATE;
+  IF FOUND THEN
+    IF existing.id IS DISTINCT FROM expected_id OR
+       existing.actor_user_id IS DISTINCT FROM p_actor_user_id OR
+       existing.membership_id IS DISTINCT FROM p_membership_id OR
+       existing.action IS DISTINCT FROM p_action OR
+       existing.resource_type IS DISTINCT FROM p_resource_type OR
+       existing.resource_id IS DISTINCT FROM p_resource_id OR
+       existing.details IS DISTINCT FROM p_details OR
+       existing.event_digest::text IS DISTINCT FROM expected_digest THEN
+      RAISE EXCEPTION 'API audit idempotency key conflicts with different facts' USING ERRCODE = '23505';
+    END IF;
+    INSERT INTO scopeproof.api_audit_outbox_work (tenant_id, outbox_id)
+    VALUES (active_tenant, existing.id)
+    ON CONFLICT (tenant_id, outbox_id) DO NOTHING;
+    RETURN QUERY SELECT existing.id, false, existing.event_digest::text;
+    RETURN;
+  END IF;
+
+  INSERT INTO scopeproof.api_audit_outbox (
+    tenant_id, id, actor_user_id, membership_id, request_id, action,
+    resource_type, resource_id, idempotency_key, details, event_digest
+  ) VALUES (
+    active_tenant, expected_id, p_actor_user_id, p_membership_id, p_request_id, p_action,
+    p_resource_type, p_resource_id, p_idempotency_key, p_details, expected_digest
+  );
+  INSERT INTO scopeproof.api_audit_outbox_work (tenant_id, outbox_id)
+  VALUES (active_tenant, expected_id);
+  RETURN QUERY SELECT expected_id, true, expected_digest;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION scopeproof.record_api_audit_event(
+  scopeproof.resource_identifier, scopeproof.resource_identifier, text, text, text, text, text, jsonb
+) FROM PUBLIC;
+
+CREATE FUNCTION scopeproof.claim_next_api_audit_event(
+  p_lease_token text,
+  p_claimed_at timestamptz,
+  p_lease_seconds integer
+)
+RETURNS TABLE (
+  outbox_id scopeproof.resource_identifier,
+  event_id scopeproof.resource_identifier,
+  occurred_at timestamptz,
+  actor_user_id scopeproof.resource_identifier,
+  membership_id scopeproof.resource_identifier,
+  request_id text,
+  action text,
+  resource_type text,
+  resource_id text,
+  outcome text,
+  details jsonb,
+  event_digest text,
+  attempt_count integer,
+  lease_expires_at timestamptz
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, scopeproof
+AS $$
+DECLARE
+  active_tenant scopeproof.tenant_identifier := scopeproof.current_tenant_id();
+BEGIN
+  IF active_tenant IS NULL THEN
+    RAISE EXCEPTION 'tenant context is required' USING ERRCODE = '42501';
+  END IF;
+  IF p_lease_token IS NULL OR
+     p_lease_token !~ '^[A-Za-z0-9_-]{16,128}$' OR
+     p_claimed_at IS NULL OR
+     p_claimed_at < clock_timestamp() - interval '5 minutes' OR
+     p_claimed_at > clock_timestamp() + interval '5 minutes' OR
+     p_lease_seconds NOT BETWEEN 30 AND 300 THEN
+    RAISE EXCEPTION 'API audit outbox lease is invalid' USING ERRCODE = '22023';
+  END IF;
+
+  RETURN QUERY
+  WITH candidate AS MATERIALIZED (
+    SELECT work.outbox_id
+      FROM scopeproof.api_audit_outbox_work AS work
+      JOIN scopeproof.api_audit_outbox AS queued
+        ON queued.tenant_id = work.tenant_id
+       AND queued.id = work.outbox_id
+     WHERE work.tenant_id = active_tenant
+       AND work.completed_at IS NULL
+       AND work.dead_lettered_at IS NULL
+       AND work.attempt_count < 8
+       AND work.next_attempt_at <= p_claimed_at
+       AND (work.lease_token IS NULL OR work.lease_expires_at <= p_claimed_at)
+     ORDER BY queued.occurred_at, queued.id
+     FOR UPDATE OF work SKIP LOCKED
+     LIMIT 1
+  ), claimed AS (
+    UPDATE scopeproof.api_audit_outbox_work AS work
+       SET lease_token = p_lease_token,
+           lease_expires_at = p_claimed_at + make_interval(secs => p_lease_seconds)
+      FROM candidate
+     WHERE work.tenant_id = active_tenant
+       AND work.outbox_id = candidate.outbox_id
+    RETURNING work.outbox_id, work.attempt_count, work.lease_expires_at
+  )
+  SELECT queued.id,
+         ('evt_' || substr(queued.event_digest::text, 1, 32))::scopeproof.resource_identifier,
+         queued.occurred_at, queued.actor_user_id, queued.membership_id,
+         queued.request_id, queued.action, queued.resource_type,
+         queued.resource_id, queued.outcome, queued.details,
+         queued.event_digest::text, claimed.attempt_count, claimed.lease_expires_at
+    FROM claimed
+    JOIN scopeproof.api_audit_outbox AS queued
+      ON queued.tenant_id = active_tenant
+     AND queued.id = claimed.outbox_id;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION scopeproof.claim_next_api_audit_event(text, timestamptz, integer) FROM PUBLIC;
+
+CREATE FUNCTION scopeproof.record_api_audit_outbox_failure(
+  p_outbox_id scopeproof.resource_identifier,
+  p_lease_token text,
+  p_error_code text,
+  p_failed_at timestamptz
+)
+RETURNS TABLE (
+  failure_state text,
+  committed_attempt_count integer,
+  committed_next_attempt_at timestamptz,
+  committed_dead_lettered_at timestamptz
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, scopeproof
+AS $$
+DECLARE
+  active_tenant scopeproof.tenant_identifier := scopeproof.current_tenant_id();
+  work scopeproof.api_audit_outbox_work%ROWTYPE;
+  next_attempt_count integer;
+BEGIN
+  IF active_tenant IS NULL THEN
+    RAISE EXCEPTION 'tenant context is required' USING ERRCODE = '42501';
+  END IF;
+  IF p_outbox_id IS NULL OR p_outbox_id NOT LIKE 'aob\_%' ESCAPE '\' OR
+     p_lease_token IS NULL OR p_lease_token !~ '^[A-Za-z0-9_-]{16,128}$' OR
+     p_error_code IS NULL OR p_error_code !~ '^[A-Z][A-Z0-9_]{2,63}$' OR
+     p_failed_at IS NULL OR
+     p_failed_at < clock_timestamp() - interval '5 minutes' OR
+     p_failed_at > clock_timestamp() + interval '5 minutes' THEN
+    RAISE EXCEPTION 'API audit outbox failure record is invalid' USING ERRCODE = '22023';
+  END IF;
+
+  SELECT * INTO work
+    FROM scopeproof.api_audit_outbox_work
+   WHERE tenant_id = active_tenant AND outbox_id = p_outbox_id
+   FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'API audit outbox work was not found' USING ERRCODE = '40001';
+  END IF;
+  IF work.completed_at IS NOT NULL THEN
+    RETURN QUERY SELECT 'already_completed'::text, work.attempt_count,
+      work.next_attempt_at, work.dead_lettered_at;
+    RETURN;
+  END IF;
+  IF work.dead_lettered_at IS NOT NULL THEN
+    RETURN QUERY SELECT 'already_dead_lettered'::text, work.attempt_count,
+      work.next_attempt_at, work.dead_lettered_at;
+    RETURN;
+  END IF;
+  IF work.lease_token IS DISTINCT FROM p_lease_token THEN
+    RAISE EXCEPTION 'API audit outbox lease changed' USING ERRCODE = '40001';
+  END IF;
+
+  next_attempt_count := work.attempt_count + 1;
+  UPDATE scopeproof.api_audit_outbox_work AS pending
+     SET attempt_count = next_attempt_count,
+         next_attempt_at = p_failed_at + make_interval(secs => least(
+           21600,
+           (30 * power(2, least(work.attempt_count, 10)))::integer
+         )),
+         lease_token = NULL,
+         lease_expires_at = NULL,
+         last_error_code = p_error_code,
+         last_failed_at = p_failed_at,
+         dead_lettered_at = CASE WHEN next_attempt_count >= 8 THEN p_failed_at ELSE NULL END
+   WHERE pending.tenant_id = active_tenant
+     AND pending.outbox_id = p_outbox_id
+     AND pending.lease_token = p_lease_token;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'API audit outbox failure transition changed' USING ERRCODE = '40001';
+  END IF;
+
+  SELECT * INTO STRICT work
+    FROM scopeproof.api_audit_outbox_work
+   WHERE tenant_id = active_tenant AND outbox_id = p_outbox_id;
+  RETURN QUERY SELECT
+    CASE WHEN work.dead_lettered_at IS NULL THEN 'retry_scheduled' ELSE 'dead_lettered' END,
+    work.attempt_count, work.next_attempt_at, work.dead_lettered_at;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION scopeproof.record_api_audit_outbox_failure(
+  scopeproof.resource_identifier, text, text, timestamptz
+) FROM PUBLIC;
+
+CREATE FUNCTION scopeproof.read_api_audit_outbox_health(
+  p_observed_at timestamptz
+)
+RETURNS TABLE (
+  backlog_count bigint,
+  dead_lettered_count bigint,
+  oldest_unsigned_age_seconds bigint
+)
+LANGUAGE plpgsql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, scopeproof
+AS $$
+DECLARE
+  active_tenant scopeproof.tenant_identifier := scopeproof.current_tenant_id();
+BEGIN
+  IF active_tenant IS NULL THEN
+    RAISE EXCEPTION 'tenant context is required' USING ERRCODE = '42501';
+  END IF;
+  IF p_observed_at IS NULL OR
+     p_observed_at < clock_timestamp() - interval '5 minutes' OR
+     p_observed_at > clock_timestamp() + interval '5 minutes' THEN
+    RAISE EXCEPTION 'API audit outbox observation time is invalid' USING ERRCODE = '22023';
+  END IF;
+
+  RETURN QUERY
+  SELECT count(*)::bigint,
+         count(*) FILTER (WHERE work.dead_lettered_at IS NOT NULL)::bigint,
+         coalesce(max(greatest(0, floor(extract(epoch FROM (p_observed_at - queued.occurred_at)))::bigint)), 0)::bigint
+    FROM scopeproof.api_audit_outbox AS queued
+    JOIN scopeproof.api_audit_outbox_work AS work
+      ON work.tenant_id = queued.tenant_id
+     AND work.outbox_id = queued.id
+   WHERE queued.tenant_id = active_tenant
+     AND work.completed_at IS NULL;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION scopeproof.read_api_audit_outbox_health(timestamptz) FROM PUBLIC;
+
+-- Owner-only recovery after the root cause of a poison row has been corrected.
+-- The signer role is intentionally not granted this function.
+CREATE FUNCTION scopeproof.requeue_dead_lettered_api_audit_event(
+  p_outbox_id scopeproof.resource_identifier,
+  p_requeued_at timestamptz
+)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, scopeproof
+AS $$
+DECLARE
+  active_tenant scopeproof.tenant_identifier := scopeproof.current_tenant_id();
+BEGIN
+  IF active_tenant IS NULL OR
+     p_outbox_id IS NULL OR p_outbox_id NOT LIKE 'aob\_%' ESCAPE '\' OR
+     p_requeued_at IS NULL OR
+     p_requeued_at < clock_timestamp() - interval '5 minutes' OR
+     p_requeued_at > clock_timestamp() + interval '5 minutes' THEN
+    RAISE EXCEPTION 'API audit dead-letter requeue is invalid' USING ERRCODE = '22023';
+  END IF;
+  UPDATE scopeproof.api_audit_outbox_work
+     SET attempt_count = 0,
+         next_attempt_at = p_requeued_at,
+         lease_token = NULL,
+         lease_expires_at = NULL,
+         last_error_code = NULL,
+         last_failed_at = NULL,
+         dead_lettered_at = NULL
+   WHERE tenant_id = active_tenant
+     AND outbox_id = p_outbox_id
+     AND completed_at IS NULL
+     AND dead_lettered_at IS NOT NULL;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'API audit dead-letter row is not requeueable' USING ERRCODE = '40001';
+  END IF;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION scopeproof.requeue_dead_lettered_api_audit_event(
+  scopeproof.resource_identifier, timestamptz
+) FROM PUBLIC;
 
 CREATE FUNCTION scopeproof.reserve_exact_version_legal_hold(
   p_operation_id scopeproof.resource_identifier,
@@ -1348,6 +1802,152 @@ REVOKE ALL ON FUNCTION scopeproof.approve_exact_version_legal_hold(
   timestamptz, text, text
 ) FROM PUBLIC;
 
+-- Public legal-hold API wrappers. The workflow transition and its audit outbox
+-- row are one PostgreSQL transaction: an audit failure rolls back the state
+-- change, so a privileged request can never succeed without a durable record.
+CREATE FUNCTION scopeproof.reserve_exact_version_legal_hold_with_audit(
+  p_operation_id scopeproof.resource_identifier,
+  p_hold_id scopeproof.resource_identifier,
+  p_evidence_id scopeproof.resource_identifier,
+  p_control_id text,
+  p_evidence_bucket text,
+  p_object_key text,
+  p_object_version_id text,
+  p_desired_status text,
+  p_hold_kind text,
+  p_reason text,
+  p_requested_by scopeproof.resource_identifier,
+  p_expected_hold_revision integer,
+  p_changed_at timestamptz,
+  p_canonical_request text,
+  p_request_digest text,
+  p_membership_id scopeproof.resource_identifier,
+  p_request_id text
+)
+RETURNS TABLE (
+  operation_state text,
+  operation_revision integer,
+  committed_canonical_approval text,
+  committed_approval_digest text,
+  committed_canonical_receipt text,
+  committed_receipt_sha256 text,
+  committed_application_attempt_id text,
+  committed_application_prior_status text,
+  committed_application_observed_request_id text,
+  committed_application_started_at timestamptz
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, scopeproof
+AS $$
+DECLARE
+  reserved record;
+BEGIN
+  SELECT *
+    INTO STRICT reserved
+    FROM scopeproof.reserve_exact_version_legal_hold(
+      p_operation_id, p_hold_id, p_evidence_id, p_control_id,
+      p_evidence_bucket, p_object_key, p_object_version_id, p_desired_status,
+      p_hold_kind, p_reason, p_requested_by, p_expected_hold_revision,
+      p_changed_at, p_canonical_request, p_request_digest
+    );
+
+  PERFORM scopeproof.record_api_audit_event(
+    p_requested_by,
+    p_membership_id,
+    p_request_id,
+    'evidence.legal_hold_requested',
+    'legal_hold_operation',
+    p_operation_id::text,
+    'legal-hold-request:' || p_operation_id::text,
+    jsonb_build_object(
+      'evidenceId', p_evidence_id,
+      'holdId', p_hold_id,
+      'requestDigest', p_request_digest,
+      'desiredStatus', p_desired_status,
+      'operationRevision', reserved.operation_revision
+    )
+  );
+
+  RETURN QUERY SELECT
+    reserved.operation_state::text,
+    reserved.operation_revision::integer,
+    reserved.committed_canonical_approval::text,
+    reserved.committed_approval_digest::text,
+    reserved.committed_canonical_receipt::text,
+    reserved.committed_receipt_sha256::text,
+    reserved.committed_application_attempt_id::text,
+    reserved.committed_application_prior_status::text,
+    reserved.committed_application_observed_request_id::text,
+    reserved.committed_application_started_at::timestamptz;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION scopeproof.reserve_exact_version_legal_hold_with_audit(
+  scopeproof.resource_identifier, scopeproof.resource_identifier,
+  scopeproof.resource_identifier, text, text, text, text, text, text, text,
+  scopeproof.resource_identifier, integer, timestamptz, text, text,
+  scopeproof.resource_identifier, text
+) FROM PUBLIC;
+
+CREATE FUNCTION scopeproof.approve_exact_version_legal_hold_with_audit(
+  p_operation_id scopeproof.resource_identifier,
+  p_request_digest text,
+  p_approved_by scopeproof.resource_identifier,
+  p_approved_at timestamptz,
+  p_canonical_approval text,
+  p_approval_digest text,
+  p_membership_id scopeproof.resource_identifier,
+  p_request_id text
+)
+RETURNS TABLE (
+  operation_state text,
+  operation_revision integer,
+  committed_canonical_approval text,
+  committed_approval_digest text
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, scopeproof
+AS $$
+DECLARE
+  approved record;
+BEGIN
+  SELECT *
+    INTO STRICT approved
+    FROM scopeproof.approve_exact_version_legal_hold(
+      p_operation_id, p_request_digest, p_approved_by, p_approved_at,
+      p_canonical_approval, p_approval_digest
+    );
+
+  PERFORM scopeproof.record_api_audit_event(
+    p_approved_by,
+    p_membership_id,
+    p_request_id,
+    'evidence.legal_hold_approved',
+    'legal_hold_operation',
+    p_operation_id::text,
+    'legal-hold-approval:' || p_operation_id::text || ':' || p_approved_by::text,
+    jsonb_build_object(
+      'requestDigest', p_request_digest,
+      'approvalDigest', p_approval_digest,
+      'operationRevision', approved.operation_revision
+    )
+  );
+
+  RETURN QUERY SELECT
+    approved.operation_state::text,
+    approved.operation_revision::integer,
+    approved.committed_canonical_approval::text,
+    approved.committed_approval_digest::text;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION scopeproof.approve_exact_version_legal_hold_with_audit(
+  scopeproof.resource_identifier, text, scopeproof.resource_identifier,
+  timestamptz, text, text, scopeproof.resource_identifier, text
+) FROM PUBLIC;
+
 CREATE FUNCTION scopeproof.read_exact_version_legal_hold_operation(
   p_operation_id scopeproof.resource_identifier,
   p_request_digest text
@@ -1708,6 +2308,12 @@ DECLARE
   assessment_status text;
   existing_intent scopeproof.upload_intents%ROWTYPE;
   existing_evidence scopeproof.evidence_artifacts%ROWTYPE;
+  device_public_key_sha256 text;
+  device_last_upload_sequence bigint;
+  device_proof jsonb;
+  signed_manifest jsonb;
+  expected_manifest jsonb;
+  device_sequence bigint;
   intent_exists boolean := false;
 BEGIN
   active_tenant := scopeproof.current_tenant_id();
@@ -1716,18 +2322,80 @@ BEGIN
   END IF;
   PERFORM scopeproof.assert_actor_permission(p_requested_by, 'evidence:collect');
 
-  IF p_device_id IS NOT NULL AND NOT EXISTS (
-    SELECT 1
-      FROM scopeproof.device_enrollments
-     WHERE tenant_id = active_tenant
-       AND id = p_device_id
-       AND principal_id = p_requested_by
-       AND status = 'ACTIVE'
-  ) THEN
+  IF p_device_id IS NULL THEN
     RAISE EXCEPTION 'active actor-bound device enrollment is required' USING ERRCODE = '42501';
   END IF;
-  IF p_captured_at > clock_timestamp() + interval '5 minutes' THEN
-    RAISE EXCEPTION 'evidence capture time cannot be in the future' USING ERRCODE = '22023';
+  SELECT device.device_public_key_sha256::text, device.last_upload_sequence
+    INTO device_public_key_sha256, device_last_upload_sequence
+    FROM scopeproof.device_enrollments AS device
+   WHERE device.tenant_id = active_tenant
+     AND device.id = p_device_id
+     AND device.principal_id = p_requested_by
+     AND device.status = 'ACTIVE'
+   FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'active actor-bound device enrollment is required' USING ERRCODE = '42501';
+  END IF;
+  IF p_captured_at > clock_timestamp() + interval '5 minutes' OR
+     p_captured_at < clock_timestamp() - interval '30 days' THEN
+    RAISE EXCEPTION 'evidence capture time is outside the collection window' USING ERRCODE = '22023';
+  END IF;
+
+  device_proof := p_metadata -> 'scopeproofDeviceProof';
+  IF jsonb_typeof(device_proof) <> 'object' OR
+     (SELECT count(*) FROM jsonb_object_keys(device_proof)) <> 10 OR
+     device_proof ->> 'schemaVersion' <> '1' OR
+     device_proof ->> 'algorithm' <> 'ECDSA_P256_SHA256' OR
+     device_proof ->> 'publicKeySha256' IS DISTINCT FROM device_public_key_sha256 OR
+     device_proof ->> 'publicKeySha256' !~ '^[0-9a-f]{64}$' OR
+     device_proof ->> 'manifestDigest' !~ '^[0-9a-f]{64}$' OR
+     device_proof ->> 'challengeDigest' !~ '^[0-9a-f]{64}$' OR
+     device_proof ->> 'nonceDigest' !~ '^[0-9a-f]{64}$' OR
+     device_proof ->> 'signature' !~ '^[A-Za-z0-9_-]{86}$' OR
+     device_proof ->> 'sequence' !~ '^[1-9][0-9]{0,15}$' OR
+     device_proof ->> 'signedAt' !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z$' OR
+     octet_length(device_proof ->> 'canonicalManifest') NOT BETWEEN 128 AND 8192 THEN
+    RAISE EXCEPTION 'device upload proof is invalid' USING ERRCODE = '22023';
+  END IF;
+  BEGIN
+    signed_manifest := (device_proof ->> 'canonicalManifest')::jsonb;
+    device_sequence := (device_proof ->> 'sequence')::bigint;
+  EXCEPTION WHEN OTHERS THEN
+    RAISE EXCEPTION 'device upload proof is invalid' USING ERRCODE = '22023';
+  END;
+  expected_manifest := jsonb_build_object(
+    'schemaVersion', 1,
+    'tenantId', active_tenant,
+    'userId', p_requested_by,
+    'deviceId', p_device_id,
+    'assessmentId', p_assessment_id,
+    'controlId', p_control_id,
+    'evidenceId', p_evidence_id,
+    'expectedSha256', p_checksum_sha256,
+    'expectedSize', p_content_length,
+    'contentType', p_content_type,
+    'capturedAt', to_char(p_captured_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),
+    'challenge', signed_manifest ->> 'challenge',
+    'nonce', signed_manifest ->> 'nonce',
+    'sequence', device_sequence,
+    'signedAt', signed_manifest ->> 'signedAt'
+  );
+  IF signed_manifest IS DISTINCT FROM expected_manifest OR
+     char_length(signed_manifest ->> 'challenge') NOT BETWEEN 8 AND 200 OR
+     char_length(signed_manifest ->> 'nonce') NOT BETWEEN 16 AND 200 OR
+     device_proof ->> 'signedAt' IS DISTINCT FROM signed_manifest ->> 'signedAt' OR
+     (device_proof ->> 'signedAt')::timestamptz < clock_timestamp() - interval '5 minutes' OR
+     (device_proof ->> 'signedAt')::timestamptz > clock_timestamp() + interval '5 minutes' OR
+     encode(sha256(convert_to(
+       'scopeproof-device-upload-manifest-v1' || chr(10) || (device_proof ->> 'canonicalManifest'), 'UTF8'
+     )), 'hex') IS DISTINCT FROM device_proof ->> 'manifestDigest' OR
+     encode(sha256(convert_to(
+       'scopeproof-device-token-challenge-v1' || chr(10) || (signed_manifest ->> 'challenge'), 'UTF8'
+     )), 'hex') IS DISTINCT FROM device_proof ->> 'challengeDigest' OR
+     encode(sha256(convert_to(
+       'scopeproof-device-upload-nonce-v1' || chr(10) || (signed_manifest ->> 'nonce'), 'UTF8'
+     )), 'hex') IS DISTINCT FROM device_proof ->> 'nonceDigest' THEN
+    RAISE EXCEPTION 'device upload manifest binding is invalid' USING ERRCODE = '22023';
   END IF;
 
   SELECT quarantine_bucket, retention_days
@@ -1796,6 +2464,19 @@ BEGIN
     END IF;
     RETURN QUERY SELECT p_id, p_evidence_id, false;
     RETURN;
+  END IF;
+
+  IF device_sequence <= device_last_upload_sequence THEN
+    RAISE EXCEPTION 'device upload sequence has already been consumed' USING ERRCODE = '23505';
+  END IF;
+  UPDATE scopeproof.device_enrollments
+     SET last_upload_sequence = device_sequence,
+         last_seen_at = clock_timestamp()
+   WHERE tenant_id = active_tenant
+     AND id = p_device_id
+     AND last_upload_sequence = device_last_upload_sequence;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'device upload sequence changed concurrently' USING ERRCODE = '40001';
   END IF;
 
   INSERT INTO scopeproof.evidence_artifacts (
@@ -2409,6 +3090,175 @@ REVOKE ALL ON FUNCTION scopeproof.append_signed_audit_event(
   bigint, scopeproof.resource_identifier, timestamptz, jsonb, text, text,
   scopeproof.resource_identifier, text, text, jsonb, text, text, text, jsonb,
   text, text, text, text, text, timestamptz
+) FROM PUBLIC;
+
+-- The public-API signer can append only the exact immutable row it leased. It
+-- is never granted the generic append function, so a compromised worker cannot
+-- invent an actor, action, resource, request, or event payload.
+CREATE FUNCTION scopeproof.append_signed_api_audit_event(
+  p_outbox_id scopeproof.resource_identifier,
+  p_lease_token text,
+  p_sequence bigint,
+  p_event_id scopeproof.resource_identifier,
+  p_occurred_at timestamptz,
+  p_actor jsonb,
+  p_action text,
+  p_resource_type text,
+  p_resource_id scopeproof.resource_identifier,
+  p_request_id text,
+  p_outcome text,
+  p_details jsonb,
+  p_previous_hash text,
+  p_event_hash text,
+  p_canonical_event text,
+  p_receipt_payload jsonb,
+  p_canonical_receipt text,
+  p_receipt_payload_sha256 text,
+  p_signing_key_arn text,
+  p_signing_algorithm text,
+  p_signature text,
+  p_signed_at timestamptz
+)
+RETURNS TABLE (
+  committed_sequence bigint,
+  committed_event_hash text,
+  was_created boolean,
+  committed_canonical_receipt text,
+  committed_receipt_payload_sha256 text,
+  committed_signature text,
+  committed_signed_at timestamptz
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, scopeproof
+AS $$
+DECLARE
+  active_tenant scopeproof.tenant_identifier := scopeproof.current_tenant_id();
+  queued scopeproof.api_audit_outbox%ROWTYPE;
+  work scopeproof.api_audit_outbox_work%ROWTYPE;
+  expected_actor jsonb;
+  expected_details jsonb;
+  expected_event_id scopeproof.resource_identifier;
+  expected_outbox_id scopeproof.resource_identifier;
+  expected_outbox_digest text;
+  appended_sequence bigint;
+  appended_event_hash text;
+  appended_was_created boolean;
+  appended_canonical_receipt text;
+  appended_receipt_payload_sha256 text;
+  appended_signature text;
+  appended_signed_at timestamptz;
+BEGIN
+  IF active_tenant IS NULL OR
+     p_outbox_id IS NULL OR p_outbox_id NOT LIKE 'aob\_%' ESCAPE '\' OR
+     p_lease_token IS NULL OR p_lease_token !~ '^[A-Za-z0-9_-]{16,128}$' THEN
+    RAISE EXCEPTION 'API audit append lease is invalid' USING ERRCODE = '22023';
+  END IF;
+
+  SELECT queued_row, work_row
+    INTO STRICT queued, work
+    FROM scopeproof.api_audit_outbox AS queued_row
+    JOIN scopeproof.api_audit_outbox_work AS work_row
+      ON work_row.tenant_id = queued_row.tenant_id
+     AND work_row.outbox_id = queued_row.id
+   WHERE queued_row.tenant_id = active_tenant
+     AND queued_row.id = p_outbox_id
+   FOR UPDATE OF work_row;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'API audit outbox work was not found' USING ERRCODE = '40001';
+  END IF;
+
+  expected_outbox_digest := encode(sha256(convert_to(
+    'scopeproof-api-audit-outbox-v1' || chr(10) ||
+    active_tenant::text || chr(10) || queued.actor_user_id::text || chr(10) ||
+    queued.membership_id::text || chr(10) || queued.action || chr(10) ||
+    queued.resource_type || chr(10) || queued.resource_id || chr(10) ||
+    queued.idempotency_key || chr(10) || queued.details::text,
+    'UTF8'
+  )), 'hex');
+  expected_outbox_id := ('aob_' || substr(expected_outbox_digest, 1, 32))::scopeproof.resource_identifier;
+  expected_event_id := ('evt_' || substr(expected_outbox_digest, 1, 32))::scopeproof.resource_identifier;
+  expected_actor := jsonb_build_object(
+    'type', 'user',
+    'userId', queued.actor_user_id,
+    'membershipId', queued.membership_id
+  );
+  expected_details := queued.details || jsonb_build_object(
+    'scopeproofOutboxId', queued.id,
+    'scopeproofOutboxDigest', queued.event_digest::text,
+    'scopeproofMembershipId', queued.membership_id
+  );
+  IF queued.id IS DISTINCT FROM expected_outbox_id OR
+     queued.event_digest::text IS DISTINCT FROM expected_outbox_digest OR
+     p_event_id IS DISTINCT FROM expected_event_id OR
+     p_occurred_at IS DISTINCT FROM queued.occurred_at OR
+     p_actor IS DISTINCT FROM expected_actor OR
+     p_action IS DISTINCT FROM queued.action OR
+     p_resource_type IS DISTINCT FROM queued.resource_type OR
+     p_resource_id::text IS DISTINCT FROM queued.resource_id OR
+     p_request_id IS DISTINCT FROM queued.request_id OR
+     p_outcome IS DISTINCT FROM queued.outcome OR
+     p_details IS DISTINCT FROM expected_details THEN
+    RAISE EXCEPTION 'signed API audit event does not match its immutable outbox row' USING ERRCODE = '42501';
+  END IF;
+
+  IF work.completed_at IS NOT NULL THEN
+    IF work.audit_event_id IS DISTINCT FROM p_event_id OR
+       work.audit_event_hash::text IS DISTINCT FROM p_event_hash THEN
+      RAISE EXCEPTION 'completed API audit event conflicts with replay' USING ERRCODE = '23505';
+    END IF;
+    RETURN QUERY
+    SELECT event.sequence, event.event_hash::text, false,
+           event.canonical_receipt, event.receipt_payload_sha256::text,
+           event.kms_signature, event.signed_at
+      FROM scopeproof.audit_events AS event
+     WHERE event.tenant_id = active_tenant AND event.id = p_event_id;
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'completed API audit event is missing' USING ERRCODE = '40001';
+    END IF;
+    RETURN;
+  END IF;
+  IF work.dead_lettered_at IS NOT NULL OR work.lease_token IS DISTINCT FROM p_lease_token THEN
+    RAISE EXCEPTION 'API audit outbox lease changed' USING ERRCODE = '40001';
+  END IF;
+
+  SELECT * INTO STRICT
+    appended_sequence, appended_event_hash, appended_was_created,
+    appended_canonical_receipt, appended_receipt_payload_sha256,
+    appended_signature, appended_signed_at
+    FROM scopeproof.append_signed_audit_event(
+      p_sequence, p_event_id, p_occurred_at, p_actor, p_action,
+      p_resource_type, p_resource_id, p_request_id, p_outcome, p_details,
+      p_previous_hash, p_event_hash, p_canonical_event, p_receipt_payload,
+      p_canonical_receipt, p_receipt_payload_sha256, p_signing_key_arn,
+      p_signing_algorithm, p_signature, p_signed_at
+    );
+
+  UPDATE scopeproof.api_audit_outbox_work
+     SET lease_token = NULL,
+         lease_expires_at = NULL,
+         completed_at = clock_timestamp(),
+         audit_event_id = p_event_id,
+         audit_event_hash = appended_event_hash
+   WHERE tenant_id = active_tenant
+     AND outbox_id = p_outbox_id
+     AND lease_token = p_lease_token
+     AND completed_at IS NULL
+     AND dead_lettered_at IS NULL;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'API audit outbox completion transition changed' USING ERRCODE = '40001';
+  END IF;
+
+  RETURN QUERY SELECT appended_sequence, appended_event_hash,
+    appended_was_created, appended_canonical_receipt,
+    appended_receipt_payload_sha256, appended_signature, appended_signed_at;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION scopeproof.append_signed_api_audit_event(
+  scopeproof.resource_identifier, text, bigint, scopeproof.resource_identifier,
+  timestamptz, jsonb, text, text, scopeproof.resource_identifier, text, text,
+  jsonb, text, text, text, jsonb, text, text, text, text, text, timestamptz
 ) FROM PUBLIC;
 
 -- Bounded worker queue. REQUESTED rows are intentionally returned for age

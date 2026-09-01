@@ -7,12 +7,72 @@ export interface TenantDefinition {
 }
 
 export interface TenantDatabaseIdentifiers {
+  readonly auditSignerUsername: string;
   readonly controlUsername: string;
   readonly databaseName: string;
   readonly ingestUsername: string;
   readonly legalApiUsername: string;
   readonly ownerUsername: string;
+  readonly readUsername: string;
   readonly runtimeUsername: string;
+}
+
+export interface TenantLambdaConcurrencyBudget {
+  readonly apiAuditSigner: number;
+  readonly tenantApi: number;
+  readonly evidenceReadApi: number;
+  readonly legalHoldApi: number;
+  readonly legalHoldWorker: number;
+  readonly evidencePromoter: number;
+  readonly tenantProvisioner: number;
+}
+
+export const defaultTenantLambdaConcurrencyBudget: TenantLambdaConcurrencyBudget = Object.freeze({
+  apiAuditSigner: 1,
+  tenantApi: 5,
+  evidenceReadApi: 5,
+  legalHoldApi: 2,
+  legalHoldWorker: 1,
+  evidencePromoter: 2,
+  tenantProvisioner: 5,
+});
+
+/**
+ * Fail synthesis when a tenant can reserve an unexpectedly large share of the
+ * regional Lambda account quota. The production ceiling is intentionally
+ * equal to the reviewed default, so adding a function or increasing capacity
+ * requires an explicit security/cost review instead of silently expanding it.
+ */
+export function validateTenantLambdaConcurrencyBudget(
+  value: TenantLambdaConcurrencyBudget,
+  environment: "dev" | "stage" | "prod",
+): TenantLambdaConcurrencyBudget {
+  const entries = Object.entries(value);
+  if (entries.length !== Object.keys(defaultTenantLambdaConcurrencyBudget).length ||
+      entries.some(([name]) => !(name in defaultTenantLambdaConcurrencyBudget))) {
+    throw new Error("Tenant Lambda concurrency budget contains an unknown or missing function.");
+  }
+  for (const [name, amount] of entries) {
+    if (!Number.isSafeInteger(amount) || amount < 1 || amount > 10) {
+      throw new Error(`Tenant Lambda concurrency for ${name} must be an integer from 1 through 10.`);
+    }
+  }
+  const total = entries.reduce((sum, [, amount]) => sum + amount, 0);
+  const maximum = environment === "prod" ? 21 : 50;
+  if (total > maximum) {
+    throw new Error(`Tenant Lambda reserved concurrency ${total} exceeds the ${maximum} ${environment} budget.`);
+  }
+  return Object.freeze({ ...value });
+}
+
+export function validateTenantDeploymentSecurity(
+  tenant: TenantDefinition,
+  environment: "dev" | "stage" | "prod",
+): TenantDefinition {
+  if (environment === "prod" && tenant.retentionMode !== "COMPLIANCE") {
+    throw new Error(`Production tenant ${tenant.id} requires COMPLIANCE evidence retention.`);
+  }
+  return tenant;
 }
 
 export function tenantEvidenceControlRoleName(tenant: TenantDefinition): string {
@@ -148,19 +208,23 @@ export function tenantDatabaseIdentifiers(tenant: TenantDefinition): TenantDatab
   const roleStem = normalizedSlug.slice(0, 11);
   const tenantSuffix = tenant.id.slice(4);
   const identifiers = {
+    auditSignerUsername: `tenant_${normalizedSlug.slice(0, 10)}_${tenantSuffix}_audit_signer`,
     controlUsername: `tenant_${roleStem}_${tenantSuffix}_control`,
     databaseName: `scopeproof_${normalizedSlug}`,
     ingestUsername: `tenant_${roleStem}_${tenantSuffix}_ingest`,
     legalApiUsername: `tenant_${roleStem}_${tenantSuffix}_legal_api`,
     ownerUsername: `scopeproof_${roleStem}_${tenantSuffix}_owner`,
+    readUsername: `tenant_${roleStem}_${tenantSuffix}_read`,
     runtimeUsername: `tenant_${roleStem}_${tenantSuffix}_app_runtime`,
   };
   if (
+    identifiers.auditSignerUsername.length > 63 ||
     identifiers.controlUsername.length > 63 ||
     identifiers.databaseName.length > 63 ||
     identifiers.ingestUsername.length > 63 ||
     identifiers.legalApiUsername.length > 63 ||
     identifiers.ownerUsername.length > 63 ||
+    identifiers.readUsername.length > 63 ||
     identifiers.runtimeUsername.length > 63
   ) {
     throw new Error("Derived tenant database identifier exceeds PostgreSQL's identifier limit.");

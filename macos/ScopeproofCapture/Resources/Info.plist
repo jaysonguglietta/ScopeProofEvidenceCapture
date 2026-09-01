@@ -2,6 +2,7 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+  <key>ScopeproofHostedAPIOrigins</key><array/>
   <key>ScopeproofUpdatePublicKeys</key><array/>
   <key>ScopeproofUpdateTeamIdentifier</key><string></string>
   <key>ScopeproofUpdateDesignatedRequirement</key><string></string>
@@ -12,8 +13,8 @@
   <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
   <key>CFBundleName</key><string>Scopeproof Capture</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.8.1</string>
-  <key>CFBundleVersion</key><string>22</string>
+  <key>CFBundleShortVersionString</key><string>1.9.0</string>
+  <key>CFBundleVersion</key><string>23</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><true/>
   <key>NSScreenCaptureUsageDescription</key><string>Scopeproof Capture needs Screen Recording access to create explicit compliance evidence screenshots requested from the menu bar.</string>

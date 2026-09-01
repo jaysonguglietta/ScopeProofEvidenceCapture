@@ -26,6 +26,13 @@ BEGIN
       USING ERRCODE = '42501';
   END IF;
 
+  -- Re-running this script must converge to the exact intended capability
+  -- set. Revoke inherited/default grants before restoring the four approved
+  -- SECURITY DEFINER entry points below.
+  EXECUTE format('REVOKE ALL ON ALL TABLES IN SCHEMA scopeproof FROM %I', ingest_role);
+  EXECUTE format('REVOKE ALL ON ALL SEQUENCES IN SCHEMA scopeproof FROM %I', ingest_role);
+  EXECUTE format('REVOKE ALL ON ALL FUNCTIONS IN SCHEMA scopeproof FROM %I', ingest_role);
+
   EXECUTE format('GRANT CONNECT ON DATABASE %I TO %I', current_database(), ingest_role);
   EXECUTE format('GRANT USAGE ON SCHEMA scopeproof TO %I', ingest_role);
   EXECUTE format('GRANT EXECUTE ON FUNCTION scopeproof.current_tenant_id() TO %I', ingest_role);

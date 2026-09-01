@@ -1,5 +1,4 @@
 import {
-  Annotations,
   ArnFormat,
   CfnOutput,
   Duration,
@@ -40,6 +39,7 @@ export interface SharedPlatformStackProps extends StackProps {
   readonly rootDomain: string;
   readonly branchName: string;
   readonly hostedZoneId?: string;
+  readonly createHostedZone?: boolean;
   readonly tenantSlugs: readonly string[];
   readonly alertEmail?: string;
   readonly monthlyBudgetUsd?: number;
@@ -52,6 +52,11 @@ export class SharedPlatformStack extends Stack {
   public readonly hostedZone: route53.IHostedZone;
   public readonly controlTable: dynamodb.TableV2;
   public readonly userPool: cognito.UserPool;
+  public readonly oauthScopes: Readonly<{
+    evidenceRead: cognito.OAuthScope;
+    evidenceCollect: cognito.OAuthScope;
+    retentionManage: cognito.OAuthScope;
+  }>;
   public readonly databaseCluster: rds.DatabaseCluster;
   public readonly jobsQueue: sqs.Queue;
   public readonly amplifyApp: amplify.CfnApp;
@@ -76,9 +81,10 @@ export class SharedPlatformStack extends Stack {
       throw new Error("Amplify's fixed service quota permits at most 50 subdomain settings, including the root domain.");
     }
     if (this.rootDomain === "jsontechology.com") {
-      Annotations.of(this).addWarning(
-        "jsontechology.com is a placeholder. Supply -c rootDomain=<owned-domain> and an existing hostedZoneId before deployment.",
-      );
+      throw new Error("jsontechology.com is a planning placeholder and cannot be synthesized. Supply an owned domain.");
+    }
+    if (Boolean(props.hostedZoneId) === Boolean(props.createHostedZone)) {
+      throw new Error("Specify exactly one existing hostedZoneId or explicitly authorize createHostedZone.");
     }
 
     this.hostedZone = props.hostedZoneId
@@ -101,6 +107,7 @@ export class SharedPlatformStack extends Stack {
     this.controlTable = new dynamodb.TableV2(this, "ControlPlaneTable", {
       billing: dynamodb.Billing.onDemand(),
       deletionProtection: true,
+      dynamoStream: dynamodb.StreamViewType.NEW_AND_OLD_IMAGES,
       encryption: dynamodb.TableEncryptionV2.dynamoOwnedKey(),
       globalSecondaryIndexes: [{
         indexName: "GSI1",
@@ -137,6 +144,28 @@ export class SharedPlatformStack extends Stack {
       selfSignUpEnabled: false,
       signInAliases: { email: true },
       signInCaseSensitive: false,
+    });
+    const evidenceReadScope = new cognito.ResourceServerScope({
+      scopeName: "evidence.read",
+      scopeDescription: "Read tenant evidence metadata and request exact-version downloads",
+    });
+    const evidenceCollectScope = new cognito.ResourceServerScope({
+      scopeName: "evidence.collect",
+      scopeDescription: "Create exact, short-lived evidence upload intents",
+    });
+    const retentionManageScope = new cognito.ResourceServerScope({
+      scopeName: "retention.manage",
+      scopeDescription: "Request and approve tenant retention and legal-hold operations",
+    });
+    const scopeproofResourceServer = this.userPool.addResourceServer("ScopeproofResourceServer", {
+      identifier: "scopeproof",
+      scopes: [evidenceReadScope, evidenceCollectScope, retentionManageScope],
+      userPoolResourceServerName: "Scopeproof tenant API",
+    });
+    this.oauthScopes = Object.freeze({
+      evidenceRead: cognito.OAuthScope.resourceServer(scopeproofResourceServer, evidenceReadScope),
+      evidenceCollect: cognito.OAuthScope.resourceServer(scopeproofResourceServer, evidenceCollectScope),
+      retentionManage: cognito.OAuthScope.resourceServer(scopeproofResourceServer, retentionManageScope),
     });
 
     const authCertificate = new acm.Certificate(this, "CognitoCertificate", {
@@ -445,7 +474,7 @@ export class SharedPlatformStack extends Stack {
         "  phases:",
         "    preBuild:",
         "      commands:",
-        "        - npm ci",
+        "        - npm ci --ignore-scripts --cache .npm --prefer-offline",
         "    build:",
         "      commands:",
         "        - npm run build",
@@ -455,7 +484,7 @@ export class SharedPlatformStack extends Stack {
         "      - '**/*'",
         "  cache:",
         "    paths:",
-        "      - node_modules/**/*",
+        "      - .npm/**/*",
         "      - .next/cache/**/*",
       ].join("\n"),
       computeRoleArn: this.amplifyComputeRole.roleArn,
@@ -513,6 +542,7 @@ export class SharedPlatformStack extends Stack {
       removalPolicy: RemovalPolicy.RETAIN,
       versioned: true,
     });
+    this.releaseBucket.policy?.applyRemovalPolicy(RemovalPolicy.RETAIN);
     const releaseAccessLogs = new s3.Bucket(this, "ReleaseAccessLogs", {
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
       encryption: s3.BucketEncryption.S3_MANAGED,
@@ -521,6 +551,7 @@ export class SharedPlatformStack extends Stack {
       objectOwnership: s3.ObjectOwnership.BUCKET_OWNER_PREFERRED,
       removalPolicy: RemovalPolicy.RETAIN,
     });
+    releaseAccessLogs.policy?.applyRemovalPolicy(RemovalPolicy.RETAIN);
     const releaseCertificate = new acm.Certificate(this, "ReleaseCertificate", {
       domainName: `downloads.${this.rootDomain}`,
       validation: acm.CertificateValidation.fromDns(this.hostedZone),

@@ -22,6 +22,8 @@ export interface TenantRecord {
   displayName: string;
   /** Exact Cognito app client authorized for this tenant. */
   appClientId: string;
+  /** Complete, bounded allowlist. appClientId remains the primary web client. */
+  appClientIds?: readonly string[];
   status: TenantStatus;
 }
 
@@ -95,10 +97,13 @@ export class TenantDirectory implements TenantAuthorityResolver {
       const id = asTenantId(tenant.id);
       if (tenantMap.has(id)) throw new TenantSecurityError("INVALID_IDENTIFIER", "Tenant directory contains a duplicate tenant.");
       if (!dnsLabelPattern.test(tenant.slug) || tenant.slug.length > 63) throw new TenantSecurityError("INVALID_IDENTIFIER", "Tenant slug is invalid.");
+      const appClientId = assertTenantCognitoClientId(tenant.appClientId);
+      const appClientIds = normalizedTenantCognitoClientIds(tenant.appClientIds ?? [appClientId], appClientId);
       tenantMap.set(id, Object.freeze({
         ...tenant,
         id,
-        appClientId: assertTenantCognitoClientId(tenant.appClientId),
+        appClientId,
+        appClientIds,
         displayName: assertBoundedText(tenant.displayName, "Tenant name", 1, 160),
       }));
     }
@@ -125,6 +130,17 @@ export class TenantDirectory implements TenantAuthorityResolver {
     if (tenant.status !== "active") throw new TenantSecurityError("TENANT_INACTIVE", "Tenant is unavailable.", 403);
     return { tenant, domain };
   }
+}
+
+export function normalizedTenantCognitoClientIds(values: readonly string[], primary: string): readonly string[] {
+  if (!Array.isArray(values) || values.length < 1 || values.length > 4) {
+    throw new TenantSecurityError("INVALID_IDENTIFIER", "Tenant Cognito client allowlist is invalid.", 500);
+  }
+  const normalized = values.map(assertTenantCognitoClientId);
+  if (new Set(normalized).size !== normalized.length || !normalized.includes(assertTenantCognitoClientId(primary))) {
+    throw new TenantSecurityError("INVALID_IDENTIFIER", "Tenant Cognito client allowlist is invalid.", 500);
+  }
+  return Object.freeze([...normalized].sort());
 }
 
 export type TenantRole = "admin" | "compliance_lead" | "reviewer" | "auditor" | "collector";
@@ -177,7 +193,9 @@ export interface TenantActor {
 
 const rolePermissions: Record<TenantRole, ReadonlySet<TenantPermission>> = {
   auditor: new Set(["evidence:read", "audit:read"]),
-  collector: new Set(["evidence:read", "evidence:collect"]),
+  // A collector is an upload-only machine/user role. Keeping read access out
+  // of this role limits the blast radius of a compromised capture client.
+  collector: new Set(["evidence:collect"]),
   reviewer: new Set(["evidence:read", "evidence:approve", "evidence:export", "audit:read"]),
   compliance_lead: new Set(["evidence:read", "evidence:collect", "evidence:export", "device:manage", "integration:manage", "audit:read", "jobs:manage"]),
   admin: new Set(["tenant:manage", "evidence:read", "evidence:collect", "evidence:approve", "evidence:export", "device:manage", "integration:manage", "retention:manage", "audit:read", "jobs:manage"]),

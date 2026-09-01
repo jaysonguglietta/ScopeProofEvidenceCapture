@@ -123,11 +123,21 @@ test("tenant resolution fails closed for inactive domains and tenants", () => {
   assert.throws(() => tenantSuspended.resolve({ source: "direct", host: "acme.jsontechology.com" }), hasCode("TENANT_INACTIVE"));
 });
 
-test("tenant records require one exact bounded Cognito app client binding", () => {
+test("tenant records require a bounded Cognito app-client allowlist containing the primary client", () => {
   assert.throws(() => new TenantDirectory(
     [{ id: TENANT_A, slug: "acme", displayName: "Acme", appClientId: "bad client id", status: "active" }],
     [{ tenantId: TENANT_A, hostname: canonicalHostname("acme.jsontechology.com"), status: "active", canonical: true }],
   ), hasCode("INVALID_IDENTIFIER"));
+  assert.throws(() => new TenantDirectory(
+    [{ id: TENANT_A, slug: "acme", displayName: "Acme", appClientId: CLIENT_A, appClientIds: [CLIENT_B], status: "active" }],
+    [{ tenantId: TENANT_A, hostname: canonicalHostname("acme.jsontechology.com"), status: "active", canonical: true }],
+  ), hasCode("INVALID_IDENTIFIER"));
+
+  const withNativeClient = new TenantDirectory(
+    [{ id: TENANT_A, slug: "acme", displayName: "Acme", appClientId: CLIENT_A, appClientIds: [CLIENT_A, "scopeproof-native"], status: "active" }],
+    [{ tenantId: TENANT_A, hostname: canonicalHostname("acme.jsontechology.com"), status: "active", canonical: true }],
+  );
+  assert.deepEqual(withNativeClient.resolve({ source: "direct", host: "acme.jsontechology.com" }).tenant.appClientIds, ["scopeproof-native", CLIENT_A]);
 });
 
 test("authentication validates issuer, audience, token use, age, and expiry", () => {
@@ -179,6 +189,7 @@ test("roles deny unauthorized operations", () => {
   assert.throws(() => authorizeTenantActor({ resolved, principal: principal(), membership: membership("auditor"), permission: "evidence:collect" }), hasCode("ROLE_FORBIDDEN"));
   assert.throws(() => authorizeTenantActor({ resolved, principal: principal(), membership: membership("reviewer"), permission: "jobs:manage" }), hasCode("ROLE_FORBIDDEN"));
   assert.equal(authorizeTenantActor({ resolved, principal: principal(), membership: membership("collector"), permission: "evidence:collect" }).role, "collector");
+  assert.throws(() => authorizeTenantActor({ resolved, principal: principal(), membership: membership("collector"), permission: "evidence:read" }), hasCode("ROLE_FORBIDDEN"));
   assert.throws(() => authorizeTenantActor({ resolved, principal: principal(), membership: membership("collector"), permission: "evidence:approve" }), hasCode("ROLE_FORBIDDEN"));
   assert.equal(authorizeTenantActor({ resolved, principal: principal(), membership: membership("compliance_lead"), permission: "jobs:manage" }).role, "compliance_lead");
 });

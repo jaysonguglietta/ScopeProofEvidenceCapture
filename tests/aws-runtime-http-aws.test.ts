@@ -30,12 +30,13 @@ function activeDomainItem(overrides: Record<string, unknown> = {}): Record<strin
     PK: { S: `DOMAIN#${HOSTNAME}` },
     SK: { S: "METADATA" },
     kind: { S: "TenantDomain" },
-    schemaVersion: { N: "1" },
+    schemaVersion: { N: "2" },
     tenantId: { S: TENANT_ID },
     hostname: { S: HOSTNAME },
     slug: { S: "acme" },
     displayName: { S: "Acme Compliance" },
     appClientId: { S: "scopeproof-client-123" },
+    appClientIds: { SS: ["scopeproof-client-123", "scopeproof-native-456"] },
     status: { S: "ACTIVE" },
     canonical: { BOOL: true },
     ...overrides,
@@ -53,6 +54,7 @@ test("Dynamo tenant resolver performs one exact strongly consistent authority re
   assert.equal(resolved.tenant.id, TENANT_ID);
   assert.equal(resolved.tenant.slug, "acme");
   assert.equal(resolved.tenant.appClientId, "scopeproof-client-123");
+  assert.deepEqual(resolved.tenant.appClientIds, ["scopeproof-client-123", "scopeproof-native-456"]);
   assert.equal(resolved.domain.hostname, HOSTNAME);
   assert.equal(seen.length, 1);
   assert.equal(seen[0].input.ConsistentRead, true);
@@ -76,11 +78,13 @@ test("Dynamo tenant resolver fails closed for inactive and unknown domains", asy
 test("Dynamo tenant resolver rejects malformed active records without disclosing fields", async () => {
   for (const Item of [
     activeDomainItem({ status: { S: " active " } }),
-    activeDomainItem({ schemaVersion: { N: "2" } }),
+    activeDomainItem({ schemaVersion: { N: "1" } }),
     activeDomainItem({ hostname: { S: "bravo.jsontechology.com" } }),
     activeDomainItem({ tenantId: { S: "ten_invalid" } }),
     activeDomainItem({ canonical: { BOOL: false } }),
     activeDomainItem({ appClientId: { S: "bad client" } }),
+    activeDomainItem({ appClientIds: { SS: ["scopeproof-client-123", "scopeproof-client-123"] } }),
+    activeDomainItem({ appClientIds: { SS: ["scopeproof-native-456"] } }),
     activeDomainItem({ unexpectedSecret: { S: "must-not-be-returned" } }),
   ]) {
     const resolver = new DynamoTenantAuthorityResolver({

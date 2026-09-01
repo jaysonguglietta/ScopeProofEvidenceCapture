@@ -20,6 +20,7 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
     private let openButton = NSButton(title: "Open Screenshot", target: nil, action: nil)
     private let revealButton = NSButton(title: "Reveal in Finder", target: nil, action: nil)
     private let reviewButton = NSButton(title: "Review Status…", target: nil, action: nil)
+    private let holdButton = NSButton(title: "Place Legal Hold…", target: nil, action: nil)
     private let jiraButton = NSButton(title: "Copy Jira Comment", target: nil, action: nil)
     private let jiraUploadButton = NSButton(title: "Upload to Jira Cloud…", target: nil, action: nil)
     private let detailsLabel = NSTextField(wrappingLabelWithString: "")
@@ -126,6 +127,10 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
         reviewButton.target = self
         reviewButton.action = #selector(reviewSelected)
         reviewButton.bezelStyle = .rounded
+        holdButton.target = self
+        holdButton.action = #selector(changeLegalHold)
+        holdButton.bezelStyle = .rounded
+        holdButton.toolTip = "Place or release a signed local retention hold for the selected evidence"
         jiraButton.target = self
         jiraButton.action = #selector(copyJiraComment)
         jiraButton.bezelStyle = .rounded
@@ -138,7 +143,7 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
         detailsLabel.font = .systemFont(ofSize: 11)
         detailsLabel.maximumNumberOfLines = 2
         let spacer = NSView()
-        let actions = NSStackView(views: [statusLabel, spacer, jiraUploadButton, jiraButton, reviewButton, revealButton, openButton])
+        let actions = NSStackView(views: [statusLabel, spacer, jiraUploadButton, jiraButton, holdButton, reviewButton, revealButton, openButton])
         actions.orientation = .horizontal
         actions.alignment = .centerY
         actions.spacing = 9
@@ -271,18 +276,33 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
 
     private func updateSelectionState() {
         let hasSelection = tableView.selectedRow >= 0 && tableView.selectedRow < filteredEntries.count
+        let provenanceVerified = selectedEntry.flatMap {
+            try? ValidatedEvidenceArtifact.load($0, requireLifecycle: false)
+        }?.provenanceVerified == true
         openButton.isEnabled = hasSelection
         revealButton.isEnabled = hasSelection
-        reviewButton.isEnabled = hasSelection
-        jiraButton.isEnabled = hasSelection
-        jiraUploadButton.isEnabled = hasSelection && selectedEntry?.lifecycle.status == .approved && selectedEntry?.manifest.jiraIssueKey?.isEmpty == false
+        reviewButton.isEnabled = hasSelection && provenanceVerified
+        holdButton.isEnabled = hasSelection && provenanceVerified
+        jiraButton.isEnabled = hasSelection && provenanceVerified
+        jiraUploadButton.isEnabled = hasSelection && provenanceVerified && selectedEntry?.lifecycle.status == .approved && selectedEntry?.manifest.jiraIssueKey?.isEmpty == false
         statusLabel.stringValue = filteredEntries.isEmpty ? "No screenshots match these filters." : "\(filteredEntries.count) screenshot\(filteredEntries.count == 1 ? "" : "s") found"
         if let entry = selectedEntry {
             let lifecycle = entry.lifecycle
+            let holdStatus: String
+            switch LocalEvidenceHoldStore.state(for: entry) {
+            case .none: holdStatus = "no hold"; holdButton.title = "Place Legal Hold…"
+            case .active: holdStatus = "legal hold active"; holdButton.title = "Release Legal Hold…"
+            case .released: holdStatus = "hold released"; holdButton.title = "Place Legal Hold…"
+            case .invalid: holdStatus = "hold marker invalid (fail-closed)"; holdButton.title = "Legal Hold Invalid"
+            }
             let mappings = entry.manifest.mappedControls?.map { "\(ComplianceCatalog.framework(named: $0.framework).fileCode) \($0.controlID)" }.joined(separator: ", ") ?? "None curated"
             let jira = entry.manifest.jiraIssueKey?.isEmpty == false ? entry.manifest.jiraIssueKey! : "not assigned"
-            detailsLabel.stringValue = "\(entry.manifest.evidenceID) · \(lifecycle.status.rawValue) · Jira: \(jira) · tags: \(lifecycle.tags.isEmpty ? "none" : lifecycle.tags.joined(separator: ", ")) · mapped controls: \(mappings)"
-        } else { detailsLabel.stringValue = "Select evidence to review its lifecycle, ownership, tags, and cross-framework mappings." }
+            let provenance = provenanceVerified ? "signed provenance verified" : "legacy unsigned · browsing only"
+            detailsLabel.stringValue = "\(entry.manifest.evidenceID) · \(provenance) · \(lifecycle.status.rawValue) · \(holdStatus) · Jira: \(jira) · tags: \(lifecycle.tags.isEmpty ? "none" : lifecycle.tags.joined(separator: ", ")) · mapped controls: \(mappings)"
+        } else {
+            holdButton.title = "Place Legal Hold…"
+            detailsLabel.stringValue = "Select evidence to review its lifecycle, ownership, tags, legal hold, and cross-framework mappings."
+        }
     }
 
     private var selectedEntry: CaptureHistoryEntry? {
@@ -290,7 +310,11 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
         return filteredEntries[tableView.selectedRow]
     }
 
-    @objc private func openSelected() { if let entry = selectedEntry { NSWorkspace.shared.open(entry.imageURL) } }
+    @objc private func openSelected() {
+        guard let entry = selectedEntry,
+              (try? ValidatedEvidenceArtifact.loadForLegacyBrowsing(entry, requireLifecycle: false)) != nil else { return }
+        NSWorkspace.shared.open(entry.imageURL)
+    }
     @objc private func revealSelected() { if let entry = selectedEntry { NSWorkspace.shared.activateFileViewerSelecting([entry.imageURL]) } }
 
     @objc private func copyJiraComment() {
@@ -353,6 +377,51 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
             applyFilters()
         } catch {
             let failure = NSAlert(); failure.alertStyle = .warning; failure.messageText = "Review could not be saved"; failure.informativeText = error.localizedDescription; failure.runModal()
+        }
+    }
+
+    @objc private func changeLegalHold() {
+        guard let entry = selectedEntry else { return }
+        let active: Bool
+        let title: String
+        let action: String
+        switch LocalEvidenceHoldStore.state(for: entry) {
+        case .active:
+            active = false; title = "Release legal hold?"; action = "Release Hold"
+        case .none, .released:
+            active = true; title = "Place evidence on legal hold?"; action = "Place Hold"
+        case .invalid:
+            let alert = NSAlert()
+            alert.alertStyle = .critical
+            alert.messageText = "Legal-hold marker is invalid"
+            alert.informativeText = "Scopeproof will preserve this evidence and will not overwrite an invalid hold marker. Investigate or restore the signed marker before changing retention state."
+            alert.runModal()
+            return
+        }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = title
+        alert.informativeText = active
+            ? "Local retention will preserve \(entry.manifest.evidenceID) until this signed hold is explicitly released. This local control does not place a legal hold on hosted or S3 copies."
+            : "This removes the local retention block only. Confirm that legal, records, and investigation owners have authorized release."
+        alert.addButton(withTitle: action)
+        alert.addButton(withTitle: "Cancel")
+        let reason = NSTextField(frame: NSRect(x: 0, y: 0, width: 440, height: 26))
+        reason.placeholderString = active ? "Matter, request, or preservation reason" : "Release authorization and reason"
+        reason.setAccessibilityLabel("Legal hold reason")
+        alert.accessoryView = reason
+        alert.window.initialFirstResponder = reason
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard reason.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).count >= 10 else {
+            let error = NSAlert(); error.alertStyle = .warning; error.messageText = "Add a specific hold reason"; error.informativeText = "Enter at least 10 characters identifying the matter or release authorization."; error.runModal(); return
+        }
+        do {
+            _ = try LocalEvidenceHoldStore.set(entry: entry, active: active, reason: reason.stringValue)
+            if let evidenceRoot { allEntries = CaptureHistory.entries(in: evidenceRoot) }
+            applyFilters()
+            statusLabel.stringValue = active ? "Legal hold placed on \(entry.manifest.evidenceID)." : "Legal hold released for \(entry.manifest.evidenceID)."
+        } catch {
+            let failure = NSAlert(); failure.alertStyle = .critical; failure.messageText = "Legal hold could not be changed"; failure.informativeText = error.localizedDescription; failure.runModal()
         }
     }
 

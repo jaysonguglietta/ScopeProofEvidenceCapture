@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import LocalAuthentication
 import Security
@@ -14,6 +15,8 @@ enum KeychainStore {
     private static let updateSequenceAccount = "verified-update-highest-sequence-v1"
     private static let updateReleaseAccount = "verified-update-release-v2"
     private static let localAuditAccount = "local-console-audit-hmac-v1"
+    private static let localProvenanceAccount = "local-evidence-provenance-p256-v1"
+    private static let captureChainAnchorAccount = "local-capture-chain-anchor-v1"
     private static let s3CredentialsAccount = "aws-s3-evidence-credentials-v1"
     private static let s3DestinationAccount = "aws-s3-verified-destination-v1"
 
@@ -110,14 +113,20 @@ enum KeychainStore {
         ]
         var item: CFTypeRef?
         guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data,
-              let destination = try? JSONDecoder().decode(S3VerifiedDestination.self, from: data),
-              destination.schemaVersion == 1 else { return nil }
+              let data = item as? Data else { return nil }
+        return decodeS3VerifiedDestination(data)
+    }
+
+    static func decodeS3VerifiedDestination(_ data: Data) -> S3VerifiedDestination? {
+        guard let destination = try? JSONDecoder().decode(S3VerifiedDestination.self, from: data),
+              destination.schemaVersion == S3VerifiedDestination.currentSchemaVersion else { return nil }
         return destination
     }
 
     static func saveS3VerifiedDestination(_ destination: S3VerifiedDestination) throws {
-        guard destination.schemaVersion == 1 else { throw S3StorageFailure.invalidResponse }
+        guard destination.schemaVersion == S3VerifiedDestination.currentSchemaVersion else {
+            throw S3StorageFailure.invalidResponse
+        }
         let data = try JSONEncoder().encode(destination)
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -178,11 +187,98 @@ enum KeychainStore {
         return bytes
     }
 
+    static func localProvenancePrivateKey() throws -> Data {
+        if let existing = keychainData(account: localProvenanceAccount),
+           (try? P256.Signing.PrivateKey(rawRepresentation: existing)) != nil {
+            return existing
+        }
+        let key = P256.Signing.PrivateKey().rawRepresentation
+        try saveKeychainData(
+            key, account: localProvenanceAccount,
+            accessible: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        )
+        return key
+    }
+
+    static func captureChainAnchor() throws -> LocalCaptureChainAnchor? {
+        guard let data = keychainData(account: captureChainAnchorAccount) else { return nil }
+        guard let anchor = try? JSONDecoder().decode(LocalCaptureChainAnchor.self, from: data),
+              anchor.schemaVersion == LocalCaptureChainAnchor.currentSchemaVersion,
+              anchor.sequence > 0,
+              anchor.eventHash.range(of: #"^[a-f0-9]{64}$"#, options: .regularExpression) != nil,
+              anchor.signingKeyID.range(of: #"^[a-f0-9]{64}$"#, options: .regularExpression) != nil,
+              ISO8601DateFormatter().date(from: anchor.anchoredAt) != nil else {
+            throw LocalProvenanceFailure.invalidAnchor
+        }
+        return anchor
+    }
+
+    static func advanceCaptureChain(
+        previousHash: String, sequence: Int, eventHash: String,
+        signingKeyID: String, now: Date = Date()
+    ) throws -> LocalCaptureChainAnchor {
+        guard sequence > 0,
+              previousHash == "GENESIS" || previousHash.range(of: #"^[a-f0-9]{64}$"#, options: .regularExpression) != nil,
+              eventHash.range(of: #"^[a-f0-9]{64}$"#, options: .regularExpression) != nil,
+              signingKeyID.range(of: #"^[a-f0-9]{64}$"#, options: .regularExpression) != nil else {
+            throw LocalProvenanceFailure.invalidAnchor
+        }
+        if let existing = try captureChainAnchor() {
+            guard sequence == existing.sequence + 1, previousHash == existing.eventHash,
+                  signingKeyID == existing.signingKeyID else {
+                throw LocalProvenanceFailure.rollbackDetected
+            }
+        } else if sequence != 1 || previousHash != "GENESIS" {
+            throw LocalProvenanceFailure.rollbackDetected
+        }
+        let anchor = LocalCaptureChainAnchor(
+            schemaVersion: LocalCaptureChainAnchor.currentSchemaVersion,
+            sequence: sequence, eventHash: eventHash,
+            signingKeyID: signingKeyID,
+            anchoredAt: ISO8601DateFormatter().string(from: now)
+        )
+        try saveKeychainData(
+            try JSONEncoder().encode(anchor), account: captureChainAnchorAccount,
+            accessible: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        )
+        return anchor
+    }
+
     private static func keychainData(account: String) -> Data? {
         let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account, kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
         var item: CFTypeRef?
         guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess else { return nil }
         return item as? Data
+    }
+
+    private static func saveKeychainData(
+        _ data: Data, account: String, accessible: CFString
+    ) throws {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+        let attributes: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: accessible,
+        ]
+        let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        if status == errSecItemNotFound {
+            var create = query
+            attributes.forEach { create[$0.key] = $0.value }
+            let createStatus = SecItemAdd(create as CFDictionary, nil)
+            if createStatus == errSecDuplicateItem {
+                let retryStatus = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+                guard retryStatus == errSecSuccess else {
+                    throw NSError(domain: NSOSStatusErrorDomain, code: Int(retryStatus))
+                }
+            } else if createStatus != errSecSuccess {
+                throw NSError(domain: NSOSStatusErrorDomain, code: Int(createStatus))
+            }
+        } else if status != errSecSuccess {
+            throw NSError(domain: NSOSStatusErrorDomain, code: Int(status))
+        }
     }
 
     static func verifiedUpdateRelease() -> VerifiedUpdateRelease? {

@@ -4,6 +4,8 @@ import test from "node:test";
 import {
   createTenantApiHandler,
   type ApiGatewayRestEvent,
+  type EvidenceDownloadIntentApiPayload,
+  type EvidenceSearchApiPayload,
   type LegalHoldApprovalApiPayload,
   type LegalHoldRequestApiPayload,
   type UploadIntentApiPayload,
@@ -11,10 +13,12 @@ import {
 import type { AuthorizedApiRequest } from "../lib/aws-runtime/http/api.ts";
 import { TenantDirectory, type TenantRole } from "../lib/aws-runtime/tenancy.ts";
 import type { IssuedPresignedUpload } from "../lib/aws-runtime/evidence/upload-intent-issuer.ts";
+import type { EvidenceListPage, IssuedEvidenceDownload } from "../lib/aws-runtime/evidence/evidence-access.ts";
 import type {
   ApprovedExactVersionLegalHold,
   RequestedExactVersionLegalHold,
 } from "../lib/aws-runtime/evidence/exact-version-legal-hold.ts";
+import type { HostedApiAuditRecord } from "../lib/aws-runtime/http/audit-outbox.ts";
 
 const TENANT = `ten_${"a".repeat(32)}`;
 const USER = `usr_${"b".repeat(32)}`;
@@ -41,6 +45,7 @@ function event(path: string, method = "GET", overrides: Partial<ApiGatewayRestEv
 }
 
 function uploadBody(): Record<string, unknown> {
+  const nonce = "A".repeat(43);
   return {
     assessmentId: ASSESSMENT,
     capturedAt: "2026-08-27T16:00:00.000Z",
@@ -48,11 +53,30 @@ function uploadBody(): Record<string, unknown> {
     controlId: "PCI-DSS-10.2.1",
     description: "Redacted privileged-access review evidence",
     deviceId: DEVICE,
+    deviceManifest: {
+      schemaVersion: 1,
+      tenantId: TENANT,
+      userId: USER,
+      deviceId: DEVICE,
+      assessmentId: ASSESSMENT,
+      controlId: "PCI-DSS-10.2.1",
+      evidenceId: EVIDENCE,
+      expectedSha256: "f".repeat(64),
+      expectedSize: 4096,
+      contentType: "image/png",
+      capturedAt: "2026-08-27T16:00:00.000Z",
+      challenge: "token-id-12345678",
+      nonce,
+      sequence: 1,
+      signedAt: "2026-08-27T16:00:00.000Z",
+    },
+    devicePublicKeySpki: "A".repeat(124),
+    deviceSignature: "A".repeat(86),
     evidenceId: EVIDENCE,
     evidenceType: "SCREENSHOT",
     expectedSha256: "f".repeat(64),
     expectedSize: 4096,
-    idempotencyKey: "A".repeat(43),
+    idempotencyKey: nonce,
     metadata: { catalogVersion: "pci-dss-v4.0.1" },
     source: "Scopeproof Capture",
     systemName: "Production identity provider",
@@ -101,8 +125,12 @@ function issued(): IssuedPresignedUpload {
 function handler(input: {
   role?: TenantRole;
   issue?: (request: AuthorizedApiRequest, payload: UploadIntentApiPayload) => Promise<IssuedPresignedUpload>;
+  listEvidence?: (request: AuthorizedApiRequest, payload: EvidenceSearchApiPayload) => Promise<EvidenceListPage>;
+  issueEvidenceDownload?: (request: AuthorizedApiRequest, payload: EvidenceDownloadIntentApiPayload) => Promise<IssuedEvidenceDownload>;
   requestLegalHold?: (request: AuthorizedApiRequest, payload: LegalHoldRequestApiPayload) => Promise<RequestedExactVersionLegalHold>;
   approveLegalHold?: (request: AuthorizedApiRequest, payload: LegalHoldApprovalApiPayload) => Promise<ApprovedExactVersionLegalHold>;
+  recordApiAudit?: (record: HostedApiAuditRecord) => void;
+  omitAuditRuntime?: boolean;
 } = {}) {
   let runtimeCreations = 0;
   const directory = new TenantDirectory([
@@ -130,7 +158,12 @@ function handler(input: {
                 issuedAt: "2026-08-27T15:55:00.000Z",
                 authenticatedAt: "2026-08-27T15:55:00.000Z",
                 expiresAt: "2026-08-27T16:55:00.000Z",
-                scopes: [],
+                jwtId: "token-id-12345678",
+                scopes: [
+                  "scopeproof/evidence.read",
+                  "scopeproof/evidence.collect",
+                  "scopeproof/retention.manage",
+                ],
               };
             },
           },
@@ -150,7 +183,15 @@ function handler(input: {
             },
           },
         },
+        ...(input.omitAuditRuntime ? {} : {
+          async recordApiAudit(record: HostedApiAuditRecord) {
+            input.recordApiAudit?.(record);
+            return { outboxId: `aob_${"a".repeat(32)}`, wasCreated: true, eventDigest: "b".repeat(64) };
+          },
+        }),
         issueUploadIntent: input.issue ?? (async () => issued()),
+        listEvidence: input.listEvidence,
+        issueEvidenceDownload: input.issueEvidenceDownload,
         requestLegalHold: input.requestLegalHold,
         approveLegalHold: input.approveLegalHold,
       };
@@ -201,7 +242,7 @@ test("health is bounded, cache-disabled, and does not create privileged request 
 });
 
 test("authenticated me derives tenant and membership from verified adapters", async () => {
-  const response = await handler().api(event("/v1/me"));
+  const response = await handler().api(event("/v1/collector/me"));
   assert.equal(response.statusCode, 200);
   assert.deepEqual(JSON.parse(response.body), {
     tenantId: TENANT,
@@ -242,6 +283,71 @@ test("upload intent accepts exact JSON, uses the actor, and screens server-only 
   assert.equal(response.body.includes("idempotencyDigest"), false);
   assert.equal(response.body.includes("requestFingerprint"), false);
   assert.equal(response.body.includes("nonceDigest"), false);
+});
+
+test("evidence listing and exact-version download screen internal S3 coordinates", async () => {
+  const internal = {
+    tenantId: TENANT as never,
+    evidenceId: EVIDENCE,
+    controlId: "PCI-DSS-10.2.1",
+    title: "Quarterly privileged-access review",
+    description: "Redacted review evidence",
+    evidenceType: "SCREENSHOT" as const,
+    source: "Scopeproof Capture",
+    systemName: "Production identity provider",
+    status: "APPROVED" as const,
+    revision: 4,
+    contentType: "image/png",
+    byteSize: 4_096,
+    checksumSha256: "a".repeat(64) as never,
+    evidenceBucket: "private-tenant-evidence",
+    objectKey: `tenants/${TENANT}/controls/PCI-DSS-10.2.1/evidence/${EVIDENCE}.png`,
+    objectVersionId: "exact-version-0001",
+    capturedAt: "2026-08-27T16:00:00.000Z",
+    retainUntil: "2027-08-27T16:00:00.000Z",
+    createdAt: "2026-08-27T16:00:05.000Z",
+  };
+  let listPayload: EvidenceSearchApiPayload | undefined;
+  let downloadPayload: EvidenceDownloadIntentApiPayload | undefined;
+  const runtime = handler({
+    role: "auditor",
+    async listEvidence(_request, payload) {
+      listPayload = payload;
+      return { items: [internal], nextCursor: "opaque-signed-cursor" };
+    },
+    async issueEvidenceDownload(_request, payload) {
+      downloadPayload = payload;
+      return {
+        evidence: internal,
+        download: {
+          method: "GET",
+          url: "https://private-tenant-evidence.s3.us-east-1.amazonaws.com/exact?versionId=exact-version-0001&X-Amz-Signature=secret-capability",
+          bucket: internal.evidenceBucket,
+          key: internal.objectKey as never,
+          versionId: internal.objectVersionId,
+          expiresAt: "2026-08-27T16:01:00.000Z",
+          requiredHeaders: { "x-amz-checksum-mode": "ENABLED" },
+        },
+      };
+    },
+  });
+
+  const listed = await runtime.api(postBody("/v1/evidence/search", { cursor: null, limit: 50 }));
+  assert.equal(listed.statusCode, 200);
+  assert.deepEqual(listPayload, { limit: 50 });
+  assert.equal(listed.body.includes(internal.evidenceBucket), false);
+  assert.equal(listed.body.includes(internal.objectKey), false);
+  assert.equal(listed.body.includes(internal.objectVersionId), false);
+  assert.equal(JSON.parse(listed.body).items[0].evidenceId, EVIDENCE);
+
+  const download = await runtime.api(postBody("/v1/evidence-download-intents", { evidenceId: EVIDENCE, expectedRevision: 4 }));
+  assert.equal(download.statusCode, 201);
+  assert.deepEqual(downloadPayload, { evidenceId: EVIDENCE, expectedRevision: 4 });
+  const downloadJson = JSON.parse(download.body);
+  assert.equal("bucket" in downloadJson, false);
+  assert.equal("key" in downloadJson, false);
+  assert.equal("versionId" in downloadJson, false);
+  assert.equal(download.body.includes(internal.objectVersionId), true, "the exact version is embedded only inside the short-lived signed capability URL");
 });
 
 test("auditors cannot issue uploads and the issuer is never called", async () => {
@@ -335,6 +441,7 @@ test("legal-hold request and approval are distinct authenticated admin calls wit
   const requestDigest = "8".repeat(64);
   const runtime = handler({
     role: "admin",
+    omitAuditRuntime: true,
     async requestLegalHold(request, payload) {
       requester = request.actor.userId;
       requestedPayload = payload;

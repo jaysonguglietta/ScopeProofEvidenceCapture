@@ -1,25 +1,27 @@
 import { jsonError, requireApiPermission, requireApiUser, requireSameOrigin } from "../../../../lib/server/auth";
 import { approveEvidence, readEvidenceBytes } from "../../../../lib/server/evidence";
 import { enforceRateLimit, requireBoundedContentLength } from "../../../../lib/server/rate-limit";
+import { evidenceResponseHeaders } from "../../../../lib/server/evidence-response";
+import { appendAuditEvent } from "../../../../lib/server/audit";
 
 export async function GET(request: Request, context: { params: Promise<{ id: string }> }) {
   try {
     const user = await requireApiUser(request);
     await enforceRateLimit(request, user.id, "evidence:read", 120, 60);
     const { id } = await context.params;
-    const artifact = await readEvidenceBytes(id);
+    const artifact = await readEvidenceBytes(id, user);
     if (!artifact) return Response.json({ error: "Evidence not found" }, { status: 404 });
     const inline = new URL(request.url).searchParams.get("view") === "inline";
     const contentType = String(artifact.row.content_type);
-    const extension = contentType.includes("json") ? ".json" : contentType.includes("png") ? ".png" : contentType.includes("pdf") ? ".pdf" : ".txt";
-    return new Response(artifact.bytes.buffer.slice(artifact.bytes.byteOffset, artifact.bytes.byteOffset + artifact.bytes.byteLength) as ArrayBuffer, { headers: {
-      "content-type": contentType,
-      "content-disposition": `${inline ? "inline" : "attachment"}; filename="${id}${extension}"`,
-      "content-security-policy": "default-src 'none'; sandbox",
-      "x-content-type-options": "nosniff",
-      "x-scopeproof-sha256": String(artifact.row.sha256),
-      "cache-control": "private, no-store",
-    } });
+    const headers = evidenceResponseHeaders(id, contentType, inline);
+    headers.set("x-scopeproof-sha256", String(artifact.row.sha256));
+    // Evidence disclosure fails closed if its durable access event cannot be appended.
+    await appendAuditEvent(user, inline ? "evidence.previewed" : "evidence.downloaded", "evidence", id, {
+      artifactSha256: String(artifact.row.sha256),
+      contentType,
+      disposition: headers.get("content-disposition"),
+    });
+    return new Response(artifact.bytes.buffer.slice(artifact.bytes.byteOffset, artifact.bytes.byteOffset + artifact.bytes.byteLength) as ArrayBuffer, { headers });
   } catch (error) { return jsonError(error); }
 }
 

@@ -117,7 +117,7 @@ final class CapturePreferences {
     var targets: [String] {
         get {
             let saved = defaults.stringArray(forKey: Key.targets) ?? []
-            return saved.isEmpty ? ["https://scopeproof-pci.jayson-guglietta.chatgpt.site"] : saved
+            return saved
         }
         set { defaults.set(Array(newValue.prefix(12)), forKey: Key.targets) }
     }
@@ -132,7 +132,7 @@ final class CapturePreferences {
 
     var serverURL: URL? {
         get {
-            if defaults.object(forKey: Key.serverURL) == nil { return URL(string: "https://scopeproof-pci.jayson-guglietta.chatgpt.site") }
+            if defaults.object(forKey: Key.serverURL) == nil { return nil }
             return defaults.string(forKey: Key.serverURL).flatMap(URL.init(string:))
         }
         set { defaults.set(newValue?.absoluteString ?? "", forKey: Key.serverURL) }

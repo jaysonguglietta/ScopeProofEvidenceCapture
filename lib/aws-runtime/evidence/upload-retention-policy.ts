@@ -1,6 +1,10 @@
 import { canonicalInstant, TenantSecurityError } from "../contracts.ts";
 
 const MAXIMUM_CAPTURE_CLOCK_SKEW_MS = 5 * 60 * 1_000;
+// Ordinary capture uploads are deliberately not an unrestricted historical
+// import mechanism. A separate, reviewed migration workflow should be used for
+// older evidence so a stolen device credential cannot back-fill arbitrary data.
+export const MAXIMUM_CAPTURE_AGE_MS = 30 * 24 * 60 * 60 * 1_000;
 
 export interface ServerManagedUploadRetention {
   readonly capturedAt: string;
@@ -29,6 +33,13 @@ export function deriveServerManagedUploadRetention(input: Readonly<{
     throw new TenantSecurityError(
       "RETENTION_VIOLATION",
       "Evidence capture time exceeds the allowed clock skew.",
+      409,
+    );
+  }
+  if (Date.parse(capturedAt) < input.now.getTime() - MAXIMUM_CAPTURE_AGE_MS) {
+    throw new TenantSecurityError(
+      "RETENTION_VIOLATION",
+      "Evidence capture time is older than the 30-day collection window.",
       409,
     );
   }

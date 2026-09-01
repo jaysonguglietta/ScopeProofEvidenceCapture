@@ -30,7 +30,10 @@ const sources = [
 
 type ApiCollector = { id: string; provider: string; display_name: string; enabled: number; schedule_cron: string | null; status: string; last_run_at: string | null; last_error: string | null; configuration: { configured: boolean; missing: string[] } };
 type ApiUser = { id: string; email: string; displayName: string; role: string };
-type ApiDevice = { id: string; display_name: string; platform: string; status: string; app_version: string | null; last_seen_at: string | null; created_at: string; revoked_at: string | null };
+type ApiMember = { id: string; email: string; display_name: string; role: string; status: "active" | "suspended" | "revoked"; invited_by: string | null; created_at: string; last_seen_at: string };
+type ApiInvitation = { id: string; email: string; role: string; status: "pending" | "accepted" | "revoked" | "expired"; invited_by: string; expires_at: string; accepted_user_id?: string | null; created_at: string };
+type ApiAuditEvent = { sequence: number; id: string; occurred_at: string; actor_email: string; action: string; resource_type: string; resource_id: string; event_hash: string };
+type ApiDevice = { id: string; display_name: string; platform: string; status: string; app_version: string | null; last_seen_at: string | null; token_issued_at: string; token_expires_at: string; token_last_rotated_at: string | null; token_expired: number; created_at: string; revoked_at: string | null };
 type ApiJiraConnection = { connected: boolean; configured: boolean; id?: string; siteUrl?: string; siteName?: string; allowedProjects?: string[]; status?: "active" | "reauthorization_required"; lastTestedAt?: string | null; updatedAt?: string };
 type ApiAssessment = { id: string; name: string; framework: string; period_start: string; period_end: string; systems: string[]; controls: string[]; owner_id: string; status: "draft" | "active" | "closed"; created_at: string; updated_at: string };
 type ApiRepository = { name: string; fullName: string; defaultBranch: string; private: boolean; archived: boolean };
@@ -46,10 +49,17 @@ async function apiError(response: Response): Promise<string> { try { const data 
 
 function mapApiEvidence(row: Record<string, unknown>): Evidence {
   const type = titleCase(String(row.type)) as Evidence["type"];
-  const statusMap: Record<string, EvidenceStatus> = { approved: "Approved", needs_review: "Needs review", expiring: "Expiring", rejected: "Failed" };
+  const statusMap: Record<string, EvidenceStatus> = { approved: "Approved", needs_review: "Needs review", expiring: "Expiring", expired: "Expired", rejected: "Failed" };
   const redactionCount = Number(row.redaction_count || 0);
   const framework = String(row.framework || "PCI DSS 4.0.1");
   const sourceTags = Array.isArray(row.tags) ? row.tags.filter((value): value is string => typeof value === "string") : [];
+  const occurrenceCount = Math.max(1, Number(row.occurrence_count || 1));
+  const serverSafetyStatus = (["verified", "pending", "not_applicable"].includes(String(row.server_safety_status)) ? String(row.server_safety_status) : "not_applicable") as Evidence["serverSafetyStatus"];
+  const nativeProvenanceStatus = (["verified", "pending", "not_applicable"].includes(String(row.native_provenance_status)) ? String(row.native_provenance_status) : "not_applicable") as Evidence["nativeProvenanceStatus"];
+  const trustTags = [
+    type === "Screenshot" ? serverSafetyStatus === "verified" ? "Independent server safety verified" : "Safety verification pending · quarantined" : null,
+    nativeProvenanceStatus === "verified" ? "Signed device chain finalized" : nativeProvenanceStatus === "pending" ? "Device provenance pending · quarantined" : null,
+  ].filter((value): value is string => Boolean(value));
   return {
     id: String(row.id), title: String(row.title), control: String(row.control_id), framework, requirement: framework,
     type, source: String(row.source), system: String(row.system), capturedAt: formatDate(row.captured_at), expiresAt: formatDate(row.expires_at), status: statusMap[String(row.status)] || "Needs review",
@@ -57,10 +67,12 @@ function mapApiEvidence(row: Record<string, unknown>): Evidence {
     mappedControls: Array.isArray(row.mapped_controls) ? row.mapped_controls as Evidence["mappedControls"] : [],
     jiraIssueKey: row.jira_issue_key ? String(row.jira_issue_key) : undefined, jiraIssueURL: String(row.jira_issue_url || "").startsWith("https://") ? String(row.jira_issue_url) : undefined,
     assessmentId: row.assessment_id ? String(row.assessment_id) : undefined,
+    occurrenceCount, lastObservedAt: row.last_observed_at ? formatDate(row.last_observed_at) : undefined,
+    serverSafetyStatus, nativeProvenanceStatus,
     collector: String(row.collector_id || "Manual submission"), checksum: `sha256:${String(row.sha256)}`, sha256: String(row.sha256), createdBy: String(row.created_by || ""), approvedBy: row.approved_by ? String(row.approved_by) : undefined, description: String(row.description || ""),
     code: ["Code", "Configuration"].includes(type) ? "Encrypted artifact\nIntegrity verified on access\nOpen or export to inspect contents" : undefined,
     language: type === "Code" ? "Protected source" : type === "Configuration" ? "Protected config" : undefined,
-    accent: redactionCount ? "amber" : "emerald", tags: [...sourceTags, "Encrypted", "Server-backed", row.device_id ? "Client scan claim recorded" : "Scan metadata recorded", redactionCount ? `${redactionCount + Number(row.manual_redactions || 0)} value(s) redacted` : "No redactions reported"],
+    accent: serverSafetyStatus === "pending" || nativeProvenanceStatus === "pending" || redactionCount ? "amber" : "emerald", tags: [...sourceTags, "Encrypted", "Server-backed", `${occurrenceCount} collection occurrence${occurrenceCount === 1 ? "" : "s"}`, ...trustTags, redactionCount ? `${redactionCount + Number(row.manual_redactions || 0)} value(s) redacted` : "No redactions reported"],
   };
 }
 
@@ -135,8 +147,6 @@ export function EvidenceConsole() {
   const [auditIntegrity, setAuditIntegrity] = useState<{ valid: boolean; checked: number } | null>(null);
   const [backendState, setBackendState] = useState<"loading" | "live" | "unavailable">("loading");
   const [busy, setBusy] = useState(false);
-  const [redaction, setRedaction] = useState(true);
-  const [notifications, setNotifications] = useState(true);
 
   useEffect(() => {
     let cancelled = false;
@@ -279,7 +289,7 @@ export function EvidenceConsole() {
       const refreshed = await fetch("/api/evidence").then((result) => result.json()) as { evidence: Array<Record<string, unknown>> };
       setEvidenceItems((refreshed.evidence as Array<Record<string, unknown>>).map(mapApiEvidence));
       const result = await response.json() as { id: string; deduplicated: boolean };
-      setModal(null); setToast(result.deduplicated ? "Matching evidence already exists; no duplicate was stored." : `${result.id} encrypted and added to the review queue.`); setView("Evidence");
+      setModal(null); setToast(result.deduplicated ? "Matching bytes were reused and a new collection occurrence was recorded." : `${result.id} encrypted and added to the review queue.`); setView("Evidence");
     } catch (error) { setToast(error instanceof Error ? error.message : "Evidence upload failed."); }
     finally { setBusy(false); }
   }
@@ -352,6 +362,20 @@ export function EvidenceConsole() {
     finally { setBusy(false); }
   }
 
+  async function rotateDevice(id: string) {
+    if (!window.confirm("Rotate this device token? The current token will stop working immediately.")) return;
+    setBusy(true);
+    try {
+      const response = await fetch("/api/devices", { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ id }) });
+      if (!response.ok) throw new Error(await apiError(response));
+      const data = await response.json() as { token: string; tokenExpiresAt: string };
+      setDeviceToken(data.token); setModal("device");
+      const refreshed = await fetch("/api/devices").then((result) => result.json()) as { devices: ApiDevice[] };
+      setDeviceItems(refreshed.devices); setToast("Device token rotated. Copy the replacement now; the previous token is invalid.");
+    } catch (error) { setToast(error instanceof Error ? error.message : "Device token rotation failed."); }
+    finally { setBusy(false); }
+  }
+
   async function connectJira(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
@@ -415,7 +439,7 @@ export function EvidenceConsole() {
           <button className="mobile-menu" onClick={() => setSidebarOpen(true)} aria-label="Open navigation">☰</button>
           <div className="breadcrumbs"><span>{activeAssessment?.name || "Scopeproof"}</span><b>/</b><strong>{view}</strong></div>
           <div className="top-actions">
-            <button className="icon-button" aria-label="Notifications" onClick={() => setToast("You’re all caught up. No new notifications.")}>♢<i /></button>
+            <button className="icon-button" aria-label="Open findings requiring attention" onClick={() => navigate("Findings")}>♢{scopedEvidence.some((item) => item.status !== "Approved") || scopedRuns.some((run) => ["Failed", "Partial"].includes(run.status)) ? <i /> : null}</button>
             <button className="button secondary" disabled={!canExport} title={!canExport ? "Reviewer or evidence-operations access is required." : undefined} onClick={() => setModal("export")}>↓ <span>Export package</span></button>
             <button className="button primary" disabled={!canCollect} title={!canCollect ? "Evidence-operations access is required." : undefined} onClick={() => setModal("run")}>＋ <span>Run collection</span></button>
           </div>
@@ -430,8 +454,8 @@ export function EvidenceConsole() {
           {view === "SBOMs" && <SbomView items={scopedSboms} configured={sbomConfigured} managedError={sbomManagedError} canGenerate={canCollect} onGenerate={() => setModal("sbom")} onOpenEvidence={(id) => { const item = evidenceItems.find((entry) => entry.id === id); if (item) setSelectedEvidence(item); else setToast("The evidence record is unavailable. Reload and try again."); }} />}
           {view === "Collection runs" && <RunsView items={scopedRuns} canCollect={canCollect} onRun={() => setModal("run")} onToast={setToast} />}
           {view === "Findings" && <FindingsView evidenceItems={scopedEvidence} runItems={scopedRuns} />}
-          {view === "Connections" && <ConnectionsView collectors={collectorItems} devices={deviceItems} jira={jiraConnection} canManageJira={canManageOperations} busy={busy} onConnectJira={connectJira} onTestJira={testJira} onDisconnectJira={disconnectJiraConnection} onEnroll={() => { setDeviceToken(null); setModal("device"); }} onRevoke={revokeDevice} onToast={setToast} />}
-          {view === "Settings" && <SettingsView redaction={redaction} setRedaction={setRedaction} notifications={notifications} setNotifications={setNotifications} auditIntegrity={auditIntegrity} role={currentUser?.role || "auditor"} onToast={setToast} />}
+          {view === "Connections" && <ConnectionsView collectors={collectorItems} devices={deviceItems} jira={jiraConnection} canManageJira={canManageOperations} busy={busy} onConnectJira={connectJira} onTestJira={testJira} onDisconnectJira={disconnectJiraConnection} onEnroll={() => { setDeviceToken(null); setModal("device"); }} onRotate={rotateDevice} onRevoke={revokeDevice} onToast={setToast} />}
+          {view === "Settings" && <SettingsView auditIntegrity={auditIntegrity} currentUser={currentUser} onToast={setToast} />}
           {view === "Help" && <HelpView onNavigate={navigate} />}</>}
         </section>
       </main>
@@ -496,9 +520,9 @@ function ControlsView({ evidenceItems, onNavigate }: { evidenceItems: Evidence[]
 
 function EvidenceView({ items, canCollect, search, setSearch, status, setStatus, type, setType, onSelect, onAdd }: { items: Evidence[]; canCollect: boolean; search: string; setSearch: (v: string) => void; status: string; setStatus: (v: string) => void; type: string; setType: (v: string) => void; onSelect: (item: Evidence) => void; onAdd: () => void }) {
   return <><PageTitle eyebrow="Evidence library" title="Collected evidence" description="Review, validate, and trace every artifact back to its source and PCI requirement." actions={<button className="button primary" disabled={!canCollect} title={!canCollect ? "Evidence-operations access is required." : undefined} onClick={onAdd}>＋ Add evidence</button>} />
-    <section className="panel evidence-library"><div className="toolbar"><label className="search-box wide"><span>⌕</span><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search evidence, control, system, or tag…" /></label><select aria-label="Filter by evidence type" value={type} onChange={(e) => setType(e.target.value)}><option>All types</option><option>Screenshot</option><option>Code</option><option>Configuration</option><option>Report</option></select><select aria-label="Filter by review status" value={status} onChange={(e) => setStatus(e.target.value)}><option>All statuses</option><option>Approved</option><option>Needs review</option><option>Expiring</option><option>Failed</option></select></div>
+    <section className="panel evidence-library"><div className="toolbar"><label className="search-box wide"><span>⌕</span><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search evidence, control, system, or tag…" /></label><select aria-label="Filter by evidence type" value={type} onChange={(e) => setType(e.target.value)}><option>All types</option><option>Screenshot</option><option>Code</option><option>Configuration</option><option>Report</option></select><select aria-label="Filter by review status" value={status} onChange={(e) => setStatus(e.target.value)}><option>All statuses</option><option>Approved</option><option>Needs review</option><option>Expiring</option><option>Expired</option><option>Failed</option></select></div>
       <div className="library-subhead"><span>{items.length} artifacts</span><span>Sorted by <b>most recent</b></span></div>
-      {items.length ? <div className="library-grid">{items.map((item) => <button className="library-card" key={item.id} onClick={() => onSelect(item)}><EvidenceVisual item={item} /><div className="library-body"><div><span className="type-label">{item.type}</span><StatusPill status={item.status} /></div><h3>{item.title}</h3><p>{item.description}</p><div className="artifact-meta"><span><b>{item.control}</b> · {item.requirement}</span><span>{item.source} / {item.system}</span><span>{item.capturedAt}</span></div></div></button>)}</div> : <EmptyState message="No evidence matches these filters." action="Clear filters" onAction={() => { setSearch(""); setStatus("All statuses"); setType("All types"); }} />}
+      {items.length ? <div className="library-grid">{items.map((item) => <button className="library-card" key={item.id} onClick={() => onSelect(item)}><EvidenceVisual item={item} /><div className="library-body"><div><span className="type-label">{item.type}</span><StatusPill status={item.status} /></div><h3>{item.title}</h3><p>{item.description}</p><div className="artifact-meta"><span><b>{item.control}</b> · {item.requirement}</span><span>{item.source} / {item.system}</span><span>{item.lastObservedAt || item.capturedAt}{(item.occurrenceCount || 1) > 1 ? ` · ${item.occurrenceCount} observations` : ""}</span></div></div></button>)}</div> : <EmptyState message="No evidence matches these filters." action="Clear filters" onAction={() => { setSearch(""); setStatus("All statuses"); setType("All types"); }} />}
     </section>
   </>;
 }
@@ -545,7 +569,7 @@ function FindingsView({ evidenceItems, runItems }: { evidenceItems: Evidence[]; 
   </>;
 }
 
-function ConnectionsView({ collectors, devices, jira, canManageJira, busy, onConnectJira, onTestJira, onDisconnectJira, onEnroll, onRevoke, onToast }: { collectors: ApiCollector[]; devices: ApiDevice[]; jira: ApiJiraConnection | null; canManageJira: boolean; busy: boolean; onConnectJira: (event: React.FormEvent<HTMLFormElement>) => void; onTestJira: () => void; onDisconnectJira: () => void; onEnroll: () => void; onRevoke: (id: string) => void; onToast: (message: string) => void }) {
+function ConnectionsView({ collectors, devices, jira, canManageJira, busy, onConnectJira, onTestJira, onDisconnectJira, onEnroll, onRotate, onRevoke, onToast }: { collectors: ApiCollector[]; devices: ApiDevice[]; jira: ApiJiraConnection | null; canManageJira: boolean; busy: boolean; onConnectJira: (event: React.FormEvent<HTMLFormElement>) => void; onTestJira: () => void; onDisconnectJira: () => void; onEnroll: () => void; onRotate: (id: string) => void; onRevoke: (id: string) => void; onToast: (message: string) => void }) {
   const cards = sources.map((source) => {
     const collector = collectors.find((item) => item.id === source.id);
     return { ...source, status: collector?.configuration.configured ? titleCase(collector.status) : "Not configured", detail: collector?.configuration.configured ? source.detail : `Missing ${collector?.configuration.missing.join(", ") || "hosted secrets"}`, lastRun: collector?.last_run_at ? formatDate(collector.last_run_at) : "Never", error: collector?.last_error };
@@ -558,15 +582,93 @@ function ConnectionsView({ collectors, devices, jira, canManageJira, busy, onCon
       {!canManageJira ? <div className="jira-access-note"><strong>Evidence-operations access required</strong><p>An administrator or compliance lead must connect Jira Cloud. Reviewers remain independent from collection and disclosure operations.</p></div> : jira?.connected ? <div className="jira-connected"><div className="jira-site-mark">JI</div><div><strong>{jira.siteName}</strong><a href={jira.siteUrl} target="_blank" rel="noreferrer">{jira.siteUrl} ↗</a><small>Allowed projects: {jira.allowedProjects?.join(", ") || "None"} · {jira.lastTestedAt ? `Tested ${formatDate(jira.lastTestedAt)}` : "Not tested yet"}</small></div><div className="jira-actions"><button className="button secondary" disabled={busy} onClick={onTestJira}>{busy ? "Testing…" : "Test connection"}</button><button className="button secondary danger" disabled={busy} onClick={onDisconnectJira}>Disconnect</button></div></div> : <form className="jira-connect-form" onSubmit={onConnectJira}><label className="field"><span>Jira Cloud site URL</span><input name="siteUrl" type="url" required defaultValue={jira?.siteUrl || ""} placeholder="https://your-company.atlassian.net" autoComplete="url" /></label><label className="field"><span>Allowed project keys</span><input name="allowedProjects" required defaultValue={jira?.allowedProjects?.join(", ") || ""} placeholder="GRC, PCI" autoCapitalize="characters" /><small>Only these projects may receive evidence from Scopeproof.</small></label><div className="jira-connect-copy"><strong>Secure OAuth connection</strong><p>You will continue to Atlassian to choose the site and approve access. Scopeproof stores encrypted rotating tokens in the hosted service; Jira credentials never enter the Mac app.</p></div><button className="button primary" disabled={busy || jira?.configured === false}>{busy ? "Preparing Atlassian authorization…" : "Connect Jira Cloud"}</button>{jira?.configured === false && <p className="field-error">A platform administrator must configure the four JIRA_OAUTH_* hosted secrets first.</p>}</form>}
     </section>
     <section className="panel device-panel"><div className="panel-head"><div><h2>Mac capture devices</h2><p>Revocable device identities for locally reviewed screenshot uploads</p></div><button className="button primary" disabled={!canManageJira} title={!canManageJira ? "Evidence-operations access is required." : undefined} onClick={onEnroll}>＋ Enroll Mac</button></div>
-      {!canManageJira ? <div className="jira-access-note"><strong>Independent reviewer boundary</strong><p>Reviewers can inspect and approve evidence but cannot enroll collection devices.</p></div> : devices.length ? <div className="device-list">{devices.map((device) => <div className="device-row" key={device.id}><span className="device-icon">⌘</span><div><strong>{device.display_name}</strong><small>{device.platform} · {device.app_version ? `v${device.app_version}` : "Not connected yet"} · {device.last_seen_at ? `Seen ${formatDate(device.last_seen_at)}` : "Awaiting first upload"}</small></div><StatusPill status={titleCase(device.status)} /><button className="button secondary" disabled={device.status === "revoked"} onClick={() => onRevoke(device.id)}>{device.status === "revoked" ? "Revoked" : "Revoke"}</button></div>)}</div> : <EmptyState message="No Mac capture devices are enrolled. Create a one-time token, then paste it into Scopeproof Capture & Jira Settings." action="Enroll first Mac" onAction={onEnroll} />}
+      {!canManageJira ? <div className="jira-access-note"><strong>Independent reviewer boundary</strong><p>Reviewers can inspect and approve evidence but cannot enroll collection devices.</p></div> : devices.length ? <div className="device-list">{devices.map((device) => { const expired = Boolean(device.token_expired); return <div className="device-row" key={device.id}><span className="device-icon">⌘</span><div><strong>{device.display_name}</strong><small>{device.platform} · {device.app_version ? `v${device.app_version}` : "Not connected yet"} · {device.last_seen_at ? `Seen ${formatDate(device.last_seen_at)}` : "Awaiting first upload"}</small><small className={expired ? "danger-text" : undefined}>Token {expired ? "expired" : `expires ${formatDate(device.token_expires_at)}`}{device.token_last_rotated_at ? ` · Rotated ${formatDate(device.token_last_rotated_at)}` : ""}</small></div><StatusPill status={device.status === "active" && expired ? "Expired" : titleCase(device.status)} /><div className="device-actions"><button className="button secondary" disabled={busy || device.status === "revoked"} onClick={() => onRotate(device.id)}>Rotate</button><button className="button secondary danger" disabled={busy || device.status === "revoked"} onClick={() => onRevoke(device.id)}>{device.status === "revoked" ? "Revoked" : "Revoke"}</button></div></div>; })}</div> : <EmptyState message="No Mac capture devices are enrolled. Create a one-time token, then paste it into Scopeproof Capture & Jira Settings." action="Enroll first Mac" onAction={onEnroll} />}
     </section>
   </>;
 }
 
-function SettingsView({ redaction, setRedaction, notifications, setNotifications, auditIntegrity, role, onToast }: { redaction: boolean; setRedaction: (value: boolean) => void; notifications: boolean; setNotifications: (value: boolean) => void; auditIntegrity: { valid: boolean; checked: number } | null; role: string; onToast: (message: string) => void }) {
-  void redaction;
-  return <><PageTitle eyebrow="Workspace" title="Settings" description="Configure evidence retention, capture safety, and reviewer notifications." />
-    <div className="settings-layout"><nav><button className="active">Evidence policy</button><button onClick={() => onToast(`Your effective role is ${role.replaceAll("_", " ")}. Role changes require an administrator.`)}>Team & access</button><button onClick={() => onToast(auditIntegrity?.valid ? `Audit chain verified across ${auditIntegrity.checked} event(s).` : "Audit chain verification is pending.")}>Audit log</button></nav><section className="panel settings-panel"><h2>Evidence policy</h2><p>Enforced protections for automated and manual evidence.</p><div className="integrity-setting"><span>{auditIntegrity?.valid ? "✓" : "↻"}</span><div><strong>{auditIntegrity?.valid ? "Immutable audit chain verified" : "Verifying audit chain"}</strong><p>{auditIntegrity?.valid ? `${auditIntegrity.checked} signed event(s) validated from genesis.` : "Integrity verification runs server-side."}</p></div></div><div className="setting-row"><div><strong>Sensitive-data redaction</strong><span>Luhn-validated PAN, access tokens, API secrets, JWTs, private keys, and authorization headers are scanned before encryption. This control is mandatory in production.</span></div><button role="switch" aria-label="Sensitive-data redaction is enforced" aria-checked="true" className="switch on" onClick={() => onToast("Redaction is a mandatory server-side control and cannot be disabled.")}><i /></button></div><div className="setting-row"><div><strong>Reviewer notifications</strong><span>Notify control owners when evidence is ready, expiring, or has failed collection.</span></div><button role="switch" aria-label="Toggle reviewer notifications" aria-checked={notifications} className={cls("switch", notifications && "on")} onClick={() => setNotifications(!notifications)}><i /></button></div><label className="field"><span>Default evidence validity</span><select><option>90 days</option><option>30 days</option><option>180 days</option><option>1 year</option></select><small>Control-specific schedules override this value.</small></label><label className="field"><span>Retention period</span><select><option>13 months</option><option>2 years</option><option>3 years</option><option>7 years</option></select><small>Deletion is blocked while an artifact belongs to an active assessment.</small></label><div className="settings-actions"><button className="button secondary" onClick={() => { setRedaction(true); setNotifications(true); onToast("Unsaved settings discarded."); }}>Discard</button><button className="button primary" onClick={() => onToast("Local notification preference saved. Security controls remain enforced server-side.")}>Save changes</button></div></section></div>
+function SettingsView({ auditIntegrity, currentUser, onToast }: { auditIntegrity: { valid: boolean; checked: number } | null; currentUser: ApiUser | null; onToast: (message: string) => void }) {
+  const [tab, setTab] = useState<"policy" | "team" | "audit">("policy");
+  const [members, setMembers] = useState<ApiMember[]>([]);
+  const [invitations, setInvitations] = useState<ApiInvitation[]>([]);
+  const [auditEvents, setAuditEvents] = useState<ApiAuditEvent[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [working, setWorking] = useState(false);
+  const canReadTeam = ["admin", "compliance_lead"].includes(currentUser?.role || "");
+  const canManageTeam = currentUser?.role === "admin";
+
+  async function loadTeam() {
+    if (!canReadTeam) return;
+    setLoading(true);
+    try {
+      const response = await fetch("/api/users", { cache: "no-store" });
+      if (!response.ok) throw new Error(await apiError(response));
+      const data = await response.json() as { users: ApiMember[]; invitations: ApiInvitation[] };
+      setMembers(data.users); setInvitations(data.invitations);
+    } catch (error) { onToast(error instanceof Error ? error.message : "Team access could not be loaded."); }
+    finally { setLoading(false); }
+  }
+
+  async function openTeam() {
+    setTab("team");
+    if (!members.length) await loadTeam();
+  }
+
+  async function openAudit() {
+    setTab("audit");
+    if (auditEvents.length) return;
+    setLoading(true);
+    try {
+      const response = await fetch("/api/audit", { cache: "no-store" });
+      if (!response.ok) throw new Error(await apiError(response));
+      const data = await response.json() as { events: ApiAuditEvent[] };
+      setAuditEvents(data.events);
+    } catch (error) { onToast(error instanceof Error ? error.message : "Audit events could not be loaded."); }
+    finally { setLoading(false); }
+  }
+
+  async function inviteMember(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const values = new FormData(form);
+    setWorking(true);
+    try {
+      const response = await fetch("/api/users", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ email: values.get("email"), role: values.get("role"), expiresInDays: Number(values.get("expiresInDays")) }) });
+      if (!response.ok) throw new Error(await apiError(response));
+      form.reset(); await loadTeam(); onToast("Invitation created. Access begins only after the invited identity signs in before expiration.");
+    } catch (error) { onToast(error instanceof Error ? error.message : "Invitation could not be created."); }
+    finally { setWorking(false); }
+  }
+
+  async function changeMember(member: ApiMember, patch: { role?: string; status?: string }) {
+    const change = patch.role ? `change ${member.email} to ${patch.role.replaceAll("_", " ")}` : `${patch.status} ${member.email}`;
+    if (!window.confirm(`Confirm: ${change}? Queued collection and SBOM retries re-check this membership.`)) return;
+    setWorking(true);
+    try {
+      const response = await fetch("/api/users", { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ userId: member.id, ...patch }) });
+      if (!response.ok) throw new Error(await apiError(response));
+      await loadTeam(); onToast(`Membership updated for ${member.email}.`);
+    } catch (error) { onToast(error instanceof Error ? error.message : "Membership could not be updated."); }
+    finally { setWorking(false); }
+  }
+
+  async function revokeInvitation(invitation: ApiInvitation) {
+    if (!window.confirm(`Revoke the pending invitation for ${invitation.email}?`)) return;
+    setWorking(true);
+    try {
+      const response = await fetch("/api/users", { method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ invitationId: invitation.id }) });
+      if (!response.ok) throw new Error(await apiError(response));
+      await loadTeam(); onToast(`Invitation revoked for ${invitation.email}.`);
+    } catch (error) { onToast(error instanceof Error ? error.message : "Invitation could not be revoked."); }
+    finally { setWorking(false); }
+  }
+
+  return <><PageTitle eyebrow="Workspace" title="Settings" description="Inspect enforced evidence policy, manage membership, and verify the audit record." />
+    <div className="settings-layout"><nav aria-label="Settings sections"><button className={tab === "policy" ? "active" : ""} onClick={() => setTab("policy")}>Evidence policy</button><button className={tab === "team" ? "active" : ""} onClick={() => void openTeam()}>Team & access</button><button className={tab === "audit" ? "active" : ""} onClick={() => void openAudit()}>Audit log</button></nav>
+      {tab === "policy" && <section className="panel settings-panel"><h2>Evidence policy</h2><p>These are enforced server-side and cannot be weakened from the browser.</p><div className="integrity-setting"><span>{auditIntegrity?.valid ? "✓" : "↻"}</span><div><strong>{auditIntegrity?.valid ? "Tamper-evident audit tail verified" : "Audit verification pending"}</strong><p>{auditIntegrity?.valid ? `${auditIntegrity.checked} event(s) verified from the latest signed checkpoint.` : "Production readiness fails until the chain and independent checkpoint verify."}</p></div></div><div className="setting-row"><div><strong>Sensitive-data redaction</strong><span>Luhn-validated PAN, access tokens, API secrets, JWTs, private keys, and authorization headers are scanned before encryption. Screenshot approval additionally requires digest-bound exact-pixel scan metadata.</span></div><StatusPill status="Enforced" /></div><div className="setting-row"><div><strong>Evidence validity</strong><span>New evidence defaults to 90 days. Expired evidence cannot be approved or exported as current.</span></div><strong>90 days</strong></div><div className="setting-row"><div><strong>Retention and holds</strong><span>Expired bytes are retained while their assessment is draft or active, or while an explicit retention hold remains valid. Purge actions and failures are audited.</span></div><StatusPill status="Fail closed" /></div><div className="setting-row"><div><strong>Tenant boundary</strong><span>The legacy hosted runtime accepts exactly one canonical origin and one isolated D1/R2/key boundary. Multi-customer operation requires the tenant-aware AWS runtime.</span></div><StatusPill status="Single tenant" /></div></section>}
+      {tab === "team" && <section className="panel settings-panel"><h2>Team & access</h2><p>Invitation-only membership with server-enforced roles, suspension, revocation, and final-administrator protection.</p>{!canReadTeam ? <div className="jira-access-note"><strong>Your role is {currentUser?.role?.replaceAll("_", " ") || "unknown"}</strong><p>An administrator or compliance lead can view membership. Only an administrator can invite people or change access.</p></div> : <>{canManageTeam && <form className="invite-form" onSubmit={inviteMember}><label className="field"><span>Email address</span><input name="email" type="email" required maxLength={254} autoComplete="off" placeholder="reviewer@example.com" /></label><label className="field"><span>Role</span><select name="role" defaultValue="auditor"><option value="auditor">Auditor</option><option value="reviewer">Reviewer</option><option value="compliance_lead">Compliance lead</option><option value="admin">Administrator</option></select></label><label className="field"><span>Expires</span><select name="expiresInDays" defaultValue="7"><option value="1">1 day</option><option value="7">7 days</option><option value="14">14 days</option><option value="30">30 days</option></select></label><button className="button primary" disabled={working}>Create invitation</button></form>}{loading ? <div className="artifact-state">Loading membership…</div> : <div className="member-list">{members.map((member) => <div className="member-row" key={member.id}><div><strong>{member.display_name || member.email}</strong><small>{member.email} · Last seen {formatDate(member.last_seen_at)}</small></div>{canManageTeam ? <select aria-label={`Role for ${member.email}`} value={member.role} disabled={working || member.status !== "active"} onChange={(event) => void changeMember(member, { role: event.target.value })}><option value="auditor">Auditor</option><option value="reviewer">Reviewer</option><option value="compliance_lead">Compliance lead</option><option value="admin">Administrator</option></select> : <span>{titleCase(member.role)}</span>}<StatusPill status={titleCase(member.status)} />{canManageTeam && <div className="member-actions"><button className="button secondary" disabled={working || member.status === "revoked"} onClick={() => void changeMember(member, { status: member.status === "active" ? "suspended" : "active" })}>{member.status === "active" ? "Suspend" : "Activate"}</button><button className="button secondary danger" disabled={working || member.status === "revoked" || member.id === currentUser?.id} onClick={() => void changeMember(member, { status: "revoked" })}>Revoke</button></div>}</div>)}</div>}{canManageTeam && invitations.filter((item) => item.status === "pending").length > 0 && <div className="pending-invitations"><h3>Pending invitations</h3>{invitations.filter((item) => item.status === "pending").map((invitation) => <div key={invitation.id}><span><strong>{invitation.email}</strong><small>{titleCase(invitation.role)} · Expires {formatDate(invitation.expires_at)}</small></span><button className="button secondary danger" disabled={working} onClick={() => void revokeInvitation(invitation)}>Revoke</button></div>)}</div>}</>}</section>}
+      {tab === "audit" && <section className="panel settings-panel"><h2>Audit log</h2><p>The newest 250 material actions. Integrity is verified from the latest signed external checkpoint through the current tail.</p><div className="integrity-setting"><span>{auditIntegrity?.valid ? "✓" : "!"}</span><div><strong>{auditIntegrity?.valid ? "Audit verification passed" : "Audit verification has not passed"}</strong><p>{auditIntegrity ? `${auditIntegrity.checked} total event(s) covered by the verified chain.` : "Reload after protected services recover."}</p></div></div>{loading ? <div className="artifact-state">Loading audited actions…</div> : auditEvents.length ? <div className="audit-event-list">{auditEvents.map((event) => <div key={event.id}><span>{event.sequence}</span><div><strong>{event.action.replaceAll("_", " ")}</strong><small>{event.actor_email} · {event.resource_type}:{event.resource_id}</small></div><time dateTime={event.occurred_at}>{formatDate(event.occurred_at)}</time><code>{event.event_hash.slice(0, 12)}</code></div>)}</div> : <EmptyState message="No audit events are available yet." />}</section>}
+    </div>
   </>;
 }
 
@@ -610,7 +712,9 @@ function EvidenceDrawer({ item, currentUser, onClose, onApprove, onToast }: { it
   }, [item.id, item.sha256, item.type]);
   const roleMayApprove = currentUser ? ["reviewer", "admin"].includes(currentUser.role) : false;
   const independentReviewer = Boolean(currentUser && item.createdBy && currentUser.id !== item.createdBy);
-  const canApprove = roleMayApprove && independentReviewer && artifact.state === "ready" && confirmed && rationale.trim().length >= 20 && item.status !== "Approved";
+  const serverSafetyReady = item.type !== "Screenshot" || item.serverSafetyStatus === "verified";
+  const nativeProvenanceReady = item.nativeProvenanceStatus !== "pending";
+  const canApprove = roleMayApprove && independentReviewer && serverSafetyReady && nativeProvenanceReady && artifact.state === "ready" && confirmed && rationale.trim().length >= 20 && item.status !== "Approved";
   return <>
     <button className="drawer-scrim" aria-label="Close evidence details" onClick={onClose} />
     <aside className="drawer" aria-label="Evidence details">
@@ -621,13 +725,17 @@ function EvidenceDrawer({ item, currentUser, onClose, onApprove, onToast }: { it
           {artifact.state === "loading" ? <div className="artifact-state">Decrypting and verifying the actual artifact…</div> : artifact.state === "error" ? <div className="artifact-state error">{artifact.error}</div> : item.type === "Screenshot" && artifact.url ? <Image src={artifact.url} alt={`Actual evidence artifact for ${item.title}`} width={1600} height={900} unoptimized /> : <pre>{artifact.text}</pre>}
         </div>
         <div className={cls("integrity-banner", artifact.state !== "ready" && "pending")}><span>{artifact.state === "ready" ? "✓" : "↻"}</span><div><strong>{artifact.state === "ready" ? "Stored bytes decrypted and digest verified" : "Artifact verification required"}</strong><p>{item.checksum}</p></div></div>
-        <section className="detail-section"><h3>Evidence mapping</h3><dl><div><dt>Compliance control</dt><dd>{item.framework || item.requirement} · {item.control}</dd></div>{item.jiraIssueKey ? <div><dt>Jira issue</dt><dd>{item.jiraIssueURL ? <a href={item.jiraIssueURL} target="_blank" rel="noreferrer">{item.jiraIssueKey} ↗</a> : item.jiraIssueKey}</dd></div> : null}<div><dt>Source</dt><dd>{item.source} / {item.system}</dd></div><div><dt>Owner</dt><dd>{item.owner || "Unassigned"}</dd></div><div><dt>Scope</dt><dd>{item.environment || "Unspecified"} · {item.assessmentPeriod || "Unspecified"}</dd></div><div><dt>Captured</dt><dd>{item.capturedAt}</dd></div><div><dt>Valid until</dt><dd>{item.expiresAt}</dd></div><div><dt>Collector</dt><dd>{item.collector}</dd></div></dl></section>
+        <section className="detail-section"><h3>Evidence mapping</h3><dl><div><dt>Compliance control</dt><dd>{item.framework || item.requirement} · {item.control}</dd></div>{item.jiraIssueKey ? <div><dt>Jira issue</dt><dd>{item.jiraIssueURL ? <a href={item.jiraIssueURL} target="_blank" rel="noreferrer">{item.jiraIssueKey} ↗</a> : item.jiraIssueKey}</dd></div> : null}<div><dt>Source</dt><dd>{item.source} / {item.system}</dd></div><div><dt>Owner</dt><dd>{item.owner || "Unassigned"}</dd></div><div><dt>Scope</dt><dd>{item.environment || "Unspecified"} · {item.assessmentPeriod || "Unspecified"}</dd></div><div><dt>First captured</dt><dd>{item.capturedAt}</dd></div><div><dt>Last observed</dt><dd>{item.lastObservedAt || item.capturedAt} · {item.occurrenceCount || 1} occurrence(s)</dd></div><div><dt>Valid until</dt><dd>{item.expiresAt}</dd></div><div><dt>Collector</dt><dd>{item.collector}</dd></div></dl></section>
         {item.mappedControls?.length ? <section className="detail-section"><h3>Related controls</h3><div className="tag-row">{item.mappedControls.map((mapping) => <span key={`${mapping.framework}-${mapping.controlID}`}>{mapping.framework} · {mapping.controlID}</span>)}</div></section> : null}
-        <section className="detail-section"><h3>Safety evidence</h3><div className="check-row"><span>i</span><div><strong>Scan results are supporting claims</strong><p>Inspect the actual pixels or text above. Client and collector scans do not replace reviewer judgment.</p></div></div></section>
+        <section className="detail-section"><h3>Safety and provenance</h3>
+          {item.type === "Screenshot" ? <div className={cls("check-row", !serverSafetyReady && "warning")}><span>{serverSafetyReady ? "✓" : "!"}</span><div><strong>{serverSafetyReady ? "Independent server safety receipt verified" : "Screenshot is quarantined"}</strong><p>{serverSafetyReady ? "The stored screenshot digest is bound to the server-side OCR/DLP policy receipt. Scan results are supporting claims, not a substitute for reviewer inspection, because OCR can miss sensitive pixels." : "This legacy or incomplete screenshot cannot be opened, approved, packaged, or disclosed. Recollect browser evidence or retry the original Mac upload."}</p></div></div> : null}
+          {item.nativeProvenanceStatus !== "not_applicable" ? <div className={cls("check-row", !nativeProvenanceReady && "warning")}><span>{nativeProvenanceReady ? "✓" : "!"}</span><div><strong>{nativeProvenanceReady ? "Signed device chain finalized" : "Device provenance is pending"}</strong><p>{nativeProvenanceReady ? "The exact manifest and image digest are linked to the server-maintained monotonic device chain." : "Retry the exact original Mac upload. Scopeproof does not grandfather or manually promote unlinked native evidence."}</p></div></div> : null}
+          {item.type !== "Screenshot" ? <div className="check-row"><span>i</span><div><strong>Server redaction completed before encryption</strong><p>Inspect the actual text above. Pattern matching supports—but does not replace—reviewer judgment.</p></div></div> : null}
+        </section>
         <section className="detail-section"><h3>Tags</h3><div className="tag-row">{item.tags.map((tag) => <span key={tag}>{tag}</span>)}</div></section>
         {item.status !== "Approved" && <section className="detail-section review-attestation"><h3>Independent review attestation</h3>{!roleMayApprove ? <p className="review-blocked">A reviewer or administrator role is required to approve evidence.</p> : !independentReviewer ? <p className="review-blocked">You collected or uploaded this artifact. A different reviewer must approve it.</p> : <><label className="field"><span>Review rationale</span><textarea value={rationale} onChange={(event) => setRationale(event.target.value)} minLength={20} maxLength={1000} rows={4} placeholder="Explain what you inspected, what this proves, and why the scope and redactions are acceptable." /></label><label className="checkbox-line"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /> I inspected the actual artifact above, confirmed its digest, scope, freshness, and redactions, and understand this approval is audited.</label></>}</section>}
       </div>
-      <div className="drawer-actions"><button className="button secondary" onClick={() => onToast(`${item.id} flagged for follow-up.`)}>Flag issue</button><button className="button primary" disabled={!canApprove} onClick={() => onApprove(item, rationale.trim())}>{item.status === "Approved" ? "✓ Approved" : artifact.state !== "ready" ? "Verify artifact first" : "Approve evidence"}</button></div>
+      <div className="drawer-actions"><button className="button secondary" onClick={() => onToast(`${item.id} flagged for follow-up.`)}>Flag issue</button><button className="button primary" disabled={!canApprove} onClick={() => onApprove(item, rationale.trim())}>{item.status === "Approved" ? "✓ Approved" : !serverSafetyReady || !nativeProvenanceReady ? "Quarantined" : artifact.state !== "ready" ? "Verify artifact first" : "Approve evidence"}</button></div>
     </aside>
   </>;
 }

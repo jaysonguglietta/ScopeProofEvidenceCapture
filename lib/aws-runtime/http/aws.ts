@@ -2,6 +2,7 @@ import { asTenantId, assertBoundedText, sha256Hex, TenantSecurityError } from ".
 import {
   assertTenantCognitoClientId,
   canonicalAuthorityHostname,
+  normalizedTenantCognitoClientIds,
   type HostAuthority,
   type ResolvedTenantAuthority,
   type TenantAuthorityResolver,
@@ -21,6 +22,7 @@ interface DynamoAttributeValue {
   readonly S?: string;
   readonly N?: string;
   readonly BOOL?: boolean;
+  readonly SS?: readonly string[];
 }
 
 export interface DynamoTenantAuthorityCommandConstructors {
@@ -49,6 +51,7 @@ const tenantDomainProjectionNames = Object.freeze({
   "#slug": "slug",
   "#name": "displayName",
   "#client": "appClientId",
+  "#clients": "appClientIds",
   "#status": "status",
   "#canonical": "canonical",
 });
@@ -74,6 +77,14 @@ function exactStringAttribute(item: Readonly<Record<string, DynamoAttributeValue
   const value = item[name];
   if (!value || typeof value.S !== "string" || !exactAttributeKeys(value, ["S"])) throw malformedTenantRegistryRecord();
   return value.S;
+}
+
+function exactStringSetAttribute(item: Readonly<Record<string, DynamoAttributeValue>>, name: string): readonly string[] {
+  const value = item[name];
+  if (!value || !Array.isArray(value.SS) || !exactAttributeKeys(value, ["SS"]) || value.SS.some((entry) => typeof entry !== "string")) {
+    throw malformedTenantRegistryRecord();
+  }
+  return value.SS;
 }
 
 /**
@@ -123,7 +134,7 @@ export class DynamoTenantAuthorityResolver implements TenantAuthorityResolver {
         exactStringAttribute(item, "PK") !== partitionKey ||
         exactStringAttribute(item, "SK") !== "METADATA" ||
         exactStringAttribute(item, "kind") !== "TenantDomain" ||
-        item.schemaVersion?.N !== "1" ||
+        item.schemaVersion?.N !== "2" ||
         !exactAttributeKeys(item.schemaVersion, ["N"]) ||
         item.canonical?.BOOL !== true ||
         !exactAttributeKeys(item.canonical, ["BOOL"])
@@ -136,11 +147,12 @@ export class DynamoTenantAuthorityResolver implements TenantAuthorityResolver {
       const rawDisplayName = exactStringAttribute(item, "displayName");
       const displayName = assertBoundedText(rawDisplayName, "Tenant name", 1, 160);
       const appClientId = assertTenantCognitoClientId(exactStringAttribute(item, "appClientId"));
+      const appClientIds = normalizedTenantCognitoClientIds(exactStringSetAttribute(item, "appClientIds"), appClientId);
       if (storedHostname !== hostname || !tenantSlugPattern.test(slug) || slug.length > 63 || displayName !== rawDisplayName) {
         throw malformedTenantRegistryRecord();
       }
       return Object.freeze({
-        tenant: Object.freeze({ id: tenantId, slug, displayName, appClientId, status: "active" as const }),
+        tenant: Object.freeze({ id: tenantId, slug, displayName, appClientId, appClientIds, status: "active" as const }),
         domain: Object.freeze({ tenantId, hostname, status: "active" as const, canonical: true as const }),
       });
     } catch (error) {

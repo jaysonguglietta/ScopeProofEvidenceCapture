@@ -19,6 +19,7 @@ struct S3UploadReceipt: Codable, Sendable {
     let kmsKeyARN: String
     let retentionMode: String
     let retentionDays: Int
+    let retainUntilByObjectKey: [String: String]?
     let screenshotSHA256: String
     let manifestSHA256: String
 }
@@ -59,6 +60,13 @@ struct S3ObjectVersionListPage: Equatable, Sendable {
     let nextVersionIDMarker: String?
 }
 
+struct S3ObjectRetentionExpectation: Equatable, Sendable {
+    let mode: String
+    let retainUntil: String
+    let retainUntilDate: Date?
+    let headers: [String: String]
+}
+
 enum S3StorageFailure: LocalizedError, Equatable {
     case notConfigured
     case verificationRequired
@@ -70,9 +78,23 @@ enum S3StorageFailure: LocalizedError, Equatable {
     case invalidCredentials
     case expiredCredentials
     case temporaryCredentialsRequired
+    case invalidIdentityCenterProfile
+    case invalidAssumeRole
+    case invalidExternalID
+    case awsCLINotAvailable
+    case awsCLIUnsafeExecutable
+    case awsCLIRejected
+    case awsCLITimedOut
+    case identityCenterLoginRequired(String)
+    case identityCenterLoginFailed
+    case credentialIdentityMismatch
     case invalidKMSKey
     case kmsKeyNotApplicable
     case productionKMSRequired
+    case productionComplianceRetentionRequired
+    case kmsKeyIdentityMismatch
+    case kmsKeyRejected(Int)
+    case kmsKeyPostureFailed([String])
     case invalidRetention
     case invalidReplication
     case invalidEvidence
@@ -88,6 +110,7 @@ enum S3StorageFailure: LocalizedError, Equatable {
     case downloadTooLarge
     case objectChanged
     case checksumMismatch
+    case objectRetentionMismatch
     case unsupportedDownloadedContent
     case invalidDownloadDestination
     case bucketPostureFailed([String])
@@ -106,9 +129,23 @@ enum S3StorageFailure: LocalizedError, Equatable {
         case .invalidCredentials: return "Enter a valid AWS access key ID and secret access key. Include the session token when using temporary credentials."
         case .expiredCredentials: return "The temporary AWS credentials are expired or expire within five minutes. Obtain a fresh STS session and try again."
         case .temporaryCredentialsRequired: return "Production compliance mode requires temporary STS credentials with a session token. Use a federated IAM Identity Center or AssumeRole session."
+        case .invalidIdentityCenterProfile: return "Enter one named AWS CLI profile using only letters, numbers, periods, underscores, or hyphens. Configure it for IAM Identity Center before connecting."
+        case .invalidAssumeRole: return "Enter one exact IAM role ARN in the same AWS partition as the S3 destination."
+        case .invalidExternalID: return "The optional role external ID must be 2–1,224 characters and contain only AWS-supported letters, numbers, and _+=,.@:/- characters."
+        case .awsCLINotAvailable: return "Install AWS CLI v2 in a trusted standard location, configure a named IAM Identity Center profile, and try again. Scopeproof never searches PATH or invokes a shell."
+        case .awsCLIUnsafeExecutable: return "The AWS CLI executable resolved outside an approved installation directory or is writable by other users. Reinstall AWS CLI v2 in a trusted standard location."
+        case .awsCLIRejected: return "AWS CLI could not provide a valid temporary credential set. Check the named profile, IAM permissions, network connection, and organization policy."
+        case .awsCLITimedOut: return "AWS CLI did not finish before Scopeproof's safety deadline. Cancel any incomplete browser sign-in, check the network and named profile, then try again."
+        case .identityCenterLoginRequired(let profile): return "IAM Identity Center profile \(profile) has no current session. Select ‘Sign in before verification’ or run aws sso login for that exact profile, then try again."
+        case .identityCenterLoginFailed: return "IAM Identity Center sign-in did not complete. Confirm the browser authorization, profile configuration, network connection, and AWS CLI v2 installation."
+        case .credentialIdentityMismatch: return "The refreshed AWS credential belongs to a different account or IAM role than the verified S3 destination. Uploads remain disabled until Save & Verify succeeds again."
         case .invalidKMSKey: return "Enter a customer-managed KMS key ARN in the same partition and region as the S3 bucket."
         case .kmsKeyNotApplicable: return "SSE-S3 does not use a KMS key. Select SSE-KMS or DSSE-KMS, or clear the KMS key ARN."
         case .productionKMSRequired: return "Production compliance mode requires SSE-KMS or DSSE-KMS with a customer-managed key."
+        case .productionComplianceRetentionRequired: return "Production compliance mode requires COMPLIANCE Object Lock. Governance mode is for non-production evaluation only because privileged users can bypass or shorten its retention."
+        case .kmsKeyIdentityMismatch: return "The KMS key ARN must use the verified AWS partition, S3 Region, and bucket-owner account. Uploads remain disabled."
+        case .kmsKeyRejected(let status): return "AWS KMS rejected DescribeKey with HTTP \(status). Grant kms:DescribeKey on the exact key and verify the credentials, key policy, Region, and account."
+        case .kmsKeyPostureFailed(let failures): return "The KMS key is not eligible for evidence encryption: " + failures.joined(separator: "; ")
         case .invalidRetention: return "Retention must be 1–36,500 days. Deep Archive transition must be 0 (disabled) or 30–36,500 days."
         case .invalidReplication: return "Replication requires a valid destination bucket ARN, IAM role ARN, and destination KMS key ARN when KMS encryption is enabled."
         case .invalidEvidence: return "The local evidence or manifest failed integrity validation and was not sent to S3."
@@ -131,16 +168,17 @@ enum S3StorageFailure: LocalizedError, Equatable {
         case .downloadTooLarge: return "The selected S3 object exceeds the 250 MB download safety limit."
         case .objectChanged: return "The S3 object changed while it was being downloaded. Refresh and try again."
         case .checksumMismatch: return "The checksum returned by S3 did not match the exact bytes Scopeproof sent or downloaded. The operation was rejected."
+        case .objectRetentionMismatch: return "S3 did not confirm the configured Object Lock mode and retain-until timestamp on the exact uploaded object version."
         case .unsupportedDownloadedContent: return "The downloaded object does not contain a valid PNG or JSON evidence file and was rejected."
         case .invalidDownloadDestination: return "Choose a valid local file destination for the S3 download."
         case .bucketPostureFailed(let failures): return "The bucket is not production-ready: " + failures.joined(separator: "; ")
         case .callerIdentityRejected(let status): return "AWS STS rejected caller identity verification with HTTP \(status). Obtain fresh credentials and verify the configured region and clock."
-        case .invalidResponse: return "S3 returned an invalid or redirected response. No credentials were sent to another host."
+        case .invalidResponse: return "AWS returned an invalid or redirected response. No credentials were sent to another host."
         }
     }
 }
 
-actor S3StorageService {
+actor S3StorageService: S3CallerIdentityVerifying {
     static let maximumBrowsableObjects = 5_000
     static let maximumDownloadBytes: Int64 = 250 * 1024 * 1024
     private static let maximumListResponseBytes = 5 * 1024 * 1024
@@ -176,13 +214,17 @@ actor S3StorageService {
         let (_, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, Self.isExpectedResponse(http, requestURL: url) else { throw S3StorageFailure.invalidResponse }
         guard http.statusCode == 200 else { throw S3StorageFailure.connectionRejected(http.statusCode, http.value(forHTTPHeaderField: "x-amz-bucket-region")) }
+        let kmsKeyPosture = try await inspectKMSKey(
+            settings: cleanSettings, credentials: cleanCredentials, expectedAccountID: identity.accountID
+        )
         let posture = try await inspectBucketPosture(settings: cleanSettings, credentials: cleanCredentials, expectedOwner: identity.accountID)
         let failures = Self.postureFailures(posture, settings: cleanSettings)
         guard failures.isEmpty else { throw S3StorageFailure.bucketPostureFailed(failures) }
         return S3VerifiedDestination(
-            schemaVersion: 1, settingsDigest: cleanSettings.securityBindingDigest,
+            schemaVersion: S3VerifiedDestination.currentSchemaVersion,
+            settingsDigest: cleanSettings.securityBindingDigest,
             accountID: identity.accountID, principalARN: identity.principalARN,
-            verifiedAt: Date(), posture: posture
+            verifiedAt: Date(), posture: posture, kmsKeyPosture: kmsKeyPosture
         )
     }
 
@@ -190,6 +232,9 @@ actor S3StorageService {
         let cleanSettings = try Self.validatedSettings(settings)
         let cleanCredentials = try Self.validatedCredentials(credentials, for: cleanSettings)
         let identity = try await callerIdentity(settings: cleanSettings, credentials: cleanCredentials)
+        _ = try await inspectKMSKey(
+            settings: cleanSettings, credentials: cleanCredentials, expectedAccountID: identity.accountID
+        )
         let createBody = Self.createBucketBody(region: cleanSettings.region)
         let createURL = try Self.endpoint(settings: cleanSettings, objectKey: nil)
         let createRequest = try Self.signedRequest(
@@ -266,15 +311,12 @@ actor S3StorageService {
         let cleanSettings = try Self.validatedSettings(settings)
         guard binding.matches(cleanSettings) else { throw S3StorageFailure.destinationBindingMismatch }
         let cleanCredentials = try Self.validatedCredentials(credentials, for: cleanSettings)
-        let image = try Data(contentsOf: capture.imageURL, options: [.mappedIfSafe])
-        let manifestData = try Data(contentsOf: capture.manifestURL, options: [.mappedIfSafe])
-        guard image.count <= 50 * 1024 * 1024, manifestData.count <= 2 * 1024 * 1024,
-              let manifest = try? JSONDecoder().decode(CaptureManifest.self, from: manifestData),
-              manifest.evidenceID == capture.evidenceID, manifest.controlID == capture.context.controlID,
-              manifest.screenshotFilename == capture.imageURL.lastPathComponent,
-              Self.sha256(image) == manifest.sha256, Self.sha256(image) == capture.sha256 else {
-            throw S3StorageFailure.invalidEvidence
-        }
+        let artifact: ValidatedEvidenceArtifact
+        do { artifact = try ValidatedEvidenceArtifact.load(capture) }
+        catch { throw S3StorageFailure.invalidEvidence }
+        let image = artifact.imageData
+        let manifestData = artifact.manifestData
+        guard artifact.manifest.controlID == capture.context.controlID else { throw S3StorageFailure.invalidEvidence }
 
         let base = Self.objectBase(settings: cleanSettings, context: capture.context, evidenceID: capture.evidenceID)
         let imageKey = "\(base)/\(capture.imageURL.lastPathComponent)"
@@ -290,7 +332,7 @@ actor S3StorageService {
         )
 
         let receipt = S3UploadReceipt(
-            schemaVersion: 2, evidenceID: capture.evidenceID, bucket: cleanSettings.bucket, region: cleanSettings.region,
+            schemaVersion: 3, evidenceID: capture.evidenceID, bucket: cleanSettings.bucket, region: cleanSettings.region,
             awsAccountID: binding.accountID, principalARN: binding.principalARN,
             securityProfile: cleanSettings.securityProfile.rawValue,
             objectKeys: [imageKey, manifestKey],
@@ -301,6 +343,7 @@ actor S3StorageService {
             uploadedAt: ISO8601DateFormatter().string(from: Date()), encryption: cleanSettings.encryptionMode.rawValue,
             kmsKeyARN: cleanSettings.kmsKeyARN, retentionMode: cleanSettings.retentionMode.rawValue,
             retentionDays: cleanSettings.retentionDays,
+            retainUntilByObjectKey: [imageKey: imageWrite.retainUntil, manifestKey: manifestWrite.retainUntil],
             screenshotSHA256: Self.sha256(image), manifestSHA256: Self.sha256(manifestData)
         )
         let receiptURL = capture.manifestURL.deletingPathExtension().appendingPathExtension("s3.json")
@@ -446,11 +489,13 @@ actor S3StorageService {
     ) async throws -> S3ObjectWriteReceipt {
         let url = try Self.endpoint(settings: settings, objectKey: objectKey)
         let checksum = Self.sha256Base64(data)
+        let retention = Self.objectRetention(settings: settings, now: Date())
         let request = try Self.signedRequest(
             method: "PUT", url: url, region: settings.region, body: data, contentType: contentType,
             credentials: credentials, date: Date(), requireEncryption: true,
             expectedBucketOwner: expectedOwner, encryptionMode: settings.encryptionMode,
-            kmsKeyARN: settings.kmsKeyARN, checksumSHA256: checksum
+            kmsKeyARN: settings.kmsKeyARN, checksumSHA256: checksum,
+            extraHeaders: retention.headers
         )
         let (_, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, Self.isExpectedResponse(http, requestURL: url) else { throw S3StorageFailure.invalidResponse }
@@ -465,13 +510,40 @@ actor S3StorageService {
                 throw S3StorageFailure.bucketPostureFailed(["S3 returned an unexpected KMS key"])
             }
         }
+        if settings.securityProfile == .production {
+            try await verifyObjectRetention(
+                objectKey: objectKey, versionID: versionID, expected: retention,
+                settings: settings, credentials: credentials, expectedOwner: expectedOwner
+            )
+        }
         return S3ObjectWriteReceipt(
             eTag: String((http.value(forHTTPHeaderField: "ETag") ?? "").trimmingCharacters(in: CharacterSet(charactersIn: "\" ")).prefix(200)),
             versionID: versionID, checksumSHA256: checksum,
             requestID: Self.safeResponseHeader(http.value(forHTTPHeaderField: "x-amz-request-id"), maximum: 256),
             extendedRequestID: Self.safeResponseHeader(http.value(forHTTPHeaderField: "x-amz-id-2"), maximum: 2_048),
-            encryptionMode: responseEncryption, kmsKeyARN: settings.kmsKeyARN
+            encryptionMode: responseEncryption, kmsKeyARN: settings.kmsKeyARN,
+            retentionMode: retention.mode, retainUntil: retention.retainUntil
         )
+    }
+
+    private func verifyObjectRetention(
+        objectKey: String, versionID: String, expected: S3ObjectRetentionExpectation,
+        settings: S3StorageSettings, credentials: S3Credentials, expectedOwner: String
+    ) async throws {
+        let url = try Self.objectRetentionEndpoint(
+            settings: settings, objectKey: objectKey, versionID: versionID
+        )
+        let request = try Self.signedRequest(
+            method: "GET", url: url, region: settings.region, body: Data(), contentType: nil,
+            credentials: credentials, date: Date(), requireEncryption: false,
+            expectedBucketOwner: expectedOwner
+        )
+        let (data, response) = try await session.data(for: request)
+        guard data.count <= 64 * 1024, let http = response as? HTTPURLResponse,
+              Self.isExpectedResponse(http, requestURL: url), http.statusCode == 200,
+              Self.objectRetentionResponseMatches(data, expected: expected) else {
+            throw S3StorageFailure.objectRetentionMismatch
+        }
     }
 
     private func applyBucketSetting(
@@ -489,7 +561,7 @@ actor S3StorageService {
         guard (200...299).contains(http.statusCode) else { throw S3StorageFailure.bucketHardeningRejected(step, http.statusCode) }
     }
 
-    private func callerIdentity(settings: S3StorageSettings, credentials: S3Credentials) async throws -> S3CallerIdentity {
+    func callerIdentity(settings: S3StorageSettings, credentials: S3Credentials) async throws -> S3CallerIdentity {
         let url = try Self.stsEndpoint(settings: settings)
         let body = Data("Action=GetCallerIdentity&Version=2011-06-15".utf8)
         let request = try Self.signedAWSRequest(
@@ -508,6 +580,29 @@ actor S3StorageService {
             throw S3StorageFailure.invalidResponse
         }
         return S3CallerIdentity(accountID: account, principalARN: arn, userID: userID)
+    }
+
+    private func inspectKMSKey(
+        settings: S3StorageSettings, credentials: S3Credentials, expectedAccountID: String
+    ) async throws -> S3KMSKeyPosture? {
+        guard settings.encryptionMode.needsKMSKey else { return nil }
+        guard Self.kmsKeyARNMatchesVerifiedDestination(
+            settings.kmsKeyARN, region: settings.region, accountID: expectedAccountID
+        ) else { throw S3StorageFailure.kmsKeyIdentityMismatch }
+        let request = try Self.describeKMSKeyRequest(
+            settings: settings, credentials: credentials, date: Date()
+        )
+        guard let requestURL = request.url else { throw S3StorageFailure.invalidResponse }
+        let (data, response) = try await session.data(for: request)
+        guard data.count <= 64 * 1024, let http = response as? HTTPURLResponse,
+              Self.isExpectedResponse(http, requestURL: requestURL) else {
+            throw S3StorageFailure.invalidResponse
+        }
+        guard http.statusCode == 200 else { throw S3StorageFailure.kmsKeyRejected(http.statusCode) }
+        return try Self.parseKMSKeyPosture(
+            data, expectedARN: settings.kmsKeyARN, region: settings.region,
+            expectedAccountID: expectedAccountID
+        )
     }
 
     private func inspectBucketPosture(
@@ -537,13 +632,14 @@ actor S3StorageService {
             operation: "policy", settings: settings, credentials: credentials,
             expectedOwner: expectedOwner, missingAllowed: false
         ) : nil
-        let lifecycle = settings.archiveAfterDays > 0 ? try await bucketConfiguration(
+        let inspectOptionalConfigurations = settings.securityProfile == .production
+        let lifecycle = inspectOptionalConfigurations || settings.archiveAfterDays > 0 ? try await bucketConfiguration(
             operation: "lifecycle", settings: settings, credentials: credentials,
-            expectedOwner: expectedOwner, missingAllowed: false
+            expectedOwner: expectedOwner, missingAllowed: settings.archiveAfterDays == 0
         ) : nil
-        let replication = settings.replicationEnabled ? try await bucketConfiguration(
+        let replication = inspectOptionalConfigurations || settings.replicationEnabled ? try await bucketConfiguration(
             operation: "replication", settings: settings, credentials: credentials,
-            expectedOwner: expectedOwner, missingAllowed: false
+            expectedOwner: expectedOwner, missingAllowed: !settings.replicationEnabled
         ) : nil
 
         let publicFields = try publicAccess.map(Self.parseBoundedXML)
@@ -551,17 +647,22 @@ actor S3StorageService {
         let encryptionFields = try encryption.map(Self.parseBoundedXML)
         let ownershipFields = try ownership.map(Self.parseBoundedXML)
         let lockFields = try objectLock.map(Self.parseBoundedXML)
-        let lifecycleFields = try lifecycle.map(Self.parseBoundedXML)
-        let replicationFields = try replication.map(Self.parseBoundedXML)
         let allPublicBlocked = ["BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets"]
             .allSatisfy { publicFields?.firstValue(named: $0) == "true" }
         let algorithm = encryptionFields?.firstValue(named: "SSEAlgorithm").flatMap(S3EncryptionMode.init(rawValue:))
+        let bucketKeyEnabled: Bool? = switch encryptionFields?.firstValue(named: "BucketKeyEnabled") {
+        case "true": true
+        case "false": false
+        default: nil
+        }
         let mode = lockFields?.firstValue(named: "Mode").flatMap(S3RetentionMode.init(rawValue:))
         let retentionDays = Int(lockFields?.firstValue(named: "Days") ?? "") ?? 0
-        let archiveDays = lifecycleFields?.firstValue(named: "ID") == "ScopeproofEvidenceDeepArchive"
-            ? (Int(lifecycleFields?.firstValue(named: "Days") ?? "") ?? 0) : 0
-        let replicationBucket = replicationFields?.firstValue(named: "ID") == "ScopeproofEvidenceReplication"
-            ? (replicationFields?.firstValue(named: "Bucket") ?? "") : ""
+        let lifecycleIsExact = Self.lifecycleConfigurationIsSecure(lifecycle, settings: settings)
+        let replicationIsExact = Self.replicationConfigurationIsSecure(replication, settings: settings)
+        let archiveDays = lifecycleIsExact ? settings.archiveAfterDays : -1
+        let replicationBucket = replicationIsExact
+            ? (settings.replicationEnabled ? settings.replicationDestinationBucketARN : "")
+            : "invalid-replication-configuration"
         return S3BucketPosture(
             blockPublicAccess: allPublicBlocked,
             versioningEnabled: versionFields?.firstValue(named: "Status") == "Enabled",
@@ -569,6 +670,7 @@ actor S3StorageService {
             bucketPolicyEnforced: policy.map { Self.bucketPolicyIsSecure($0, settings: settings) } ?? false,
             encryptionMode: algorithm,
             kmsKeyARN: encryptionFields?.firstValue(named: "KMSMasterKeyID") ?? "",
+            bucketKeyEnabled: bucketKeyEnabled,
             objectLockEnabled: lockFields?.firstValue(named: "ObjectLockEnabled") == "Enabled",
             retentionMode: mode, retentionDays: retentionDays,
             lifecycleArchiveAfterDays: archiveDays,
@@ -604,7 +706,8 @@ actor S3StorageService {
             downloadsAllowed: settings.downloadsAllowed, useFIPSEndpoint: settings.useFIPSEndpoint,
             replicationDestinationBucketARN: settings.replicationDestinationBucketARN,
             replicationRoleARN: settings.replicationRoleARN,
-            replicationKMSKeyARN: settings.replicationKMSKeyARN
+            replicationKMSKeyARN: settings.replicationKMSKeyARN,
+            authentication: settings.authentication
         )
     }
 
@@ -616,7 +719,9 @@ actor S3StorageService {
             sessionToken: credentials.sessionToken, expiresAt: credentials.expiresAt
         )
         if clean.isExpired { throw S3StorageFailure.expiredCredentials }
-        if settings.securityProfile == .production && !clean.isTemporary { throw S3StorageFailure.temporaryCredentialsRequired }
+        if settings.securityProfile == .production && (!clean.isTemporary || clean.expiresAt == nil) {
+            throw S3StorageFailure.temporaryCredentialsRequired
+        }
         return clean
     }
 
@@ -627,17 +732,26 @@ actor S3StorageService {
         if posture.encryptionMode != settings.encryptionMode { failures.append("default encryption does not match \(settings.encryptionMode.displayName)") }
         if settings.encryptionMode.needsKMSKey && posture.kmsKeyARN != settings.kmsKeyARN { failures.append("the customer-managed KMS key does not match") }
         if settings.securityProfile == .production {
+            if settings.encryptionMode == .sseKMS && posture.bucketKeyEnabled != true {
+                failures.append("S3 Bucket Keys must be enabled for SSE-KMS")
+            }
             if !posture.ownershipEnforced { failures.append("Object Ownership must be BucketOwnerEnforced") }
-            if !posture.bucketPolicyEnforced { failures.append("bucket policy must deny non-TLS and incorrect encryption/key writes") }
+            if !posture.bucketPolicyEnforced { failures.append("bucket policy must be the exact Scopeproof transport, encryption, and deletion-deny policy") }
             if !posture.objectLockEnabled { failures.append("Object Lock is not enabled") }
             if posture.retentionMode != settings.retentionMode { failures.append("Object Lock retention mode does not match") }
             if posture.retentionDays < settings.retentionDays { failures.append("Object Lock retention is shorter than \(settings.retentionDays) days") }
         }
-        if settings.archiveAfterDays > 0 && posture.lifecycleArchiveAfterDays != settings.archiveAfterDays {
-            failures.append("Deep Archive lifecycle does not match \(settings.archiveAfterDays) days")
+        if (settings.securityProfile == .production || settings.archiveAfterDays > 0)
+            && posture.lifecycleArchiveAfterDays != settings.archiveAfterDays {
+            failures.append(settings.archiveAfterDays > 0
+                ? "Deep Archive lifecycle is not the exact prefix-scoped \(settings.archiveAfterDays)-day configuration"
+                : "an unexpected lifecycle configuration is present while archiving is disabled")
         }
-        if settings.replicationEnabled && posture.replicationDestinationBucketARN != settings.replicationDestinationBucketARN {
-            failures.append("replication destination does not match")
+        if (settings.securityProfile == .production || settings.replicationEnabled)
+            && posture.replicationDestinationBucketARN != settings.replicationDestinationBucketARN {
+            failures.append(settings.replicationEnabled
+                ? "replication is not the exact prefix-scoped configured destination, role, and KMS configuration"
+                : "an unexpected replication configuration is present while replication is disabled")
         }
         return failures
     }
@@ -682,6 +796,61 @@ actor S3StorageService {
         components?.percentEncodedQuery = operation
         guard let url = components?.url else { throw S3StorageFailure.invalidResponse }
         return url
+    }
+
+    nonisolated static func objectRetentionEndpoint(
+        settings: S3StorageSettings, objectKey: String, versionID: String
+    ) throws -> URL {
+        guard isSafeResponseValue(versionID, maximum: 1_024), !versionID.isEmpty, versionID != "null" else {
+            throw S3StorageFailure.invalidResponse
+        }
+        let endpoint = try endpoint(settings: settings, objectKey: objectKey)
+        var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false)
+        components?.queryItems = [
+            URLQueryItem(name: "retention", value: nil),
+            URLQueryItem(name: "versionId", value: versionID),
+        ]
+        guard let url = components?.url else { throw S3StorageFailure.invalidResponse }
+        return url
+    }
+
+    nonisolated static func objectRetention(
+        settings: S3StorageSettings, now: Date
+    ) -> S3ObjectRetentionExpectation {
+        guard settings.securityProfile == .production else {
+            return S3ObjectRetentionExpectation(mode: "", retainUntil: "", retainUntilDate: nil, headers: [:])
+        }
+        let retainUntil = now.addingTimeInterval(Double(settings.retentionDays) * 86_400)
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        let value = formatter.string(from: retainUntil)
+        return S3ObjectRetentionExpectation(
+            mode: settings.retentionMode.rawValue, retainUntil: value, retainUntilDate: retainUntil,
+            headers: [
+                "x-amz-object-lock-mode": settings.retentionMode.rawValue,
+                "x-amz-object-lock-retain-until-date": value,
+            ]
+        )
+    }
+
+    nonisolated static func objectRetentionResponseMatches(
+        _ data: Data, expected: S3ObjectRetentionExpectation
+    ) -> Bool {
+        guard !expected.mode.isEmpty, let minimumDate = expected.retainUntilDate,
+              data.count <= 64 * 1024, let fields = try? parseBoundedXML(data),
+              fields.firstValue(named: "Mode") == expected.mode,
+              let rawDate = fields.firstValue(named: "RetainUntilDate"),
+              let observedDate = parseISO8601(rawDate),
+              observedDate >= minimumDate.addingTimeInterval(-1) else { return false }
+        return true
+    }
+
+    private nonisolated static func parseISO8601(_ value: String) -> Date? {
+        let standard = ISO8601DateFormatter()
+        if let date = standard.date(from: value) { return date }
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return fractional.date(from: value)
     }
 
     nonisolated static func listObjectsEndpoint(settings: S3StorageSettings, maximumKeys: Int, continuationToken: String?) throws -> URL {
@@ -796,6 +965,15 @@ actor S3StorageService {
                 "Condition": ["Bool": ["aws:SecureTransport": "false"]],
             ],
             [
+                "Sid": "ScopeproofDenyBucketDeletion", "Effect": "Deny", "Principal": "*",
+                "Action": "s3:DeleteBucket", "Resource": bucketARN,
+            ],
+            [
+                "Sid": "ScopeproofDenyEvidenceDeletion", "Effect": "Deny", "Principal": "*",
+                "Action": ["s3:DeleteObject", "s3:DeleteObjectVersion", "s3:BypassGovernanceRetention"],
+                "Resource": objectARN,
+            ],
+            [
                 "Sid": "ScopeproofDenyWrongEncryption", "Effect": "Deny", "Principal": "*",
                 "Action": "s3:PutObject", "Resource": objectARN,
                 "Condition": ["StringNotEquals": ["s3:x-amz-server-side-encryption": settings.encryptionMode.rawValue]],
@@ -817,37 +995,117 @@ actor S3StorageService {
     nonisolated static func bucketPolicyIsSecure(_ data: Data, settings: S3StorageSettings) -> Bool {
         guard data.count <= 1 * 1024 * 1024,
               let document = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let statements = document["Statement"] as? [[String: Any]] else { return false }
-        func statement(_ sid: String) -> [String: Any]? { statements.first { $0["Sid"] as? String == sid } }
-        let partition = settings.region.hasPrefix("us-gov-") ? "aws-us-gov" : "aws"
-        let bucketARN = "arn:\(partition):s3:::\(settings.bucket)"
-        let objectARN = settings.prefix.isEmpty ? "\(bucketARN)/*" : "\(bucketARN)/\(settings.prefix)/*"
-        guard let tls = statement("ScopeproofDenyInsecureTransport"), tls["Effect"] as? String == "Deny",
-              tls["Principal"] as? String == "*", tls["Action"] as? String == "s3:*",
-              Set(tls["Resource"] as? [String] ?? []) == Set([bucketARN, "\(bucketARN)/*"]),
-              let tlsCondition = tls["Condition"] as? [String: Any],
-              let bools = tlsCondition["Bool"] as? [String: String], bools["aws:SecureTransport"] == "false",
-              let encryption = statement("ScopeproofDenyWrongEncryption"), encryption["Effect"] as? String == "Deny",
-              encryption["Principal"] as? String == "*", encryption["Action"] as? String == "s3:PutObject",
-              encryption["Resource"] as? String == objectARN,
-              let encryptionCondition = encryption["Condition"] as? [String: Any],
-              let algorithms = encryptionCondition["StringNotEquals"] as? [String: String],
-              algorithms["s3:x-amz-server-side-encryption"] == settings.encryptionMode.rawValue else { return false }
-        if settings.encryptionMode.needsKMSKey {
-            guard let kms = statement("ScopeproofDenyWrongKMSKey"), kms["Effect"] as? String == "Deny",
-                  kms["Principal"] as? String == "*", kms["Action"] as? String == "s3:PutObject",
-                  kms["Resource"] as? String == objectARN,
-                  let kmsCondition = kms["Condition"] as? [String: Any],
-                  let keys = kmsCondition["StringNotEquals"] as? [String: String],
-                  keys["s3:x-amz-server-side-encryption-aws-kms-key-id"] == settings.kmsKeyARN else { return false }
-        }
-        return true
+              let expectedData = try? bucketPolicyBody(settings: settings),
+              let expected = try? JSONSerialization.jsonObject(with: expectedData) as? [String: Any] else { return false }
+        // Resource-policy Allows can grant data access independently of the caller's identity policy.
+        // Require the complete generated policy, not merely the presence of Scopeproof's deny Sids.
+        return (document as NSDictionary).isEqual(expected as NSDictionary)
+    }
+
+    nonisolated static func lifecycleConfigurationIsSecure(_ data: Data?, settings: S3StorageSettings) -> Bool {
+        guard settings.archiveAfterDays > 0 else { return data == nil }
+        guard let data else { return false }
+        return exactXMLConfiguration(data, matches: lifecycleBody(settings: settings))
+    }
+
+    nonisolated static func replicationConfigurationIsSecure(_ data: Data?, settings: S3StorageSettings) -> Bool {
+        guard settings.replicationEnabled else { return data == nil }
+        guard let data else { return false }
+        return exactXMLConfiguration(data, matches: replicationBody(settings: settings))
+    }
+
+    private nonisolated static func exactXMLConfiguration(_ data: Data, matches expected: Data) -> Bool {
+        guard data.count <= 1 * 1024 * 1024,
+              let actualRecords = S3CanonicalXMLParser.records(in: data),
+              let expectedRecords = S3CanonicalXMLParser.records(in: expected) else { return false }
+        return actualRecords == expectedRecords
     }
 
     nonisolated static func stsEndpoint(settings: S3StorageSettings) throws -> URL {
         let label = settings.useFIPSEndpoint ? "sts-fips" : "sts"
         guard let url = URL(string: "https://\(label).\(settings.region).amazonaws.com/") else { throw S3StorageFailure.invalidResponse }
         return url
+    }
+
+    nonisolated static func kmsEndpoint(settings: S3StorageSettings) throws -> URL {
+        let label = settings.useFIPSEndpoint ? "kms-fips" : "kms"
+        guard let url = URL(string: "https://\(label).\(settings.region).amazonaws.com/") else {
+            throw S3StorageFailure.invalidResponse
+        }
+        return url
+    }
+
+    nonisolated static func describeKMSKeyRequest(
+        settings: S3StorageSettings, credentials: S3Credentials, date: Date
+    ) throws -> URLRequest {
+        guard settings.encryptionMode.needsKMSKey else { throw S3StorageFailure.kmsKeyNotApplicable }
+        let body = try JSONSerialization.data(
+            withJSONObject: ["KeyId": settings.kmsKeyARN], options: [.sortedKeys]
+        )
+        return try signedAWSRequest(
+            method: "POST", url: kmsEndpoint(settings: settings), region: settings.region,
+            service: "kms", body: body, contentType: "application/x-amz-json-1.1",
+            credentials: credentials, date: date,
+            extraHeaders: ["x-amz-target": "TrentService.DescribeKey"]
+        )
+    }
+
+    nonisolated static func kmsKeyARNMatchesVerifiedDestination(
+        _ arn: String, region: String, accountID: String
+    ) -> Bool {
+        let fields = arn.split(separator: ":", maxSplits: 5, omittingEmptySubsequences: false).map(String.init)
+        guard fields.count == 6, fields[0] == "arn", fields[2] == "kms",
+              fields[3] == region, fields[4] == accountID else { return false }
+        let expectedPartition = region.hasPrefix("us-gov-") ? "aws-us-gov" : "aws"
+        return fields[1] == expectedPartition
+            && fields[5].range(
+                of: #"^key/(?:[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}|mrk-[A-Fa-f0-9]{32})$"#,
+                options: .regularExpression
+            ) != nil
+    }
+
+    nonisolated static func parseKMSKeyPosture(
+        _ data: Data, expectedARN: String, region: String, expectedAccountID: String
+    ) throws -> S3KMSKeyPosture {
+        guard data.count <= 64 * 1024,
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let metadata = root["KeyMetadata"] as? [String: Any],
+              let arn = metadata["Arn"] as? String,
+              let accountID = metadata["AWSAccountId"] as? String,
+              let keyManager = metadata["KeyManager"] as? String,
+              let keyUsage = metadata["KeyUsage"] as? String,
+              let keySpec = metadata["KeySpec"] as? String,
+              let keyState = metadata["KeyState"] as? String,
+              let enabled = metadata["Enabled"] as? Bool,
+              isSafeResponseValue(arn, maximum: 2_048),
+              isSafeResponseValue(accountID, maximum: 12),
+              isSafeResponseValue(keyManager, maximum: 64),
+              isSafeResponseValue(keyUsage, maximum: 64),
+              isSafeResponseValue(keySpec, maximum: 64),
+              isSafeResponseValue(keyState, maximum: 64) else {
+            throw S3StorageFailure.invalidResponse
+        }
+        let fields = arn.split(separator: ":", maxSplits: 5, omittingEmptySubsequences: false).map(String.init)
+        guard fields.count == 6 else { throw S3StorageFailure.invalidResponse }
+        let posture = S3KMSKeyPosture(
+            arn: arn, partition: fields[1], region: fields[3], accountID: accountID,
+            keyManager: keyManager, keyUsage: keyUsage, keySpec: keySpec,
+            keyState: keyState, enabled: enabled
+        )
+        var failures: [String] = []
+        if arn != expectedARN { failures.append("DescribeKey returned a different key ARN") }
+        if !kmsKeyARNMatchesVerifiedDestination(arn, region: region, accountID: expectedAccountID)
+            || accountID != expectedAccountID {
+            failures.append("key partition, Region, or account does not match the verified bucket owner")
+        }
+        if keyManager != "CUSTOMER" { failures.append("KeyManager must be CUSTOMER") }
+        if keyUsage != "ENCRYPT_DECRYPT" { failures.append("KeyUsage must be ENCRYPT_DECRYPT") }
+        if keySpec != "SYMMETRIC_DEFAULT" { failures.append("KeySpec must be SYMMETRIC_DEFAULT") }
+        if !enabled || keyState != "Enabled" {
+            failures.append("key must be Enabled and not pending deletion or otherwise unavailable")
+        }
+        guard failures.isEmpty else { throw S3StorageFailure.kmsKeyPostureFailed(failures) }
+        return posture
     }
 
     nonisolated static func signedRequest(
@@ -888,12 +1146,13 @@ actor S3StorageService {
         method: String, url: URL, region: String, service: String, body: Data, contentType: String?,
         credentials: S3Credentials, date: Date, extraHeaders: [String: String]
     ) throws -> URLRequest {
-        guard ["GET", "PUT", "POST"].contains(method), ["s3", "sts"].contains(service),
+        guard ["GET", "PUT", "POST"].contains(method), ["s3", "sts", "kms"].contains(service),
               url.scheme == "https", let host = url.host, host.hasSuffix(".amazonaws.com") else {
             throw S3StorageFailure.invalidResponse
         }
         if service == "s3" && !isAllowedS3Host(host, region: region) { throw S3StorageFailure.invalidResponse }
         if service == "sts" && !isAllowedSTSHost(host, region: region) { throw S3StorageFailure.invalidResponse }
+        if service == "kms" && !isAllowedKMSHost(host, region: region) { throw S3StorageFailure.invalidResponse }
         let timestamp = awsTimestamp(date)
         let dateStamp = String(timestamp.prefix(8))
         let payloadHash = sha256(body)
@@ -953,6 +1212,11 @@ actor S3StorageService {
     private nonisolated static func isAllowedSTSHost(_ host: String, region: String) -> Bool {
         guard host == host.lowercased(), host.hasSuffix(".amazonaws.com") else { return false }
         return host == "sts.\(region).amazonaws.com" || host == "sts-fips.\(region).amazonaws.com"
+    }
+
+    private nonisolated static func isAllowedKMSHost(_ host: String, region: String) -> Bool {
+        guard host == host.lowercased(), host.hasSuffix(".amazonaws.com") else { return false }
+        return host == "kms.\(region).amazonaws.com" || host == "kms-fips.\(region).amazonaws.com"
     }
 
     private nonisolated static func isExpectedResponse(_ response: HTTPURLResponse, requestURL: URL) -> Bool {
@@ -1056,6 +1320,96 @@ actor S3StorageService {
             "LSQuarantineOriginURL": "https://aws.amazon.com/s3/",
         ]
         try? mutableURL.setResourceValues(values)
+    }
+}
+
+private final class S3CanonicalXMLParser: NSObject, XMLParserDelegate {
+    private var stack: [String] = []
+    private var textStack: [String] = []
+    private var recordCounts: [String: Int] = [:]
+    private var elementCount = 0
+    private var rootCount = 0
+    private var invalid = false
+
+    static func records(in data: Data) -> [String: Int]? {
+        let delegate = S3CanonicalXMLParser()
+        let parser = XMLParser(data: data)
+        parser.shouldResolveExternalEntities = false
+        parser.delegate = delegate
+        guard parser.parse(), !delegate.invalid, delegate.rootCount == 1,
+              delegate.stack.isEmpty, delegate.textStack.isEmpty else { return nil }
+        return delegate.recordCounts
+    }
+
+    func parser(
+        _ parser: XMLParser, didStartElement elementName: String, namespaceURI: String?,
+        qualifiedName qName: String?, attributes attributeDict: [String: String] = [:]
+    ) {
+        elementCount += 1
+        guard elementCount <= 2_000, stack.count < 32,
+              attributeDict.keys.allSatisfy({ $0 == "xmlns" || $0.hasPrefix("xmlns:") }) else {
+            invalid = true
+            parser.abortParsing()
+            return
+        }
+        if stack.isEmpty { rootCount += 1 }
+        stack.append(elementName)
+        textStack.append("")
+        addRecord(kind: "element", path: stack, value: nil)
+    }
+
+    func parser(_ parser: XMLParser, foundCharacters string: String) {
+        guard !textStack.isEmpty,
+              textStack[textStack.count - 1].utf8.count + string.utf8.count <= 8_192 else {
+            invalid = true
+            parser.abortParsing()
+            return
+        }
+        textStack[textStack.count - 1] += string
+    }
+
+    func parser(_ parser: XMLParser, foundCDATA CDATABlock: Data) {
+        guard let value = String(data: CDATABlock, encoding: .utf8) else {
+            invalid = true
+            parser.abortParsing()
+            return
+        }
+        self.parser(parser, foundCharacters: value)
+    }
+
+    func parser(
+        _ parser: XMLParser, didEndElement elementName: String,
+        namespaceURI: String?, qualifiedName qName: String?
+    ) {
+        guard stack.last == elementName, let rawText = textStack.last else {
+            invalid = true
+            parser.abortParsing()
+            return
+        }
+        let value = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !value.isEmpty { addRecord(kind: "text", path: stack, value: value) }
+        stack.removeLast()
+        textStack.removeLast()
+    }
+
+    func parser(_ parser: XMLParser, foundInternalEntityDeclarationWithName name: String, value: String?) {
+        invalid = true
+        parser.abortParsing()
+    }
+
+    func parser(
+        _ parser: XMLParser, foundExternalEntityDeclarationWithName name: String,
+        publicID: String?, systemID: String?
+    ) {
+        invalid = true
+        parser.abortParsing()
+    }
+
+    private func addRecord(kind: String, path: [String], value: String?) {
+        let encodedPath = path.map { "\($0.utf8.count):\($0)" }.joined(separator: "|")
+        let encodedValue = value.map { "|\($0.utf8.count):\($0)" } ?? ""
+        let key = "\(kind)|\(encodedPath)\(encodedValue)"
+        recordCounts[key, default: 0] += 1
     }
 }
 

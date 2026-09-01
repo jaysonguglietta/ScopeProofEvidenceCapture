@@ -10,9 +10,12 @@ import { promisify } from "node:util";
 const codeqlPath = new URL("../.github/workflows/codeql-swift.yml", import.meta.url);
 const releaseWorkflowPath = new URL("../.github/workflows/macos-production-release.yml", import.meta.url);
 const securityWorkflowPath = new URL("../.github/workflows/security.yml", import.meta.url);
+const trivyIgnorePath = new URL("../.trivyignore.yaml", import.meta.url);
 const dependabotPath = new URL("../.github/dependabot.yml", import.meta.url);
 const buildScriptPath = new URL("../Scripts/build_macos_production_release.sh", import.meta.url);
 const publishScriptPath = new URL("../Scripts/publish_release.sh", import.meta.url);
+const entitlementValidatorPath = new URL("../Scripts/validate_macos_release_entitlements.mjs", import.meta.url);
+const releaseEntitlementsPath = new URL("../macos/ScopeproofCapture/Resources/ScopeproofCapture.entitlements", import.meta.url);
 const evidenceScriptPath = new URL("../Scripts/macos_release_evidence.mjs", import.meta.url);
 const manifestScriptPath = new URL("../Scripts/sign_update_manifest.mjs", import.meta.url);
 const updateKeyValidatorPath = new URL("../Scripts/validate_macos_update_keys.mjs", import.meta.url);
@@ -21,6 +24,7 @@ const notaryScriptPath = new URL("../Scripts/configure_macos_notary_profile.sh",
 const releaseRunbookPath = new URL("../docs/AWS_RECOVERY_AND_MACOS_RELEASE.md", import.meta.url);
 const awsPackagePath = new URL("../infra/aws/cdk/package.json", import.meta.url);
 const awsWorkspacePath = new URL("../infra/aws/cdk/pnpm-workspace.yaml", import.meta.url);
+const codeownersPath = new URL("../.github/CODEOWNERS", import.meta.url);
 const execFileAsync = promisify(execFile);
 
 function assertPinnedActions(workflow: string): void {
@@ -48,7 +52,11 @@ test("production release is manual, main-only, protected, and cleans credentials
   assert.doesNotMatch(workflow, /^\s*(?:push|pull_request):/m);
   assert.match(workflow, /if: github\.ref == 'refs\/heads\/main'/);
   assert.match(workflow, /environment: production-release/);
+  assert.match(workflow, /actions: read/);
   assert.match(workflow, /test "\$EXPECTED_COMMIT" = "\$GITHUB_SHA"/);
+  assert.match(workflow, /actions\/workflows\/\$workflow\/runs\?branch=main&event=push&head_sha=\$EXPECTED_COMMIT&status=completed/);
+  assert.match(workflow, /security\.yml codeql-swift\.yml/);
+  assert.match(workflow, /run\.conclusion === "success"/);
   assert.match(workflow, /persist-credentials: false/);
   assert.match(workflow, /swift test --arch arm64/);
   assert.match(workflow, /security delete-keychain/);
@@ -60,11 +68,15 @@ test("production release is manual, main-only, protected, and cleans credentials
   assert.ok(workflow.indexOf("Destroy temporary release credentials") < workflow.indexOf("Attest the signed release candidate"));
   assert.ok(workflow.indexOf("Destroy temporary release credentials") < workflow.indexOf("Upload the signed release candidate"));
   assert.ok(workflow.indexOf("swift test --arch arm64") < workflow.indexOf("MACOS_DEVELOPER_ID_P12_BASE64"));
+  assert.ok(workflow.indexOf("Require successful security workflows") < workflow.indexOf("MACOS_DEVELOPER_ID_P12_BASE64"));
   assertPinnedActions(workflow);
 });
 
 test("pull-request security jobs have no OIDC or attestation authority and gate dependency licenses", async () => {
-  const workflow = await readFile(securityWorkflowPath, "utf8");
+  const [workflow, trivyIgnore] = await Promise.all([
+    readFile(securityWorkflowPath, "utf8"),
+    readFile(trivyIgnorePath, "utf8"),
+  ]);
   assert.doesNotMatch(workflow, /id-token:\s*write/);
   assert.doesNotMatch(workflow, /attestations:\s*write/);
   assert.match(workflow, /actions\/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294/);
@@ -73,6 +85,18 @@ test("pull-request security jobs have no OIDC or attestation authority and gate 
   assert.match(workflow, /deny-licenses:.*AGPL.*GPL.*SSPL/);
   assert.match(workflow, /scopeproof-worker-sbom\.cdx\.json/);
   assert.match(workflow, /scopeproof-aws-cdk-sbom\.cdx\.json/);
+  assert.match(workflow, /npm run test:cloudformation/);
+  assert.match(workflow, /pnpm exec cdk synth/);
+  assert.match(workflow, /rootDomain=evidence\.example\.com/);
+  assert.match(workflow, /deploymentEnvironment=dev/);
+  assert.match(workflow, /recovery=\{"mode":"disabled"\}/);
+  assert.match(workflow, /aquasecurity\/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25/);
+  assert.match(workflow, /scanners: secret,misconfig/);
+  assert.match(workflow, /severity: HIGH,CRITICAL/);
+  assert.match(workflow, /trivyignores: \.trivyignore\.yaml/);
+  assert.match(trivyIgnore, /id: AVD-AWS-0015/);
+  assert.match(trivyIgnore, /infra\/aws\/scopeproof-s3-observability\.yaml/);
+  assert.match(trivyIgnore, /expired_at: 2026-11-30/);
   assertPinnedActions(workflow);
 });
 
@@ -83,16 +107,41 @@ test("Dependabot covers both npm lockfile boundaries and pinned Actions", async 
   assert.match(source, /package-ecosystem: github-actions/);
 });
 
-test("AWS pnpm lockfile produces a complete deterministic CycloneDX inventory", async () => {
+test("AWS pnpm lockfile produces a complete deterministic CycloneDX dependency graph", async () => {
   const directory = await mkdtemp(join(tmpdir(), "scopeproof-pnpm-sbom-"));
   try {
     const output = join(directory, "aws.cdx.json");
+    const secondOutput = join(directory, "aws-second.cdx.json");
     await execFileAsync(process.execPath, [pnpmSbomScriptPath.pathname, awsPackagePath.pathname, new URL("../infra/aws/cdk/pnpm-lock.yaml", import.meta.url).pathname, output]);
-    const sbom = JSON.parse(await readFile(output, "utf8")) as { bomFormat: string; specVersion: string; components: unknown[]; dependencies: Array<{ dependsOn: string[] }> };
+    await execFileAsync(process.execPath, [pnpmSbomScriptPath.pathname, awsPackagePath.pathname, new URL("../infra/aws/cdk/pnpm-lock.yaml", import.meta.url).pathname, secondOutput]);
+    const sbom = JSON.parse(await readFile(output, "utf8")) as {
+      bomFormat: string;
+      specVersion: string;
+      metadata: { tools: { components: Array<{ name: string }> }; properties: Array<{ name: string; value: string }> };
+      components: Array<{ "bom-ref": string; name: string; scope: string; hashes?: Array<{ alg: string; content: string }>; properties?: Array<{ name: string; value: string }> }>;
+      dependencies: Array<{ ref: string; dependsOn: string[] }>;
+    };
     assert.equal(sbom.bomFormat, "CycloneDX");
     assert.equal(sbom.specVersion, "1.6");
     assert.ok(sbom.components.length > 50);
     assert.equal(sbom.dependencies[0].dependsOn.length, 19);
+    assert.equal(sbom.dependencies.length, sbom.components.length + 1);
+    assert.equal(new Set(sbom.components.map((component) => component["bom-ref"])).size, sbom.components.length);
+    assert.ok(sbom.components.every((component) => component.hashes?.[0].alg === "SHA-512" && /^[a-f0-9]{128}$/.test(component.hashes[0].content)));
+    assert.deepEqual(
+      new Set(sbom.dependencies.slice(1).map((dependency) => dependency.ref)),
+      new Set(sbom.components.map((component) => component["bom-ref"])),
+    );
+    const component = (name: string) => sbom.components.find((candidate) => candidate.name === name)!;
+    const dependency = (name: string) => sbom.dependencies.find((candidate) => candidate.ref === component(name)["bom-ref"])!;
+    assert.equal(component("@aws-sdk/client-s3").scope, "required");
+    assert.equal(component("aws-cdk").scope, "excluded");
+    assert.ok(dependency("@aws-sdk/client-s3").dependsOn.includes(component("@aws-sdk/checksums")["bom-ref"]));
+    assert.ok(dependency("esbuild").dependsOn.length >= 20);
+    assert.match(component("@aws-cdk/cloud-assembly-schema").properties?.[0].value ?? "", /jsonschema,semver/);
+    assert.equal(sbom.metadata.tools.components[0].name, "scopeproof-pnpm-lock-to-cyclonedx");
+    assert.ok(sbom.metadata.properties.some(({ name, value }) => name === "scopeproof:dependencyGraph" && value === "complete-for-pnpm-snapshots"));
+    assert.deepEqual(JSON.parse(await readFile(secondOutput, "utf8")), sbom);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -113,6 +162,7 @@ test("production builder enforces hardened signing, notarization, stapling, and 
   assert.match(build, /ScopeproofUpdateDownloadOrigin/);
   assert.match(build, /validate_macos_update_keys\.mjs/);
   assert.match(build, /macos_release_evidence\.mjs" create/);
+  assert.equal([...build.matchAll(/validate_macos_release_entitlements\.mjs/g)].length, 2);
   assert.match(configure, /notarytool store-credentials/);
   assert.match(configure, /Refusing to read an App Store Connect private key from the repository/);
   assert.doesNotMatch(`${build}\n${configure}`, /--disable-sandbox/);
@@ -158,6 +208,30 @@ test("production update keys are canonical P-256 points with a current non-dupli
   assert.match(duplicate.stderr, /Duplicate update key IDs/);
 });
 
+test("production entitlement validation rejects every capability outside the exact reviewed allowlist", async () => {
+  const { validateReleaseEntitlements } = await import(entitlementValidatorPath.href);
+  const exact = {
+    "com.apple.security.cs.allow-jit": false,
+    "com.apple.security.cs.allow-unsigned-executable-memory": false,
+    "com.apple.security.cs.disable-library-validation": false,
+  };
+  assert.equal(validateReleaseEntitlements(exact), true);
+  const source = await readFile(releaseEntitlementsPath, "utf8");
+  const sourceEntries = Object.fromEntries(
+    [...source.matchAll(/<key>([^<]+)<\/key>\s*<(true|false)\/>/g)]
+      .map(([, key, value]) => [key, value === "true"]),
+  );
+  assert.deepEqual(sourceEntries, exact);
+  assert.equal([...source.matchAll(/<key>/g)].length, Object.keys(exact).length);
+  assert.throws(() => validateReleaseEntitlements({ ...exact, "com.apple.security.get-task-allow": true }), /allowlist mismatch/);
+  assert.throws(() => validateReleaseEntitlements({ ...exact, "com.apple.security.cs.disable-library-validation": true }), /must be false/);
+  const missing = {
+    "com.apple.security.cs.allow-unsigned-executable-memory": false,
+    "com.apple.security.cs.disable-library-validation": false,
+  };
+  assert.throws(() => validateReleaseEntitlements(missing), /allowlist mismatch/);
+});
+
 test("publication verifies the exact attested candidate and never rebuilds or re-archives it", async () => {
   const publish = await readFile(publishScriptPath, "utf8");
   assert.match(publish, /SCOPEPROOF_RELEASE_CANDIDATE_DIR/);
@@ -175,7 +249,24 @@ test("publication verifies the exact attested candidate and never rebuilds or re
   assert.match(publish, /stapler validate/);
   assert.match(publish, /spctl --assess/);
   assert.match(publish, /sign_update_manifest\.mjs" "\$archive"/);
+  assert.match(publish, /Refusing to read an update-signing private key from the repository/);
+  assert.match(publish, /must have mode 0400 or 0600/);
+  assert.match(publish, /must be owned by the publishing user/);
+  assert.match(publish, /must not have additional hard links/);
+  assert.match(publish, /must not have an extended ACL/);
+  assert.match(publish, /must not be group- or world-writable/);
   assert.doesNotMatch(publish, /build_macos_capture|swift build|ditto -c/);
+});
+
+test("CODEOWNERS covers cloud infrastructure, AWS runtime, dependency locks, and vendored code", async () => {
+  const source = await readFile(codeownersPath, "utf8");
+  for (const protectedPath of [
+    "/infra/aws/",
+    "/lib/aws-runtime/",
+    "/package.json",
+    "/package-lock.json",
+    "/vendor/",
+  ]) assert.ok(source.split(/\r?\n/).includes(`${protectedPath} @jaysonguglietta`));
 });
 
 test("update manifest signer accepts only the compiled immutable CloudFront release path", async () => {

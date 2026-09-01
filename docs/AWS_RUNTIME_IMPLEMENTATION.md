@@ -14,8 +14,9 @@ true before customer evidence is trusted:
 
 1. The request arrived for an exact, active tenant hostname through the
    configured authority path.
-2. Cognito signed an unexpired access token for an allowed application client,
-   and the database still contains an active membership with the required role.
+2. Cognito signed an unexpired access token for an allowed web or native
+   application client, the token includes the exact operation scope, and the
+   database still contains an active membership with the required role.
 3. The upload capability binds one tenant, control, evidence identifier,
    checksum, byte length, media type, KMS context, key, object path, and short
    expiry using temporary STS credentials and SigV4.
@@ -33,15 +34,18 @@ authorization inputs.
 | --- | --- | --- |
 | `DynamoTenantAuthorityResolver` | Strongly consistent exact-host lookup, active/canonical-state validation, and tenant/app-client binding | DynamoDB tenant registry |
 | `CognitoJwtVerifier` | Strict RS256/JWKS and access-token verification | Cognito user-pool keys |
-| `authorizeApiGatewayRequest` | Request target, exact host authority, bearer token, membership, and RBAC | Request context plus PostgreSQL |
+| `authorizeApiGatewayRequest` | Request target, exact host authority, bearer token, app-client allowlist, OAuth scope, membership, and RBAC | Request context plus PostgreSQL |
 | `HmacTrustedEdgeAuthorityVerifier` | Cryptographically binds a viewer host to one method/path/request and consumes the nonce | Edge secret plus DynamoDB replay row |
 | `RdsDataMembershipRepository` | Active principal/membership lookup under tenant RLS | Tenant PostgreSQL database |
-| Tenant API Gateway/Lambda | Answers `GET /health` as an API Gateway mock and routes authenticated `GET /v1/me` plus `POST /v1/upload-intents` to Lambda on one exact `api-<tenant>.<domain>` | API Gateway context plus tenant-scoped adapters |
+| Tenant API Gateway/Lambdas | Answers `GET /health` as an API Gateway mock; routes identity/upload calls to the upload Lambda and metadata listing/exact-version download calls to a separately privileged read Lambda on one exact `api-<tenant>.<domain>` | API Gateway context plus tenant-scoped adapters |
 | `UploadIntentIssuer` | Creates one opaque, checksum-bound, short-lived S3 PUT capability | Exact intent contract |
 | `DynamoConditionalUploadIntentStore` | Atomically reserves the intent ID and nonce digest | DynamoDB control table |
 | `RdsDataUploadIntentProjection` | Creates the corresponding evidence and upload rows through one idempotent procedure | Tenant PostgreSQL database |
+| `RdsDataEvidenceAccessRepository` | Lists and resolves downloadable evidence through tenant-scoped execute-only procedures | Tenant PostgreSQL database |
+| `HostedEvidenceAccessService` | Issues HMAC-protected tenant-bound cursors and 60-second exact-version GET capabilities | Aurora metadata plus S3 SigV4 |
 | GuardDuty promotion Lambda | Verifies the exact scanned version, performs one conditional Object-Locked destination write, and reconciles state | S3, DynamoDB, and PostgreSQL |
 | `RdsDataSignedAuditReceiptStore` | Verifies and appends one KMS-signed event into the tenant hash chain | Tenant PostgreSQL database |
+| API audit outbox/signer | Durably records successful public API facts, leases a bounded batch, signs each canonical event with tenant KMS, atomically appends it to the hash chain, and retries/dead-letters poison rows | Tenant PostgreSQL, dedicated Lambda/database login, KMS, EventBridge, DLQ, CloudWatch |
 | Exact-version legal-hold service | Separately commits requester-only `REQUESTED`, distinct-admin `APPROVED`, durable worker-only `APPLYING`, and exact-readback `APPLIED` state for one exact S3 `VersionId` | PostgreSQL plus S3 Object Lock |
 | Legal-hold API/worker | Authenticates request and approval in separate calls, sweeps approved/applying operations, appends or reuses an exact KMS-signed audit receipt, publishes the audit-bound recovery record, and clears the Aurora outbox only after publication acknowledgement | Separate API/worker Lambda roles, PostgreSQL, S3 Object Lock, KMS, DynamoDB, EventBridge, and CloudWatch |
 
@@ -51,7 +55,8 @@ and replay behavior without credentials or network access.
 
 ## Configure authentication
 
-Create one verifier per trusted Cognito user pool and bounded client set. Never
+Create one verifier per trusted Cognito user pool and bounded web/native client
+set. Never
 accept these values from an HTTP request.
 
 ```ts
@@ -62,7 +67,7 @@ import {
 
 const jwt = new CognitoJwtVerifier({
   issuer: "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_EXAMPLE",
-  clientIds: ["the-exact-cognito-app-client-id"],
+  clientIds: ["the-exact-web-client-id", "the-exact-native-client-id"],
   maximumAuthenticationAgeSeconds: 3_600,
   maximumTokenLifetimeSeconds: 3_600,
   clockSkewSeconds: 30,
@@ -78,7 +83,9 @@ const memberships = new RdsDataMembershipRepository({
 ```
 
 The verifier requires an access token with `token_use=access` and an allowed
-`client_id`. It rejects algorithm changes, embedded key URLs, duplicate JSON
+`client_id`. Authorization then maps each `TenantPermission` to one exact
+`scopeproof/...` OAuth scope before the membership lookup. It rejects algorithm
+changes, embedded key URLs, duplicate JSON
 claims, non-canonical base64url, unexpected `aud`, invalid token lifetimes,
 stale authentication, oversized JWKS documents, redirects, weak RSA keys,
 duplicate key IDs, and unknown-key refresh floods. Do not substitute an ID token.
@@ -103,7 +110,14 @@ kept outside that execution role. The API exposes:
   membership, role, and bounded token expiry; and
 - `POST /v1/upload-intents`, which requires `evidence:collect`, strictly parses a
   bounded exact-key JSON body, loads the server-side tenant secret, reconciles
-  DynamoDB/Aurora, and returns an exact presigned S3 capability; and
+  DynamoDB/Aurora, and returns an exact presigned S3 capability;
+- `POST /v1/evidence/search`, which requires `evidence:read`, accepts only a
+  bounded page size and optional opaque tenant-bound cursor, and returns display
+  metadata without bucket, object key, KMS ARN, or version fields;
+- `POST /v1/evidence-download-intents`, which requires `evidence:read`, accepts
+  only an evidence ID and expected revision, resolves the immutable bucket, key,
+  and version server-side, and returns a 60-second exact-version S3 GET
+  capability; and
 - `POST /v1/legal-hold-requests` plus `POST /v1/legal-hold-approvals`, both of
   which require `retention:manage` and route to a separate legal-control Lambda
   so request and independent approval are different authenticated calls.
@@ -166,22 +180,24 @@ store to `UploadIntentIssuer`. The issuer derives a stable 128-bit intent ID,
 stable 256-bit nonce, and separate stored idempotency digest from the tenant ID,
 client key, and server HMAC. It persists only digests and the approved,
 secret-screened recovery projection. The raw client key and raw nonce are never
-stored. A retry receives the same logical intent and nonce but a newly signed,
-short-lived S3 capability.
+stored, and the public API does not return the nonce. Its digest is bound into
+the signed object metadata and verified again by the promotion worker. A retry
+receives the same logical intent but a newly signed, short-lived S3 capability.
 
 The caller must send every returned `requiredHeaders` entry exactly as returned.
 The signature includes:
 
 - `Content-Length` and an allowlisted `Content-Type`;
 - full-object `x-amz-checksum-sha256`;
-- tenant, control, evidence, and upload-intent metadata;
+- tenant, control, evidence, upload-intent, and upload-nonce-digest metadata;
 - `aws:kms`, the exact tenant KMS key ARN, and the exact base64 encryption
   context `{scopeproofPurpose:"quarantine",scopeproofTenantId:"..."}`;
 - a temporary STS session token; and
 - a maximum ten-minute expiry.
 
 The client must not follow redirects or change the path, query, or signed headers.
-The raw nonce, authorization header, and STS credentials must never be logged.
+The authorization header, presigned URL, signed metadata, and STS credentials
+must never be logged.
 
 ### Cross-service failure behavior
 
@@ -220,6 +236,40 @@ current key to create anything. Do not rotate by simply removing the prior
 stage while retry rows may still exist, because the same client key would
 derive a new intent ID under the new key. A live rotation/retry drill remains a
 production gate.
+
+## List and download immutable evidence
+
+Evidence browsing uses Aurora as the authoritative metadata index; the public
+API never lists S3 directly. `scopeproof.list_accessible_evidence` and
+`scopeproof.read_accessible_evidence` are `SECURITY DEFINER` procedures that
+require transaction-local tenant context and independently recheck active
+membership with `evidence:read`. The dedicated evidence-read identity receives execute only on
+those procedures, not table privileges. Listing is ordered by
+`captured_at DESC, evidence_id DESC`, uses a matching partial index, and is
+bounded to 100 returned items.
+
+Pagination cursors are canonical, HMAC-authenticated, tenant-bound, keyset-based,
+and expire after 15 minutes. A modified cursor, a cursor from another tenant, an
+expired cursor, or a repository row from another tenant fails closed. Listing
+responses include bounded display and integrity metadata but omit the bucket,
+object key, KMS ARN, and version ID.
+
+Cursor signing uses a purpose-specific Secrets Manager value, not the upload
+idempotency HMAC. New cursors use `AWSCURRENT`; the composed Lambda may try the
+one distinct `AWSPREVIOUS` version so an in-flight cursor survives a controlled
+rotation (the service contract can accept at most two prior keys for other
+adapters). The current and prior bytes are copied into the service and wiped from
+the loader buffers. Clients cannot select a key version.
+
+Downloads accept only an opaque evidence ID and expected revision. The server
+reads the exact promoted S3 bucket, canonical tenant/control object key, and
+nonempty immutable `VersionId` from Aurora, then signs `GetObject` for exactly
+60 seconds with checksum mode and expected-bucket-owner headers. The client
+cannot substitute any storage coordinate. The separate read Lambda can assume
+only the tenant read role, whose S3 and KMS permissions are limited to exact
+evidence versions under that tenant prefix and the immutable-evidence
+encryption context. Application logs must never include the signed URL or its
+`X-Amz-*` query values.
 
 ## Promote and reconcile evidence
 
@@ -283,6 +333,44 @@ tenant-specific role, alert on key-policy and signing anomalies, retain CloudTra
 management events, and periodically export public keys and signed checkpoints to
 an independently controlled archive.
 
+### Public-API outbox drain
+
+Successful upload-intent, evidence-search, exact-version download-intent, and
+legal-hold request/approval handlers call `RdsDataApiAuditOutbox.record(...)`.
+`scopeproof.record_api_audit_event(...)` independently validates active
+membership/RBAC/resource binding and inserts both the immutable action record and
+its delivery state atomically. API identities have no direct table access.
+
+Every minute, one reserved-concurrency signer Lambda leases no more than ten due
+rows for 120 seconds. `RdsDataApiAuditOutboxSignerStore` validates the bounded
+Data API response, reads the serialized tenant audit head, builds the exact user
+actor and action/resource/request event, obtains an RSA-PSS KMS signature, and
+calls only `scopeproof.append_signed_api_audit_event(...)`. That specialized
+procedure re-derives the outbox digest, event identifier, actor, occurrence time,
+request, resource, outcome, and enriched details before it delegates internally
+to the generic chain append. Append and delivery completion commit in one
+transaction. The signer role is deliberately not granted the generic append
+procedure or table access.
+
+The lease is committed before runtime JSON validation. If a database row violates
+the safe-details contract, the adapter retains only the validated tenant/outbox/
+lease tuple and records `CLAIM_PARSE_FAILED`; it never signs the malformed facts.
+Other failures record a stage-only code. Backoff starts at 30 seconds, caps at six
+hours, and transitions the row to a persistent dead letter on attempt eight.
+Later due rows remain claimable with `FOR UPDATE SKIP LOCKED`. If append committed
+but its Data API response was lost, the failure procedure returns
+`already_completed`, so retry neither overwrites the original randomized RSA-PSS
+signature nor creates a second event.
+
+The worker emits only counts/ages and safe identifiers. Alerts cover any failed
+attempt, persistent dead letters, an oldest unsigned age of five minutes, missing
+health telemetry, Lambda errors/throttles, and the retained EventBridge invocation
+DLQ. Requeue is intentionally owner-only. Operators must correct the producer or
+schema first, use `scopeproof.requeue_dead_lettered_api_audit_event(...)` only in
+a reviewed break-glass owner session, then verify `completed_at`, the KMS receipt,
+and chain continuity. Direct table edits and temporary generic-append grants are
+not supported recovery actions.
+
 ## Exact-version S3 legal holds
 
 Legal holds operate on a bucket, controlled evidence key, and non-empty S3
@@ -337,7 +425,7 @@ UI/process exists, alerts are delivered, and adversarial live tests pass.
 
 ## Database and IAM role separation
 
-Each tenant is provisioned with four distinct `NOINHERIT` database logins and
+Each tenant is provisioned with six distinct `NOINHERIT` database logins and
 corresponding Secrets Manager credentials:
 
 - the upload runtime role has no table or sequence privileges and may execute
@@ -349,7 +437,12 @@ corresponding Secrets Manager credentials:
 - the evidence-control role has no table grants and may execute only signed
   audit append plus legal-hold reserve/confirm procedures; and
 - the legal-hold API role has no table grants and may execute only membership
-  resolution plus legal-hold request and approval procedures.
+  resolution plus legal-hold request and approval procedures; and
+- the evidence-read role has no table grants and may execute only tenant context,
+  membership resolution, bounded keyset listing, and exact evidence lookup; and
+- the API-audit signer role has no table grants and may execute only tenant
+  context, one-row leasing, audit-head read, exact outbox-bound append, bounded
+  failure transition, and queue-health procedures.
 
 The IAM split mirrors the database split. The tenant data role can resolve its
 tenant registry, reserve upload intents and quota counters, retrieve its
@@ -361,6 +454,12 @@ promotion receipts. The tenant evidence-control role receives KMS signing/
 verification for application audit receipts plus exact-version
 `s3:GetObjectLegalHold`/`s3:PutObjectLegalHold`; it cannot delete evidence or
 bypass governance retention. Never merge these roles for deployment convenience.
+The separate evidence-read role uses only the evidence-read database secret,
+cursor HMAC secret, exact tenant-version S3 read permission, and S3-mediated KMS
+decrypt; it cannot create uploads or use the upload idempotency key.
+The API-audit signer Lambda uses only its dedicated database secret and cluster,
+the tenant audit key for `kms:Sign`/`kms:Verify`, and its pre-created log group;
+it cannot assume a tenant data/control role or access S3 or DynamoDB.
 
 ## Validation
 
@@ -373,8 +472,21 @@ node --experimental-strip-types --test tests/aws-runtime-*.test.ts tests/aws-pos
 cd infra/aws/cdk
 pnpm install --frozen-lockfile --ignore-scripts
 pnpm test
-pnpm run synth
+pnpm run synth \
+  -c deploymentEnvironment=dev \
+  -c rootDomain=evidence.example.com \
+  -c hostedZoneId=Z0123456789EXAMPLE \
+  -c 'recovery={"mode":"disabled"}' \
+  -c 'tenants=[]'
 ```
+
+`cdk.json` deliberately leaves `rootDomain` and `deploymentEnvironment` empty.
+The example above imports an existing example zone for local synthesis only;
+every run must explicitly provide an environment, complete tenant array, and
+recovery object, and a reviewed deployment must use the owned domain and real
+zone ID or deliberately replace `hostedZoneId` with
+`-c createHostedZone=true`. Tenant stacks reject missing recovery configuration;
+supplying neither or both Route 53 modes also fails.
 
 Required adversarial cases include a wrong tenant host, ID token, stale token,
 revoked membership, replayed edge assertion, traversal control, changed signed
@@ -387,16 +499,22 @@ S3 legal-hold postcondition mismatch.
 
 Do not enable customer traffic until all of the following are true:
 
-- the per-tenant API Gateway `/health` mock and authenticated Lambda have been
-  deployed, and `/health`, `/v1/me`, and `/v1/upload-intents` pass live host/JWT/
-  membership/STS/Data API/DynamoDB/S3 tests, including the 60/300 per-minute
-  request limits, atomic 500/5,000 daily creation limits, quota-boundary exact
-  retry recovery, and 429 behavior;
+- the per-tenant API Gateway `/health` mock and authenticated Lambdas have been
+  deployed, and `/health`, `/v1/me`, `/v1/upload-intents`, `/v1/evidence/search`,
+  and `/v1/evidence-download-intents` pass live host/JWT/scope/membership/STS/
+  Data API/DynamoDB/S3 tests. Evidence-read tests must cover two tenants,
+  revoked membership, cursor tampering and expiry, current-to-previous cursor-key
+  rotation, exact `VersionId` and signed response-header binding, the 60-second
+  download capability, and independent per-route throttling/abuse behavior.
+  Upload tests must include the 60/300 per-minute request limits, atomic 500/5,000
+  daily creation limits, quota-boundary exact retry recovery, and 429 behavior;
 - the exact Cognito issuer/client IDs and tenant domains are configuration, not
   request data;
-- upload runtime, ingest, evidence-control, and legal-hold API database
-  credentials resolve to four different NOINHERIT roles, and the matching IAM
-  roles cannot cross their procedure or object-control boundaries;
+- upload runtime, ingest, evidence-control, legal-hold API, evidence-read, and
+  API-audit signer database credentials resolve to six different NOINHERIT roles, and the
+  provisioner confirms no managed owner/application role participates in a
+  PostgreSQL membership edge, while matching IAM roles cannot cross their
+  procedure or object-control boundaries;
 - the GuardDuty clean rule, DLQ, alarms, and runbook canaries pass in stage;
 - KMS key policies, S3 Object Lock, CloudTrail data events, recovery replication,
   and legal-hold permissions match the synthesized templates;
@@ -404,6 +522,9 @@ Do not enable customer traffic until all of the following are true:
 - the CDK-wired request/approval routes and least-privilege legal-hold worker are
   deployed and prove the three committed phases and
   KMS audit behavior; and
+- the API-audit signer proves exact outbox/event binding, single-writer chain
+  ordering, ambiguous-commit recovery, malformed-row retry/dead-letter behavior,
+  later-row progress, owner-only requeue, and alarm delivery; and
 - operators have rehearsed partial upload, promotion, audit, legal-hold, and
   database-recovery scenarios.
 

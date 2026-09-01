@@ -3,6 +3,7 @@ import CryptoKit
 import Foundation
 import ImageIO
 import Network
+import Security
 
 enum LocalConsoleFailure: LocalizedError {
     case startup(String)
@@ -45,23 +46,27 @@ final class LocalConsoleServer {
     private let evidenceRoot: URL
     private let preferences: CapturePreferences
     private let s3Service: S3StorageService
+    private let credentialProvider: S3CredentialProvider
     private let requestCapture: @MainActor () -> Void
     private let openS3Browser: @MainActor () -> Void
     private let queue = DispatchQueue(label: "com.scopeproof.capture.local-console", qos: .userInitiated)
+    private let connectionLimiter = LocalConsoleConnectionLimiter(maximumConnections: 32)
     private var listener: NWListener?
     private var port: UInt16?
-    private let sessionToken = LocalConsoleServer.randomToken(byteCount: 32)
+    private var sessionState = LocalConsoleSessionState()
     private var storedIndex: LocalEvidenceIndex?
     private var s3Cache: S3InventoryCache?
 
     init(
         evidenceRoot: URL, preferences: CapturePreferences, s3Service: S3StorageService,
+        credentialProvider: S3CredentialProvider,
         requestCapture: @escaping @MainActor () -> Void,
         openS3Browser: @escaping @MainActor () -> Void
     ) {
         self.evidenceRoot = evidenceRoot.standardizedFileURL
         self.preferences = preferences
         self.s3Service = s3Service
+        self.credentialProvider = credentialProvider
         self.requestCapture = requestCapture
         self.openS3Browser = openS3Browser
     }
@@ -72,7 +77,8 @@ final class LocalConsoleServer {
     func open() async throws {
         if !isRunning { try await start() }
         try syncIndex(action: "console.opened")
-        guard let port, let launchURL = URL(string: "http://127.0.0.1:\(port)/launch?token=\(sessionToken)") else { throw LocalConsoleFailure.startup("No local address was assigned.") }
+        let launchNonce = sessionState.beginOpen()
+        guard let port, let launchURL = URL(string: "http://127.0.0.1:\(port)/launch?token=\(launchNonce)") else { throw LocalConsoleFailure.startup("No local address was assigned.") }
         NSWorkspace.shared.open(launchURL)
     }
 
@@ -80,6 +86,7 @@ final class LocalConsoleServer {
         listener?.cancel()
         listener = nil
         port = nil
+        sessionState.invalidate()
     }
 
     func syncIndex(action: String = "index.synchronized") throws {
@@ -119,46 +126,70 @@ final class LocalConsoleServer {
     }
 
     nonisolated private func handle(_ connection: NWConnection) {
+        guard let lease = connectionLimiter.acquire() else { connection.cancel(); return }
         connection.start(queue: queue)
-        receiveRequest(connection: connection, accumulated: Data())
+        let deadline = DispatchWorkItem { [weak connection, weak lease] in
+            connection?.cancel()
+            lease?.cancelAndFinish()
+        }
+        lease.install(deadline: deadline)
+        queue.asyncAfter(deadline: .now() + 15, execute: deadline)
+        receiveRequest(connection: connection, accumulated: Data(), lease: lease)
     }
 
-    nonisolated private func receiveRequest(connection: NWConnection, accumulated: Data) {
+    nonisolated private func receiveRequest(
+        connection: NWConnection, accumulated: Data, lease: LocalConsoleConnectionLease
+    ) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] content, _, complete, error in
-            guard let self else { connection.cancel(); return }
+            guard let self else { connection.cancel(); lease.finish(); return }
             var buffer = accumulated
             if let content { buffer.append(content) }
             if buffer.count > 2 * 1024 * 1024 {
-                self.send(.json(status: 413, object: ["error": "Request body is too large."]), on: connection); return
+                self.send(.json(status: 413, object: ["error": "Request body is too large."]), on: connection, lease: lease); return
             }
             if let request = HTTPRequest.parse(buffer) {
                 if buffer.count < request.expectedLength {
-                    self.receiveRequest(connection: connection, accumulated: buffer); return
+                    self.receiveRequest(connection: connection, accumulated: buffer, lease: lease); return
                 }
-                Task { @MainActor in
+                let task = Task { @MainActor in
                     let response = await self.route(request)
-                    self.send(response, on: connection)
+                    guard !Task.isCancelled else {
+                        connection.cancel()
+                        lease.finish()
+                        return
+                    }
+                    self.send(response, on: connection, lease: lease)
                 }
+                lease.install(cancellation: { task.cancel() })
             } else if complete || error != nil {
-                self.send(.json(status: 400, object: ["error": LocalConsoleFailure.invalidRequest.localizedDescription]), on: connection)
+                self.send(.json(status: 400, object: ["error": LocalConsoleFailure.invalidRequest.localizedDescription]), on: connection, lease: lease)
             } else {
-                self.receiveRequest(connection: connection, accumulated: buffer)
+                self.receiveRequest(connection: connection, accumulated: buffer, lease: lease)
             }
         }
     }
 
-    nonisolated private func send(_ response: HTTPResponse, on connection: NWConnection) {
-        connection.send(content: response.encoded, completion: .contentProcessed { _ in connection.cancel() })
+    nonisolated private func send(
+        _ response: HTTPResponse, on connection: NWConnection, lease: LocalConsoleConnectionLease
+    ) {
+        connection.send(content: response.encoded, completion: .contentProcessed { _ in
+            connection.cancel()
+            lease.finish()
+        })
     }
 
     private func route(_ request: HTTPRequest) async -> HTTPResponse {
         do {
             guard ["127.0.0.1", "localhost"].contains(request.hostName), request.hostPort == port else { throw LocalConsoleFailure.forbidden }
             if request.path == "/launch", request.method == "GET" {
-                guard request.query["token"] == sessionToken else { throw LocalConsoleFailure.unauthorized }
-                return .redirect(location: "/", cookie: sessionCookie)
+                guard let token = request.query["token"].flatMap({ sessionState.consumeLaunchNonce($0) }) else {
+                    throw LocalConsoleFailure.unauthorized
+                }
+                return .redirect(location: "/", cookie: sessionCookie(token: token))
             }
-            guard request.cookies["scopeproof_local"] == sessionToken else { throw LocalConsoleFailure.unauthorized }
+            guard let cookie = request.cookies["scopeproof_local"], sessionState.authorize(cookie) else {
+                throw LocalConsoleFailure.unauthorized
+            }
             if request.method != "GET" {
                 guard request.headers["origin"] == displayURL?.absoluteString.dropLast().description,
                       request.headers["sec-fetch-site"] == "same-origin",
@@ -174,14 +205,18 @@ final class LocalConsoleServer {
                 return .data(status: 200, contentType: "text/javascript; charset=utf-8", body: Data(LocalConsoleAssets.javascript.utf8), cache: "private, max-age=3600")
             case ("GET", "/api/status"):
                 let index = try evidenceIndex()
-                try index.sync(entries: CaptureHistory.entries(in: evidenceRoot))
+                let entries = CaptureHistory.entries(in: evidenceRoot)
+                try index.sync(entries: entries)
                 let server = preferences.serverURL?.absoluteString ?? ""
                 let hosted = BackendTrust.normalizedOrigin(preferences.serverURL).flatMap(KeychainStore.readToken(for:)) != nil
                 let auditValid = try index.verifyAuditChain()
+                let captureChainValid = CaptureHistory.captureChainIntegrity(entries)
                 let s3Settings = preferences.s3Storage
                 return .codable(Status(
                     localUser: NSFullUserName(), evidenceRoot: evidenceRoot.path,
-                    indexState: auditValid ? "Ready · loopback only · audit verified" : "Audit verification failed",
+                    indexState: auditValid && captureChainValid
+                        ? "Ready · loopback only · audit and capture anchor verified"
+                        : "Audit or capture-chain rollback verification failed",
                     hostedConnected: hosted, hostedServer: server, autoUpload: preferences.autoUpload,
                     retentionDays: preferences.retentionDays, summary: try index.summary(),
                     s3Configured: s3Settings.isConfigured, s3InventoryState: s3InventoryState(settings: s3Settings),
@@ -245,11 +280,10 @@ final class LocalConsoleServer {
 
     private func imageResponse(evidenceID: String) throws -> HTTPResponse {
         let entry = try entry(for: evidenceID)
-        let data = try Data(contentsOf: entry.imageURL, options: [.mappedIfSafe])
-        guard data.count <= 40 * 1024 * 1024, data.starts(with: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]), sha256(data) == entry.manifest.sha256 else {
-            throw LocalConsoleFailure.invalidBody("The evidence image failed its integrity check.")
-        }
-        return .data(status: 200, contentType: "image/png", body: data, cache: "private, max-age=60")
+        let artifact: ValidatedEvidenceArtifact
+        do { artifact = try ValidatedEvidenceArtifact.loadForLegacyBrowsing(entry, requireLifecycle: false) }
+        catch { throw LocalConsoleFailure.invalidBody("The evidence image failed its integrity check.") }
+        return .data(status: 200, contentType: "image/png", body: artifact.imageData, cache: "private, max-age=60")
     }
 
     private func s3ImageResponse(evidenceID: String) async throws -> HTTPResponse {
@@ -260,10 +294,10 @@ final class LocalConsoleServer {
         }
         let settings = preferences.s3Storage
         guard settings == cache.settings, settings.downloadsAllowed,
-              let credentials = KeychainStore.readS3Credentials(),
               let binding = KeychainStore.readS3VerifiedDestination(), binding.matches(settings) else {
             throw S3StorageFailure.verificationRequired
         }
+        let credentials = try await credentialProvider.credentials(for: settings, binding: binding)
         let entries = CaptureHistory.entries(in: evidenceRoot)
         let receiptBindings = EvidenceLibraryBuilder.verifiedReceiptBindings(
             entries: entries, settings: settings, destination: binding
@@ -287,21 +321,23 @@ final class LocalConsoleServer {
             attributes: [.posixPermissions: 0o700]
         )
         defer { try? FileManager.default.removeItem(at: previewDirectory) }
-        let previewURL = previewDirectory.appendingPathComponent("\(evidenceID).png", isDirectory: false)
-        let manifestURL = previewDirectory.appendingPathComponent("\(evidenceID).json", isDirectory: false)
+        let imageFilename = screenshot.filename
+        let manifestFilename = URL(fileURLWithPath: screenshot.manifestObject.key).lastPathComponent
+        guard URL(fileURLWithPath: imageFilename).lastPathComponent == imageFilename,
+              URL(fileURLWithPath: manifestFilename).lastPathComponent == manifestFilename else {
+            throw S3StorageFailure.invalidEvidence
+        }
+        let previewURL = previewDirectory.appendingPathComponent(imageFilename, isDirectory: false)
+        let manifestURL = previewDirectory.appendingPathComponent(manifestFilename, isDirectory: false)
         let manifestDownload = try await s3Service.downloadObject(
             screenshot.manifestObject, settings: settings, credentials: credentials,
             binding: binding, to: manifestURL
         )
-        let manifestData = try Data(contentsOf: manifestURL, options: [.mappedIfSafe])
-        guard manifestData.count <= 2 * 1024 * 1024,
-              manifestDownload.versionID == screenshot.manifestObject.versionID,
-              let manifest = try? JSONDecoder().decode(CaptureManifest.self, from: manifestData),
-              manifest.schemaVersion == 6,
-              manifest.evidenceID == screenshot.evidenceID,
-              manifest.screenshotFilename == screenshot.filename,
-              manifest.sha256.range(of: #"^[a-f0-9]{64}$"#, options: .regularExpression) != nil,
-              manifest.safetyScanSha256 == manifest.sha256,
+        let manifestData = try ValidatedEvidenceArtifact.readBoundedRegularFile(
+            at: manifestURL, within: previewDirectory,
+            maximumBytes: ValidatedEvidenceArtifact.maximumManifestBytes
+        )
+        guard manifestDownload.versionID == screenshot.manifestObject.versionID,
               screenshot.receiptBinding.map({
                   $0.manifestVersionID == manifestDownload.versionID &&
                   $0.manifestSHA256 == manifestDownload.sha256
@@ -312,19 +348,26 @@ final class LocalConsoleServer {
             screenshot.object, settings: settings, credentials: credentials,
             binding: binding, to: previewURL
         )
-        let data = try Data(contentsOf: previewURL, options: [.mappedIfSafe])
-        guard data.count <= 40 * 1024 * 1024,
-              data.starts(with: [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]),
+        let data = try ValidatedEvidenceArtifact.readBoundedRegularFile(
+            at: previewURL, within: previewDirectory,
+            maximumBytes: ValidatedEvidenceArtifact.maximumImageBytes
+        )
+        let artifact = try ValidatedEvidenceArtifact.validateDownloadedForLegacyBrowsing(
+            manifestData: manifestData, imageData: data, manifestURL: manifestURL,
+            imageURL: previewURL, requireLocalAnchor: entries.contains(where: {
+                $0.manifest.evidenceID == evidenceID
+            })
+        )
+        guard artifact.manifest.evidenceID == screenshot.evidenceID,
               imageDownload.versionID == screenshot.object.versionID,
-              imageDownload.sha256 == manifest.sha256,
-              validatedPNGDimensions(data, width: manifest.pixelWidth, height: manifest.pixelHeight),
+              imageDownload.sha256 == artifact.manifest.sha256,
               screenshot.receiptBinding.map({
                   $0.imageVersionID == imageDownload.versionID &&
                   $0.imageSHA256 == imageDownload.sha256
               }) ?? true else {
             throw S3StorageFailure.unsupportedDownloadedContent
         }
-        return .data(status: 200, contentType: "image/png", body: data)
+        return .data(status: 200, contentType: "image/png", body: artifact.imageData)
     }
 
     private func libraryPayload(forceS3Refresh: Bool) async throws -> EvidenceLibraryPayload {
@@ -337,10 +380,10 @@ final class LocalConsoleServer {
         var state = s3InventoryState(settings: settings)
         var warning: String?
 
-        if settings.isConfigured,
-           let credentials = KeychainStore.readS3Credentials(),
-            let binding = KeychainStore.readS3VerifiedDestination(), binding.matches(settings) {
+        if settings.isConfigured, S3CredentialProvider.hasConfiguredSource(settings),
+           let binding = KeychainStore.readS3VerifiedDestination(), binding.matches(settings) {
             do {
+                let credentials = try await credentialProvider.credentials(for: settings, binding: binding)
                 let objects: [S3StoredObject]
                 if !forceS3Refresh, let cache = s3Cache,
                    cache.settings == settings, Date().timeIntervalSince(cache.loadedAt) < 60 {
@@ -384,7 +427,7 @@ final class LocalConsoleServer {
 
     private func s3InventoryState(settings: S3StorageSettings) -> String {
         guard settings.isConfigured else { return "Not configured" }
-        guard KeychainStore.readS3Credentials() != nil,
+        guard S3CredentialProvider.hasConfiguredSource(settings),
               KeychainStore.readS3VerifiedDestination()?.matches(settings) == true else { return "Verification required" }
         return "Ready"
     }
@@ -396,6 +439,7 @@ final class LocalConsoleServer {
         if [.approved, .rejected, .superseded].contains(status), notes.count < 20 { throw LocalConsoleFailure.invalidBody("Approval, rejection, and supersession require a rationale of at least 20 characters.") }
         guard !body.reviewer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw LocalConsoleFailure.invalidBody("A reviewer is required.") }
         let entry = try entry(for: evidenceID)
+        _ = try ValidatedEvidenceArtifact.load(entry, requireLifecycle: true)
         guard EvidenceLifecycleStore.verify(entry.lifecycle, artifactSha256: entry.manifest.sha256) else { throw EvidenceLifecycleFailure.integrityFailure }
         _ = try EvidenceLifecycleStore.update(entry: entry, status: status, owner: body.owner, reviewer: body.reviewer, notes: notes, tags: body.tags)
         let index = try evidenceIndex()
@@ -439,7 +483,9 @@ final class LocalConsoleServer {
         catch { throw LocalConsoleFailure.invalidBody("The request body is invalid.") }
     }
 
-    private var sessionCookie: String { "scopeproof_local=\(sessionToken); Path=/; HttpOnly; SameSite=Strict; Max-Age=43200" }
+    private func sessionCookie(token: String) -> String {
+        "scopeproof_local=\(token); Path=/; HttpOnly; SameSite=Strict; Max-Age=1800"
+    }
     private func sha256(_ data: Data) -> String { SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined() }
 
     private func validatedPNGDimensions(_ data: Data, width: Int, height: Int) -> Bool {
@@ -453,9 +499,155 @@ final class LocalConsoleServer {
               (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue == height else { return false }
         return true
     }
-    private static func randomToken(byteCount: Int) -> String {
-        Data((0..<byteCount).map { _ in UInt8.random(in: .min ... .max) }).base64EncodedString().replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
+}
+
+struct LocalConsoleSessionState {
+    static let launchLifetime: TimeInterval = 60
+    static let idleLifetime: TimeInterval = 30 * 60
+    static let absoluteLifetime: TimeInterval = 4 * 60 * 60
+
+    private var launchNonce: String?
+    private var launchExpiresAt = Date.distantPast
+    private var sessionToken: String?
+    private var sessionCreatedAt = Date.distantPast
+    private var lastUsedAt = Date.distantPast
+    private let tokenGenerator: () -> String
+
+    init(tokenGenerator: @escaping () -> String = { Self.randomToken(byteCount: 32) }) {
+        self.tokenGenerator = tokenGenerator
     }
+
+    mutating func beginOpen(now: Date = Date()) -> String {
+        let nonce = tokenGenerator()
+        launchNonce = nonce
+        launchExpiresAt = now.addingTimeInterval(Self.launchLifetime)
+        sessionToken = tokenGenerator()
+        sessionCreatedAt = now
+        lastUsedAt = now
+        return nonce
+    }
+
+    mutating func consumeLaunchNonce(_ candidate: String, now: Date = Date()) -> String? {
+        guard let nonce = launchNonce, now <= launchExpiresAt else {
+            launchNonce = nil
+            return nil
+        }
+        guard constantTimeEqual(candidate, nonce), let sessionToken else { return nil }
+        launchNonce = nil
+        launchExpiresAt = .distantPast
+        lastUsedAt = now
+        return sessionToken
+    }
+
+    mutating func authorize(_ candidate: String, now: Date = Date()) -> Bool {
+        guard let sessionToken,
+              now.timeIntervalSince(lastUsedAt) <= Self.idleLifetime,
+              now.timeIntervalSince(sessionCreatedAt) <= Self.absoluteLifetime,
+              constantTimeEqual(candidate, sessionToken) else {
+            if now.timeIntervalSince(lastUsedAt) > Self.idleLifetime
+                || now.timeIntervalSince(sessionCreatedAt) > Self.absoluteLifetime {
+                invalidate()
+            }
+            return false
+        }
+        lastUsedAt = now
+        return true
+    }
+
+    mutating func invalidate() {
+        launchNonce = nil
+        sessionToken = nil
+        launchExpiresAt = .distantPast
+        sessionCreatedAt = .distantPast
+        lastUsedAt = .distantPast
+    }
+
+    private func constantTimeEqual(_ left: String, _ right: String) -> Bool {
+        guard left.utf8.count == right.utf8.count else { return false }
+        var difference: UInt8 = 0
+        for (leftByte, rightByte) in zip(left.utf8, right.utf8) { difference |= leftByte ^ rightByte }
+        return difference == 0
+    }
+
+    private static func randomToken(byteCount: Int) -> String {
+        var data = Data(count: byteCount)
+        let status = data.withUnsafeMutableBytes { bytes in
+            SecRandomCopyBytes(kSecRandomDefault, bytes.count, bytes.baseAddress!)
+        }
+        precondition(status == errSecSuccess)
+        return data.base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+}
+
+private final class LocalConsoleConnectionLimiter: @unchecked Sendable {
+    private let lock = NSLock()
+    private let maximumConnections: Int
+    private var activeConnections = 0
+
+    init(maximumConnections: Int) { self.maximumConnections = max(1, maximumConnections) }
+
+    func acquire() -> LocalConsoleConnectionLease? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard activeConnections < maximumConnections else { return nil }
+        activeConnections += 1
+        return LocalConsoleConnectionLease { [weak self] in self?.release() }
+    }
+
+    private func release() {
+        lock.lock()
+        activeConnections = max(0, activeConnections - 1)
+        lock.unlock()
+    }
+}
+
+private final class LocalConsoleConnectionLease: @unchecked Sendable {
+    private let lock = NSLock()
+    private var releaseAction: (() -> Void)?
+    private var deadline: DispatchWorkItem?
+    private var cancellation: (() -> Void)?
+
+    init(release: @escaping () -> Void) { releaseAction = release }
+
+    func install(deadline: DispatchWorkItem) {
+        lock.lock()
+        if releaseAction == nil { lock.unlock(); deadline.cancel(); return }
+        self.deadline = deadline
+        lock.unlock()
+    }
+
+    func install(cancellation: @escaping () -> Void) {
+        lock.lock()
+        if releaseAction == nil { lock.unlock(); cancellation(); return }
+        self.cancellation = cancellation
+        lock.unlock()
+    }
+
+    func cancelAndFinish() {
+        lock.lock()
+        let cancellation = self.cancellation
+        self.cancellation = nil
+        lock.unlock()
+        cancellation?()
+        finish()
+    }
+
+    func finish() {
+        lock.lock()
+        let action = releaseAction
+        releaseAction = nil
+        let deadline = deadline
+        self.deadline = nil
+        cancellation = nil
+        lock.unlock()
+        deadline?.cancel()
+        action?()
+    }
+
+    deinit { finish() }
 }
 
 private struct ActionBody: Decodable { let evidenceID: String }

@@ -6,6 +6,87 @@ enum S3SecurityProfile: String, Codable, CaseIterable, Sendable {
     case compatible = "Compatible S3"
 }
 
+enum S3AuthenticationMethod: String, Codable, CaseIterable, Sendable {
+    case manualCredentials = "Manual credentials"
+    case identityCenterProfile = "IAM Identity Center profile"
+    case identityCenterAssumeRole = "Identity Center + assumed role"
+
+    var usesAWSCLI: Bool { self != .manualCredentials }
+
+    var helpText: String {
+        switch self {
+        case .manualCredentials:
+            return "Paste one temporary STS credential set. Compatible S3 may also use a dedicated static key as a migration exception."
+        case .identityCenterProfile:
+            return "Use a named AWS CLI IAM Identity Center profile. Temporary AWS credentials stay in memory and refresh automatically."
+        case .identityCenterAssumeRole:
+            return "Use a named IAM Identity Center profile to assume one exact, least-privilege IAM role. Temporary credentials stay in memory."
+        }
+    }
+}
+
+struct S3AuthenticationConfiguration: Codable, Equatable, Sendable {
+    var method: S3AuthenticationMethod
+    var profileName: String
+    var roleARN: String
+    var externalID: String
+
+    static let manual = S3AuthenticationConfiguration(
+        method: .manualCredentials, profileName: "", roleARN: "", externalID: ""
+    )
+
+    static func validated(
+        method: S3AuthenticationMethod,
+        profileName: String = "",
+        roleARN: String = "",
+        externalID: String = "",
+        region: String
+    ) throws -> S3AuthenticationConfiguration {
+        let cleanProfile = profileName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanRole = roleARN.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanExternalID = externalID.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        switch method {
+        case .manualCredentials:
+            return .manual
+        case .identityCenterProfile:
+            guard Self.isValidProfileName(cleanProfile) else { throw S3StorageFailure.invalidIdentityCenterProfile }
+            return S3AuthenticationConfiguration(
+                method: method, profileName: cleanProfile, roleARN: "", externalID: ""
+            )
+        case .identityCenterAssumeRole:
+            guard Self.isValidProfileName(cleanProfile) else { throw S3StorageFailure.invalidIdentityCenterProfile }
+            guard Self.isValidRoleARN(cleanRole, region: region) else { throw S3StorageFailure.invalidAssumeRole }
+            guard cleanExternalID.isEmpty || Self.isValidExternalID(cleanExternalID) else {
+                throw S3StorageFailure.invalidExternalID
+            }
+            return S3AuthenticationConfiguration(
+                method: method, profileName: cleanProfile, roleARN: cleanRole, externalID: cleanExternalID
+            )
+        }
+    }
+
+    static func isValidProfileName(_ value: String) -> Bool {
+        guard (1...128).contains(value.utf8.count),
+              value.range(of: #"^[A-Za-z0-9][A-Za-z0-9._-]*$"#, options: .regularExpression) != nil,
+              !value.contains(".."), !value.hasSuffix(".") else { return false }
+        return true
+    }
+
+    static func isValidRoleARN(_ value: String, region: String) -> Bool {
+        let partition = region.hasPrefix("us-gov-") ? "aws-us-gov" : "aws"
+        return value.range(
+            of: #"^arn:"# + partition + #":iam::\d{12}:role\/[A-Za-z0-9+=,.@_\/-]{1,512}$"#,
+            options: .regularExpression
+        ) != nil && !value.contains("//") && !value.hasSuffix("/")
+    }
+
+    static func isValidExternalID(_ value: String) -> Bool {
+        (2...1_224).contains(value.utf8.count)
+            && value.range(of: #"^[A-Za-z0-9][A-Za-z0-9_+=,.@:\/-]+$"#, options: .regularExpression) != nil
+    }
+}
+
 enum S3EncryptionMode: String, Codable, CaseIterable, Sendable {
     case sseS3 = "AES256"
     case sseKMS = "aws:kms"
@@ -26,7 +107,11 @@ enum S3RetentionMode: String, Codable, CaseIterable, Sendable {
     case governance = "GOVERNANCE"
     case compliance = "COMPLIANCE"
 
-    var displayName: String { self == .compliance ? "Compliance" : "Governance" }
+    var displayName: String {
+        self == .compliance
+            ? "Compliance"
+            : "Governance — non-production (bypassable)"
+    }
 }
 
 struct S3StorageSettings: Codable, Equatable, Sendable {
@@ -46,13 +131,15 @@ struct S3StorageSettings: Codable, Equatable, Sendable {
     var replicationDestinationBucketARN: String
     var replicationRoleARN: String
     var replicationKMSKeyARN: String
+    var authentication: S3AuthenticationConfiguration
 
     static let defaults = S3StorageSettings(
         bucket: "", region: "us-east-1", prefix: "scopeproof-evidence", autoUpload: false,
         uploadsAllowed: false, securityProfile: .production, encryptionMode: .sseKMS,
-        kmsKeyARN: "", retentionMode: .governance, retentionDays: 365,
-        archiveAfterDays: 90, downloadsAllowed: false, useFIPSEndpoint: false,
-        replicationDestinationBucketARN: "", replicationRoleARN: "", replicationKMSKeyARN: ""
+        kmsKeyARN: "", retentionMode: .compliance, retentionDays: 365,
+        archiveAfterDays: 0, downloadsAllowed: false, useFIPSEndpoint: false,
+        replicationDestinationBucketARN: "", replicationRoleARN: "", replicationKMSKeyARN: "",
+        authentication: .manual
     )
 
     var isConfigured: Bool { !bucket.isEmpty && !region.isEmpty }
@@ -66,7 +153,7 @@ struct S3StorageSettings: Codable, Equatable, Sendable {
         retentionMode: S3RetentionMode = .governance, retentionDays: Int = 365,
         archiveAfterDays: Int = 0, downloadsAllowed: Bool = true, useFIPSEndpoint: Bool = false,
         replicationDestinationBucketARN: String = "", replicationRoleARN: String = "",
-        replicationKMSKeyARN: String = ""
+        replicationKMSKeyARN: String = "", authentication: S3AuthenticationConfiguration = .manual
     ) {
         self.bucket = bucket
         self.region = region
@@ -84,12 +171,14 @@ struct S3StorageSettings: Codable, Equatable, Sendable {
         self.replicationDestinationBucketARN = replicationDestinationBucketARN
         self.replicationRoleARN = replicationRoleARN
         self.replicationKMSKeyARN = replicationKMSKeyARN
+        self.authentication = authentication
     }
 
     private enum CodingKeys: String, CodingKey {
         case bucket, region, prefix, autoUpload, uploadsAllowed, securityProfile, encryptionMode, kmsKeyARN
         case retentionMode, retentionDays, archiveAfterDays, downloadsAllowed, useFIPSEndpoint
         case replicationDestinationBucketARN, replicationRoleARN, replicationKMSKeyARN
+        case authentication
     }
 
     init(from decoder: Decoder) throws {
@@ -110,15 +199,16 @@ struct S3StorageSettings: Codable, Equatable, Sendable {
         replicationDestinationBucketARN = try values.decodeIfPresent(String.self, forKey: .replicationDestinationBucketARN) ?? ""
         replicationRoleARN = try values.decodeIfPresent(String.self, forKey: .replicationRoleARN) ?? ""
         replicationKMSKeyARN = try values.decodeIfPresent(String.self, forKey: .replicationKMSKeyARN) ?? ""
+        authentication = try values.decodeIfPresent(S3AuthenticationConfiguration.self, forKey: .authentication) ?? .manual
     }
 
     static func validated(
         bucket: String, region: String, prefix: String, autoUpload: Bool, uploadsAllowed: Bool = false,
         securityProfile: S3SecurityProfile = .compatible, encryptionMode: S3EncryptionMode = .sseS3,
-        kmsKeyARN: String = "", retentionMode: S3RetentionMode = .governance, retentionDays: Int = 365,
+        kmsKeyARN: String = "", retentionMode: S3RetentionMode = .compliance, retentionDays: Int = 365,
         archiveAfterDays: Int = 0, downloadsAllowed: Bool = true, useFIPSEndpoint: Bool = false,
         replicationDestinationBucketARN: String = "", replicationRoleARN: String = "",
-        replicationKMSKeyARN: String = ""
+        replicationKMSKeyARN: String = "", authentication: S3AuthenticationConfiguration = .manual
     ) throws -> S3StorageSettings {
         let cleanBucket = bucket.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let cleanRegion = region.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -141,6 +231,10 @@ struct S3StorageSettings: Codable, Equatable, Sendable {
               cleanRegion.range(of: #"^[a-z]{2}(?:-gov)?-[a-z]+-\d$"#, options: .regularExpression) != nil else {
             throw S3StorageFailure.invalidRegion
         }
+        let cleanAuthentication = try S3AuthenticationConfiguration.validated(
+            method: authentication.method, profileName: authentication.profileName,
+            roleARN: authentication.roleARN, externalID: authentication.externalID, region: cleanRegion
+        )
         let prefixSegments = cleanPrefix.split(separator: "/", omittingEmptySubsequences: false)
         guard cleanPrefix.count <= 240, !cleanPrefix.contains(".."), !cleanPrefix.contains("\\"), !cleanPrefix.contains("//"),
               prefixSegments.allSatisfy({ $0 != "." && $0 != ".." }),
@@ -158,6 +252,9 @@ struct S3StorageSettings: Codable, Equatable, Sendable {
             throw S3StorageFailure.kmsKeyNotApplicable
         }
         if securityProfile == .production && !encryptionMode.needsKMSKey { throw S3StorageFailure.productionKMSRequired }
+        if securityProfile == .production && retentionMode != .compliance {
+            throw S3StorageFailure.productionComplianceRetentionRequired
+        }
 
         let replicationValues = [cleanDestination, cleanRole, cleanReplicaKMS]
         let hasAnyReplication = replicationValues.contains(where: { !$0.isEmpty })
@@ -176,14 +273,20 @@ struct S3StorageSettings: Codable, Equatable, Sendable {
             kmsKeyARN: cleanKMS, retentionMode: retentionMode, retentionDays: retentionDays,
             archiveAfterDays: archiveAfterDays, downloadsAllowed: downloadsAllowed, useFIPSEndpoint: useFIPSEndpoint,
             replicationDestinationBucketARN: cleanDestination, replicationRoleARN: cleanRole,
-            replicationKMSKeyARN: cleanReplicaKMS
+            replicationKMSKeyARN: cleanReplicaKMS, authentication: cleanAuthentication
         )
     }
 
     private static func isValidKMSKeyARN(_ value: String, region: String?) -> Bool {
         let regionPattern = region.map(NSRegularExpression.escapedPattern(for:)) ?? #"[a-z]{2}(?:-gov)?-[a-z]+-\d"#
+        let partitionPattern: String
+        if let region {
+            partitionPattern = region.hasPrefix("us-gov-") ? "aws-us-gov" : "aws"
+        } else {
+            partitionPattern = "(?:aws|aws-us-gov)"
+        }
         return value.range(
-            of: #"^arn:(?:aws|aws-us-gov):kms:"# + regionPattern + #":\d{12}:key/[A-Fa-f0-9-]{8,128}$"#,
+            of: #"^arn:"# + partitionPattern + #":kms:"# + regionPattern + #":\d{12}:key/(?:[A-Fa-f0-9]{8}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}-[A-Fa-f0-9]{12}|mrk-[A-Fa-f0-9]{32})$"#,
             options: .regularExpression
         ) != nil
     }
@@ -193,6 +296,7 @@ struct S3StorageSettings: Codable, Equatable, Sendable {
             bucket, region, prefix, securityProfile.rawValue, encryptionMode.rawValue, kmsKeyARN,
             retentionMode.rawValue, String(retentionDays), String(archiveAfterDays), String(downloadsAllowed),
             String(useFIPSEndpoint), replicationDestinationBucketARN, replicationRoleARN, replicationKMSKeyARN,
+            authentication.method.rawValue, authentication.profileName, authentication.roleARN, authentication.externalID,
         ]
         return SHA256.hash(data: Data(fields.joined(separator: "\u{1f}").utf8)).map { String(format: "%02x", $0) }.joined()
     }
@@ -235,6 +339,32 @@ struct S3CallerIdentity: Codable, Equatable, Sendable {
     let userID: String
 }
 
+struct S3KMSKeyPosture: Codable, Equatable, Sendable {
+    let arn: String
+    let partition: String
+    let region: String
+    let accountID: String
+    let keyManager: String
+    let keyUsage: String
+    let keySpec: String
+    let keyState: String
+    let enabled: Bool
+
+    func satisfies(_ settings: S3StorageSettings, accountID expectedAccountID: String) -> Bool {
+        let expectedPartition = settings.region.hasPrefix("us-gov-") ? "aws-us-gov" : "aws"
+        return settings.encryptionMode.needsKMSKey
+            && arn == settings.kmsKeyARN
+            && partition == expectedPartition
+            && region == settings.region
+            && accountID == expectedAccountID
+            && keyManager == "CUSTOMER"
+            && keyUsage == "ENCRYPT_DECRYPT"
+            && keySpec == "SYMMETRIC_DEFAULT"
+            && keyState == "Enabled"
+            && enabled
+    }
+}
+
 struct S3BucketPosture: Codable, Equatable, Sendable {
     let blockPublicAccess: Bool
     let versioningEnabled: Bool
@@ -242,6 +372,7 @@ struct S3BucketPosture: Codable, Equatable, Sendable {
     let bucketPolicyEnforced: Bool
     let encryptionMode: S3EncryptionMode?
     let kmsKeyARN: String
+    let bucketKeyEnabled: Bool?
     let objectLockEnabled: Bool
     let retentionMode: S3RetentionMode?
     let retentionDays: Int
@@ -251,6 +382,7 @@ struct S3BucketPosture: Codable, Equatable, Sendable {
     init(
         blockPublicAccess: Bool, versioningEnabled: Bool, ownershipEnforced: Bool,
         bucketPolicyEnforced: Bool = false, encryptionMode: S3EncryptionMode?, kmsKeyARN: String,
+        bucketKeyEnabled: Bool? = nil,
         objectLockEnabled: Bool, retentionMode: S3RetentionMode?, retentionDays: Int,
         lifecycleArchiveAfterDays: Int, replicationDestinationBucketARN: String
     ) {
@@ -260,6 +392,7 @@ struct S3BucketPosture: Codable, Equatable, Sendable {
         self.bucketPolicyEnforced = bucketPolicyEnforced
         self.encryptionMode = encryptionMode
         self.kmsKeyARN = kmsKeyARN
+        self.bucketKeyEnabled = bucketKeyEnabled
         self.objectLockEnabled = objectLockEnabled
         self.retentionMode = retentionMode
         self.retentionDays = retentionDays
@@ -273,23 +406,52 @@ struct S3BucketPosture: Codable, Equatable, Sendable {
         if settings.securityProfile == .production {
             guard ownershipEnforced, bucketPolicyEnforced, objectLockEnabled, retentionMode == settings.retentionMode,
                   retentionDays >= settings.retentionDays else { return false }
+            if settings.encryptionMode == .sseKMS && bucketKeyEnabled != true { return false }
         }
-        if settings.archiveAfterDays > 0 && lifecycleArchiveAfterDays != settings.archiveAfterDays { return false }
-        if settings.replicationEnabled && replicationDestinationBucketARN != settings.replicationDestinationBucketARN { return false }
+        if (settings.securityProfile == .production || settings.archiveAfterDays > 0)
+            && lifecycleArchiveAfterDays != settings.archiveAfterDays { return false }
+        if (settings.securityProfile == .production || settings.replicationEnabled)
+            && replicationDestinationBucketARN != settings.replicationDestinationBucketARN { return false }
         return true
     }
 }
 
 struct S3VerifiedDestination: Codable, Equatable, Sendable {
+    static let currentSchemaVersion = 4
+    static let maximumVerificationAge: TimeInterval = 15 * 60
+    static let maximumClockSkew: TimeInterval = 5 * 60
+
     let schemaVersion: Int
     let settingsDigest: String
     let accountID: String
     let principalARN: String
     let verifiedAt: Date
     let posture: S3BucketPosture
+    let kmsKeyPosture: S3KMSKeyPosture?
 
-    func matches(_ settings: S3StorageSettings) -> Bool {
-        schemaVersion == 1 && settingsDigest == settings.securityBindingDigest && posture.satisfies(settings)
+    init(
+        schemaVersion: Int, settingsDigest: String, accountID: String,
+        principalARN: String, verifiedAt: Date, posture: S3BucketPosture,
+        kmsKeyPosture: S3KMSKeyPosture? = nil
+    ) {
+        self.schemaVersion = schemaVersion
+        self.settingsDigest = settingsDigest
+        self.accountID = accountID
+        self.principalARN = principalARN
+        self.verifiedAt = verifiedAt
+        self.posture = posture
+        self.kmsKeyPosture = kmsKeyPosture
+    }
+
+    func matches(_ settings: S3StorageSettings, now: Date = Date()) -> Bool {
+        schemaVersion == Self.currentSchemaVersion
+            && settingsDigest == settings.securityBindingDigest
+            && posture.satisfies(settings)
+            && (settings.encryptionMode.needsKMSKey
+                ? kmsKeyPosture?.satisfies(settings, accountID: accountID) == true
+                : kmsKeyPosture == nil)
+            && verifiedAt <= now.addingTimeInterval(Self.maximumClockSkew)
+            && verifiedAt >= now.addingTimeInterval(-Self.maximumVerificationAge)
     }
 }
 
@@ -301,6 +463,8 @@ struct S3ObjectWriteReceipt: Codable, Equatable, Sendable {
     let extendedRequestID: String
     let encryptionMode: String
     let kmsKeyARN: String
+    let retentionMode: String
+    let retainUntil: String
 }
 
 struct S3DownloadResult: Equatable, Sendable {

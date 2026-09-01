@@ -31,12 +31,30 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 0
           persist-credentials: false
+      - name: Scan tracked content for secrets and infrastructure misconfiguration
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_DISABLE_TELEMETRY: "true"
+          TRIVY_SKIP_VERSION_CHECK: "true"
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: secret,misconfig
+          format: table
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: false
+          skip-dirs: node_modules,**/node_modules,infra/aws/cdk/cdk.out,.vinext,DerivedData
+          trivyignores: .trivyignore.yaml
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22.13.0"
           cache: npm
       - run: npm ci --ignore-scripts
+      - name: Validate CloudFormation security templates
+        run: npm run test:cloudformation
       - run: npm test
       - name: Replay database migrations
         run: ./Scripts/verify_migrations.sh
@@ -54,9 +72,15 @@ jobs:
         run: |
           pnpm install --frozen-lockfile --ignore-scripts
           pnpm test
-          pnpm run synth
+          pnpm exec cdk synth \
+            -c rootDomain=evidence.example.com \
+            -c hostedZoneId=Z1111111111111 \
+            -c deploymentEnvironment=dev \
+            -c createHostedZone=false \
+            -c 'recovery={"mode":"disabled"}' \
+            -c 'tenants=[]'
           pnpm audit --audit-level high
-      - name: Generate complete CycloneDX dependency SBOMs
+      - name: Generate dependency-graph CycloneDX SBOMs
         run: |
           npm sbom --sbom-format=cyclonedx > scopeproof-worker-sbom.cdx.json
           node Scripts/pnpm_lock_to_cyclonedx.mjs infra/aws/cdk/package.json infra/aws/cdk/pnpm-lock.yaml scopeproof-aws-cdk-sbom.cdx.json

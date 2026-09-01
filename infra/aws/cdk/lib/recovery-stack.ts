@@ -170,6 +170,7 @@ export class RecoveryStack extends Stack {
         principals: [new iam.AnyPrincipal()],
         resources: [evidenceBucket.arnForObjects("*")],
       }));
+      evidenceBucket.policy?.applyRemovalPolicy(RemovalPolicy.RETAIN);
       evidenceBucket.addToResourcePolicy(new iam.PolicyStatement({
         // Delete-marker replication is disabled. Prevent every principal,
         // including administrators and the replication role, from creating a
@@ -216,6 +217,7 @@ export class RecoveryStack extends Stack {
         value: evidenceKey.keyArn,
       });
     }
+    accessLogs.policy?.applyRemovalPolicy(RemovalPolicy.RETAIN);
 
     new CfnOutput(this, "RecoveryRegion", { value: this.region });
     new CfnOutput(this, "RecoveryBackupVaultArn", { value: vault.backupVaultArn });

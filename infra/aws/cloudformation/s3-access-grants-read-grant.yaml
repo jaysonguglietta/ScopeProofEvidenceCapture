@@ -1,0 +1,394 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Read-only S3 Access Grants location and grant for one exact tenant evidence
+  prefix. Requires the regional S3 Access Grants singleton to already exist.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Exact evidence location
+        Parameters:
+          - EvidenceBucketName
+          - KmsKeyArn
+          - TenantId
+          - ControlId
+      - Label:
+          default: Existing grantee
+        Parameters:
+          - GranteeMode
+          - IamRoleGranteeArn
+          - DirectoryGroupId
+          - DirectoryApplicationArn
+    ParameterLabels:
+      GranteeMode:
+        default: IAM role or IAM Identity Center directory group
+      IamRoleGranteeArn:
+        default: Existing IAM role ARN (IAM users are not accepted)
+      DirectoryApplicationArn:
+        default: Exact trusted-identity-propagation application ARN
+
+Parameters:
+  EvidenceBucketName:
+    Type: String
+    MinLength: 3
+    MaxLength: 63
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+  ControlId:
+    Type: String
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+  KmsKeyArn:
+    Type: String
+    AllowedPattern: "^arn:(aws|aws-us-gov|aws-cn):kms:[a-z0-9-]+:[0-9]{12}:key/([0-9a-fA-F-]{36}|mrk-[0-9a-fA-F]{32})$"
+  TenantId:
+    Type: String
+    AllowedPattern: "^ten_[a-f0-9]{32}$"
+  GranteeMode:
+    Type: String
+    Default: DIRECTORY_GROUP
+    AllowedValues:
+      - DIRECTORY_GROUP
+      - IAM_ROLE
+  IamRoleGranteeArn:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^arn:(aws|aws-us-gov|aws-cn):iam::[0-9]{12}:role/[A-Za-z0-9+=,.@_/-]{1,512}$"
+  DirectoryGroupId:
+    Type: String
+    Default: ""
+    MaxLength: 128
+    AllowedPattern: "^$|^[A-Za-z0-9-]{10,128}$"
+  DirectoryApplicationArn:
+    Type: String
+    Default: ""
+    MaxLength: 1224
+    AllowedPattern: "^$|^arn:(aws|aws-us-gov|aws-cn):sso::[0-9]{12}:application/.+$"
+    Description: >-
+      Required for DIRECTORY_GROUP. Use the exact IAM Identity Center application
+      configured for the calling application's trusted identity propagation; this
+      is not the Identity Center instance ARN.
+Rules:
+  RequireSelectedGrantee:
+    Assertions:
+      - Assert:
+          Fn::Or:
+            - Fn::And:
+                - Fn::Equals:
+                    - Ref: GranteeMode
+                    - IAM_ROLE
+                - Fn::Not:
+                    - Fn::Equals:
+                        - Ref: IamRoleGranteeArn
+                        - ""
+            - Fn::And:
+                - Fn::Equals:
+                    - Ref: GranteeMode
+                    - DIRECTORY_GROUP
+                - Fn::Not:
+                    - Fn::Equals:
+                        - Ref: DirectoryGroupId
+                        - ""
+        AssertDescription: Supply the existing IAM role ARN or directory group ID selected by GranteeMode.
+  RequireDirectoryApplication:
+    RuleCondition:
+      Fn::Equals:
+        - Ref: GranteeMode
+        - DIRECTORY_GROUP
+    Assertions:
+      - Assert:
+          Fn::Not:
+            - Fn::Equals:
+                - Ref: DirectoryApplicationArn
+                - ""
+        AssertDescription: DirectoryApplicationArn is required for DIRECTORY_GROUP grants.
+  RejectDirectoryApplicationForIamRole:
+    RuleCondition:
+      Fn::Equals:
+        - Ref: GranteeMode
+        - IAM_ROLE
+    Assertions:
+      - Assert:
+          Fn::Equals:
+            - Ref: DirectoryApplicationArn
+            - ""
+        AssertDescription: DirectoryApplicationArn must be empty for IAM_ROLE grants.
+
+Conditions:
+  GranteeIsIamRole:
+    Fn::Equals:
+      - Ref: GranteeMode
+      - IAM_ROLE
+  GranteeIsDirectoryGroup:
+    Fn::Equals:
+      - Ref: GranteeMode
+      - DIRECTORY_GROUP
+
+Resources:
+  AccessGrantsLocationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /scopeproof/
+      Description: S3 Access Grants vending role constrained to one evidence prefix.
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: ExactRegionalAccessGrantsInstance
+            Effect: Allow
+            Principal:
+              Service: access-grants.s3.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:SetSourceIdentity
+            Condition:
+              StringEquals:
+                aws:SourceAccount:
+                  Ref: AWS::AccountId
+                aws:SourceArn:
+                  Fn::Sub: arn:${AWS::Partition}:s3:${AWS::Region}:${AWS::AccountId}:access-grants/default
+          - Fn::If:
+              - GranteeIsDirectoryGroup
+              - Sid: IdentityCenterContextFromExactAccessGrantsInstance
+                Effect: Allow
+                Principal:
+                  Service: access-grants.s3.amazonaws.com
+                Action:
+                  - sts:SetContext
+                Condition:
+                  StringEquals:
+                    aws:SourceAccount:
+                      Ref: AWS::AccountId
+                    aws:SourceArn:
+                      Fn::Sub: arn:${AWS::Partition}:s3:${AWS::Region}:${AWS::AccountId}:access-grants/default
+                  ForAllValues:ArnEquals:
+                    sts:RequestContextProviders:
+                      - Fn::Sub: arn:${AWS::Partition}:iam::aws:contextProvider/IdentityCenter
+                  "Null":
+                    sts:RequestContextProviders: "false"
+              - Ref: AWS::NoValue
+      Tags:
+        - Key: Application
+          Value: scopeproof
+        - Key: TenantId
+          Value:
+            Ref: TenantId
+      Policies:
+        - PolicyName: exact-access-grants-evidence-boundary
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ListExactEvidencePrefixThroughAccessGrants
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::${EvidenceBucketName}
+                Condition:
+                  StringEquals:
+                    aws:ResourceAccount:
+                      Ref: AWS::AccountId
+                  ArnEquals:
+                    s3:AccessGrantsInstanceArn:
+                      Fn::Sub: arn:${AWS::Partition}:s3:${AWS::Region}:${AWS::AccountId}:access-grants/default
+                  StringLike:
+                    s3:prefix:
+                      - Fn::Sub: tenants/${TenantId}/controls/${ControlId}/evidence/*
+              - Sid: ReadExactEvidencePrefixThroughAccessGrants
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::${EvidenceBucketName}/tenants/${TenantId}/controls/${ControlId}/evidence/*
+                Condition:
+                  StringEquals:
+                    aws:ResourceAccount:
+                      Ref: AWS::AccountId
+                  ArnEquals:
+                    s3:AccessGrantsInstanceArn:
+                      Fn::Sub: arn:${AWS::Partition}:s3:${AWS::Region}:${AWS::AccountId}:access-grants/default
+              - Sid: DenyObjectReadsOutsideExactEvidencePrefix
+                Effect: Deny
+                Action:
+                  - s3:GetObject*
+                NotResource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::${EvidenceBucketName}/tenants/${TenantId}/controls/${ControlId}/evidence/*
+              - Sid: DenyListWithoutPrefix
+                Effect: Deny
+                Action:
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::*
+                Condition:
+                  "Null":
+                    s3:prefix: "true"
+              - Sid: DenyListOutsideExactEvidencePrefix
+                Effect: Deny
+                Action:
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::*
+                Condition:
+                  StringNotLike:
+                    s3:prefix:
+                      - Fn::Sub: tenants/${TenantId}/controls/${ControlId}/evidence/*
+              - Sid: DecryptEvidenceThroughS3Only
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource:
+                  - Ref: KmsKeyArn
+                Condition:
+                  StringEquals:
+                    kms:ViaService:
+                      Fn::Sub: s3.${AWS::Region}.${AWS::URLSuffix}
+                    kms:EncryptionContext:scopeproofTenantId:
+                      Ref: TenantId
+                    kms:EncryptionContext:scopeproofPurpose: immutable-evidence
+              - Sid: DenyS3OverInsecureTransport
+                Effect: Deny
+                Action:
+                  - s3:*
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::${EvidenceBucketName}
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::${EvidenceBucketName}/*
+                Condition:
+                  Bool:
+                    aws:SecureTransport: "false"
+              - Sid: DenyAllObjectWritesAndMutations
+                Effect: Deny
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:DeleteObjectVersion
+                  - s3:BypassGovernanceRetention
+                  - s3:PutObjectAcl
+                  - s3:PutObjectLegalHold
+                  - s3:PutObjectRetention
+                  - s3:RestoreObject
+                Resource:
+                  - Fn::Sub: arn:${AWS::Partition}:s3:::*/*
+              - Sid: DenyKmsOutsideRegionalS3
+                Effect: Deny
+                Action:
+                  - kms:Decrypt
+                Resource:
+                  - Ref: KmsKeyArn
+                Condition:
+                  StringNotEquals:
+                    kms:ViaService:
+                      Fn::Sub: s3.${AWS::Region}.${AWS::URLSuffix}
+              - Sid: DenyKmsUseOutsideConfiguredKey
+                Effect: Deny
+                Action:
+                  - kms:Decrypt
+                NotResource:
+                  - Ref: KmsKeyArn
+              - Sid: DenyWrongTenantEncryptionContext
+                Effect: Deny
+                Action:
+                  - kms:Decrypt
+                Resource:
+                  - Ref: KmsKeyArn
+                Condition:
+                  StringNotEquals:
+                    kms:EncryptionContext:scopeproofTenantId:
+                      Ref: TenantId
+              - Sid: DenyWrongPurposeEncryptionContext
+                Effect: Deny
+                Action:
+                  - kms:Decrypt
+                Resource:
+                  - Ref: KmsKeyArn
+                Condition:
+                  StringNotEquals:
+                    kms:EncryptionContext:scopeproofPurpose: immutable-evidence
+
+  TenantEvidenceLocation:
+    Type: AWS::S3::AccessGrantsLocation
+    Properties:
+      IamRoleArn:
+        Fn::GetAtt:
+          - AccessGrantsLocationRole
+          - Arn
+      LocationScope:
+        Fn::Sub: s3://${EvidenceBucketName}/tenants/${TenantId}/controls/${ControlId}/evidence/
+      Tags:
+        - Key: Application
+          Value: scopeproof
+        - Key: TenantId
+          Value:
+            Ref: TenantId
+        - Key: ControlId
+          Value:
+            Ref: ControlId
+
+  TenantEvidenceReadGrant:
+    Type: AWS::S3::AccessGrant
+    Properties:
+      ApplicationArn:
+        Fn::If:
+          - GranteeIsDirectoryGroup
+          - Ref: DirectoryApplicationArn
+          - Ref: AWS::NoValue
+      AccessGrantsLocationId:
+        Fn::GetAtt:
+          - TenantEvidenceLocation
+          - AccessGrantsLocationId
+      Grantee:
+        GranteeIdentifier:
+          Fn::If:
+            - GranteeIsIamRole
+            - Ref: IamRoleGranteeArn
+            - Ref: DirectoryGroupId
+        GranteeType:
+          Fn::If:
+            - GranteeIsIamRole
+            - IAM
+            - DIRECTORY_GROUP
+      Permission: READ
+      Tags:
+        - Key: Application
+          Value: scopeproof
+        - Key: TenantId
+          Value:
+            Ref: TenantId
+        - Key: ControlId
+          Value:
+            Ref: ControlId
+
+Outputs:
+  AccessGrantsLocationArn:
+    Value:
+      Fn::GetAtt:
+        - TenantEvidenceLocation
+        - AccessGrantsLocationArn
+  AccessGrantsLocationId:
+    Value:
+      Fn::GetAtt:
+        - TenantEvidenceLocation
+        - AccessGrantsLocationId
+  AccessGrantArn:
+    Value:
+      Fn::GetAtt:
+        - TenantEvidenceReadGrant
+        - AccessGrantArn
+  AccessGrantId:
+    Value:
+      Fn::GetAtt:
+        - TenantEvidenceReadGrant
+        - AccessGrantId
+  GrantScope:
+    Value:
+      Fn::GetAtt:
+        - TenantEvidenceReadGrant
+        - GrantScope
+  LocationRoleArn:
+    Value:
+      Fn::GetAtt:
+        - AccessGrantsLocationRole
+        - Arn

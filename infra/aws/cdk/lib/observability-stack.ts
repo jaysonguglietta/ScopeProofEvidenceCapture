@@ -23,9 +23,6 @@ export interface ObservabilityStackProps extends StackProps {
 export class ObservabilityStack extends Stack {
   public constructor(scope: Construct, id: string, props: ObservabilityStackProps) {
     super(scope, id, props);
-    if (props.tenants.length < 1) {
-      throw new Error("The observability stack requires at least one tenant data plane.");
-    }
 
     const auditKey = new kms.Key(this, "AuditKey", {
       alias: "alias/scopeproof/platform-audit",
@@ -58,6 +55,7 @@ export class ObservabilityStack extends Stack {
       removalPolicy: RemovalPolicy.RETAIN,
       versioned: true,
     });
+    auditBucket.policy?.applyRemovalPolicy(RemovalPolicy.RETAIN);
     const trailLogGroup = new logs.LogGroup(this, "TrailLogs", {
       encryptionKey: auditKey,
       removalPolicy: RemovalPolicy.RETAIN,
@@ -76,15 +74,25 @@ export class ObservabilityStack extends Stack {
       sendToCloudWatchLogs: true,
       snsTopic: props.shared.operationsTopic,
     });
-    trail.addS3EventSelector(
-      props.tenants.flatMap((tenant) => [
-        { bucket: tenant.ingestBucket },
-        { bucket: tenant.evidenceBucket },
-      ]),
-      {
-        includeManagementEvents: true,
-        readWriteType: cloudtrail.ReadWriteType.ALL,
-      },
+    if (props.tenants.length > 0) {
+      trail.addS3EventSelector(
+        props.tenants.flatMap((tenant) => [
+          { bucket: tenant.ingestBucket },
+          { bucket: tenant.evidenceBucket },
+        ]),
+        {
+          includeManagementEvents: true,
+          readWriteType: cloudtrail.ReadWriteType.ALL,
+        },
+      );
+    }
+    // The current CDK enum lags CloudTrail's supported DynamoDB data-resource
+    // type. CloudFormation accepts this exact value and records item-level API
+    // activity for the authoritative tenant/domain/control table.
+    trail.addEventSelector(
+      "AWS::DynamoDB::Table" as cloudtrail.DataResourceType,
+      [props.shared.controlTable.tableArn],
+      { includeManagementEvents: true, readWriteType: cloudtrail.ReadWriteType.ALL },
     );
 
     const deniedMetric = new logs.MetricFilter(this, "DeniedApiCallsMetric", {

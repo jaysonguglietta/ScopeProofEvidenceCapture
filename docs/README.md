@@ -2,7 +2,7 @@
 
 Scopeproof documentation is organized by the person performing the work.
 
-The current downloadable Mac build is the [Scopeproof Capture 1.8.1 development preview](https://github.com/jaysonguglietta/ScopeProofEvidenceCapture/releases/tag/v1.8.1-development-preview.1). It is an Apple Silicon-only, ad-hoc-signed testing release; verify its checksum and read the [macOS installation guide](MACOS_INSTALLATION.md) before opening it.
+The most recent public DMG is the older [Scopeproof Capture 1.8.1 development preview](https://github.com/jaysonguglietta/ScopeProofEvidenceCapture/releases/tag/v1.8.1-development-preview.1) built from `8cd2d5c`. It is Apple Silicon-only, ad-hoc signed, and does not contain the current **Unreleased 1.9.0 (build 23)** working-tree changes. No 1.9.0 DMG exists. As of 2026-08-28 those changes are not merged into the public default branch. Verify the checksum and read the [macOS installation guide](MACOS_INSTALLATION.md) before opening the preview; use an exact reviewed source checkout for current behavior until a new release is published.
 
 | Guide | Primary audience | Purpose |
 | --- | --- | --- |
@@ -16,6 +16,7 @@ The current downloadable Mac build is the [Scopeproof Capture 1.8.1 development 
 | [AWS platform runbook](AWS_PLATFORM_RUNBOOK.md) | AWS deployment operators and service owners | Validate, review, migrate an existing control table safely, deploy, provision, test, activate, operate, recover, and retire the AWS platform without confusing source readiness with customer launch. |
 | [AWS runtime security and evidence lifecycle](AWS_RUNTIME_IMPLEMENTATION.md) | Hosted runtime engineers and AppSec reviewers | Operate and validate the per-tenant API/JWT/membership boundary, retry-safe upload intents, DynamoDB/Aurora reconciliation, KMS receipts, and the separately gated two-person exact-version legal-hold workflow. |
 | [AWS recovery and production macOS release](AWS_RECOVERY_AND_MACOS_RELEASE.md) | Recovery, release, and security operators | Bootstrap the global control plane plus same-account cross-region S3/Aurora recovery, backfill and verify existing versions, run restore drills, configure protected Developer ID/notarization releases, and transition Swift CodeQL safely. |
+| [Full adversarial security audit](SECURITY_AUDIT_2026-08-28.md) | Security engineering, AppSec, red teams, and production approvers | Review the complete application threat model, prioritized findings, remediation status, combined attack paths, test plan, and remaining production blockers. |
 | [AWS adversarial security review](AWS_SECURITY_REVIEW.md) | Security engineering, AppSec, and risk owners | Review confirmed weaknesses, attack paths, residual design gaps, remediation priorities, and required production security tests for the AWS migration. |
 | [Assessor guide](ASSESSOR_GUIDE.md) | External assessors and assessment leads | Navigate a package and independently verify hashes, signatures, scope, and review status. |
 | [Deployment guide](DEPLOYMENT.md) | Platform and security administrators | Configure identity, roles, secrets, storage, collectors, macOS releases, and production operations. |

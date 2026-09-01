@@ -339,7 +339,8 @@ export class CognitoJwtVerifier implements CognitoAccessTokenVerifier {
     if (typeof value !== "string" || value.length > 2_048 || /\p{Cc}/u.test(value)) throw authFailure("scope claim is invalid.");
     const scopes = value.split(" ").filter(Boolean);
     if (scopes.length > 50 || scopes.some((scope) => !/^[A-Za-z0-9:._/-]{1,128}$/.test(scope))) throw authFailure("scope claim is invalid.");
-    return Object.freeze([...new Set(scopes)]);
+    if (new Set(scopes).size !== scopes.length) throw authFailure("scope claim contains duplicate values.");
+    return Object.freeze(scopes);
   }
 
   async #key(kid: string): Promise<CryptoKey> {

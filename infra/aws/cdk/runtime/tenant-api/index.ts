@@ -19,10 +19,12 @@ import {
   AwsSdkV3RdsDataApiExecutor,
   CognitoJwtVerifier,
   DynamoTenantAuthorityResolver,
+  RdsDataApiAuditOutbox,
   RdsDataMembershipRepository,
   createTenantApiHandler,
   type ApiAuthenticationDependencies,
   type ApiGatewayRestEvent,
+  type HostedApiAuditRecord,
   type RdsDataApiCommandConstructors,
   type TenantApiRequestRuntime,
   type UploadIntentApiPayload,
@@ -36,12 +38,14 @@ import {
   UploadIntentIssuer,
   deriveServerManagedUploadRetention,
   loadRotatingUploadIdempotencySecrets,
+  verifyDeviceUploadManifest,
 } from "../../../../../lib/aws-runtime/evidence/index.ts";
 import type { AuthorizedApiRequest } from "../../../../../lib/aws-runtime/http/api.ts";
+import { assertSafeJson, TenantSecurityError, type JsonValue } from "../../../../../lib/aws-runtime/contracts.ts";
 
 const requiredEnvironment = [
   "API_HOSTNAME",
-  "COGNITO_APP_CLIENT_ID",
+  "COGNITO_APP_CLIENT_IDS",
   "COGNITO_ISSUER",
   "CONTROL_TABLE_NAME",
   "DATABASE_CLUSTER_ARN",
@@ -78,6 +82,14 @@ function environment(): Readonly<Record<RequiredEnvironmentName, string>> {
 }
 
 const config = environment();
+const cognitoAppClientIds = (() => {
+  let parsed: unknown;
+  try { parsed = JSON.parse(config.COGNITO_APP_CLIENT_IDS); } catch { throw new Error("Cognito app-client allowlist is invalid."); }
+  if (!Array.isArray(parsed) || parsed.length !== 2 || new Set(parsed).size !== parsed.length || parsed.some((value) => typeof value !== "string" || !/^[A-Za-z0-9_.:+/=_~-]{3,128}$/.test(value))) {
+    throw new Error("Cognito app-client allowlist is invalid.");
+  }
+  return Object.freeze([...parsed].sort()) as readonly string[];
+})();
 const region = process.env.AWS_REGION;
 if (!region || !/^[a-z]{2}(?:-gov)?-[a-z]+-\d$/.test(region)) throw new Error("Lambda AWS region is invalid.");
 
@@ -90,7 +102,7 @@ const tenants = new DynamoTenantAuthorityResolver({
 });
 const jwt = new CognitoJwtVerifier({
   issuer: config.COGNITO_ISSUER,
-  clientIds: [config.COGNITO_APP_CLIENT_ID],
+  clientIds: cognitoAppClientIds,
   maximumAuthenticationAgeSeconds: 60 * 60,
   maximumTokenLifetimeSeconds: 60 * 60,
   jwksTimeoutMilliseconds: 3_000,
@@ -155,6 +167,12 @@ function createRequestRuntime(requestId: string): TenantApiRequestRuntime {
     database: config.DATABASE_NAME,
     lookupMode: "security_definer_function",
   });
+  const auditOutbox = new RdsDataApiAuditOutbox({
+    executor: rds,
+    resourceArn: config.DATABASE_CLUSTER_ARN,
+    secretArn: config.DATABASE_SECRET_ARN,
+    database: config.DATABASE_NAME,
+  });
   const authentication: ApiAuthenticationDependencies = Object.freeze({
     authority: Object.freeze({ mode: "api_gateway_domain" as const }),
     jwt,
@@ -163,6 +181,10 @@ function createRequestRuntime(requestId: string): TenantApiRequestRuntime {
   });
   return Object.freeze({
     authentication,
+    async recordApiAudit(record: HostedApiAuditRecord) {
+      if (record.actor.tenantId !== config.TENANT_ID) throw new Error("Authenticated tenant does not match the Lambda boundary.");
+      return await auditOutbox.record(record);
+    },
     async issueUploadIntent(request: AuthorizedApiRequest, payload: UploadIntentApiPayload) {
       if (request.actor.tenantId !== config.TENANT_ID) throw new Error("Authenticated tenant does not match the Lambda boundary.");
       const requestNow = new Date();
@@ -181,6 +203,30 @@ function createRequestRuntime(requestId: string): TenantApiRequestRuntime {
       await requestRateLimiter.consume({
         tenantId: request.actor.tenantId,
         requestedBy: request.actor.userId,
+        now: requestNow,
+      });
+      const clientMetadata = assertSafeJson(payload.evidence.metadata, "Evidence metadata");
+      if (!clientMetadata || typeof clientMetadata !== "object" || Array.isArray(clientMetadata) ||
+          Object.hasOwn(clientMetadata, "scopeproofDeviceProof")) {
+        throw new TenantSecurityError("INVALID_UPLOAD_INTENT", "Evidence metadata contains a reserved or invalid device-proof field.");
+      }
+      const deviceProof = await verifyDeviceUploadManifest({
+        actor: request.actor,
+        identity: request.identity,
+        manifest: payload.deviceManifest,
+        publicKeySpki: payload.devicePublicKeySpki,
+        signature: payload.deviceSignature,
+        request: {
+          idempotencyKey: payload.idempotencyKey,
+          deviceId: payload.evidence.deviceId,
+          assessmentId: payload.evidence.assessmentId,
+          controlId: payload.controlId,
+          evidenceId: payload.evidenceId,
+          expectedSha256: payload.expectedSha256,
+          expectedSize: payload.expectedSize,
+          contentType: payload.contentType,
+          capturedAt: retention.capturedAt,
+        },
         now: requestNow,
       });
       const dynamo = new DynamoConditionalUploadIntentStore({
@@ -202,6 +248,10 @@ function createRequestRuntime(requestId: string): TenantApiRequestRuntime {
           ...payload.evidence,
           capturedAt: retention.capturedAt,
           artifactExpiresAt: retention.artifactExpiresAt,
+          metadata: Object.freeze({
+            ...(clientMetadata as Record<string, JsonValue>),
+            scopeproofDeviceProof: deviceProof,
+          }),
         }),
       });
       const s3 = new S3Client({ region, credentials });

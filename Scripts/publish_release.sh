@@ -29,6 +29,43 @@ project_root="${0:A:h:h}"
 source_candidate_dir="${SCOPEPROOF_RELEASE_CANDIDATE_DIR:A}"
 [[ -f "$SCOPEPROOF_UPDATE_PRIVATE_KEY" && ! -L "$SCOPEPROOF_UPDATE_PRIVATE_KEY" ]] || { echo "Update private key must be a regular, non-symlink file." >&2; exit 1; }
 private_key="${SCOPEPROOF_UPDATE_PRIVATE_KEY:A}"
+if [[ "$private_key" == "$project_root"/* ]]; then
+  echo "Refusing to read an update-signing private key from the repository." >&2
+  exit 1
+fi
+private_key_mode="$(/usr/bin/stat -f '%Lp' "$private_key")"
+[[ "$private_key_mode" == "400" || "$private_key_mode" == "600" ]] || {
+  echo "The update-signing private key must have mode 0400 or 0600." >&2
+  exit 1
+}
+[[ "$(/usr/bin/stat -f '%u' "$private_key")" == "$(/usr/bin/id -u)" ]] || {
+  echo "The update-signing private key must be owned by the publishing user." >&2
+  exit 1
+}
+[[ "$(/usr/bin/stat -f '%l' "$private_key")" == "1" ]] || {
+  echo "The update-signing private key must not have additional hard links." >&2
+  exit 1
+}
+key_acl_mode="$(/bin/ls -lde "$private_key" | /usr/bin/awk '{ print $1 }')"
+[[ "$key_acl_mode" != *+* ]] || {
+  echo "The update-signing private key must not have an extended ACL." >&2
+  exit 1
+}
+key_directory="${private_key:h}"
+while [[ "$key_directory" != "/" ]]; do
+  key_directory_mode="$(/usr/bin/stat -f '%Lp' "$key_directory")"
+  [[ "$key_directory_mode" =~ '^[0-7]{3,4}$' ]] || {
+    echo "Could not validate update-signing key directory permissions: $key_directory" >&2
+    exit 1
+  }
+  group_digit="${key_directory_mode[-2]}"
+  world_digit="${key_directory_mode[-1]}"
+  [[ "$group_digit" != [2367] && "$world_digit" != [2367] ]] || {
+    echo "Update-signing key directories must not be group- or world-writable: $key_directory" >&2
+    exit 1
+  }
+  key_directory="${key_directory:h}"
+done
 
 for required_command in codesign ditto gh hdiutil node plutil spctl unzip xcrun; do
   command -v "$required_command" >/dev/null || { echo "Required publication command is unavailable: $required_command" >&2; exit 1; }

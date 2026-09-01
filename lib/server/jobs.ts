@@ -1,4 +1,4 @@
-import type { AuthenticatedUser } from "./auth";
+import { assertPermission, loadActiveUser, type AuthenticatedUser } from "./auth";
 import { executeAuditedBatch } from "./audit";
 import { collectorConfiguration, CollectorError, runCollector, type CollectorProvider } from "./collectors";
 import { createAuditCheckpoint } from "./checkpoints";
@@ -12,6 +12,16 @@ import { purgeExpiredEvidence } from "./retention";
 import { processDueSbomWork } from "./sbom";
 
 const systemActor: AuthenticatedUser = { id: "system:scheduler", email: "scheduler@scopeproof.internal", displayName: "Scopeproof Scheduler", role: "admin" };
+
+async function authorizedJobActor(job: Record<string, unknown>, supplied?: AuthenticatedUser): Promise<AuthenticatedUser> {
+  const requestedBy = String(job.requested_by || "");
+  if (String(job.trigger_type) === "scheduled" && requestedBy === systemActor.id) return systemActor;
+  const current = await loadActiveUser(requestedBy);
+  if (!current || (supplied && supplied.id !== current.id)) throw new CollectorError("The requesting user is no longer authorized to collect evidence.", "AUTHORIZATION_REVOKED", false);
+  try { assertPermission(current, "collect_evidence"); }
+  catch { throw new CollectorError("The requesting user is no longer authorized to collect evidence.", "AUTHORIZATION_REVOKED", false); }
+  return current;
+}
 
 export async function ensureDefaultCollectors(actor: AuthenticatedUser): Promise<void> {
   const env = getEnv();
@@ -45,18 +55,47 @@ export async function processJob(jobId: string, actor?: AuthenticatedUser): Prom
   if (!job) throw new Error("Collection job not found.");
   const collector = await env.DB.prepare("SELECT * FROM collectors WHERE id = ?").bind(job.collector_id).first<Record<string, unknown>>();
   if (!collector) throw new Error("Collector not found.");
-  const runActor = actor || systemActor;
+  let runActor: AuthenticatedUser;
+  try { runActor = await authorizedJobActor(job, actor); }
+  catch (error) {
+    const failure = error instanceof CollectorError ? error : new CollectorError("The collection requester could not be authorized.", "AUTHORIZATION_REVOKED", false);
+    const completedAt = new Date().toISOString();
+    await executeAuditedBatch(systemActor, "collection.authorization_revoked", "collection_job", jobId, { code: failure.code, requestedBy: job.requested_by }, [
+      env.DB.prepare("UPDATE collection_jobs SET status = 'failed', error_code = ?, error_message = ?, completed_at = ?, lease_id = NULL, lease_expires_at = NULL WHERE id = ? AND status IN ('queued', 'retrying', 'running')").bind(failure.code, failure.message, completedAt, jobId),
+    ], { sql: "EXISTS (SELECT 1 FROM collection_jobs WHERE id = ? AND status = 'failed' AND error_code = 'AUTHORIZATION_REVOKED')", bindings: [jobId] });
+    return { status: "failed", artifacts: 0, error: failure.message };
+  }
+  if (Number(collector.enabled) !== 1) {
+    const completedAt = new Date().toISOString();
+    await executeAuditedBatch(runActor, "collection.disabled", "collection_job", jobId, { collectorId: collector.id, code: "COLLECTOR_DISABLED" }, [
+      env.DB.prepare("UPDATE collection_jobs SET status = 'failed', error_code = 'COLLECTOR_DISABLED', error_message = 'The collector was disabled before execution.', completed_at = ?, lease_id = NULL, lease_expires_at = NULL WHERE id = ? AND status IN ('queued', 'retrying', 'running')").bind(completedAt, jobId),
+    ], { sql: "EXISTS (SELECT 1 FROM collection_jobs WHERE id = ? AND status = 'failed' AND error_code = 'COLLECTOR_DISABLED')", bindings: [jobId] });
+    return { status: "failed", artifacts: 0, error: "The collector was disabled before execution." };
+  }
   const attempt = Number(job.attempt || 0) + 1;
   const leaseId = randomId("lease");
   const startedAt = new Date().toISOString();
   const leaseExpiresAt = new Date(Date.now() + 30 * 60_000).toISOString();
   const [claim] = await executeAuditedBatch(runActor, "collection.started", "collection_job", jobId, { collectorId: collector.id, attempt, leaseId, leaseExpiresAt }, [
     env.DB.prepare(`UPDATE collection_jobs SET status = 'running', attempt = ?, started_at = ?, lease_id = ?, lease_expires_at = ?, error_code = NULL, error_message = NULL
-      WHERE id = ? AND (status = 'queued' OR (status = 'retrying' AND next_attempt_at <= ?) OR (status = 'running' AND lease_expires_at < ?))`).bind(attempt, startedAt, leaseId, leaseExpiresAt, jobId, startedAt, startedAt),
-    env.DB.prepare("UPDATE collectors SET status = 'running', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND EXISTS (SELECT 1 FROM collection_jobs WHERE id = ? AND lease_id = ?)").bind(collector.id, jobId, leaseId),
+      WHERE id = ? AND EXISTS (SELECT 1 FROM collectors WHERE id = ? AND enabled = 1)
+        AND (status = 'queued' OR (status = 'retrying' AND next_attempt_at <= ?) OR (status = 'running' AND lease_expires_at < ?))`).bind(attempt, startedAt, leaseId, leaseExpiresAt, jobId, collector.id, startedAt, startedAt),
+    env.DB.prepare("UPDATE collectors SET status = 'running', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND enabled = 1 AND EXISTS (SELECT 1 FROM collection_jobs WHERE id = ? AND lease_id = ?)").bind(collector.id, jobId, leaseId),
   ], { sql: "EXISTS (SELECT 1 FROM collection_jobs WHERE id = ? AND lease_id = ?)", bindings: [jobId, leaseId] });
-  if (!claim.meta.changes) return { status: String(job.status), artifacts: Number(job.artifact_count || 0), error: "Collection job is already claimed." };
+  if (!claim.meta.changes) {
+    const currentCollector = await env.DB.prepare("SELECT enabled FROM collectors WHERE id = ?").bind(collector.id).first<{ enabled: number }>();
+    if (!currentCollector || Number(currentCollector.enabled) !== 1) {
+      const completedAt = new Date().toISOString();
+      await executeAuditedBatch(runActor, "collection.disabled", "collection_job", jobId, { collectorId: collector.id, code: "COLLECTOR_DISABLED" }, [
+        env.DB.prepare("UPDATE collection_jobs SET status = 'failed', error_code = 'COLLECTOR_DISABLED', error_message = 'The collector was disabled before execution.', completed_at = ?, lease_id = NULL, lease_expires_at = NULL WHERE id = ? AND status IN ('queued', 'retrying', 'running')").bind(completedAt, jobId),
+      ], { sql: "EXISTS (SELECT 1 FROM collection_jobs WHERE id = ? AND status = 'failed' AND error_code = 'COLLECTOR_DISABLED')", bindings: [jobId] });
+      return { status: "failed", artifacts: 0, error: "The collector was disabled before execution." };
+    }
+    return { status: String(job.status), artifacts: Number(job.artifact_count || 0), error: "Collection job is already claimed." };
+  }
   try {
+    const stillEnabled = await env.DB.prepare("SELECT 1 FROM collectors WHERE id = ? AND enabled = 1").bind(collector.id).first();
+    if (!stillEnabled) throw new CollectorError("The collector was disabled before its outbound request.", "COLLECTOR_DISABLED", false);
     const collection = await runCollector(String(collector.provider) as CollectorProvider, { actor: runActor, config: JSON.parse(String(collector.config_json || "{}")) });
     let stored = 0;
     for (const artifact of collection.artifacts) {

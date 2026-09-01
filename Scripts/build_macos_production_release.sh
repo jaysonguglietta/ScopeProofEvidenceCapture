@@ -58,6 +58,8 @@ xcrun --find notarytool >/dev/null
 xcrun --find stapler >/dev/null
 plutil -lint "$info_plist" >/dev/null
 plutil -lint "$entitlements" >/dev/null
+plutil -convert json -o - "$entitlements" \
+  | node "$project_root/Scripts/validate_macos_release_entitlements.mjs"
 
 if [[ -n "$(git -C "$project_root" status --porcelain --untracked-files=normal)" ]]; then
   echo "Production releases require a clean, committed Git worktree." >&2
@@ -70,12 +72,18 @@ bundle_build="$(plutil -extract CFBundleVersion raw -o - "$info_plist")"
 compiled_team="$(plutil -extract ScopeproofUpdateTeamIdentifier raw -o - "$info_plist")"
 compiled_requirement="$(plutil -extract ScopeproofUpdateDesignatedRequirement raw -o - "$info_plist")"
 compiled_download_origin="$(plutil -extract ScopeproofUpdateDownloadOrigin raw -o - "$info_plist")"
+compiled_hosted_origin="$(plutil -extract ScopeproofHostedAPIOrigins.0 raw -o - "$info_plist" 2>/dev/null || true)"
 compiled_update_keys="$(plutil -extract ScopeproofUpdatePublicKeys json -o - "$info_plist" 2>/dev/null || true)"
 [[ "$bundle_identifier" == "com.scopeproof.capture" ]] || { echo "Unexpected bundle identifier." >&2; exit 1; }
 [[ "$bundle_version" == "$SCOPEPROOF_RELEASE_VERSION" ]] || { echo "Release version does not match Info.plist." >&2; exit 1; }
 [[ "$bundle_build" == "$SCOPEPROOF_RELEASE_BUILD_NUMBER" ]] || { echo "Release build number does not match Info.plist." >&2; exit 1; }
 [[ "$compiled_team" == "$SCOPEPROOF_RELEASE_TEAM_ID" ]] || { echo "Compiled update team does not match the signing team." >&2; exit 1; }
 [[ "$compiled_download_origin" =~ '^https://[A-Za-z0-9.-]+$' && "$compiled_download_origin" != *".."* ]] || { echo "No exact HTTPS update download origin is compiled into Info.plist." >&2; exit 1; }
+[[ "$compiled_hosted_origin" =~ '^https://[A-Za-z0-9.-]+$' && "$compiled_hosted_origin" != *".."* ]] || { echo "No exact HTTPS hosted API origin is compiled into Info.plist." >&2; exit 1; }
+if plutil -extract ScopeproofHostedAPIOrigins.1 raw -o - "$info_plist" >/dev/null 2>&1; then
+  echo "Production releases must bind exactly one hosted API origin." >&2
+  exit 1
+fi
 [[ -n "$compiled_update_keys" ]] || { echo "No update-signing public key is compiled into Info.plist." >&2; exit 1; }
 printf '%s' "$compiled_update_keys" | node "$project_root/Scripts/validate_macos_update_keys.mjs" json
 [[ "$compiled_requirement" == *"anchor apple generic"* \
@@ -137,10 +145,8 @@ signature_details="$(codesign -dv --verbose=4 "$app_root" 2>&1)"
 signed_entitlements="$release_temp/signed-entitlements.plist"
 codesign -d --entitlements :- "$app_root" >"$signed_entitlements" 2>/dev/null
 plutil -lint "$signed_entitlements" >/dev/null
-if plutil -extract com.apple.security.get-task-allow raw -o - "$signed_entitlements" 2>/dev/null | grep -q '^true$'; then
-  echo "Production signing must not enable get-task-allow." >&2
-  exit 1
-fi
+plutil -convert json -o - "$signed_entitlements" \
+  | node "$project_root/Scripts/validate_macos_release_entitlements.mjs"
 
 notary_arguments=(--keychain-profile "$SCOPEPROOF_NOTARY_PROFILE")
 if [[ -n "${SCOPEPROOF_NOTARY_KEYCHAIN:-}" ]]; then

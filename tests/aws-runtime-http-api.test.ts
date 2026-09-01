@@ -58,7 +58,11 @@ function identity(): VerifiedCognitoAccessToken {
     issuedAt: "2026-08-27T15:59:00.000Z",
     authenticatedAt: "2026-08-27T15:58:00.000Z",
     expiresAt: "2026-08-27T17:00:00.000Z",
-    scopes: Object.freeze([]),
+    scopes: Object.freeze([
+      "scopeproof/evidence.read",
+      "scopeproof/evidence.collect",
+      "scopeproof/retention.manage",
+    ]),
   });
 }
 
@@ -151,6 +155,20 @@ test("authorization binds a verified Cognito client to the resolved tenant", asy
   assert.equal(membershipLookups, 0);
 });
 
+test("authorization requires the exact OAuth scope before membership lookup", async () => {
+  let membershipLookups = 0;
+  const base = dependencies({
+    async findActiveByIdentity() {
+      membershipLookups += 1;
+      return membership();
+    },
+  });
+  await assert.rejects(authorizeApiGatewayRequest(event(), "audit:read", base), (error: unknown) =>
+    error instanceof TenantSecurityError && error.code === "OAUTH_SCOPE_REQUIRED" && error.safeStatus === 403,
+  );
+  assert.equal(membershipLookups, 0);
+});
+
 test("direct authority ignores attacker-controlled Host forwarding headers", async () => {
   const request = await authorizeApiGatewayRequest(event({
     headers: {
@@ -231,8 +249,8 @@ test("RDS Data API membership adapter supports an explicit direct-table maintena
   };
   const adapter = new RdsDataMembershipRepository({
     executor,
-    resourceArn: "arn:aws:rds:us-east-1:171058045575:cluster:scopeproof-prod",
-    secretArn: "arn:aws:secretsmanager:us-east-1:171058045575:secret:scopeproof/runtime-AbCd12",
+    resourceArn: "arn:aws:rds:us-east-1:123456789012:cluster:scopeproof-prod",
+    secretArn: "arn:aws:secretsmanager:us-east-1:123456789012:secret:scopeproof/runtime-AbCd12",
     database: "scopeproof",
     lookupMode: "direct_tables",
   });
@@ -265,8 +283,8 @@ test("RDS membership adapter securely defaults to an execute-only security-defin
   };
   const adapter = new RdsDataMembershipRepository({
     executor,
-    resourceArn: "arn:aws:rds:us-east-1:171058045575:cluster:scopeproof-prod",
-    secretArn: "arn:aws:secretsmanager:us-east-1:171058045575:secret:scopeproof/legal-api-AbCd12",
+    resourceArn: "arn:aws:rds:us-east-1:123456789012:cluster:scopeproof-prod",
+    secretArn: "arn:aws:secretsmanager:us-east-1:123456789012:secret:scopeproof/legal-api-AbCd12",
     database: "scopeproof",
   });
 
@@ -286,8 +304,8 @@ test("RDS Data API membership adapter rolls back malformed or duplicate results"
   };
   const adapter = new RdsDataMembershipRepository({
     executor,
-    resourceArn: "arn:aws:rds:us-east-1:171058045575:cluster:scopeproof-prod",
-    secretArn: "arn:aws:secretsmanager:us-east-1:171058045575:secret:scopeproof/runtime-AbCd12",
+    resourceArn: "arn:aws:rds:us-east-1:123456789012:cluster:scopeproof-prod",
+    secretArn: "arn:aws:secretsmanager:us-east-1:123456789012:secret:scopeproof/runtime-AbCd12",
     database: "scopeproof",
   });
   await assert.rejects(adapter.findActiveByIdentity({ tenantId: TENANT_A, identitySubject: identity().subject }));

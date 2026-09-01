@@ -7,7 +7,7 @@ The Mac app can generate a direct, one-time repository SBOM without a hosted acc
 ## Requirements
 
 - macOS 14 or newer.
-- An Apple Silicon (`arm64`) Mac for the current 1.8.1 development-preview DMG.
+- An Apple Silicon (`arm64`) Mac for the older published 1.8.1 development-preview DMG.
 - Screen Recording permission for browser-window capture.
 - Documents Folder access when macOS requests it for local evidence storage.
 - HTTPS access to `api.github.com` when using local repository SBOM generation.
@@ -16,6 +16,18 @@ The Mac app can generate a direct, one-time repository SBOM without a hosted acc
 The downloadable DMG does not require a repository checkout, Xcode, or Swift. Building from source additionally requires a local copy of this repository and Apple's Swift toolchain. Install the toolchain with `xcode-select --install` if `swift --version` is unavailable.
 
 ## Install the development-preview DMG
+
+> **Older published build:** `v1.8.1-development-preview.1` was built from
+> commit `8cd2d5c`. It does not contain the current **Unreleased 1.9.0 (build 23)** native changes
+> described elsewhere in this guide, and the current working branch is not
+> merged into the public default branch as of 2026-08-28. Use this DMG only to
+> evaluate the tagged build. It writes new captures under
+> `~/Pictures/Scopeproof Evidence` and uses manual AWS credential entry rather
+> than the current Documents-root and direct AWS CLI IAM Identity
+> Center/AssumeRole workflow. Build an exact reviewed current-source checkout for
+> current behavior until a new versioned DMG is independently verified and
+> published. Current source is version `1.9.0` build `23`; no 1.9.0 artifact
+> exists.
 
 Open the [Scopeproof Capture 1.8.1 development-preview release](https://github.com/jaysonguglietta/ScopeProofEvidenceCapture/releases/tag/v1.8.1-development-preview.1) and download both:
 
@@ -42,7 +54,12 @@ From Terminal, change to the repository root and run:
 ./Scripts/run_macos_capture.sh
 ```
 
-The script builds a release executable, creates `DerivedData/Scopeproof Capture.app`, installs it at `~/Applications/Scopeproof Capture.app`, replaces an older per-user installation when present, and launches it. Administrator access is not required. Do not keep both the DMG-installed and source-installed copies running; quit Scopeproof and consistently open one installed path so macOS permissions remain associated with the intended bundle.
+The checkout must contain the reviewed **Unreleased** changes you intend to
+test. Until they are merged, a plain clone of the public default branch is not
+equivalent to this working tree. Record the exact commit and require a clean
+`git status --short` before treating a source build as review evidence.
+
+The script builds a release executable into a fresh staging bundle, verifies its signature, bundle identifier, and macOS minimum, and only then publishes `DerivedData/Scopeproof Capture.app`. Installation likewise copies into a fresh staging directory on the destination volume, verifies it, stops the running Scopeproof process, and replaces `~/Applications/Scopeproof Capture.app` by same-volume rename. A failed replacement restores the prior complete app instead of merging new files over stale resources. Administrator access is not required. Do not keep both the DMG-installed and source-installed copies running; consistently open one installed path so macOS permissions remain associated with the intended bundle.
 
 Scopeproof appears as a shield in the menu bar and opens its Local Console in the default browser. The console is served by the running Mac app on a random `127.0.0.1` port and is not published to the LAN or internet. Its Evidence library shows local screenshots and, when the S3 destination is configured and verified, matching S3 screenshots with explicit storage badges and on-demand previews. If the tab is closed, choose **Open Local Console** from the shield menu or press `Command-Shift-L`.
 
@@ -59,9 +76,17 @@ If Scopeproof is not listed, attempt one capture first so macOS can register the
 
 ## Confirm local-only settings
 
-Open **Capture & Jira Settings…** from the shield menu. Leave **Server URL** blank to prevent hosted synchronization. The Local Console, capture, search, review, Jira comment generation, and local assessor-package export continue to work.
+Open **Capture & Jira Settings…** from the shield menu. Leave **Server URL** blank to prevent hosted synchronization. The Local Console, capture, search, review, Jira comment generation, and local assessor-package export continue to work even when no hosted OCR/DLP scanner or trusted timestamp authority exists. New captures still use a signed schema-7 manifest and the device's locally anchored P-256 provenance identity.
 
-New evidence is stored under `~/Documents/Scopeproof Evidence/<framework>/<control>/`. Existing captures under `~/Pictures/Scopeproof Evidence` remain searchable, reviewable, uploadable, and exportable; Scopeproof does not move or delete them automatically. The Local Console's SQLite search index lives in the current user's Application Support folder and can be rebuilt from the immutable evidence manifests and lifecycle sidecars.
+New evidence is stored under `~/Documents/Scopeproof Evidence/<framework>/<control>/`. Existing captures under `~/Pictures/Scopeproof Evidence` remain discoverable; Scopeproof does not move or delete them automatically. Storage location does not determine trust. A valid signed schema-7 capture can use the supported legacy root, but unsigned schema-6 and older artifacts are an explicit visibly unverified browsing/migration path and are blocked from approval, upload, legal-hold/retention assertions, package export, and Jira trust workflows. Recapture legacy evidence with the current app rather than editing its manifest or lifecycle record. The Local Console's SQLite search index lives in the current user's Application Support folder and can be rebuilt from the immutable evidence manifests and lifecycle sidecars.
+
+## Optional hosted synchronization requirements
+
+Hosted synchronization is not required for installation or local use. The checked-in `Info.plist` has an empty `ScopeproofHostedAPIOrigins` array, so an ordinary current-source release build rejects every remote HTTPS Server URL and remains local-only. A release operator must first compile one reviewed, exact, pathless HTTPS origin with `SCOPEPROOF_HOSTED_API_ORIGIN` through `Scripts/configure_macos_release_identity.sh`; never add a personal or historical service as a source default. When an administrator enrolls the Mac for that compiled origin, paste the one-time audience-bound device token and the same HTTPS Server URL under **Capture & Jira Settings…**. The token is stored in a device-only Keychain item; the schema-7 provenance signing key is a separate device-only P-256 Keychain identity. Development-only loopback HTTP is accepted only by debug builds for local integration testing.
+
+A production server accepts the current signed schema-7 PNG/manifest pair only. It independently rescans the exact PNG through the OCR/DLP service configured by the legacy-named `BROWSER_OCR_ENDPOINT`, `BROWSER_OCR_TOKEN`, and `BROWSER_OCR_ALLOWED_HOSTS` settings, verifies a trusted RFC 3161 timestamp, and finalizes the exact artifact into the server-side device chain. Recognized OCR text is evaluated transiently and is not retained. Until the scan, timestamp, and final chain linkage succeed, the hosted item is quarantined and cannot be read, previewed, approved, packaged, exported, or sent to Jira.
+
+If scanner or timestamp verification is unavailable, the hosted upload fails closed while the local artifact remains usable. Retry the unchanged current pair after recovery. An unsigned legacy capture must be recaptured; an older hosted item missing the independent scan or final linkage must be re-uploaded/rescanned. Administrators must never grandfather either population with direct database updates. Server operators must apply migrations through `0023_independent_image_safety.sql` and confirm production readiness has no scanner or trusted-timestamp failures before enabling native uploads. No AWS deployment is performed by installing or building the Mac app.
 
 ## Update the DMG installation
 
@@ -75,7 +100,7 @@ Pull or copy the updated repository source, then run the installation command ag
 ./Scripts/run_macos_capture.sh
 ```
 
-The script quits a running Scopeproof process before replacing the application. Evidence under `~/Documents/Scopeproof Evidence` or the legacy `~/Pictures/Scopeproof Evidence` location, Keychain keys, and user preferences are not removed. Use `./Scripts/run_macos_capture.sh --no-launch` when installation should finish without opening the app.
+The script quits a running Scopeproof process before replacing the application, including when `--no-launch` is supplied. It stages and verifies a fresh bundle, replaces the prior app by same-volume rename, and restores the prior bundle if replacement fails; it never overlays resources into an existing app. Evidence under `~/Documents/Scopeproof Evidence` or the legacy `~/Pictures/Scopeproof Evidence` location, Keychain keys, and user preferences are not removed. Use `./Scripts/run_macos_capture.sh --no-launch` when installation should finish without reopening the app.
 
 ## Verify the installation
 
@@ -84,10 +109,10 @@ The script quits a running Scopeproof process before replacing the application. 
 - **Open Local Console** opens a browser page while Scopeproof is running.
 - **Open Evidence Folder** opens `~/Documents/Scopeproof Evidence`.
 - **Generate Repository SBOM…** opens a masked one-time GitHub credential dialog and offers CycloneDX 1.6 or SPDX 2.3 JSON.
-- **AWS S3 Storage…** opens the security-profile, KMS/Object Lock, lifecycle/replication, FIPS, and Keychain credential configuration. Use **Save & Verify** for an existing bucket or **Create & Harden Bucket** after reviewing the irreversible retention warning.
+- **AWS S3 Storage…** opens the authentication, security-profile, KMS/Object Lock, lifecycle/replication, and FIPS configuration. Identity Center credentials stay in memory; manual credentials use Keychain. Use **Save & Verify** for an existing bucket or **Create & Harden Bucket** after reviewing the irreversible retention warning.
 - **Browse S3 Evidence…** searches and sorts immutable versions under the verified prefix and downloads one selected PNG/JSON version to an explicit quarantined local destination.
 - The capture form shows the selected catalog version, source, and control count; **Update Controls…** validates and imports an approved JSON, OSCAL JSON, or CSV catalog without changing existing evidence.
-- A browser-window test capture shows a real right-side Mac menu-bar pixel strip across the top, followed by the selected framework/control, canonical capture timestamp, local clock/timezone reading, and full URL in its visible banner.
+- A browser-window test capture shows a real right-side Mac menu-bar pixel strip across the top, followed by the selected framework/control, canonical capture timestamp, local clock/timezone reading, and origin-only source URL in its visible banner.
 - The PNG, manifest, and lifecycle sidecar appear together under the expected framework/control folder.
 
 ## Troubleshooting
@@ -106,6 +131,8 @@ The script quits a running Scopeproof process before replacing the application. 
 | Repository SBOM authentication fails | Create a fresh fine-grained token selected only for the repository with Metadata: read and Contents: read, then submit a new run. The app never retains or retries a one-time token. |
 | The app says SSE-S3 does not use a KMS key | Select SSE-KMS or DSSE-KMS when the bucket uses your customer-managed key, or clear the KMS ARN for an intentional SSE-S3 bucket. |
 | S3 verification or upload fails | Confirm the STS expiration, same-account bucket owner, posture-read permissions, KMS/Object Lock policy, exact prefix, and reported control failure; then re-verify before retrying. |
+| Hosted upload reports scanner or timestamp unavailable | Keep using the local artifact, ask the service operator to restore the independent scanner/RFC 3161 boundary, then retry the unchanged schema-7 pair. The server intentionally stores nothing for this failed attempt. |
+| Hosted evidence is unverified or quarantined | Do not approve, export, package, download, or disclose it. Retry the original current upload to rescan/finalize it; recapture unsigned legacy evidence. Never manually change the trust fields. |
 
 ## Managed distribution
 

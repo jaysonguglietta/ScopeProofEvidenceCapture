@@ -187,13 +187,29 @@ export interface AppliedExactVersionLegalHold {
 }
 
 /**
+ * Authenticated API facts that the RDS boundary commits with the legal-hold
+ * transition. Keeping these facts separate from the client payload prevents a
+ * caller from nominating an audit identity or request identifier.
+ */
+export interface ExactVersionLegalHoldApiAuditContext {
+  readonly membershipId: string;
+  readonly requestId: string;
+}
+
+/**
  * Every method is a separate committed transaction. request() authenticates the
  * requester, approve() independently authenticates a different approver, and
  * read() prevents a reconciliation worker from creating or approving work.
  */
 export interface ExactVersionLegalHoldOperationStore {
-  request(operation: ExactVersionLegalHoldOperation): Promise<ReservedExactVersionLegalHold>;
-  approve(approval: ExactVersionLegalHoldApproval): Promise<ApprovedExactVersionLegalHold>;
+  request(
+    operation: ExactVersionLegalHoldOperation,
+    apiAudit?: ExactVersionLegalHoldApiAuditContext,
+  ): Promise<ReservedExactVersionLegalHold>;
+  approve(
+    approval: ExactVersionLegalHoldApproval,
+    apiAudit?: ExactVersionLegalHoldApiAuditContext,
+  ): Promise<ApprovedExactVersionLegalHold>;
   read(operation: ExactVersionLegalHoldOperation): Promise<ReservedExactVersionLegalHold>;
   beginApply(
     operation: ExactVersionLegalHoldOperation,
@@ -233,9 +249,10 @@ export async function requestExactVersionLegalHoldChange(
   request: DurableExactVersionLegalHoldRequest,
   requester: Pick<TenantActor, "tenantId" | "userId" | "role">,
   policy: ExactVersionLegalHoldPolicy,
+  apiAudit?: ExactVersionLegalHoldApiAuditContext,
 ): Promise<RequestedExactVersionLegalHold> {
   const operation = await prepareExactVersionLegalHoldOperation(request, requester, policy);
-  const reservation = await store.request(operation);
+  const reservation = await store.request(operation, apiAudit);
   assertReservationState(reservation, operation);
   return Object.freeze({ operation, reservation });
 }
@@ -249,9 +266,10 @@ export async function approveExactVersionLegalHoldChange(
   store: ExactVersionLegalHoldOperationStore,
   request: ExactVersionLegalHoldApprovalRequest,
   approver: Pick<TenantActor, "tenantId" | "userId" | "role">,
+  apiAudit?: ExactVersionLegalHoldApiAuditContext,
 ): Promise<ApprovedExactVersionLegalHold> {
   const approval = await prepareExactVersionLegalHoldApproval(request, approver);
-  const approved = await store.approve(approval);
+  const approved = await store.approve(approval, apiAudit);
   assertApprovalMatchesRequest(approved.approval, approval.operationId, approval.requestDigest);
   if (approved.approval.canonicalApproval !== approval.canonicalApproval ||
       approved.approval.approvalDigest !== approval.approvalDigest ||

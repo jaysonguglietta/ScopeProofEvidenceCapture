@@ -1,9 +1,10 @@
 -- Run after 001_tenant_schema.sql while connected as the schema owner.
 --
--- This public-API login can only resolve the active tenant membership, create
--- a legal-hold request, or record a second administrator's approval. It cannot
--- read/apply queued work, access tables directly, append audit events, or
--- invoke any reconciliation boundary.
+-- This public-API login can only resolve the active tenant membership or invoke
+-- audited legal-hold transitions. Each wrapper commits its state change and
+-- audit outbox row atomically. The role cannot invoke the unaudited transition
+-- primitives, append standalone audit events, access tables directly, or use a
+-- reconciliation boundary.
 
 BEGIN;
 
@@ -39,11 +40,11 @@ BEGIN
     legal_api_role
   );
   EXECUTE format(
-    'GRANT EXECUTE ON FUNCTION scopeproof.reserve_exact_version_legal_hold(scopeproof.resource_identifier, scopeproof.resource_identifier, scopeproof.resource_identifier, text, text, text, text, text, text, text, scopeproof.resource_identifier, integer, timestamptz, text, text) TO %I',
+    'GRANT EXECUTE ON FUNCTION scopeproof.reserve_exact_version_legal_hold_with_audit(scopeproof.resource_identifier, scopeproof.resource_identifier, scopeproof.resource_identifier, text, text, text, text, text, text, text, scopeproof.resource_identifier, integer, timestamptz, text, text, scopeproof.resource_identifier, text) TO %I',
     legal_api_role
   );
   EXECUTE format(
-    'GRANT EXECUTE ON FUNCTION scopeproof.approve_exact_version_legal_hold(scopeproof.resource_identifier, text, scopeproof.resource_identifier, timestamptz, text, text) TO %I',
+    'GRANT EXECUTE ON FUNCTION scopeproof.approve_exact_version_legal_hold_with_audit(scopeproof.resource_identifier, text, scopeproof.resource_identifier, timestamptz, text, text, scopeproof.resource_identifier, text) TO %I',
     legal_api_role
   );
 

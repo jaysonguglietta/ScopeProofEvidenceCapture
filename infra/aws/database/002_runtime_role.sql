@@ -30,7 +30,7 @@ BEGIN
   EXECUTE format('GRANT CONNECT ON DATABASE %I TO %I', current_database(), runtime_role);
   EXECUTE format('GRANT USAGE ON SCHEMA scopeproof TO %I', runtime_role);
   -- This migration is an allow-list reset. Reapplying it removes legacy table
-  -- grants before restoring only the three reviewed SECURITY DEFINER entrypoints.
+  -- grants before restoring only the four reviewed SECURITY DEFINER entrypoints.
   EXECUTE format('REVOKE ALL ON ALL TABLES IN SCHEMA scopeproof FROM %I', runtime_role);
   EXECUTE format('REVOKE ALL ON ALL SEQUENCES IN SCHEMA scopeproof FROM %I', runtime_role);
   EXECUTE format('REVOKE ALL ON ALL FUNCTIONS IN SCHEMA scopeproof FROM %I', runtime_role);
@@ -41,6 +41,10 @@ BEGIN
   );
   EXECUTE format(
     'GRANT EXECUTE ON FUNCTION scopeproof.create_upload_intent(scopeproof.resource_identifier, text, scopeproof.resource_identifier, scopeproof.resource_identifier, scopeproof.resource_identifier, scopeproof.resource_identifier, text, text, text, bigint, text, timestamptz, timestamptz, text, text, text, text, text, text, timestamptz, timestamptz, jsonb) TO %I',
+    runtime_role
+  );
+  EXECUTE format(
+    'GRANT EXECUTE ON FUNCTION scopeproof.record_api_audit_event(scopeproof.resource_identifier, scopeproof.resource_identifier, text, text, text, text, text, jsonb) TO %I',
     runtime_role
   );
   EXECUTE format('ALTER ROLE %I SET search_path = pg_catalog, scopeproof', runtime_role);

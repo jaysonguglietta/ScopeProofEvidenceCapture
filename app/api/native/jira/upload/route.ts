@@ -2,6 +2,7 @@ import { jsonError } from "../../../../../lib/server/auth";
 import { sha256 } from "../../../../../lib/server/crypto";
 import { requireCaptureDevice } from "../../../../../lib/server/devices";
 import { getEnv } from "../../../../../lib/server/env";
+import { evidenceSafetyReceiptSha256 } from "../../../../../lib/server/image-safety";
 import { assertJiraOperator, normalizeJiraIssueKey, uploadJiraEvidence } from "../../../../../lib/server/jira";
 import { NativeManifestError, parseNativeManifest, validatePng } from "../../../../../lib/server/native-manifest";
 import { enforceRateLimit, requireBoundedContentLength } from "../../../../../lib/server/rate-limit";
@@ -64,13 +65,25 @@ export async function POST(request: Request) {
     const signature = String(request.headers.get("x-scopeproof-upload-signature") || "").trim().toLowerCase();
     if (!await verifyUploadSignature(manifestSha256, imageSha256, signature)) return Response.json({ error: "Capture manifest signature is invalid." }, { status: 401 });
     if (!await verifyLifecycle(lifecycle, evidenceId)) return Response.json({ error: "Evidence must have a valid hash-chained Approved lifecycle record." }, { status: 422 });
-    const hosted = await getEnv().DB.prepare(`SELECT e.id, e.status, e.timestamp_token FROM native_evidence_manifests n
+    const hosted = await getEnv().DB.prepare(`SELECT e.id, e.status, e.timestamp_token, e.server_safety_scan_sha256,
+        e.server_safety_scan_policy, e.server_safety_scan_completed_at, e.server_safety_scanner_origin, e.server_safety_receipt_sha256
+      FROM native_evidence_manifests n
       JOIN evidence_artifacts e ON e.id = n.artifact_id
+      JOIN capture_devices d ON d.id = n.device_id
       WHERE n.device_id = ? AND n.local_evidence_id = ? AND n.image_sha256 = ? AND n.manifest_sha256 = ? AND n.jira_issue_key = ?
         AND e.device_id = n.device_id AND e.created_by = ? AND e.sha256 = n.image_sha256 AND e.manifest_sha256 = n.manifest_sha256
-        AND e.jira_issue_key = n.jira_issue_key AND e.expires_at > ?`)
-      .bind(device.id, evidenceId, imageSha256, manifestSha256, issueKey, actor.id, Date.now()).first<{ id: string; status: string; timestamp_token: string | null }>();
+        AND e.jira_issue_key = n.jira_issue_key AND e.expires_at > ?
+        AND n.chain_sequence IS NOT NULL AND n.chain_sequence > 0 AND n.chain_event_hash = e.chain_event_hash
+        AND n.provenance_key_id IS NOT NULL AND d.provenance_key_id = n.provenance_key_id AND d.chain_sequence >= n.chain_sequence
+        AND e.server_safety_scan_sha256 = e.sha256 AND e.server_safety_scan_policy IS NOT NULL AND e.server_safety_scan_completed_at IS NOT NULL
+        AND e.server_safety_scanner_origin IS NOT NULL AND e.server_safety_receipt_sha256 IS NOT NULL`)
+      .bind(device.id, evidenceId, imageSha256, manifestSha256, issueKey, actor.id, new Date().toISOString()).first<{ id: string; status: string; timestamp_token: string | null; server_safety_scan_sha256: string; server_safety_scan_policy: string; server_safety_scan_completed_at: string; server_safety_scanner_origin: string; server_safety_receipt_sha256: string }>();
     if (!hosted) return Response.json({ error: "Upload this exact evidence set to Scopeproof before sending it to Jira Cloud." }, { status: 409 });
+    const hostedSafetyReceipt = await evidenceSafetyReceiptSha256({
+      digest: hosted.server_safety_scan_sha256, policy: hosted.server_safety_scan_policy,
+      completedAt: hosted.server_safety_scan_completed_at, scannerOrigin: hosted.server_safety_scanner_origin,
+    });
+    if (hostedSafetyReceipt !== hosted.server_safety_receipt_sha256) return Response.json({ error: "The hosted screenshot safety receipt is invalid. Re-upload and re-review the evidence before Jira disclosure." }, { status: 409 });
     if (hosted.status !== "approved") return Response.json({ error: "An authenticated Scopeproof reviewer must approve the hosted evidence before Jira disclosure." }, { status: 409 });
     if (!hosted.timestamp_token || hosted.timestamp_token.length > 256 * 1024) return Response.json({ error: "The hosted evidence is missing a valid signed Scopeproof attestation." }, { status: 409 });
     const signedAttestation = new File([hosted.timestamp_token], `${evidenceId}.receipt.json`, { type: "application/json" });

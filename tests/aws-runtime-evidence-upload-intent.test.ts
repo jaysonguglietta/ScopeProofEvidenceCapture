@@ -138,6 +138,7 @@ test("issuer reserves a one-time intent and signs every security-relevant upload
     "x-amz-meta-expected-sha256": SHA256,
     "x-amz-meta-tenant-id": TENANT,
     "x-amz-meta-upload-intent-id": result.intent.id,
+    "x-amz-meta-upload-nonce-digest": result.intent.nonceDigest,
     "x-amz-server-side-encryption": "aws:kms",
     "x-amz-server-side-encryption-aws-kms-key-id": KMS_ARN,
     "x-amz-server-side-encryption-context": Buffer.from(JSON.stringify({

@@ -3,7 +3,8 @@
 This directory contains a synthable AWS foundation for a hosted Scopeproof
 evidence portal. It includes a small production-shaped per-tenant API Gateway/
 Lambda, strict tenant/JWT/membership adapters, an idempotent upload-intent route
-with DynamoDB/Aurora reconciliation, KMS-signed audit/promotion receipts,
+with DynamoDB/Aurora reconciliation, a durable public-API audit outbox and
+bounded KMS signer, KMS-signed audit/promotion receipts,
 CDK-wired two-person exact-version legal-hold routes/worker, a cross-region recovery topology
 with existing-version backfill, and a protected macOS release workflow. It still
 does **not** contain the complete customer web product, membership-administration
@@ -20,7 +21,7 @@ not a production-ready hosted service until the release gates below are closed.
 - **Core models:** opaque tenant, exact domain, membership, upload lifecycle, immutable evidence version/receipt, job, audit event/head, and retention policy.
 - **Edge cases:** replay/duplicate/expired uploads, slow scans, unknown hosts, partial schemas, failed DNS, poison messages, KMS denial, and Object Lock conflicts.
 - **Assumptions:** `us-east-1`, an owned Route 53 domain, Amplify Hosting compute, and authoritative host-plus-membership authorization on every request.
-- **Done here:** shared/tenant/audit stacks, fail-closed provisioning, DNS-last activation, a tenant-specific API/custom domain with API Gateway mock health plus authenticated identity/upload-intent routes, immutable S3 boundaries, an active exact-intent GuardDuty promotion path, upload reconciliation and two-person legal-hold persistence procedures, split API/runtime/ingest/evidence-control roles, WAF, CloudTrail data events, encrypted alerting/logs, budgets, release distribution, SES identity, and an explicit two-phase cross-region recovery foundation with a global control table and existing-version backfill/verifier.
+- **Done here:** shared/tenant/audit stacks, fail-closed provisioning, DNS-last activation, a tenant-specific API/custom domain with API Gateway mock health plus authenticated identity/upload-intent routes, immutable S3 boundaries, an active exact-intent GuardDuty promotion path, upload reconciliation, durable KMS-signed API auditing, two-person legal-hold persistence procedures, split API/runtime/ingest/evidence-control roles, WAF, CloudTrail data events, encrypted alerting/logs, budgets, release distribution, SES identity, and an explicit two-phase cross-region recovery foundation with a global control table and existing-version backfill/verifier.
 
 ## Implemented architecture
 
@@ -33,11 +34,13 @@ not a production-ready hosted service until the release gates below are closed.
 | Metadata | Aurora PostgreSQL 16 Serverless v2, Data API | Isolated/no-NAT network, auto-pause, database-per-tenant, FORCE RLS. |
 | Provisioning | Step Functions, Lambda, Secrets Manager, Route 53 | Lease/initialize/verify/activate/fail states; schema and DNS precede `ACTIVE`. |
 | Evidence | quarantine/evidence S3, KMS, GuardDuty, SQS/DLQ, Lambda | 25 MiB intent contract; only promoter writes Object-Locked evidence. |
-| Audit/ops | CloudTrail, Object-Locked S3, CloudWatch, SNS | Exact tenant data events, denial/root metrics, DLQ/job/database alarms. |
+| Audit/ops | Aurora outbox/hash chain, asymmetric KMS, Lambda/EventBridge/DLQ, CloudTrail, Object-Locked S3, CloudWatch, SNS | Exact application-action receipts plus tenant S3 data events, bounded retries, persistent poison-row alarms, denial/root metrics, and DLQ/job/database alarms. |
 | Recovery | S3 CRR/RTC/Batch Operations, exact verifier, destination KMS/Object Lock, AWS Backup/Vault Lock | Live and pre-existing exact tenant versions plus daily Aurora recovery points; destination resources are bootstrapped before source replication is enabled. |
 | Cost/email | Budgets, Cost Anomaly Detection, SES/DKIM | USD 100 default budget; optional email notifications; identity only. |
 
 The design avoids always-on containers, load balancers, NAT gateways, and provisioned DynamoDB. Route 53, WAF, CloudFront, KMS, Secrets Manager, GuardDuty, logs, S3, Amplify, Cognito, Aurora, CloudTrail, and backups remain billable.
+
+The dormant Amplify build specification uses `npm ci --ignore-scripts --cache .npm --prefer-offline`, keeps npm data under the workspace `.npm` cache, and then runs `npm run build`. This reduces lifecycle-script and home-cache exposure, but it does not make the current UI deployable: the Amplify app has no repository/source connection, its branch has automatic builds disabled, and no AWS web release has run.
 
 ## Layout and validation
 
@@ -53,25 +56,36 @@ runtime/provision-tenant/index.mjs fail-closed database and DNS worker
 runtime/promote-evidence/index.mjs intent-bound immutable evidence promoter
 runtime/reconcile-recovery/*       durable Batch backfill and exact-version verifier
 runtime/tenant-api/index.ts        authenticated JWT/membership/upload-intent Lambda
+runtime/tenant-evidence-read-api/* isolated evidence search/exact-version-download Lambda
 runtime/tenant-legal-hold-api/*    separate authenticated request/approval Lambda
 runtime/reconcile-legal-holds/*    scheduled approved-only S3/KMS audit worker
+runtime/sign-api-audit-outbox/*   bounded retry-safe public-API KMS signer
 test/foundation.test.ts            template and runtime-contract guardrails
 ../database/001_tenant_schema.sql  authoritative schema/RLS migration
 ../database/002_runtime_role.sql   authoritative least-privilege runtime grants
 ../database/003_ingest_role.sql    execute-only promotion-reconciliation grants
 ../database/004_evidence_control_role.sql execute-only audit/legal-hold grants
+../database/005_legal_hold_api_role.sql execute-only request/approval grants
+../database/006_evidence_access_api.sql tenant-authorized list/exact-read procedures
+../database/007_evidence_read_role.sql execute-only evidence-read grants
+../database/008_api_audit_signer_role.sql execute-only audit-outbox signer grants
 ../../../lib/aws-runtime/http      exact-host, JWT, membership, and API adapters
 ../../../lib/aws-runtime/evidence  upload, receipt, reconciliation, and hold adapters
 ```
 
-Use Node.js 22+ and pnpm. These commands do not deploy:
+Use Node.js 22+ and pnpm. Install and test first; the final command performs a local synthesis only and does not deploy. The checked-in context intentionally has no domain, so even local synthesis must receive an explicit owned/example domain and exactly one Route 53 mode:
 
 ```bash
 cd infra/aws/cdk
 pnpm install --frozen-lockfile
 pnpm run build
 pnpm test
-pnpm run synth
+pnpm run synth \
+  -c deploymentEnvironment=dev \
+  -c rootDomain=evidence.example.com \
+  -c hostedZoneId=Z0123456789EXAMPLE \
+  -c 'recovery={"mode":"disabled"}' \
+  -c 'tenants=[]'
 ```
 
 Production-shaped baseline synthesis requires an explicit account and region. Production intentionally refuses `recovery.mode=disabled`; use the two-phase recovery procedure below.
@@ -153,27 +167,29 @@ implemented in this slice.
 
 ```bash
 pnpm exec cdk synth \
+  -c deploymentEnvironment=dev \
   -c rootDomain=evidence.example.com \
   -c hostedZoneId=Z0123456789EXAMPLE \
   -c alertEmail=security@example.com \
   -c monthlyBudgetUsd=100 \
-  -c 'tenants=[{"id":"ten_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","slug":"acme","displayName":"Acme Corporation","retentionDays":365,"retentionMode":"GOVERNANCE"}]'
+  -c 'tenants=[{"id":"ten_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","slug":"acme","displayName":"Acme Corporation","retentionDays":365,"retentionMode":"GOVERNANCE"}]' \
+  -c 'recovery={"mode":"disabled"}'
 ```
 
-The default `jsontechology.com` is a placeholder. Tenant IDs must be `ten_` plus 32 lowercase hex characters. Slugs are 1–48 character lowercase DNS labels and cannot use reserved platform names. More than 49 tenants is rejected because the root mapping consumes one of Amplify's 50 fixed domain settings.
+There is no default domain or deployment environment: `cdk.json` leaves `rootDomain` and `deploymentEnvironment` blank, and synthesis fails until both are supplied. Supply the complete tenant list and explicit recovery object too; tenant stacks never infer a recovery policy. Supply exactly one of an existing `hostedZoneId` (recommended) or `-c createHostedZone=true`; specifying neither or both fails. The latter is a deliberate, billable public-zone creation choice and is not implied by a domain name. `jsontechology.com` appears only in planning examples. Tenant IDs must be `ten_` plus 32 lowercase hex characters. Slugs are 1–48 character lowercase DNS labels and cannot use reserved platform names. More than 49 tenants is rejected because the root mapping consumes one of Amplify's 50 fixed domain settings.
 
 ## Fail-closed activation
 
 CloudFormation creates the Cognito client, tenant data plane, exact Amplify mapping, and `TENANT#<id>`/`DOMAIN#<host>` registry rows in `PROVISIONING`; it publishes no tenant CNAME. Start `TenantProvisioningStateMachineArn` with a unique Standard Workflow execution name. It:
 
 1. atomically leases both registry rows;
-2. creates a separate NOLOGIN/NOSUPERUSER/NOBYPASSRLS owner and four distinct NOINHERIT logins—upload runtime, ingest reconciliation, evidence control, and legal-hold API—supplying PostgreSQL-native SCRAM verifiers rather than placing reusable generated passwords in SQL;
-3. temporarily grants the administrator `SET ROLE` membership, applies authoritative migration `001` as the owner, applies grants migrations `002`, `003`, `004`, and `005`, and always revokes membership;
-4. verifies the exact migration, tables/domains/functions and their owners, FORCE RLS policies, tenant FKs, triggers, singleton tenant/domain rows, all four role boundaries, and a real wrong-context denial;
+2. creates a separate NOLOGIN/NOSUPERUSER/NOBYPASSRLS owner and six distinct NOINHERIT logins—upload runtime, ingest reconciliation, evidence control, legal-hold API, evidence read, and API-audit signer—supplying PostgreSQL-native SCRAM verifiers rather than placing reusable generated passwords in SQL;
+3. temporarily grants the administrator `SET ROLE` membership, applies authoritative migrations `001` and `006` as the owner, applies grants migrations `002`, `003`, `004`, `005`, `007`, and `008`, records an all-eight-file bundle digest plus live function/index catalog digest, and always revokes membership;
+4. verifies that exact database attestation, tables/domains/functions and their owners, FORCE RLS policies, tenant FKs, triggers, singleton tenant/domain rows, all six role boundaries, zero PostgreSQL membership edges involving any managed owner/application role, and a real wrong-context denial;
 5. re-verifies, UPSERTs only the approved CNAME under conditioned IAM, waits for Route 53 `INSYNC`, then marks the database and both registry rows `ACTIVE`; and
 6. restores the database to `PROVISIONING` and marks registry rows `FAILED` on terminal failure. A `FAILED` tenant can be retried with a new execution.
 
-Active registry rows record schema version 1 and the packaged `001` SHA-256. A CNAME may remain after a late failure, but the tenant API must return a generic non-disclosing failure for non-active registry state; DNS is never authorization.
+Active registry rows record schema version 2 and the SHA-256 of all eight packaged SQL files. The database migration table comment independently binds that package digest to an ordered SHA-256 of the live `scopeproof` function and index definitions. Any mismatch fails before activation and requires a separately reviewed forward migration; changing the recorded hash is not an upgrade mechanism. A CNAME may remain after a late failure, but the tenant API must return a generic non-disclosing failure for non-active registry state; DNS is never authorization.
 
 The shared Aurora administrator secret, cluster, database KMS key, tenant database secrets, upload-idempotency HMAC secret, and tenant secret KMS keys are retained. The administrator secret uses the customer-managed database key; each provisioner receives only exact secret-read, Secrets Manager-scoped KMS decrypt, and Data API permissions. Stack deletion must never be used as credential rotation or offboarding.
 
@@ -221,6 +237,46 @@ tests, and a live HMAC rotation drill remain production gates. The handler alrea
 loads `AWSCURRENT` plus at most one optional `AWSPREVIOUS`; the prior key is
 recovery-only and cannot create a new lifecycle.
 
+## Durable public-API audit signing
+
+Successful upload-intent, evidence-search, exact-version download-intent, and
+legal-hold request/approval operations write immutable facts to
+`scopeproof.api_audit_outbox` in the same tenant database boundary. Mutable
+delivery state lives separately in `scopeproof.api_audit_outbox_work`; API roles
+cannot read or change either table directly. A one-minute EventBridge schedule
+invokes the tenant's single-concurrency signer and processes at most ten rows per
+invocation using 120-second database leases.
+
+The signer reconstructs one canonical user event from the leased tenant, user,
+membership, action, resource, request, outcome, occurrence time, details, and
+full outbox digest. It signs only the canonical receipt digest with the tenant's
+RSA-3072 KMS audit key. The specialized database append procedure independently
+recomputes the immutable outbox digest and exact field bindings, serializes the
+hash-chain head, appends the event, and marks delivery complete in the same
+transaction. The signer login has execute permission only for claim, head read,
+specialized append, failure transition, and health procedures. Its Lambda role
+has only its exact database secret/cluster, audit-key `kms:Sign`/`kms:Verify`,
+and pre-created log group; it has no S3, DynamoDB, STS, legal-hold, evidence, or
+generic audit-append capability.
+
+Retries use exponential backoff from 30 seconds to six hours and become a
+persistent dead letter after eight failed attempts. A committed append remains
+idempotent even if the Data API commit response is lost: the failure transition
+detects `already_completed` and does not create a second event. A row that fails
+runtime parsing keeps a minimal committed lease so it can follow the same retry
+and dead-letter path rather than block later rows. CloudWatch alarms cover row
+failures, persistent database dead letters, oldest unsigned age of five minutes,
+Lambda errors/throttles, missing health telemetry, and exhaustion of the
+EventBridge invocation DLQ.
+
+Do not repair a poison row by editing either outbox table or by granting the
+signer generic append/table access. Diagnose the safe `last_error_code`, correct
+the producing code or schema with a reviewed forward change, then use the
+owner-only `scopeproof.requeue_dead_lettered_api_audit_event(...)` procedure in
+an approved break-glass database session. Confirm the row reaches `completed_at`,
+verify the returned KMS receipt and tenant chain, and retain the incident and
+CloudTrail evidence.
+
 ## Storage and promotion
 
 - The tenant data role can presign only an exact SSE-KMS `PutObject` into its
@@ -262,7 +318,7 @@ recovery-only and cannot create a new lifecycle.
 - Amplify uses a **REGIONAL** WAF ACL; CloudFront releases use a separate **CLOUDFRONT** ACL. Both enforce exact hosts, managed reputation/input rules, and rate limits. The app ACL also rejects bodies over 64 KiB; direct evidence uploads use S3 controls.
 - WAF keeps blocked-request logs and redacts Authorization/Cookie. Lambda, Step Functions, WAF, and CloudTrail logs are encrypted and retained one year.
 - The multi-region trail captures global/management events, API/error insights, validation, and exact quarantine/evidence S3 data events into KMS-encrypted, versioned, compliance-locked storage.
-- SNS alarms cover shared/per-tenant DLQs, job age, Aurora capacity, denied API calls, and root use. Email subscriptions require recipient confirmation.
+- SNS alarms cover shared/per-tenant DLQs, public-API audit signing/backlog/dead letters, job age, Aurora capacity, denied API calls, and root use. Email subscriptions require recipient confirmation.
 - Releases use a private S3 origin behind CloudFront OAC. The protected production macOS candidate workflow performs Developer ID signing, hardened-runtime verification, Apple notarization/stapling, and provenance-safe artifact upload, but publishing to the AWS release bucket remains a separate approved step.
 - SES creates domain identity, Easy DKIM, and rejecting custom MAIL FROM. Sending access, bounce/suppression handling, and an app sender are not included.
 
@@ -283,8 +339,12 @@ Before launch:
 5. implement invitation/membership administration, the legal-hold UI/operating
    process, onboarding/offboarding, AWS release publishing, SES delivery,
    and incident workflows;
-6. integration-test Amplify WAF/domain behavior, DNS-last activation, Data API ownership/RLS, GuardDuty events/tags, KMS contexts, S3 checksums/Object Lock, replay, and cross-tenant denial in an isolated AWS account; and
-7. run restore/DR exercises and decide whether higher-assurance customers require separate accounts/regions.
+6. live-test API-audit ordering, KMS verification, ambiguous Data API commit
+   recovery, lease takeover, eight-attempt dead-lettering, owner-only requeue,
+   alarm delivery, and a backlog that contains both a poison row and later valid
+   rows;
+7. integration-test Amplify WAF/domain behavior, DNS-last activation, Data API ownership/RLS, GuardDuty events/tags, KMS contexts, S3 checksums/Object Lock, replay, and cross-tenant denial in an isolated AWS account; and
+8. run restore/DR exercises and decide whether higher-assurance customers require separate accounts/regions.
 
 Evidence, keys, registry/audit data, and databases are retained/deletion-protected. Stack deletion leaves billable resources and registry history. Automated offboarding/deletion is not implemented.
 

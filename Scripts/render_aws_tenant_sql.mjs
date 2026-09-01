@@ -10,6 +10,7 @@ const rolePattern = /^tenant_[a-z0-9_]{3,56}_runtime$/;
 const ingestRolePattern = /^tenant_[a-z0-9_]{3,56}_ingest$/;
 const controlRolePattern = /^tenant_[a-z0-9_]{3,56}_control$/;
 const legalApiRolePattern = /^tenant_[a-z0-9_]{3,56}_legal_api$/;
+const readRolePattern = /^tenant_[a-z0-9_]{3,56}_read$/;
 const hostnamePattern = /^(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/;
 const bucketPattern = /^(?=.{3,63}$)(?!\d+\.\d+\.\d+\.\d+$)[a-z0-9](?:[a-z0-9.-]*[a-z0-9])$/;
 const regionPattern = /^[a-z]{2}(?:-gov)?-[a-z]+-\d$/;
@@ -36,6 +37,7 @@ export function validateTenantSqlOptions(candidate) {
     ingestRole: String(candidate.ingestRole || "").trim().toLowerCase(),
     controlRole: String(candidate.controlRole || "").trim().toLowerCase(),
     legalApiRole: String(candidate.legalApiRole || "").trim().toLowerCase(),
+    readRole: String(candidate.readRole || "").trim().toLowerCase(),
     awsAccountId: String(candidate.awsAccountId || "").trim(),
     awsRegion: String(candidate.awsRegion || "").trim().toLowerCase(),
     quarantineBucket: String(candidate.quarantineBucket || "").trim().toLowerCase(),
@@ -62,6 +64,13 @@ export function validateTenantSqlOptions(candidate) {
     value.legalApiRole === value.ingestRole ||
     value.legalApiRole === value.controlRole
   ) throw new Error("--legal-api-role must be a distinct role matching tenant_[a-z0-9_]{3,56}_legal_api.");
+  if (
+    !readRolePattern.test(value.readRole) ||
+    value.readRole === value.runtimeRole ||
+    value.readRole === value.ingestRole ||
+    value.readRole === value.controlRole ||
+    value.readRole === value.legalApiRole
+  ) throw new Error("--read-role must be a distinct role matching tenant_[a-z0-9_]{3,56}_read.");
   if (!/^\d{12}$/.test(value.awsAccountId)) throw new Error("--aws-account-id must contain exactly 12 digits.");
   if (!regionPattern.test(value.awsRegion)) throw new Error("--aws-region is invalid.");
   if (!isValidBucketName(value.quarantineBucket) || !isValidBucketName(value.evidenceBucket) || value.quarantineBucket === value.evidenceBucket) throw new Error("Quarantine and evidence bucket names must be distinct valid S3 bucket names.");
@@ -75,12 +84,14 @@ export function validateTenantSqlOptions(candidate) {
 
 export async function renderTenantSql(candidate) {
   const options = validateTenantSqlOptions(candidate);
-  const [schema, grants, ingestGrants, controlGrants, legalApiGrants] = await Promise.all([
+  const [schema, evidenceAccess, grants, ingestGrants, controlGrants, legalApiGrants, readGrants] = await Promise.all([
     readFile(new URL("001_tenant_schema.sql", migrationDirectory), "utf8"),
+    readFile(new URL("006_evidence_access_api.sql", migrationDirectory), "utf8"),
     readFile(new URL("002_runtime_role.sql", migrationDirectory), "utf8"),
     readFile(new URL("003_ingest_role.sql", migrationDirectory), "utf8"),
     readFile(new URL("004_evidence_control_role.sql", migrationDirectory), "utf8"),
     readFile(new URL("005_legal_hold_api_role.sql", migrationDirectory), "utf8"),
+    readFile(new URL("007_evidence_read_role.sql", migrationDirectory), "utf8"),
   ]);
   const seed = [
     "-- Seed the immutable database identity before granting runtime access.",
@@ -101,7 +112,9 @@ export async function renderTenantSql(candidate) {
   if (renderedControlGrants.includes("__SCOPEPROOF_CONTROL_ROLE__")) throw new Error("Evidence-control role substitution did not complete.");
   const renderedLegalApiGrants = legalApiGrants.replaceAll("__SCOPEPROOF_LEGAL_API_ROLE__", options.legalApiRole);
   if (renderedLegalApiGrants.includes("__SCOPEPROOF_LEGAL_API_ROLE__")) throw new Error("Legal-hold API role substitution did not complete.");
-  return `${schema.trim()}\n\n${seed}\n\n${renderedGrants.trim()}\n\n${renderedIngestGrants.trim()}\n\n${renderedControlGrants.trim()}\n\n${renderedLegalApiGrants.trim()}\n`;
+  const renderedReadGrants = readGrants.replaceAll("__SCOPEPROOF_EVIDENCE_READ_ROLE__", options.readRole);
+  if (renderedReadGrants.includes("__SCOPEPROOF_EVIDENCE_READ_ROLE__")) throw new Error("Evidence-read role substitution did not complete.");
+  return `${schema.trim()}\n\n${seed}\n\n${evidenceAccess.trim()}\n\n${renderedGrants.trim()}\n\n${renderedIngestGrants.trim()}\n\n${renderedControlGrants.trim()}\n\n${renderedLegalApiGrants.trim()}\n\n${renderedReadGrants.trim()}\n`;
 }
 
 function parseArguments(argv) {
@@ -112,6 +125,7 @@ function parseArguments(argv) {
     ["ingest-role", "ingestRole"], ["output", "output"],
     ["control-role", "controlRole"],
     ["legal-api-role", "legalApiRole"],
+    ["read-role", "readRole"],
     ["aws-account-id", "awsAccountId"], ["aws-region", "awsRegion"],
     ["quarantine-bucket", "quarantineBucket"], ["evidence-bucket", "evidenceBucket"],
     ["kms-key-arn", "kmsKeyArn"],

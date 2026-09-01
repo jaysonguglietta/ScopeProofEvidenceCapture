@@ -5,12 +5,15 @@ import test from "node:test";
 import { App } from "aws-cdk-lib";
 import { Match, Template } from "aws-cdk-lib/assertions";
 import {
+  defaultTenantLambdaConcurrencyBudget,
   parseTenants,
   tenantDatabaseIdentifiers,
   tenantEvidenceControlRoleName,
   validateBranchName,
   validateRootDomain,
   validateTenant,
+  validateTenantDeploymentSecurity,
+  validateTenantLambdaConcurrencyBudget,
 } from "../lib/config";
 import { ObservabilityStack } from "../lib/observability-stack";
 import {
@@ -29,6 +32,12 @@ const env = { account: "111111111111", region: "us-east-1" };
 const acmeTenantId = "ten_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const firstTenantId = "ten_11111111111111111111111111111111";
 const secondTenantId = "ten_22222222222222222222222222222222";
+const developmentRecovery = parseRecoveryConfiguration({ mode: "disabled" }, {
+  account: env.account,
+  deploymentEnvironment: "dev",
+  primaryRegion: env.region,
+  tenants: [],
+});
 
 function foundation() {
   const app = new App({
@@ -45,6 +54,7 @@ function foundation() {
   });
   const tenant = new TenantStack(app, "TenantAcme", {
     env,
+    recovery: developmentRecovery,
     rootDomain: "evidence.example.com",
     shared,
     tenant: {
@@ -87,6 +97,18 @@ function assertNoVacuousMultiValueIamConditions(template: Template): void {
     Object.values(object).forEach(visit);
   };
   visit(template.toJSON());
+}
+
+function assertRetainedBucketPolicies(template: Template): void {
+  const synthesized = template.toJSON() as { Resources: Record<string, Record<string, unknown>> };
+  const policies = Object.entries(synthesized.Resources).filter(([, resource]) =>
+    resource.Type === "AWS::S3::BucketPolicy"
+  );
+  assert.ok(policies.length > 0, "expected at least one S3 bucket policy");
+  for (const [logicalId, policy] of policies) {
+    assert.equal(policy.DeletionPolicy, "Retain", `${logicalId} must survive deletion with its retained bucket`);
+    assert.equal(policy.UpdateReplacePolicy, "Retain", `${logicalId} must survive replacement with its retained bucket`);
+  }
 }
 
 function recoveryFoundation() {
@@ -229,8 +251,57 @@ test("configuration validation normalizes DNS and rejects ambiguous tenants", ()
   );
 });
 
+test("production tenant retention and Lambda concurrency budgets fail closed", () => {
+  const governance = validateTenant({
+    id: acmeTenantId,
+    slug: "acme",
+    displayName: "Acme Corporation",
+    retentionMode: "GOVERNANCE",
+  });
+  assert.throws(() => validateTenantDeploymentSecurity(governance, "prod"), /requires COMPLIANCE/);
+  assert.equal(validateTenantDeploymentSecurity(governance, "stage"), governance);
+  assert.equal(
+    Object.values(validateTenantLambdaConcurrencyBudget(defaultTenantLambdaConcurrencyBudget, "prod")).reduce((sum, value) => sum + value, 0),
+    21,
+  );
+  assert.throws(() => validateTenantLambdaConcurrencyBudget({
+    ...defaultTenantLambdaConcurrencyBudget,
+    tenantApi: 6,
+  }, "prod"), /exceeds the 21 prod budget/);
+  assert.throws(() => validateTenantLambdaConcurrencyBudget({
+    ...defaultTenantLambdaConcurrencyBudget,
+    tenantApi: 0,
+  }, "dev"), /integer from 1 through 10/);
+});
+
+test("shared platform requires an owned domain and explicit Route 53 ownership decision", () => {
+  const base = {
+    branchName: "main",
+    env,
+    tenantSlugs: [] as string[],
+  };
+  assert.throws(() => new SharedPlatformStack(new App(), "PlaceholderDomain", {
+    ...base,
+    hostedZoneId: "Z1111111111111",
+    rootDomain: "jsontechology.com",
+  }), /planning placeholder/);
+  assert.throws(() => new SharedPlatformStack(new App(), "ImplicitHostedZone", {
+    ...base,
+    rootDomain: "evidence.example.com",
+  }), /exactly one existing hostedZoneId or explicitly authorize createHostedZone/);
+
+  const explicit = new SharedPlatformStack(new App(), "ExplicitHostedZone", {
+    ...base,
+    createHostedZone: true,
+    rootDomain: "evidence.example.com",
+  });
+  assert.equal(explicit.hostedZone.zoneName, "evidence.example.com");
+});
+
 test("recovery configuration is explicit, cross-region, complete, and production fail-closed", () => {
   assert.equal(validateDeploymentEnvironment("PROD"), "prod");
+  assert.throws(() => validateDeploymentEnvironment(undefined), /explicitly set/);
+  assert.throws(() => validateDeploymentEnvironment(""), /explicitly set/);
   assert.equal(
     primaryEvidenceBucketName(env.account, "ap-southeast-2", acmeTenantId).length,
     63,
@@ -310,6 +381,7 @@ test("recovery configuration is explicit, cross-region, complete, and production
 test("recovery stack creates locked destination vault and immutable tenant evidence replicas", () => {
   const { recoveryStack } = recoveryFoundation();
   const template = Template.fromStack(recoveryStack);
+  assertRetainedBucketPolicies(template);
   const synthesized = template.toJSON() as { Resources: Record<string, Record<string, unknown>> };
 
   template.hasResourceProperties("AWS::Backup::BackupVault", {
@@ -363,6 +435,8 @@ test("recovery stack creates locked destination vault and immutable tenant evide
 
 test("enabled recovery adds exact Aurora backup copies and evidence replication without broad managed roles", () => {
   const { app, shared, tenant } = recoveryFoundation();
+  assertRetainedBucketPolicies(Template.fromStack(shared));
+  assertRetainedBucketPolicies(Template.fromStack(tenant));
   const sharedTemplate = Template.fromStack(shared);
   const sharedJson = sharedTemplate.toJSON() as { Resources: Record<string, Record<string, unknown>> };
   sharedTemplate.resourceCountIs("AWS::Backup::BackupPlan", 1);
@@ -471,6 +545,7 @@ test("shared platform reserves exact tenant mappings but publishes no tenant DNS
   });
   const synthesized = template.toJSON() as { Resources: Record<string, { Type: string; Properties?: unknown }> };
   const domain = Object.values(synthesized.Resources).find((resource) => resource.Type === "AWS::Amplify::Domain");
+  const amplifyApp = Object.values(synthesized.Resources).find((resource) => resource.Type === "AWS::Amplify::App");
   const recordSets = Object.values(synthesized.Resources).filter(
     (resource) => resource.Type === "AWS::Route53::RecordSet",
   );
@@ -478,6 +553,9 @@ test("shared platform reserves exact tenant mappings but publishes no tenant DNS
     (record.Properties as { Name?: unknown } | undefined)?.Name,
   );
   assert.ok(domain);
+  assert.ok(amplifyApp);
+  assert.match(JSON.stringify(amplifyApp), /npm ci --ignore-scripts --cache \.npm --prefer-offline/);
+  assert.doesNotMatch(JSON.stringify(amplifyApp), /node_modules\/\*\*/);
   assert.doesNotMatch(JSON.stringify(domain), /"Prefix":"\*"/);
   assert.equal(
     recordNames.some((name) => name === "*.evidence.example.com" || name === "*.evidence.example.com."),
@@ -509,6 +587,7 @@ test("shared platform reserves exact tenant mappings but publishes no tenant DNS
   });
   template.hasResourceProperties("AWS::DynamoDB::GlobalTable", {
     BillingMode: "PAY_PER_REQUEST",
+    StreamSpecification: { StreamViewType: "NEW_AND_OLD_IMAGES" },
     Replicas: Match.arrayWith([
       Match.objectLike({
         DeletionProtectionEnabled: true,
@@ -553,6 +632,7 @@ test("multi-value IAM scoping keys cannot match vacuously when request context i
 test("shared edge, release, alerting, email, and cost controls are production bounded", () => {
   const { shared } = foundation();
   const template = Template.fromStack(shared);
+  assertRetainedBucketPolicies(template);
   const synthesized = template.toJSON() as { Resources: Record<string, Record<string, unknown>> };
 
   template.resourceCountIs("AWS::WAFv2::WebACL", 2);
@@ -603,6 +683,7 @@ test("shared edge, release, alerting, email, and cost controls are production bo
 test("tenant stack is isolated, immutable, and remains provisioning", () => {
   const { tenant } = foundation();
   const template = Template.fromStack(tenant);
+  assertRetainedBucketPolicies(template);
   const synthesized = template.toJSON() as { Resources: Record<string, Record<string, unknown>> };
   const buckets = Object.values(synthesized.Resources).filter(
     (resource) => resource.Type === "AWS::S3::Bucket",
@@ -676,7 +757,8 @@ test("tenant stack is isolated, immutable, and remains provisioning", () => {
   assert.match(policyJson, /s3:PutObject/);
   assert.match(policyJson, /kms:GenerateDataKey/);
   assert.match(policyJson, /scopeproofPurpose":"quarantine/);
-  assert.match(policyJson, /x-amz-server-side-encryption-context/);
+  assert.match(policyJson, /s3:x-amz-server-side-encryption-aws-kms-key-id/);
+  assert.doesNotMatch(policyJson, /s3:x-amz-server-side-encryption-context/);
   assert.match(policyJson, /tenants\/ten_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\/controls\/\*\/quarantine/);
   const evidenceControlPolicy = Object.values(synthesized.Resources).find((resource) => {
     if (resource.Type !== "AWS::IAM::Policy") return false;
@@ -759,14 +841,14 @@ test("tenant stack is isolated, immutable, and remains provisioning", () => {
   ]) {
     assert.match(workflowJson, new RegExp(state));
   }
-  template.resourceCountIs("AWS::Lambda::Function", 6);
+  template.resourceCountIs("AWS::Lambda::Function", 8);
   assert.equal(
     Object.values(synthesized.Resources).filter(
       (resource) =>
         resource.Type === "AWS::Lambda::Function" &&
         JSON.stringify(resource).includes('"Architectures":["arm64"]'),
     ).length,
-    5,
+    7,
   );
   template.hasResourceProperties("AWS::IAM::Role", {
     Path: "/scopeproof/api/",
@@ -825,7 +907,47 @@ test("tenant stack is isolated, immutable, and remains provisioning", () => {
   assert.match(apiRolePolicyJson, /DOMAIN#api-acme\.evidence\.example\.com/);
   assert.match(apiRolePolicyJson, /sts:AssumeRole/);
   assert.doesNotMatch(apiRolePolicyJson, /rds-data:|secretsmanager:GetSecretValue|s3:PutObject|kms:Decrypt/);
-  template.resourceCountIs("AWS::SQS::Queue", 2);
+  template.resourceCountIs("AWS::SQS::Queue", 3);
+  template.hasResourceProperties("AWS::Lambda::Function", {
+    Environment: {
+      Variables: Match.objectLike({
+        API_AUDIT_BATCH_LIMIT: "10",
+        API_AUDIT_LEASE_SECONDS: "120",
+        TENANT_ID: acmeTenantId,
+      }),
+    },
+    MemorySize: 256,
+    ReservedConcurrentExecutions: 1,
+    Runtime: "nodejs22.x",
+    Timeout: 60,
+  });
+  template.hasResourceProperties("AWS::Events::Rule", {
+    ScheduleExpression: "rate(1 minute)",
+    State: "ENABLED",
+    Targets: Match.arrayWith([
+      Match.objectLike({
+        RetryPolicy: {
+          MaximumEventAgeInSeconds: 300,
+          MaximumRetryAttempts: 2,
+        },
+      }),
+    ]),
+  });
+  const auditSignerPolicy = Object.values(synthesized.Resources).find((resource) => {
+    if (resource.Type !== "AWS::IAM::Policy") return false;
+    const roles = (resource.Properties as Record<string, unknown>).Roles;
+    return Array.isArray(roles) && JSON.stringify(roles).includes("TenantApiAuditSignerExecutionRole");
+  });
+  assert.ok(auditSignerPolicy);
+  const auditSignerPolicyJson = JSON.stringify(auditSignerPolicy);
+  assert.match(auditSignerPolicyJson, /rds-data:BeginTransaction/);
+  assert.match(auditSignerPolicyJson, /secretsmanager:GetSecretValue/);
+  assert.match(auditSignerPolicyJson, /kms:Sign/);
+  assert.match(auditSignerPolicyJson, /kms:Verify/);
+  assert.doesNotMatch(auditSignerPolicyJson, /s3:|dynamodb:|sts:AssumeRole/);
+  assert.match(JSON.stringify(synthesized), /ApiAuditDeadLetterAlarm/);
+  assert.match(JSON.stringify(synthesized), /ApiAuditBacklogAgeAlarm/);
+  assert.match(JSON.stringify(synthesized), /ApiAuditSignerInvocationDeadLetterAlarm/);
   template.hasResourceProperties("AWS::Events::Rule", {
     EventPattern: Match.objectLike({
       detail: Match.objectLike({
@@ -868,10 +990,44 @@ test("runtime assets enforce exact provisioning and single-writer promotion cont
     path.join(__dirname, "..", "runtime", "reconcile-legal-holds", "index.ts"),
     "utf8",
   );
+  const apiAuditSigner = readFileSync(
+    path.join(__dirname, "..", "runtime", "sign-api-audit-outbox", "index.ts"),
+    "utf8",
+  );
 
   assert.match(provisioner, /SET LOCAL ROLE/);
   assert.match(provisioner, /REVOKE \$\{ownerRole\} FROM \$\{adminRole\}/);
+  assert.match(provisioner, /pg_catalog\.pg_auth_members/);
+  assert.match(provisioner, /NOT rolinherit/);
+  assert.match(provisioner, /isolated from all role memberships/);
+  assert.ok(
+    provisioner.indexOf("await verifyManagedRoleIsolation();") <
+      provisioner.indexOf("GRANT ${ownerRole} TO ${adminRole}"),
+    "role membership isolation must pass before the administrator receives temporary owner membership",
+  );
+  assert.ok(
+    provisioner.lastIndexOf("await verifyManagedRoleIsolation();") >
+      provisioner.indexOf("REVOKE ${ownerRole} FROM ${adminRole}"),
+    "role membership isolation must be rechecked after the temporary owner grant is revoked",
+  );
   assert.match(provisioner, /tenant_security_baseline/);
+  assert.match(provisioner, /databaseBundleMarkerPrefix/);
+  assert.match(provisioner, /pg_get_functiondef/);
+  assert.match(provisioner, /pg_get_indexdef/);
+  assert.match(provisioner, /Installed tenant database definitions do not match the attested migration bundle/);
+  const activationStart = provisioner.indexOf("async function activateTenant");
+  const activationVerification = provisioner.indexOf(
+    'await verifyDatabase(["PROVISIONING", "ACTIVE"]);',
+    activationStart,
+  );
+  const databaseActivation = provisioner.indexOf(
+    'await setDatabaseTenantStatus("ACTIVE"',
+    activationStart,
+  );
+  assert.ok(
+    activationStart >= 0 && activationVerification > activationStart && databaseActivation > activationVerification,
+    "the exact package-and-catalog marker must be verified before database activation",
+  );
   assert.match(provisioner, /assert_database_tenant/);
   assert.match(provisioner, /tenant_domains/);
   assert.match(provisioner, /ChangeResourceRecordSetsCommand/);
@@ -881,13 +1037,30 @@ test("runtime assets enforce exact provisioning and single-writer promotion cont
   assert.match(provisioner, /SELECT set_config\('scopeproof\.tenant_id', :tenant_id, true\)/);
   assert.match(provisioner, /SCRAM-SHA-256/);
   assert.match(provisioner, /pbkdf2Sync\(password, salt, iterations, 32, "sha256"\)/);
+  assert.match(
+    provisioner,
+    /new Set\(\[\s*password,\s*ingestPassword,\s*controlPassword,\s*legalApiPassword,\s*readPassword,\s*apiAuditPassword,\s*\]\)\.size !== 6/,
+  );
   assert.match(provisioner, /import \{ transactionToken \} from "\.\/idempotency\.mjs"/);
   assert.match(provisioner, /lastProvisionExecutionId/);
   assert.match(provisioner, /"read_promoted_evidence_receipt"/);
   assert.match(provisioner, /"approve_exact_version_legal_hold"/);
   assert.match(provisioner, /"read_exact_version_legal_hold_operation"/);
-  assert.match(provisioner, /p\.proname IN \('current_tenant_id', 'resolve_active_membership', 'create_upload_intent'\)/);
+  assert.match(provisioner, /p\.proname IN \('current_tenant_id', 'resolve_active_membership', 'create_upload_intent', 'record_api_audit_event'\)/);
+  assert.match(provisioner, /fieldNumber\(functions\[0\]\) !== 4/);
   assert.match(provisioner, /Tenant upload runtime is not an execute-only membership and upload identity/);
+  assert.match(provisioner, /p\.proname IN \('current_tenant_id', 'resolve_active_membership', 'list_accessible_evidence', 'read_accessible_evidence', 'record_api_audit_event'\)/);
+  assert.match(provisioner, /Tenant evidence-read role is not an execute-only listing and exact-version read identity/);
+  assert.match(provisioner, /const apiAuditSignerRoleAllowedFunctions = Object\.freeze\(\[/);
+  for (const functionName of [
+    "append_signed_api_audit_event",
+    "claim_next_api_audit_event",
+    "current_tenant_id",
+    "read_api_audit_outbox_health",
+    "read_tenant_audit_head",
+    "record_api_audit_outbox_failure",
+  ]) assert.match(provisioner, new RegExp(`"${functionName}"`));
+  assert.match(provisioner, /Tenant API audit-signer role is not an execute-only leased-outbox identity/);
   assert.match(provisioner, /const controlRoleAllowedFunctions = Object\.freeze\(\[/);
   for (const functionName of [
     "acknowledge_legal_hold_recovery_publication",
@@ -904,8 +1077,8 @@ test("runtime assets enforce exact provisioning and single-writer promotion cont
     "read_tenant_audit_head",
   ]) assert.match(provisioner, new RegExp(`"${functionName}"`));
   assert.match(provisioner, /fieldNumber\(functions\[0\]\) !== controlRoleAllowedFunctions\.length/);
-  assert.match(provisioner, /p\.proname IN \('current_tenant_id', 'resolve_active_membership', 'reserve_exact_version_legal_hold', 'approve_exact_version_legal_hold'\)/);
-  assert.match(provisioner, /fieldNumber\(functions\[0\]\) !== 4/);
+  assert.match(provisioner, /p\.proname IN \('current_tenant_id', 'resolve_active_membership', 'reserve_exact_version_legal_hold', 'approve_exact_version_legal_hold', 'record_api_audit_event'\)/);
+  assert.match(provisioner, /fieldNumber\(functions\[0\]\) !== 5/);
   assert.match(provisioner, /p\.proname IN \('claim_promotion_fence', 'current_tenant_id', 'read_promoted_evidence_receipt', 'reconcile_promoted_evidence'\)/);
   assert.match(provisioner, /fieldNumber\(functions\[0\]\) !== 4/);
   assert.doesNotMatch(provisioner, /stableToken\(executionId/);
@@ -978,11 +1151,25 @@ test("runtime assets enforce exact provisioning and single-writer promotion cont
   assert.match(legalHoldWorker, /verifyRequestId: state\.receipt\.verifyRequestId/);
   assert.match(legalHoldWorker, /operationRevision: state\.operationRevision/);
   assert.match(tenantApi, /unhoistableHeaders: new Set\(options\.unhoistableHeaders\)/);
+  assert.match(apiAuditSigner, /API_AUDIT_BATCH_LIMIT/);
+  assert.match(apiAuditSigner, /limit < 1 \|\| limit > 25/);
+  assert.match(apiAuditSigner, /leaseSeconds < 30 \|\| leaseSeconds > 300/);
+  assert.match(apiAuditSigner, /for \(let index = 0; index < Number\(config\.API_AUDIT_BATCH_LIMIT\); index \+= 1\)/);
+  assert.match(apiAuditSigner, /getRemainingTimeInMillis\(\) < 20_000/);
+  assert.match(apiAuditSigner, /await store\.recordFailure/);
+  assert.match(apiAuditSigner, /ApiAuditOutboxPoisonedClaimError/);
+  assert.match(apiAuditSigner, /CLAIM_PARSE_FAILED/);
+  assert.match(apiAuditSigner, /failureState\.state === "already_completed"/);
+  assert.match(apiAuditSigner, /failureState\.state === "dead_lettered"/);
+  assert.match(apiAuditSigner, /await store\.health/);
+  assert.match(apiAuditSigner, /Scopeproof\/ApiAudit/);
+  assert.doesNotMatch(apiAuditSigner, /console\.(?:log|error)\([^\n]*(?:secret|signature|canonicalReceipt|details)/i);
 });
 
-test("central audit stack captures exact tenant S3 data events immutably", () => {
+test("central audit stack captures exact tenant S3 and authoritative DynamoDB data events immutably", () => {
   const { observability } = foundation();
   const template = Template.fromStack(observability);
+  assertRetainedBucketPolicies(template);
   const synthesized = template.toJSON() as { Resources: Record<string, Record<string, unknown>> };
 
   template.resourceCountIs("AWS::CloudTrail::Trail", 1);
@@ -1004,6 +1191,8 @@ test("central audit stack captures exact tenant S3 data events immutably", () =>
   assert.ok(trail);
   const trailJson = JSON.stringify(trail);
   assert.match(trailJson, /AWS::S3::Object/);
+  assert.match(trailJson, /AWS::DynamoDB::Table/);
+  assert.match(trailJson, /ControlPlaneTable/);
   assert.match(trailJson, /IngestBucket/);
   assert.match(trailJson, /EvidenceBucket/);
   assert.doesNotMatch(trailJson, /arn:aws:s3:::\*/);

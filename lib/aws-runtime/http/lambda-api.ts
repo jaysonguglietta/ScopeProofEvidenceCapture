@@ -1,6 +1,8 @@
 import { TenantSecurityError, type JsonValue } from "../contracts.ts";
 import type { IssuedPresignedUpload } from "../evidence/upload-intent-issuer.ts";
 import type { UploadIntentEvidenceProjection } from "../evidence/upload-intent-database.ts";
+import type { EvidenceListPage, IssuedEvidenceDownload } from "../evidence/evidence-access.ts";
+import type { DeviceUploadManifest } from "../evidence/device-upload-manifest.ts";
 import type {
   ApprovedExactVersionLegalHold,
   DurableExactVersionLegalHoldRequest,
@@ -17,6 +19,7 @@ import {
   type AuthorizedApiRequest,
 } from "./api.ts";
 import { parseStrictJsonObject } from "./jwt.ts";
+import type { HostedApiAuditRecord, RecordedHostedApiAudit } from "./audit-outbox.ts";
 
 export interface ApiGatewayRestEvent {
   readonly body?: string | null;
@@ -45,7 +48,20 @@ export interface UploadIntentApiPayload {
   readonly expectedSha256: string;
   readonly expectedSize: number;
   readonly contentType: string;
+  readonly deviceManifest: DeviceUploadManifest;
+  readonly devicePublicKeySpki: string;
+  readonly deviceSignature: string;
   readonly evidence: Omit<UploadIntentEvidenceProjection, "artifactExpiresAt">;
+}
+
+export interface EvidenceSearchApiPayload {
+  readonly cursor?: string;
+  readonly limit: number;
+}
+
+export interface EvidenceDownloadIntentApiPayload {
+  readonly evidenceId: string;
+  readonly expectedRevision: number;
 }
 
 /**
@@ -60,14 +76,26 @@ export type LegalHoldApprovalApiPayload = Omit<ExactVersionLegalHoldApprovalRequ
 
 export interface TenantApiRequestRuntime {
   readonly authentication: ApiAuthenticationDependencies;
+  /** Required by every state/capability-producing API route; absence fails closed. */
+  readonly recordApiAudit?: (record: HostedApiAuditRecord) => Promise<RecordedHostedApiAudit>;
   readonly issueUploadIntent?: (
     request: AuthorizedApiRequest,
     payload: UploadIntentApiPayload,
   ) => Promise<IssuedPresignedUpload>;
+  readonly listEvidence?: (
+    request: AuthorizedApiRequest,
+    payload: EvidenceSearchApiPayload,
+  ) => Promise<EvidenceListPage>;
+  readonly issueEvidenceDownload?: (
+    request: AuthorizedApiRequest,
+    payload: EvidenceDownloadIntentApiPayload,
+  ) => Promise<IssuedEvidenceDownload>;
+  /** Must commit the transition and its API audit outbox row atomically. */
   readonly requestLegalHold?: (
     request: AuthorizedApiRequest,
     payload: LegalHoldRequestApiPayload,
   ) => Promise<RequestedExactVersionLegalHold>;
+  /** Must commit the approval and its API audit outbox row atomically. */
   readonly approveLegalHold?: (
     request: AuthorizedApiRequest,
     payload: LegalHoldApprovalApiPayload,
@@ -90,6 +118,9 @@ const uploadBodyKeys = Object.freeze([
   "controlId",
   "description",
   "deviceId",
+  "deviceManifest",
+  "devicePublicKeySpki",
+  "deviceSignature",
   "evidenceId",
   "evidenceType",
   "expectedSha256",
@@ -100,6 +131,8 @@ const uploadBodyKeys = Object.freeze([
   "systemName",
   "title",
 ] as const);
+const evidenceSearchBodyKeys = Object.freeze(["cursor", "limit"] as const);
+const evidenceDownloadBodyKeys = Object.freeze(["evidenceId", "expectedRevision"] as const);
 const legalHoldRequestBodyKeys = Object.freeze([
   "bucket",
   "changedAt",
@@ -194,6 +227,9 @@ function parseUploadBody(body: string | null | undefined, headers: Readonly<Reco
     expectedSha256: stringField(value.expectedSha256),
     expectedSize: value.expectedSize as number,
     contentType: stringField(value.contentType),
+    deviceManifest: value.deviceManifest as DeviceUploadManifest,
+    devicePublicKeySpki: stringField(value.devicePublicKeySpki),
+    deviceSignature: stringField(value.deviceSignature),
     evidence: Object.freeze({
       deviceId: stringField(value.deviceId),
       assessmentId: stringField(value.assessmentId),
@@ -206,6 +242,26 @@ function parseUploadBody(body: string | null | undefined, headers: Readonly<Reco
       metadata: value.metadata as JsonValue,
     }),
   });
+}
+
+function parseEvidenceSearchBody(body: string | null | undefined, headers: Readonly<Record<string, string>>): EvidenceSearchApiPayload {
+  const value = parseJsonBody(body, headers, evidenceSearchBodyKeys, "Evidence search");
+  if (!Number.isSafeInteger(value.limit) || (value.cursor !== null && typeof value.cursor !== "string")) {
+    throw new TenantSecurityError("INVALID_IDENTIFIER", "Evidence search fields are invalid.");
+  }
+  const cursor = typeof value.cursor === "string" ? value.cursor : undefined;
+  if (cursor !== undefined && (cursor.length < 80 || cursor.length > 1_500 || /\p{Cc}/u.test(cursor))) {
+    throw new TenantSecurityError("INVALID_IDENTIFIER", "Evidence search cursor is invalid.");
+  }
+  return Object.freeze({ limit: value.limit as number, ...(cursor ? { cursor } : {}) });
+}
+
+function parseEvidenceDownloadBody(body: string | null | undefined, headers: Readonly<Record<string, string>>): EvidenceDownloadIntentApiPayload {
+  const value = parseJsonBody(body, headers, evidenceDownloadBodyKeys, "Evidence download intent");
+  if (!Number.isSafeInteger(value.expectedRevision)) {
+    throw new TenantSecurityError("INVALID_IDENTIFIER", "Expected evidence revision is invalid.");
+  }
+  return Object.freeze({ evidenceId: stringField(value.evidenceId), expectedRevision: value.expectedRevision as number });
 }
 
 function parseLegalHoldRequestBody(body: string | null | undefined, headers: Readonly<Record<string, string>>): LegalHoldRequestApiPayload {
@@ -365,11 +421,11 @@ export function createTenantApiHandler(options: TenantApiHandlerOptions): (event
       let response: Response;
       if (path === "/health" && method === "GET") {
         response = jsonResponse({ status: "ok" });
-      } else if (path === "/v1/me" && method === "GET") {
+      } else if ((path === "/v1/me" || path === "/v1/collector/me") && method === "GET") {
         const runtime = options.createRequestRuntime(envelope.v2.requestContext.requestId);
         response = await handleAuthorizedApiRequest(
           envelope.v2,
-          "evidence:read",
+          path === "/v1/collector/me" ? "evidence:collect" : "evidence:read",
           runtime.authentication,
           async ({ actor, identity }) => jsonResponse({
             tenantId: actor.tenantId,
@@ -389,17 +445,116 @@ export function createTenantApiHandler(options: TenantApiHandlerOptions): (event
           runtime.authentication,
           async (request) => {
             const payload = parseUploadBody(event.body, envelope.headers);
-            if (!runtime.issueUploadIntent) throw new Error("Upload-intent runtime is not configured for this route.");
+            if (!runtime.issueUploadIntent || !runtime.recordApiAudit) throw new Error("Upload-intent runtime is not configured for this route.");
             const issued = await runtime.issueUploadIntent(request, payload);
+            await runtime.recordApiAudit({
+              action: "evidence.upload_intent_issued",
+              actor: request.actor,
+              requestId: request.requestId,
+              resourceType: "evidence",
+              resourceId: issued.intent.resourceId,
+              idempotencyKey: `upload-intent:${issued.intent.id}`,
+              details: {
+                uploadIntentId: issued.intent.id,
+                controlId: issued.intent.controlId,
+                checksumSha256: issued.intent.expectedSha256,
+                expectedSize: issued.intent.expectedSize,
+                contentType: issued.intent.contentType,
+              },
+            });
             return jsonResponse({
               uploadIntentId: issued.intent.id,
               evidenceId: issued.intent.resourceId,
               expiresAt: issued.intent.expiresAt,
-              nonce: issued.nonce,
               upload: {
                 method: issued.upload.method,
                 url: issued.upload.url,
                 requiredHeaders: issued.upload.requiredHeaders,
+              },
+            }, 201);
+          },
+          options.onInternalError,
+        );
+      } else if (path === "/v1/evidence/search" && method === "POST") {
+        const runtime = options.createRequestRuntime(envelope.v2.requestContext.requestId);
+        response = await handleAuthorizedApiRequest(
+          envelope.v2,
+          "evidence:read",
+          runtime.authentication,
+          async (request) => {
+            if (!runtime.listEvidence || !runtime.recordApiAudit) throw new Error("Evidence-list runtime is not configured for this route.");
+            const payload = parseEvidenceSearchBody(event.body, envelope.headers);
+            const page = await runtime.listEvidence(request, payload);
+            await runtime.recordApiAudit({
+              action: "evidence.search_performed",
+              actor: request.actor,
+              requestId: request.requestId,
+              resourceType: "evidence_collection",
+              resourceId: request.actor.tenantId,
+              idempotencyKey: `evidence-search:${request.requestId}`,
+              details: {
+                requestedLimit: payload.limit,
+                cursorPresented: payload.cursor !== undefined,
+                resultCount: page.items.length,
+                hasNextPage: page.nextCursor !== undefined,
+              },
+            });
+            return jsonResponse({
+              items: page.items.map((item) => ({
+                evidenceId: item.evidenceId,
+                controlId: item.controlId,
+                title: item.title,
+                description: item.description,
+                evidenceType: item.evidenceType,
+                source: item.source,
+                systemName: item.systemName,
+                status: item.status,
+                revision: item.revision,
+                contentType: item.contentType,
+                byteSize: item.byteSize,
+                checksumSha256: item.checksumSha256,
+                capturedAt: item.capturedAt,
+                retainUntil: item.retainUntil,
+              })),
+              nextCursor: page.nextCursor ?? null,
+            });
+          },
+          options.onInternalError,
+        );
+      } else if (path === "/v1/evidence-download-intents" && method === "POST") {
+        const runtime = options.createRequestRuntime(envelope.v2.requestContext.requestId);
+        response = await handleAuthorizedApiRequest(
+          envelope.v2,
+          "evidence:read",
+          runtime.authentication,
+          async (request) => {
+            if (!runtime.issueEvidenceDownload || !runtime.recordApiAudit) throw new Error("Evidence-download runtime is not configured for this route.");
+            const issued = await runtime.issueEvidenceDownload(request, parseEvidenceDownloadBody(event.body, envelope.headers));
+            await runtime.recordApiAudit({
+              action: "evidence.download_intent_issued",
+              actor: request.actor,
+              requestId: request.requestId,
+              resourceType: "evidence",
+              resourceId: issued.evidence.evidenceId,
+              idempotencyKey: `evidence-download:${request.requestId}`,
+              details: {
+                revision: issued.evidence.revision,
+                checksumSha256: issued.evidence.checksumSha256,
+                expectedSize: issued.evidence.byteSize,
+                contentType: issued.evidence.contentType,
+              },
+            });
+            return jsonResponse({
+              evidenceId: issued.evidence.evidenceId,
+              revision: issued.evidence.revision,
+              expectedSize: issued.evidence.byteSize,
+              expectedSha256: issued.evidence.checksumSha256,
+              contentType: issued.evidence.contentType,
+              expiresAt: issued.download.expiresAt,
+              download: {
+                method: issued.download.method,
+                url: issued.download.url,
+                requiredHeaders: issued.download.requiredHeaders,
               },
             }, 201);
           },
@@ -444,7 +599,10 @@ export function createTenantApiHandler(options: TenantApiHandlerOptions): (event
       } else if ([
         "/health",
         "/v1/me",
+        "/v1/collector/me",
         "/v1/upload-intents",
+        "/v1/evidence/search",
+        "/v1/evidence-download-intents",
         "/v1/legal-hold-requests",
         "/v1/legal-hold-approvals",
       ].includes(path)) {

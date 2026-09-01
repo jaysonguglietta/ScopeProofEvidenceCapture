@@ -106,21 +106,29 @@ final class LocalEvidenceIndex: @unchecked Sendable {
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """
                 for entry in entries {
+                    guard let artifact = try? ValidatedEvidenceArtifact.loadForLegacyBrowsing(
+                        entry, requireLifecycle: false
+                    ) else { continue }
+                    let manifest = artifact.manifest
                     let lifecycle = entry.lifecycle
-                    let valid = EvidenceLifecycleStore.verify(lifecycle, artifactSha256: entry.manifest.sha256)
-                    let tags = lifecycle.tags.isEmpty ? (entry.manifest.tags ?? []) : lifecycle.tags
+                    let valid = artifact.provenanceVerified && EvidenceLifecycleStore.verify(
+                        lifecycle, artifactSha256: manifest.sha256,
+                        provenanceKeyID: manifest.provenance?.keyID
+                    )
+                    let tags = lifecycle.tags.isEmpty ? (manifest.tags ?? []) : lifecycle.tags
                     let tagsJSON = String(data: try JSONEncoder().encode(tags), encoding: .utf8) ?? "[]"
                     try withStatementUnlocked(sql) { statement in
                         let values: [SQLiteValue] = [
-                            .text(entry.manifest.evidenceID), .text(entry.manifest.capturedAt), .text(entry.manifest.localTimestamp),
-                            .text(entry.manifest.complianceArea ?? "PCI DSS 4.0.1"), .text(entry.manifest.controlID),
-                            .text(entry.manifest.controlTitle ?? ""), .text(entry.manifest.title), .text(entry.manifest.system),
-                            .text(entry.manifest.environment), .text(entry.manifest.assessmentPeriod),
-                            .text(lifecycle.owner.isEmpty ? (entry.manifest.evidenceOwner ?? "") : lifecycle.owner),
+                            .text(manifest.evidenceID), .text(manifest.capturedAt), .text(manifest.localTimestamp),
+                            .text(manifest.complianceArea ?? "PCI DSS 4.0.1"), .text(manifest.controlID),
+                            .text(manifest.controlTitle ?? ""), .text(manifest.title), .text(manifest.system),
+                            .text(manifest.environment), .text(manifest.assessmentPeriod),
+                            .text(lifecycle.owner.isEmpty ? (manifest.evidenceOwner ?? "") : lifecycle.owner),
                             .text(lifecycle.reviewer), .text(lifecycle.status.rawValue), .text(lifecycle.reviewNotes),
-                            .text(tagsJSON), entry.manifest.jiraIssueKey.map(SQLiteValue.text) ?? .null,
-                            entry.manifest.sourceURL.map(SQLiteValue.text) ?? .null,
-                            .text(entry.manifest.safetyStatus), .text(entry.manifest.sha256), .integer(entry.isUploaded ? 1 : 0),
+                            .text(tagsJSON), manifest.jiraIssueKey.map(SQLiteValue.text) ?? .null,
+                            manifest.sourceURL.map(SQLiteValue.text) ?? .null,
+                            .text(artifact.provenanceVerified ? manifest.safetyStatus : "Legacy unsigned · browsing only"),
+                            .text(manifest.sha256), .integer(entry.isUploaded && artifact.provenanceVerified ? 1 : 0),
                             .integer(valid ? 1 : 0), .text(entry.manifestURL.path), .text(entry.imageURL.path),
                             .text(ISO8601DateFormatter().string(from: Date())),
                         ]

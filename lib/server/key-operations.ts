@@ -3,9 +3,10 @@ import { executeAuditedBatch } from "./audit";
 import { activeEvidenceKeyId, availableAuditKeyIds, availableEvidenceKeyIds, decryptEvidence, decryptSecret, encryptEvidence, encryptSecret, rotatingSecretKeyring, stableJson } from "./crypto";
 import { getEnv } from "./env";
 
-type EvidenceKeyRow = { id: string; control_id: string; source: string; captured_at: string; r2_key: string; encryption_iv: string; encryption_key_id: string; sha256: string };
-type PackageKeyRow = { id: string; r2_key: string; encryption_key_id: string; sha256: string };
+type EvidenceKeyRow = { id: string; control_id: string; source: string; captured_at: string; r2_key: string; encryption_iv: string; encryption_key_id: string; sha256: string; expires_at: string };
+type PackageKeyRow = { id: string; r2_key: string; encryption_key_id: string; sha256: string; expires_at: string };
 type JiraKeyRow = { id: string; user_id: string; access_token_ciphertext: string; access_token_iv: string; refresh_token_ciphertext: string; refresh_token_iv: string; token_key_id: string; token_version: number };
+const ROTATION_LEASE_MS = 5 * 60_000;
 
 function jiraAad(id: string, userId: string, kind: "access" | "refresh"): string {
   return stableJson({ purpose: "jira-oauth-token", version: 1, connectionId: id, userId, kind });
@@ -13,55 +14,114 @@ function jiraAad(id: string, userId: string, kind: "access" | "refresh"): string
 
 async function rotateEvidenceObject(row: EvidenceKeyRow, actor: AuthenticatedUser): Promise<boolean> {
   const env = getEnv();
-  const object = await env.EVIDENCE_BUCKET.get(row.r2_key);
-  if (!object) throw new Error(`Encrypted evidence object ${row.id} is missing during key rotation.`);
-  const aad = stableJson({ id: row.id, controlId: row.control_id, source: row.source, capturedAt: row.captured_at });
-  const plain = await decryptEvidence(new Uint8Array(await object.arrayBuffer()), row.encryption_iv, aad, row.encryption_key_id);
-  const encrypted = await encryptEvidence(plain, aad);
+  const now = new Date();
+  const nowISO = now.toISOString();
+  const leaseId = crypto.randomUUID();
+  const leaseExpiresAt = new Date(now.getTime() + ROTATION_LEASE_MS).toISOString();
   const nextKey = `${row.r2_key}.rekey-${crypto.randomUUID()}`;
-  await env.EVIDENCE_BUCKET.put(nextKey, encrypted.ciphertext, {
-    httpMetadata: object.httpMetadata,
-    customMetadata: { ...(object.customMetadata || {}), evidenceId: row.id, sha256: row.sha256, encryptionVersion: "2", encryptionKeyId: encrypted.keyId },
-  });
+  const claim = await env.DB.prepare(`UPDATE evidence_artifacts SET rotation_lease_id = ?, rotation_lease_expires_at = ?, rotation_pending_r2_key = ?
+    WHERE id = ? AND r2_key = ? AND encryption_key_id = ? AND status NOT IN ('expired', 'purged') AND expires_at > ?
+      AND rotation_pending_r2_key IS NULL AND (rotation_lease_id IS NULL OR rotation_lease_expires_at <= ?)`)
+    .bind(leaseId, leaseExpiresAt, nextKey, row.id, row.r2_key, row.encryption_key_id, nowISO, nowISO).run();
+  if (!claim.meta.changes) return false;
+  const releaseClaim = async () => {
+    await env.DB.prepare("UPDATE evidence_artifacts SET rotation_lease_id = NULL, rotation_lease_expires_at = NULL, rotation_pending_r2_key = NULL WHERE id = ? AND rotation_lease_id = ? AND rotation_pending_r2_key = ?")
+      .bind(row.id, leaseId, nextKey).run();
+  };
+  const object = await env.EVIDENCE_BUCKET.get(row.r2_key);
+  if (!object) { await releaseClaim(); throw new Error(`Encrypted evidence object ${row.id} is missing during key rotation.`); }
+  const aad = stableJson({ id: row.id, controlId: row.control_id, source: row.source, capturedAt: row.captured_at });
+  let encrypted: Awaited<ReturnType<typeof encryptEvidence>>;
   try {
-    const [updated] = await executeAuditedBatch(actor, "key.evidence_rotated", "evidence", row.id, { previousKeyId: row.encryption_key_id, activeKeyId: encrypted.keyId }, [
-      env.DB.prepare("UPDATE evidence_artifacts SET r2_key = ?, encryption_iv = ?, encryption_version = 2, encryption_key_id = ? WHERE id = ? AND r2_key = ? AND encryption_key_id = ?").bind(nextKey, encrypted.iv, encrypted.keyId, row.id, row.r2_key, row.encryption_key_id),
-    ], { sql: "EXISTS (SELECT 1 FROM evidence_artifacts WHERE id = ? AND r2_key = ? AND encryption_key_id = ?)", bindings: [row.id, nextKey, encrypted.keyId] });
-    if (!updated.meta.changes) { await env.EVIDENCE_BUCKET.delete(nextKey); return false; }
+    const plain = await decryptEvidence(new Uint8Array(await object.arrayBuffer()), row.encryption_iv, aad, row.encryption_key_id);
+    encrypted = await encryptEvidence(plain, aad);
+    await env.EVIDENCE_BUCKET.put(nextKey, encrypted.ciphertext, {
+      httpMetadata: object.httpMetadata,
+      customMetadata: { ...(object.customMetadata || {}), evidenceId: row.id, sha256: row.sha256, encryptionVersion: "2", encryptionKeyId: encrypted.keyId },
+    });
   } catch (error) {
-    await env.EVIDENCE_BUCKET.delete(nextKey);
+    await env.EVIDENCE_BUCKET.delete(nextKey).catch(() => undefined);
+    await releaseClaim();
     throw error;
   }
-  try { await env.EVIDENCE_BUCKET.delete(row.r2_key); }
-  catch (error) { console.error("scopeproof_rekey_old_object_delete_failure", { type: "evidence", id: row.id, key: row.r2_key, error: String(error) }); }
+  try {
+    const [updated] = await executeAuditedBatch(actor, "key.evidence_rotated", "evidence", row.id, { previousKeyId: row.encryption_key_id, activeKeyId: encrypted.keyId }, [
+      env.DB.prepare(`UPDATE evidence_artifacts SET r2_key = ?, encryption_iv = ?, encryption_version = 2, encryption_key_id = ?,
+        rotation_previous_r2_key = ?, rotation_pending_r2_key = NULL, rotation_lease_id = NULL, rotation_lease_expires_at = NULL
+        WHERE id = ? AND r2_key = ? AND encryption_key_id = ? AND rotation_lease_id = ? AND rotation_pending_r2_key = ?
+          AND status NOT IN ('expired', 'purged') AND expires_at > ?`)
+        .bind(nextKey, encrypted.iv, encrypted.keyId, row.r2_key, row.id, row.r2_key, row.encryption_key_id, leaseId, nextKey, new Date().toISOString()),
+    ], { sql: "EXISTS (SELECT 1 FROM evidence_artifacts WHERE id = ? AND r2_key = ? AND encryption_key_id = ?)", bindings: [row.id, nextKey, encrypted.keyId] });
+    if (!updated.meta.changes) { await env.EVIDENCE_BUCKET.delete(nextKey); await releaseClaim(); return false; }
+  } catch (error) {
+    await env.EVIDENCE_BUCKET.delete(nextKey);
+    await releaseClaim();
+    throw error;
+  }
+  try {
+    await env.EVIDENCE_BUCKET.delete(row.r2_key);
+    await executeAuditedBatch(actor, "key.evidence_previous_object_deleted", "evidence", row.id, { previousKeyId: row.encryption_key_id }, [
+      env.DB.prepare("UPDATE evidence_artifacts SET rotation_previous_r2_key = NULL WHERE id = ? AND r2_key = ? AND rotation_previous_r2_key = ?")
+        .bind(row.id, nextKey, row.r2_key),
+    ], { sql: "EXISTS (SELECT 1 FROM evidence_artifacts WHERE id = ? AND r2_key = ? AND rotation_previous_r2_key IS NULL)", bindings: [row.id, nextKey] });
+  } catch (error) { console.error("scopeproof_rekey_old_object_delete_failure", { type: "evidence", id: row.id, error: String(error) }); }
   return true;
 }
 
 async function rotatePackageObject(row: PackageKeyRow, actor: AuthenticatedUser): Promise<boolean> {
   const env = getEnv();
+  const now = new Date();
+  const nowISO = now.toISOString();
+  const leaseId = crypto.randomUUID();
+  const leaseExpiresAt = new Date(now.getTime() + ROTATION_LEASE_MS).toISOString();
+  const nextKey = `${row.r2_key}.rekey-${crypto.randomUUID()}`;
+  const claim = await env.DB.prepare(`UPDATE export_packages SET rotation_lease_id = ?, rotation_lease_expires_at = ?, rotation_pending_r2_key = ?
+    WHERE id = ? AND r2_key = ? AND encryption_key_id = ? AND status = 'ready' AND expires_at > ?
+      AND rotation_pending_r2_key IS NULL AND (rotation_lease_id IS NULL OR rotation_lease_expires_at <= ?)`)
+    .bind(leaseId, leaseExpiresAt, nextKey, row.id, row.r2_key, row.encryption_key_id, nowISO, nowISO).run();
+  if (!claim.meta.changes) return false;
+  const releaseClaim = async () => {
+    await env.DB.prepare("UPDATE export_packages SET rotation_lease_id = NULL, rotation_lease_expires_at = NULL, rotation_pending_r2_key = NULL WHERE id = ? AND rotation_lease_id = ? AND rotation_pending_r2_key = ?")
+      .bind(row.id, leaseId, nextKey).run();
+  };
   const object = await env.EVIDENCE_BUCKET.get(row.r2_key);
-  if (!object) throw new Error(`Encrypted package object ${row.id} is missing during key rotation.`);
+  if (!object) { await releaseClaim(); throw new Error(`Encrypted package object ${row.id} is missing during key rotation.`); }
   const aad = stableJson({ id: row.id, type: "assessor_package" });
   const iv = object.customMetadata?.encryptionIv;
-  if (!iv) throw new Error(`Encrypted package ${row.id} is missing its IV.`);
-  const plain = await decryptEvidence(new Uint8Array(await object.arrayBuffer()), iv, aad, row.encryption_key_id);
-  const encrypted = await encryptEvidence(plain, aad);
-  const nextKey = `${row.r2_key}.rekey-${crypto.randomUUID()}`;
-  await env.EVIDENCE_BUCKET.put(nextKey, encrypted.ciphertext, {
-    httpMetadata: object.httpMetadata,
-    customMetadata: { ...(object.customMetadata || {}), packageId: row.id, sha256: row.sha256, encryptionIv: encrypted.iv, encryptionVersion: "2", encryptionKeyId: encrypted.keyId },
-  });
+  if (!iv) { await releaseClaim(); throw new Error(`Encrypted package ${row.id} is missing its IV.`); }
+  let encrypted: Awaited<ReturnType<typeof encryptEvidence>>;
   try {
-    const [updated] = await executeAuditedBatch(actor, "key.package_rotated", "export_package", row.id, { previousKeyId: row.encryption_key_id, activeKeyId: encrypted.keyId }, [
-      env.DB.prepare("UPDATE export_packages SET r2_key = ?, encryption_key_id = ? WHERE id = ? AND r2_key = ? AND encryption_key_id = ?").bind(nextKey, encrypted.keyId, row.id, row.r2_key, row.encryption_key_id),
-    ], { sql: "EXISTS (SELECT 1 FROM export_packages WHERE id = ? AND r2_key = ? AND encryption_key_id = ?)", bindings: [row.id, nextKey, encrypted.keyId] });
-    if (!updated.meta.changes) { await env.EVIDENCE_BUCKET.delete(nextKey); return false; }
+    const plain = await decryptEvidence(new Uint8Array(await object.arrayBuffer()), iv, aad, row.encryption_key_id);
+    encrypted = await encryptEvidence(plain, aad);
+    await env.EVIDENCE_BUCKET.put(nextKey, encrypted.ciphertext, {
+      httpMetadata: object.httpMetadata,
+      customMetadata: { ...(object.customMetadata || {}), packageId: row.id, sha256: row.sha256, encryptionIv: encrypted.iv, encryptionVersion: "2", encryptionKeyId: encrypted.keyId },
+    });
   } catch (error) {
-    await env.EVIDENCE_BUCKET.delete(nextKey);
+    await env.EVIDENCE_BUCKET.delete(nextKey).catch(() => undefined);
+    await releaseClaim();
     throw error;
   }
-  try { await env.EVIDENCE_BUCKET.delete(row.r2_key); }
-  catch (error) { console.error("scopeproof_rekey_old_object_delete_failure", { type: "package", id: row.id, key: row.r2_key, error: String(error) }); }
+  try {
+    const [updated] = await executeAuditedBatch(actor, "key.package_rotated", "export_package", row.id, { previousKeyId: row.encryption_key_id, activeKeyId: encrypted.keyId }, [
+      env.DB.prepare(`UPDATE export_packages SET r2_key = ?, encryption_key_id = ?, rotation_previous_r2_key = ?,
+        rotation_pending_r2_key = NULL, rotation_lease_id = NULL, rotation_lease_expires_at = NULL
+        WHERE id = ? AND r2_key = ? AND encryption_key_id = ? AND rotation_lease_id = ? AND rotation_pending_r2_key = ? AND status = 'ready' AND expires_at > ?`)
+        .bind(nextKey, encrypted.keyId, row.r2_key, row.id, row.r2_key, row.encryption_key_id, leaseId, nextKey, new Date().toISOString()),
+    ], { sql: "EXISTS (SELECT 1 FROM export_packages WHERE id = ? AND r2_key = ? AND encryption_key_id = ?)", bindings: [row.id, nextKey, encrypted.keyId] });
+    if (!updated.meta.changes) { await env.EVIDENCE_BUCKET.delete(nextKey); await releaseClaim(); return false; }
+  } catch (error) {
+    await env.EVIDENCE_BUCKET.delete(nextKey);
+    await releaseClaim();
+    throw error;
+  }
+  try {
+    await env.EVIDENCE_BUCKET.delete(row.r2_key);
+    await executeAuditedBatch(actor, "key.package_previous_object_deleted", "export_package", row.id, { previousKeyId: row.encryption_key_id }, [
+      env.DB.prepare("UPDATE export_packages SET rotation_previous_r2_key = NULL WHERE id = ? AND r2_key = ? AND rotation_previous_r2_key = ?")
+        .bind(row.id, nextKey, row.r2_key),
+    ], { sql: "EXISTS (SELECT 1 FROM export_packages WHERE id = ? AND r2_key = ? AND rotation_previous_r2_key IS NULL)", bindings: [row.id, nextKey] });
+  } catch (error) { console.error("scopeproof_rekey_old_object_delete_failure", { type: "package", id: row.id, error: String(error) }); }
   return true;
 }
 
@@ -82,15 +142,62 @@ async function rotateJiraToken(row: JiraKeyRow, actor: AuthenticatedUser): Promi
   return Boolean(updated.meta.changes);
 }
 
+async function reconcileRotationGarbage(actor: AuthenticatedUser, limit: number): Promise<void> {
+  const env = getEnv();
+  const now = new Date().toISOString();
+  const evidence = (await env.DB.prepare(`SELECT id, r2_key, rotation_pending_r2_key, rotation_previous_r2_key FROM evidence_artifacts
+    WHERE (rotation_pending_r2_key IS NOT NULL OR rotation_previous_r2_key IS NOT NULL)
+      AND (rotation_lease_id IS NULL OR rotation_lease_expires_at <= ?) ORDER BY created_at LIMIT ?`)
+    .bind(now, limit).all<{ id: string; r2_key: string; rotation_pending_r2_key: string | null; rotation_previous_r2_key: string | null }>()).results;
+  for (const row of evidence) {
+    const garbage = [...new Set([row.rotation_pending_r2_key, row.rotation_previous_r2_key].filter((key): key is string => Boolean(key) && key !== row.r2_key))];
+    try {
+      for (const key of garbage) await env.EVIDENCE_BUCKET.delete(key);
+      await executeAuditedBatch(actor, "key.evidence_rotation_reconciled", "evidence", row.id, { deletedObjectCount: garbage.length }, [
+        env.DB.prepare(`UPDATE evidence_artifacts SET rotation_pending_r2_key = NULL, rotation_previous_r2_key = NULL,
+          rotation_lease_id = NULL, rotation_lease_expires_at = NULL
+          WHERE id = ? AND (rotation_lease_id IS NULL OR rotation_lease_expires_at <= ?)`)
+          .bind(row.id, now),
+      ], { sql: "EXISTS (SELECT 1 FROM evidence_artifacts WHERE id = ? AND rotation_pending_r2_key IS NULL AND rotation_previous_r2_key IS NULL)", bindings: [row.id] });
+    } catch (error) { console.error("scopeproof_rekey_reconciliation_failure", { type: "evidence", id: row.id, error: String(error) }); }
+  }
+  const packages = (await env.DB.prepare(`SELECT id, r2_key, rotation_pending_r2_key, rotation_previous_r2_key FROM export_packages
+    WHERE (rotation_pending_r2_key IS NOT NULL OR rotation_previous_r2_key IS NOT NULL)
+      AND (rotation_lease_id IS NULL OR rotation_lease_expires_at <= ?) ORDER BY created_at LIMIT ?`)
+    .bind(now, limit).all<{ id: string; r2_key: string; rotation_pending_r2_key: string | null; rotation_previous_r2_key: string | null }>()).results;
+  for (const row of packages) {
+    const garbage = [...new Set([row.rotation_pending_r2_key, row.rotation_previous_r2_key].filter((key): key is string => Boolean(key) && key !== row.r2_key))];
+    try {
+      for (const key of garbage) await env.EVIDENCE_BUCKET.delete(key);
+      await executeAuditedBatch(actor, "key.package_rotation_reconciled", "export_package", row.id, { deletedObjectCount: garbage.length }, [
+        env.DB.prepare(`UPDATE export_packages SET rotation_pending_r2_key = NULL, rotation_previous_r2_key = NULL,
+          rotation_lease_id = NULL, rotation_lease_expires_at = NULL
+          WHERE id = ? AND (rotation_lease_id IS NULL OR rotation_lease_expires_at <= ?)`)
+          .bind(row.id, now),
+      ], { sql: "EXISTS (SELECT 1 FROM export_packages WHERE id = ? AND rotation_pending_r2_key IS NULL AND rotation_previous_r2_key IS NULL)", bindings: [row.id] });
+    } catch (error) { console.error("scopeproof_rekey_reconciliation_failure", { type: "package", id: row.id, error: String(error) }); }
+  }
+}
+
 export async function rotateStoredKeys(actor: AuthenticatedUser, limit = 10): Promise<{ evidence: number; packages: number; jiraConnections: number; remaining: number }> {
   const env = getEnv();
   const boundedLimit = Math.min(Math.max(Math.floor(limit), 1), 25);
+  await reconcileRotationGarbage(actor, boundedLimit);
   const activeEvidence = activeEvidenceKeyId();
-  const evidence = (await env.DB.prepare("SELECT id, control_id, source, captured_at, r2_key, encryption_iv, encryption_key_id, sha256 FROM evidence_artifacts WHERE status != 'purged' AND encryption_key_id != ? ORDER BY created_at LIMIT ?").bind(activeEvidence, boundedLimit).all<EvidenceKeyRow>()).results;
+  const now = new Date().toISOString();
+  const evidence = (await env.DB.prepare(`SELECT id, control_id, source, captured_at, r2_key, encryption_iv, encryption_key_id, sha256, expires_at FROM evidence_artifacts
+    WHERE status NOT IN ('expired', 'purged') AND expires_at > ? AND encryption_key_id != ?
+      AND rotation_pending_r2_key IS NULL AND rotation_previous_r2_key IS NULL
+      AND (rotation_lease_id IS NULL OR rotation_lease_expires_at <= ?) ORDER BY created_at LIMIT ?`)
+    .bind(now, activeEvidence, now, boundedLimit).all<EvidenceKeyRow>()).results;
   let evidenceRotated = 0;
   for (const row of evidence) if (await rotateEvidenceObject(row, actor)) evidenceRotated += 1;
   let budget = boundedLimit - evidence.length;
-  const packages = budget > 0 ? (await env.DB.prepare("SELECT id, r2_key, encryption_key_id, sha256 FROM export_packages WHERE status = 'ready' AND r2_key IS NOT NULL AND encryption_key_id != ? ORDER BY created_at LIMIT ?").bind(activeEvidence, budget).all<PackageKeyRow>()).results : [];
+  const packages = budget > 0 ? (await env.DB.prepare(`SELECT id, r2_key, encryption_key_id, sha256, expires_at FROM export_packages
+    WHERE status = 'ready' AND expires_at > ? AND r2_key IS NOT NULL AND encryption_key_id != ?
+      AND rotation_pending_r2_key IS NULL AND rotation_previous_r2_key IS NULL
+      AND (rotation_lease_id IS NULL OR rotation_lease_expires_at <= ?) ORDER BY created_at LIMIT ?`)
+    .bind(now, activeEvidence, now, budget).all<PackageKeyRow>()).results : [];
   let packagesRotated = 0;
   for (const row of packages) if (await rotatePackageObject(row, actor)) packagesRotated += 1;
   budget -= packages.length;
@@ -111,7 +218,9 @@ export async function keyRotationBacklog(): Promise<number> {
   const row = await env.DB.prepare(`SELECT
       (SELECT COUNT(*) FROM evidence_artifacts WHERE status != 'purged' AND encryption_key_id != ?) +
       (SELECT COUNT(*) FROM export_packages WHERE status = 'ready' AND r2_key IS NOT NULL AND encryption_key_id != ?) +
-      (SELECT COUNT(*) FROM jira_connections WHERE token_key_id != ?) AS count`).bind(activeEvidence, activeEvidence, jiraRing?.activeId || "legacy-v1").first<{ count: number }>();
+      (SELECT COUNT(*) FROM jira_connections WHERE token_key_id != ?) +
+      (SELECT COUNT(*) FROM evidence_artifacts WHERE rotation_pending_r2_key IS NOT NULL OR rotation_previous_r2_key IS NOT NULL) +
+      (SELECT COUNT(*) FROM export_packages WHERE rotation_pending_r2_key IS NOT NULL OR rotation_previous_r2_key IS NOT NULL) AS count`).bind(activeEvidence, activeEvidence, jiraRing?.activeId || "legacy-v1").first<{ count: number }>();
   return Number(row?.count || 0);
 }
 

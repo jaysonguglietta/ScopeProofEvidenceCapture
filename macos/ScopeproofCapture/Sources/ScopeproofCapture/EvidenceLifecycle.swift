@@ -27,6 +27,7 @@ struct EvidenceLifecycleEvent: Codable, Sendable {
     let safetyScanPolicy: String
     let previousHash: String
     let eventHash: String
+    var provenance: LocalProvenanceSignature?
 }
 
 struct EvidenceLifecycleRecord: Codable, Sendable {
@@ -60,22 +61,48 @@ enum EvidenceLifecycleStore {
 
     static func load(for entry: CaptureHistoryEntry) -> EvidenceLifecycleRecord {
         let sidecar = url(for: entry.manifestURL)
-        guard let data = try? Data(contentsOf: sidecar),
+        let root = entry.evidenceRoot ?? entry.manifestURL.deletingLastPathComponent()
+        guard let data = try? ValidatedEvidenceArtifact.readBoundedRegularFile(
+                at: sidecar, within: root,
+                maximumBytes: ValidatedEvidenceArtifact.maximumSidecarBytes
+              ),
               let record = try? JSONDecoder().decode(EvidenceLifecycleRecord.self, from: data),
               record.evidenceID == entry.manifest.evidenceID,
-              verify(record, artifactSha256: entry.manifest.sha256) else {
+              verify(
+                record, artifactSha256: entry.manifest.sha256,
+                provenanceKeyID: entry.manifest.provenance?.keyID
+              ) else {
             return EvidenceLifecycleRecord(schemaVersion: 0, evidenceID: entry.manifest.evidenceID, events: [])
         }
         return record
     }
 
     @discardableResult
-    static func update(entry: CaptureHistoryEntry, status: EvidenceReviewStatus, owner: String, reviewer: String, notes: String, tags: [String], supersedesEvidenceID: String? = nil) throws -> EvidenceLifecycleRecord {
+    static func update(
+        entry: CaptureHistoryEntry, status: EvidenceReviewStatus, owner: String,
+        reviewer: String, notes: String, tags: [String],
+        supersedesEvidenceID: String? = nil,
+        privateKeyDataOverride: Data? = nil,
+        trustedAnchor: LocalCaptureChainAnchor? = nil
+    ) throws -> EvidenceLifecycleRecord {
+        // Lifecycle decisions are trust-bearing. Legacy schema-6 artifacts remain
+        // browseable for migration, but cannot acquire a new review history.
+        _ = try ValidatedEvidenceArtifact.load(
+            entry, requireLifecycle: false, trustedAnchor: trustedAnchor
+        )
         let sidecar = url(for: entry.manifestURL)
         let exists = FileManager.default.fileExists(atPath: sidecar.path)
         var record = load(for: entry)
-        if exists && !verify(record, artifactSha256: entry.manifest.sha256) { throw EvidenceLifecycleFailure.integrityFailure }
-        if !exists { record = EvidenceLifecycleRecord(schemaVersion: 2, evidenceID: entry.manifest.evidenceID, events: []) }
+        if exists && !verify(
+            record, artifactSha256: entry.manifest.sha256,
+            provenanceKeyID: entry.manifest.provenance?.keyID
+        ) { throw EvidenceLifecycleFailure.integrityFailure }
+        if !exists {
+            record = EvidenceLifecycleRecord(
+                schemaVersion: entry.manifest.schemaVersion >= 7 ? 3 : 2,
+                evidenceID: entry.manifest.evidenceID, events: []
+            )
+        }
         let now = ISO8601DateFormatter().string(from: Date())
         let cleanOwner = String(owner.trimmingCharacters(in: .whitespacesAndNewlines).prefix(160))
         let cleanReviewer = String((reviewer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? NSFullUserName() : reviewer.trimmingCharacters(in: .whitespacesAndNewlines)).prefix(160))
@@ -92,13 +119,26 @@ enum EvidenceLifecycleStore {
             artifactSha256: entry.manifest.sha256, policyVersion: policyVersion, safetyScanPolicy: safetyScanPolicy, previousHash: previousHash
         )
         let eventHash = digest(payload)
-        let event = EvidenceLifecycleEvent(
+        var event = EvidenceLifecycleEvent(
             sequence: sequence, occurredAt: now, actor: cleanReviewer, action: action, status: status, owner: cleanOwner, reviewer: cleanReviewer,
             reviewNotes: cleanNotes, tags: Array(cleanTags), supersedesEvidenceID: cleanSupersedes, artifactSha256: entry.manifest.sha256,
-            policyVersion: policyVersion, safetyScanPolicy: safetyScanPolicy, previousHash: previousHash, eventHash: eventHash
+            policyVersion: policyVersion, safetyScanPolicy: safetyScanPolicy,
+            previousHash: previousHash, eventHash: eventHash, provenance: nil
         )
-        record = EvidenceLifecycleRecord(schemaVersion: 2, evidenceID: record.evidenceID, events: record.events + [event])
-        guard verify(record, artifactSha256: entry.manifest.sha256) else { throw EvidenceLifecycleFailure.integrityFailure }
+        if record.schemaVersion == 3 {
+            event.provenance = try LocalProvenance.signLifecycleEvent(
+                event, evidenceID: record.evidenceID,
+                privateKeyData: privateKeyDataOverride
+            )
+        }
+        record = EvidenceLifecycleRecord(
+            schemaVersion: record.schemaVersion, evidenceID: record.evidenceID,
+            events: record.events + [event]
+        )
+        guard verify(
+            record, artifactSha256: entry.manifest.sha256,
+            provenanceKeyID: entry.manifest.provenance?.keyID
+        ) else { throw EvidenceLifecycleFailure.integrityFailure }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         try encoder.encode(record).write(to: sidecar, options: [.atomic, .completeFileProtection])
@@ -106,11 +146,15 @@ enum EvidenceLifecycleStore {
         return record
     }
 
-    static func verify(_ record: EvidenceLifecycleRecord, artifactSha256: String? = nil) -> Bool {
-        guard record.schemaVersion == 2, !record.events.isEmpty else { return false }
+    static func verify(
+        _ record: EvidenceLifecycleRecord, artifactSha256: String? = nil,
+        provenanceKeyID expectedProvenanceKeyID: String? = nil
+    ) -> Bool {
+        guard [2, 3].contains(record.schemaVersion), !record.events.isEmpty else { return false }
         var previous = "GENESIS"
         var previousOccurredAt: Date?
         var seenHashes = Set<String>()
+        var recordProvenanceKeyID: String?
         for (index, event) in record.events.enumerated() {
             guard event.sequence == index + 1, event.previousHash == previous, event.actor == event.reviewer,
                   event.action == "status.\(event.status.rawValue.lowercased().replacingOccurrences(of: " ", with: "_"))",
@@ -126,6 +170,15 @@ enum EvidenceLifecycleStore {
                 safetyScanPolicy: event.safetyScanPolicy, previousHash: event.previousHash
             )
             guard digest(payload) == event.eventHash else { return false }
+            if record.schemaVersion == 3 {
+                guard let eventKeyID = event.provenance?.keyID,
+                      expectedProvenanceKeyID.map({ $0 == eventKeyID }) ?? true,
+                      recordProvenanceKeyID.map({ $0 == eventKeyID }) ?? true,
+                      LocalProvenance.verifyLifecycleEvent(event, evidenceID: record.evidenceID) else { return false }
+                recordProvenanceKeyID = eventKeyID
+            } else if event.provenance != nil {
+                return false
+            }
             seenHashes.insert(event.eventHash)
             previous = event.eventHash
             previousOccurredAt = occurredAt

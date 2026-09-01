@@ -14,6 +14,7 @@ const valid = {
   ingestRole: "tenant_acme_ingest",
   controlRole: "tenant_acme_control",
   legalApiRole: "tenant_acme_legal_api",
+  readRole: "tenant_acme_read",
   awsAccountId: "123456789012",
   awsRegion: "us-east-1",
   quarantineBucket: "scopeproof-acme-quarantine",
@@ -36,6 +37,8 @@ test("tenant SQL renderer emits a complete, non-secret bootstrap bundle", async 
   assert.doesNotMatch(sql, /__SCOPEPROOF_CONTROL_ROLE__/);
   assert.match(sql, /legal_api_role CONSTANT text := 'tenant_acme_legal_api'/);
   assert.doesNotMatch(sql, /__SCOPEPROOF_LEGAL_API_ROLE__/);
+  assert.match(sql, /read_role CONSTANT text := 'tenant_acme_read'/);
+  assert.doesNotMatch(sql, /__SCOPEPROOF_EVIDENCE_READ_ROLE__/);
   assert.doesNotMatch(sql, /password|secret_access_key|client_secret/i);
 });
 
@@ -56,6 +59,8 @@ test("tenant SQL renderer rejects identifier and hostname injection", () => {
     { ...valid, controlRole: valid.runtimeRole },
     { ...valid, legalApiRole: "tenant_acme_legal_api;GRANT ALL" },
     { ...valid, legalApiRole: valid.controlRole },
+    { ...valid, readRole: "tenant_acme_read;GRANT ALL" },
+    { ...valid, readRole: valid.runtimeRole },
     { ...valid, awsAccountId: "123" },
     { ...valid, evidenceBucket: "scopeproof-acme-quarantine" },
     { ...valid, evidenceBucket: "scopeproof..evidence" },

@@ -1,7 +1,7 @@
-import { jsonError, requireApiPermission, requireApiUser, requireSameOrigin } from "../../../lib/server/auth";
+import { assertPermission, jsonError, requireApiPermission, requireApiUser, requireSameOrigin } from "../../../lib/server/auth";
 import { enforceRateLimit, requireBoundedContentLength } from "../../../lib/server/rate-limit";
 import { getEnv } from "../../../lib/server/env";
-import { listSbomJobs, listSbomRepositories, parseGitHubRepositoryUrl, processSbom, queueSbom, SbomError, validateOneTimeGitHubToken, type SbomFormat } from "../../../lib/server/sbom";
+import { listSbomJobs, listSbomRepositoriesCached, parseGitHubRepositoryUrl, processSbom, queueSbom, SbomError, validateOneTimeGitHubToken, type SbomFormat } from "../../../lib/server/sbom";
 
 const noStoreHeaders = { "cache-control": "no-store, max-age=0", pragma: "no-cache" };
 
@@ -21,13 +21,16 @@ export async function GET(request: Request) {
     if (assessmentId && !/^asm_[a-f0-9]{32}$/.test(assessmentId)) return Response.json({ error: "Assessment identifier is invalid." }, { status: 400 });
     const managedPresent = Boolean(getEnv().GITHUB_TOKEN && getEnv().GITHUB_ORG);
     const jobs = await listSbomJobs(assessmentId);
-    let repositories: Awaited<ReturnType<typeof listSbomRepositories>> = [];
+    let repositories: Awaited<ReturnType<typeof listSbomRepositoriesCached>> = [];
     let managedError: string | null = null;
-    if (managedPresent) {
-      try { repositories = await listSbomRepositories(); }
+    let canDiscoverRepositories = true;
+    try { assertPermission(user, "generate_sbom"); } catch { canDiscoverRepositories = false; }
+    if (managedPresent && canDiscoverRepositories) {
+      await enforceRateLimit(request, user.id, "sbom:repository-discovery", 10, 3_600);
+      try { repositories = await listSbomRepositoriesCached(); }
       catch (error) { managedError = error instanceof SbomError ? error.message : "Managed GitHub repository access is unavailable."; }
     }
-    return Response.json({ jobs, repositories, configured: managedPresent && !managedError, managedError }, { headers: noStoreHeaders });
+    return Response.json({ jobs, repositories, configured: managedPresent && canDiscoverRepositories && !managedError, managedError, repositoryDiscoveryAuthorized: canDiscoverRepositories }, { headers: noStoreHeaders });
   } catch (error) { return sbomError(error); }
 }
 

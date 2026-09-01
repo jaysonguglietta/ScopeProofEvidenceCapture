@@ -7,6 +7,8 @@ const grantsPath = new URL("../infra/aws/database/002_runtime_role.sql", import.
 const ingestGrantsPath = new URL("../infra/aws/database/003_ingest_role.sql", import.meta.url);
 const controlGrantsPath = new URL("../infra/aws/database/004_evidence_control_role.sql", import.meta.url);
 const legalApiGrantsPath = new URL("../infra/aws/database/005_legal_hold_api_role.sql", import.meta.url);
+const readGrantsPath = new URL("../infra/aws/database/007_evidence_read_role.sql", import.meta.url);
+const apiAuditSignerGrantsPath = new URL("../infra/aws/database/008_api_audit_signer_role.sql", import.meta.url);
 
 function tableBody(sql: string, table: string): string {
   const match = sql.match(new RegExp(`CREATE TABLE scopeproof\\.${table} \\(([\\s\\S]*?)\\n\\);`));
@@ -26,7 +28,8 @@ test("AWS PostgreSQL schema has a per-database tenant guard and forced RLS", asy
     "principals", "memberships", "tenant_domains", "device_enrollments",
     "assessments", "integrations", "jobs", "upload_intents",
     "evidence_artifacts", "ingest_receipts", "retention_holds", "legal_hold_operations",
-    "audit_heads", "audit_events", "export_receipts", "support_access_grants",
+    "audit_heads", "audit_events", "api_audit_outbox", "api_audit_outbox_work",
+    "export_receipts", "support_access_grants",
   ];
 
   for (const table of tenantTables) {
@@ -110,6 +113,48 @@ test("upload and immutable-evidence constraints fail closed", async () => {
   assert.match(sql, /scopeproof-promotion-receipt-v1'[\s\S]*p_canonical_receipt[\s\S]*p_receipt_sha256/);
   assert.match(sql, /promotion reconciliation idempotency conflict/);
   assert.match(sql, /FOR UPDATE/);
+  assert.match(tableBody(sql, "device_enrollments"), /last_upload_sequence bigint NOT NULL DEFAULT 0 CHECK \(last_upload_sequence >= 0\)/);
+  assert.match(sql, /p_captured_at < clock_timestamp\(\) - interval '30 days'/);
+  assert.match(sql, /device_proof := p_metadata -> 'scopeproofDeviceProof'/);
+  assert.match(sql, /device_sequence <= device_last_upload_sequence/);
+  assert.match(sql, /SET last_upload_sequence = device_sequence/);
+});
+
+test("public API audit events are actor-bound, idempotent, and immutable", async () => {
+  const sql = await readFile(schemaPath, "utf8");
+  const outbox = tableBody(sql, "api_audit_outbox");
+  const record = functionBody(sql, "record_api_audit_event");
+  assert.match(outbox, /membership_id scopeproof\.resource_identifier NOT NULL CHECK \(membership_id LIKE 'mem/);
+  assert.match(outbox, /UNIQUE \(tenant_id, idempotency_key\)/);
+  assert.match(outbox, /event_digest char\(64\) NOT NULL/);
+  assert.match(record, /membership\.principal_id = p_actor_user_id/);
+  assert.match(record, /membership\.status = 'ACTIVE'/);
+  assert.match(record, /API audit idempotency key conflicts with different facts/);
+  assert.match(record, /scopeproof-api-audit-outbox-v1/);
+  assert.match(sql, /CREATE TRIGGER protect_api_audit_outbox[\s\S]*BEFORE UPDATE OR DELETE/);
+  const work = tableBody(sql, "api_audit_outbox_work");
+  assert.match(work, /attempt_count integer NOT NULL DEFAULT 0 CHECK \(attempt_count BETWEEN 0 AND 8\)/);
+  assert.match(work, /CHECK \(\(lease_token IS NULL\) = \(lease_expires_at IS NULL\)\)/);
+  assert.match(work, /dead_lettered_at timestamptz/);
+  assert.match(work, /completed_at timestamptz/);
+  assert.match(record, /INSERT INTO scopeproof\.api_audit_outbox_work/);
+  const claim = functionBody(sql, "claim_next_api_audit_event");
+  const fail = functionBody(sql, "record_api_audit_outbox_failure");
+  const append = functionBody(sql, "append_signed_api_audit_event");
+  const health = functionBody(sql, "read_api_audit_outbox_health");
+  assert.match(claim, /FOR UPDATE OF work SKIP LOCKED/);
+  assert.match(claim, /work\.attempt_count < 8/);
+  assert.match(claim, /work\.lease_expires_at <= p_claimed_at/);
+  assert.match(fail, /next_attempt_count >= 8/);
+  assert.match(fail, /power\(2, least\(work\.attempt_count, 10\)\)/);
+  assert.match(append, /expected_outbox_id := \('aob_' \|\| substr\(expected_outbox_digest, 1, 32\)\)/);
+  assert.match(append, /queued\.id IS DISTINCT FROM expected_outbox_id/);
+  assert.match(append, /signed API audit event does not match its immutable outbox row/);
+  assert.match(append, /scopeproof\.append_signed_audit_event/);
+  assert.match(append, /scopeproofMembershipId/);
+  assert.match(append, /audit_event_id = p_event_id/);
+  assert.match(health, /work\.completed_at IS NULL/);
+  assert.match(sql, /CREATE FUNCTION scopeproof\.requeue_dead_lettered_api_audit_event/);
 });
 
 test("legal/support access requires dual control and expires quickly", async () => {
@@ -143,8 +188,10 @@ test("legal/support access requires dual control and expires quickly", async () 
   assert.match(sql, /CREATE UNIQUE INDEX one_pending_legal_hold_operation_per_version/);
   assert.match(sql, /WHERE operation_state IN \('REQUESTED', 'APPROVED', 'APPLYING'\)/);
   assert.match(sql, /CREATE FUNCTION scopeproof\.reserve_exact_version_legal_hold/);
+  assert.match(sql, /CREATE FUNCTION scopeproof\.reserve_exact_version_legal_hold_with_audit/);
   assert.match(sql, /CREATE FUNCTION scopeproof\.resolve_active_membership/);
   assert.match(sql, /CREATE FUNCTION scopeproof\.approve_exact_version_legal_hold/);
+  assert.match(sql, /CREATE FUNCTION scopeproof\.approve_exact_version_legal_hold_with_audit/);
   assert.match(sql, /CREATE FUNCTION scopeproof\.read_exact_version_legal_hold_operation/);
   assert.match(sql, /CREATE FUNCTION scopeproof\.begin_exact_version_legal_hold_application/);
   assert.match(sql, /CREATE FUNCTION scopeproof\.confirm_exact_version_legal_hold/);
@@ -171,6 +218,8 @@ test("exact-version legal holds require durable, independently authorized reques
   const sql = await readFile(schemaPath, "utf8");
   const reserve = functionBody(sql, "reserve_exact_version_legal_hold");
   const approve = functionBody(sql, "approve_exact_version_legal_hold");
+  const auditedReserve = functionBody(sql, "reserve_exact_version_legal_hold_with_audit");
+  const auditedApprove = functionBody(sql, "approve_exact_version_legal_hold_with_audit");
   const read = functionBody(sql, "read_exact_version_legal_hold_operation");
   const confirm = functionBody(sql, "confirm_exact_version_legal_hold");
   const expire = functionBody(sql, "expire_stale_exact_version_legal_hold_requests");
@@ -200,6 +249,20 @@ test("exact-version legal holds require durable, independently authorized reques
   assert.match(approve, /requested_operation\.request_digest IS DISTINCT FROM p_request_digest/);
   assert.match(approve, /scopeproof-legal-hold-approval-v1/);
   assert.match(approve, /operation_state = 'APPROVED'/);
+  assert.ok(
+    auditedReserve.indexOf("scopeproof.reserve_exact_version_legal_hold(") <
+      auditedReserve.indexOf("scopeproof.record_api_audit_event("),
+    "the request transition must be followed by its audit record in one wrapper transaction",
+  );
+  assert.match(auditedReserve, /'evidence\.legal_hold_requested'/);
+  assert.match(auditedReserve, /'legal-hold-request:' \|\| p_operation_id/);
+  assert.ok(
+    auditedApprove.indexOf("scopeproof.approve_exact_version_legal_hold(") <
+      auditedApprove.indexOf("scopeproof.record_api_audit_event("),
+    "the approval transition must be followed by its audit record in one wrapper transaction",
+  );
+  assert.match(auditedApprove, /'evidence\.legal_hold_approved'/);
+  assert.match(auditedApprove, /'legal-hold-approval:' \|\| p_operation_id/);
   assert.doesNotMatch(read, /INSERT|UPDATE|DELETE/i);
   assert.match(read, /operation\.tenant_id = active_tenant/);
   assert.match(read, /operation\.request_digest = p_request_digest/);
@@ -275,6 +338,7 @@ test("runtime database role is non-owner, forced-RLS, and has no destructive gra
   assert.doesNotMatch(sql, /GRANT[^;]*tenant_identity[^;]*(?:INSERT|UPDATE)/i);
   assert.match(sql, /GRANT EXECUTE ON FUNCTION scopeproof\.create_upload_intent/);
   assert.match(sql, /GRANT EXECUTE ON FUNCTION scopeproof\.resolve_active_membership/);
+  assert.doesNotMatch(sql, /GRANT EXECUTE ON FUNCTION scopeproof\.(?:list_accessible_evidence|read_accessible_evidence)/);
   assert.match(sql, /REVOKE ALL ON ALL TABLES IN SCHEMA scopeproof/);
   assert.doesNotMatch(sql, /GRANT SELECT ON scopeproof\./);
   assert.doesNotMatch(sql, /GRANT (?:INSERT|UPDATE) ON scopeproof\./);
@@ -286,6 +350,25 @@ test("runtime database role is non-owner, forced-RLS, and has no destructive gra
   assert.doesNotMatch(sql, /GRANT EXECUTE ON FUNCTION scopeproof\.reconcile_promoted_evidence/);
   assert.doesNotMatch(sql, /GRANT EXECUTE ON FUNCTION scopeproof\.read_promoted_evidence_receipt/);
   assert.match(schema, /REVOKE ALL ON ALL TABLES IN SCHEMA scopeproof FROM PUBLIC/);
+});
+
+test("evidence-read database role has only membership and exact evidence read procedures", async () => {
+  const sql = await readFile(readGrantsPath, "utf8");
+  assert.match(sql, /REVOKE ALL ON ALL TABLES IN SCHEMA scopeproof/);
+  assert.match(sql, /REVOKE ALL ON ALL FUNCTIONS IN SCHEMA scopeproof/);
+  assert.match(sql, /ALTER ROLE %I SET row_security = on/);
+  assert.doesNotMatch(sql, /GRANT (?:SELECT|INSERT|UPDATE|DELETE) ON/i);
+  assert.doesNotMatch(sql, /GRANT EXECUTE ON FUNCTION scopeproof\.(?:create_upload_intent|reserve_exact_version_legal_hold|approve_exact_version_legal_hold|append_signed_audit_event)/);
+  const grants = [...sql.matchAll(/GRANT EXECUTE ON FUNCTION scopeproof\.([a-z_]+)/g)]
+    .map((match) => match[1])
+    .sort();
+  assert.deepEqual(grants, [
+    "current_tenant_id",
+    "list_accessible_evidence",
+    "read_accessible_evidence",
+    "record_api_audit_event",
+    "resolve_active_membership",
+  ]);
 });
 
 test("evidence-control database role can only reconcile approved legal holds and append receipts", async () => {
@@ -333,13 +416,16 @@ test("legal-hold API database role is an execute-only authentication/request/app
   assert.match(sql, /REVOKE ALL ON ALL FUNCTIONS IN SCHEMA scopeproof/);
   assert.doesNotMatch(sql, /GRANT (?:SELECT|INSERT|UPDATE|DELETE) ON/i);
   assert.doesNotMatch(sql, /GRANT EXECUTE ON FUNCTION scopeproof\.(?:acknowledge_legal_hold_recovery_publication|append_signed_audit_event|read_exact_version_legal_hold_operation|confirm_exact_version_legal_hold|expire_stale_exact_version_legal_hold_requests|list_pending_exact_version_legal_holds|list_unaudited_applied_legal_holds|list_unaudited_expired_legal_holds|record_exact_version_legal_hold_reconciliation_failure|read_tenant_audit_head)/);
+  assert.doesNotMatch(sql, /GRANT EXECUTE ON FUNCTION scopeproof\.record_api_audit_event\(/);
+  assert.doesNotMatch(sql, /GRANT EXECUTE ON FUNCTION scopeproof\.reserve_exact_version_legal_hold\(/);
+  assert.doesNotMatch(sql, /GRANT EXECUTE ON FUNCTION scopeproof\.approve_exact_version_legal_hold\(/);
   const grants = [...sql.matchAll(/GRANT EXECUTE ON FUNCTION scopeproof\.([a-z_]+)/g)]
     .map((match) => match[1])
     .sort();
   assert.deepEqual(grants, [
-    "approve_exact_version_legal_hold",
+    "approve_exact_version_legal_hold_with_audit",
     "current_tenant_id",
-    "reserve_exact_version_legal_hold",
+    "reserve_exact_version_legal_hold_with_audit",
     "resolve_active_membership",
   ]);
 });
@@ -352,7 +438,32 @@ test("ingest database role can only execute exact reconciliation", async () => {
   assert.match(sql, /GRANT EXECUTE ON FUNCTION scopeproof\.claim_promotion_fence/);
   assert.match(sql, /GRANT EXECUTE ON FUNCTION scopeproof\.read_promoted_evidence_receipt/);
   assert.match(sql, /ALTER ROLE %I SET row_security = on/);
+  assert.match(sql, /REVOKE ALL ON ALL TABLES IN SCHEMA scopeproof/);
+  assert.match(sql, /REVOKE ALL ON ALL SEQUENCES IN SCHEMA scopeproof/);
+  assert.match(sql, /REVOKE ALL ON ALL FUNCTIONS IN SCHEMA scopeproof/);
   assert.doesNotMatch(sql, /GRANT (?:SELECT|INSERT|UPDATE|DELETE) ON/i);
   assert.doesNotMatch(sql, /\bDELETE\b/);
   assert.doesNotMatch(sql, /\bTRUNCATE\b/);
+});
+
+test("API audit signer database role can only lease, sign, retry, and observe outbox work", async () => {
+  const sql = await readFile(apiAuditSignerGrantsPath, "utf8");
+  assert.match(sql, /REVOKE ALL ON ALL TABLES IN SCHEMA scopeproof/);
+  assert.match(sql, /REVOKE ALL ON ALL SEQUENCES IN SCHEMA scopeproof/);
+  assert.match(sql, /REVOKE ALL ON ALL FUNCTIONS IN SCHEMA scopeproof/);
+  assert.doesNotMatch(sql, /GRANT (?:SELECT|INSERT|UPDATE|DELETE) ON/i);
+  assert.doesNotMatch(sql, /GRANT EXECUTE ON FUNCTION scopeproof\.append_signed_audit_event\(/);
+  assert.doesNotMatch(sql, /GRANT EXECUTE ON FUNCTION scopeproof\.requeue_dead_lettered_api_audit_event/);
+  assert.doesNotMatch(sql, /GRANT EXECUTE ON FUNCTION scopeproof\.(?:.*legal_hold|create_upload_intent|read_accessible_evidence)/);
+  const grants = [...sql.matchAll(/GRANT EXECUTE ON FUNCTION scopeproof\.([a-z_]+)/g)]
+    .map((match) => match[1])
+    .sort();
+  assert.deepEqual(grants, [
+    "append_signed_api_audit_event",
+    "claim_next_api_audit_event",
+    "current_tenant_id",
+    "read_api_audit_outbox_health",
+    "read_tenant_audit_head",
+    "record_api_audit_outbox_failure",
+  ]);
 });

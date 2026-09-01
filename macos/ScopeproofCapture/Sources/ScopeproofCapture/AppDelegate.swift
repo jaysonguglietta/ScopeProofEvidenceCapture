@@ -15,9 +15,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     private let uploadService = UploadService()
     private let s3StorageService = S3StorageService()
+    private lazy var s3CredentialProvider = S3CredentialProvider(identityVerifier: s3StorageService)
     private let updateService = UpdateService()
     private let repositorySBOMService = RepositorySBOMService()
-    private lazy var s3ObjectBrowserController = S3ObjectBrowserController(service: s3StorageService)
+    private lazy var s3ObjectBrowserController = S3ObjectBrowserController(
+        service: s3StorageService, credentialProvider: s3CredentialProvider
+    )
     private let helpController = HelpController()
     private let evidenceSearchController = EvidenceSearchController()
     private let logger = Logger(subsystem: "com.scopeproof.capture", category: "application")
@@ -27,8 +30,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var s3ConfigurationTask: Task<Void, Never>?
     private lazy var localConsole = LocalConsoleServer(
         evidenceRoot: captureService.outputDirectory,
-        preferences: preferences,
-        s3Service: s3StorageService,
+        preferences: preferences, s3Service: s3StorageService,
+        credentialProvider: s3CredentialProvider,
         requestCapture: { [weak self] in self?.chooseBrowserWindow() },
         openS3Browser: { [weak self] in
             guard let self else { return }
@@ -155,7 +158,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         upload.isEnabled = false
         menu.addItem(upload)
         let s3Storage = NSMenuItem(title: s3StorageStatusTitle(), action: nil, keyEquivalent: "")
-        s3Storage.state = preferences.s3Storage.canUpload && KeychainStore.readS3Credentials() != nil &&
+        s3Storage.state = preferences.s3Storage.canUpload && S3CredentialProvider.hasConfiguredSource(preferences.s3Storage) &&
             KeychainStore.readS3VerifiedDestination()?.matches(preferences.s3Storage) == true ? .on : .off
         s3Storage.isEnabled = false
         menu.addItem(s3Storage)
@@ -193,12 +196,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let browseS3 = NSMenuItem(title: "Browse S3 Evidence…", action: #selector(openS3Browser), keyEquivalent: "")
         browseS3.target = self
         browseS3.isEnabled = preferences.s3Storage.canUpload && preferences.s3Storage.downloadsAllowed &&
-            KeychainStore.readS3Credentials() != nil && KeychainStore.readS3VerifiedDestination()?.matches(preferences.s3Storage) == true &&
+            S3CredentialProvider.hasConfiguredSource(preferences.s3Storage) && KeychainStore.readS3VerifiedDestination()?.matches(preferences.s3Storage) == true &&
             s3ConfigurationTask == nil
         menu.addItem(browseS3)
         let retryS3 = NSMenuItem(title: s3RetryTask == nil ? "Upload Pending Evidence to S3" : "Uploading Pending Evidence to S3…", action: #selector(retryPendingS3Uploads), keyEquivalent: "")
         retryS3.target = self
         retryS3.isEnabled = s3RetryTask == nil && s3ConfigurationTask == nil && preferences.s3Storage.canUpload &&
+            S3CredentialProvider.hasConfiguredSource(preferences.s3Storage) &&
             KeychainStore.readS3VerifiedDestination()?.matches(preferences.s3Storage) == true
         menu.addItem(retryS3)
         addItem("Open Evidence Folder", action: #selector(openEvidenceFolder), key: "o")
@@ -209,9 +213,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         login.target = self
         menu.addItem(login)
-        let s3Settings = NSMenuItem(title: s3ConfigurationTask == nil ? "AWS S3 Storage…" : "AWS S3 setup in progress…", action: #selector(openS3Settings), keyEquivalent: "")
+        let s3Settings = NSMenuItem(
+            title: s3ConfigurationTask == nil ? "AWS S3 Storage…" : "Cancel AWS S3 setup…",
+            action: s3ConfigurationTask == nil ? #selector(openS3Settings) : #selector(cancelS3Configuration),
+            keyEquivalent: ""
+        )
         s3Settings.target = self
-        s3Settings.isEnabled = s3ConfigurationTask == nil
+        s3Settings.isEnabled = true
         menu.addItem(s3Settings)
         addItem("Capture & Jira Settings…", action: #selector(openSettings), key: ",", modifiers: [.command])
         addItem(hostedConnectionAvailable ? "Check for Updates…" : "Open GitHub Releases…", action: #selector(checkForUpdatesAction))
@@ -295,7 +303,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             tags.placeholderString = "identity, quarterly, production"
             expected.placeholderString = "What should an assessor verify in this artifact?"
             jiraIssue.placeholderString = preferences.jiraHandoff.projectKey.isEmpty ? "Optional, e.g. GRC-123" : "Optional, e.g. \(preferences.jiraHandoff.projectKey)-123"
-            sourceURL.placeholderString = "Optional full page URL, e.g. https://admin.example.com/security/settings"
+            sourceURL.placeholderString = "Optional source URL; only its origin is stored"
             sourceURL.toolTip = "Scopeproof prints this URL in full in the screenshot header. URL credentials and sensitive query values are removed before saving."
             let preview = NSTextField(wrappingLabelWithString: "")
             preview.textColor = .secondaryLabelColor
@@ -440,15 +448,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func promptForURL() {
         guard let rawTarget = prompt(title: "Open URL & Capture", message: "The selected browser will open this page, wait \(preferences.delay) seconds, then capture and scan its window.", placeholder: "https://admin.example.com/security") else { return }
-        guard let target = EvidenceSourceURL.sanitized(rawTarget)?.absoluteString else { showError(CaptureFailure.invalidURL); return }
-        guard let context = captureContext(suggestedSourceURL: target) else { return }
-        preferences.addTarget(target)
-        openAndCapture(target, context: context)
+        guard let navigation = EvidenceSourceURL.navigationURL(rawTarget) else { showError(CaptureFailure.invalidURL); return }
+        guard let context = captureContext(suggestedSourceURL: EvidenceSourceURL.sanitized(rawTarget)?.absoluteString) else { return }
+        if let savedTarget = EvidenceSourceURL.savedTarget(rawTarget) { preferences.addTarget(savedTarget.absoluteString) }
+        openAndCapture(navigation.absoluteString, context: context)
     }
 
     @objc private func addSavedTarget() {
         guard let target = prompt(title: "Add Evidence URL", message: "Save a frequently captured PCI evidence page.", placeholder: "https://admin.example.com/security") else { return }
-        guard let url = EvidenceSourceURL.sanitized(target) else { showError(CaptureFailure.invalidURL); return }
+        guard let url = EvidenceSourceURL.savedTarget(target) else { showError(CaptureFailure.invalidURL); return }
         preferences.addTarget(url.absoluteString)
         setReady("Evidence URL saved")
     }
@@ -511,7 +519,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func uploadToS3(_ capture: CaptureResult) {
         let settings = preferences.s3Storage
-        guard settings.canUpload, let credentials = KeychainStore.readS3Credentials(),
+        guard settings.canUpload, S3CredentialProvider.hasConfiguredSource(settings),
               let binding = KeychainStore.readS3VerifiedDestination(), binding.matches(settings) else {
             setReady("Saved locally · S3 not configured")
             return
@@ -519,6 +527,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setBusy("Copying \(capture.evidenceID) to S3…")
         Task {
             do {
+                let credentials = try await s3CredentialProvider.credentials(for: settings, binding: binding)
                 _ = try await s3StorageService.upload(capture, settings: settings, credentials: credentials, binding: binding)
                 await MainActor.run {
                     self.setReady("Stored \(capture.evidenceID) in S3")
@@ -538,7 +547,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func retryPendingS3Uploads() {
         guard s3RetryTask == nil else { return }
         let settings = preferences.s3Storage
-        guard settings.canUpload, let credentials = KeychainStore.readS3Credentials(),
+        guard settings.canUpload, S3CredentialProvider.hasConfiguredSource(settings),
               let binding = KeychainStore.readS3VerifiedDestination(), binding.matches(settings) else {
             showError(settings.isConfigured ? S3StorageFailure.destinationBindingMismatch : S3StorageFailure.notConfigured); return
         }
@@ -547,12 +556,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setBusy("Uploading \(pending.count) capture(s) to S3…")
         s3RetryTask = Task {
             var completed = 0
-            for entry in pending {
-                guard !Task.isCancelled else { break }
-                let capture = CaptureResult(imageURL: entry.imageURL, manifestURL: entry.manifestURL, evidenceID: entry.manifest.evidenceID,
-                    context: CaptureContext(sessionID: entry.manifest.sessionID, sessionName: entry.manifest.sessionName, controlID: entry.manifest.controlID, title: entry.manifest.title, system: entry.manifest.system, environment: entry.manifest.environment, assessmentPeriod: entry.manifest.assessmentPeriod, description: entry.manifest.description, complianceArea: entry.manifest.complianceArea, controlTitle: entry.manifest.controlTitle, customFileName: entry.manifest.customFileName, evidenceOwner: entry.manifest.evidenceOwner, tags: entry.manifest.tags, expectedEvidence: entry.manifest.expectedEvidence, jiraIssueKey: entry.manifest.jiraIssueKey, sourceURL: entry.manifest.sourceURL),
-                    capturedAt: entry.manifest.capturedAt, safetyStatus: entry.manifest.safetyStatus, findings: entry.manifest.redactionFindings, sha256: entry.manifest.sha256, chainPreviousHash: entry.manifest.chainPreviousHash, chainEventHash: entry.manifest.chainEventHash)
-                if (try? await s3StorageService.upload(capture, settings: settings, credentials: credentials, binding: binding)) != nil { completed += 1 }
+            do {
+                let credentials = try await s3CredentialProvider.credentials(for: settings, binding: binding)
+                for entry in pending {
+                    guard !Task.isCancelled else { break }
+                    let capture = CaptureResult(imageURL: entry.imageURL, manifestURL: entry.manifestURL, evidenceID: entry.manifest.evidenceID,
+                        context: CaptureContext(sessionID: entry.manifest.sessionID, sessionName: entry.manifest.sessionName, controlID: entry.manifest.controlID, title: entry.manifest.title, system: entry.manifest.system, environment: entry.manifest.environment, assessmentPeriod: entry.manifest.assessmentPeriod, description: entry.manifest.description, complianceArea: entry.manifest.complianceArea, controlTitle: entry.manifest.controlTitle, customFileName: entry.manifest.customFileName, evidenceOwner: entry.manifest.evidenceOwner, tags: entry.manifest.tags, expectedEvidence: entry.manifest.expectedEvidence, jiraIssueKey: entry.manifest.jiraIssueKey, sourceURL: entry.manifest.sourceURL),
+                        capturedAt: entry.manifest.capturedAt, safetyStatus: entry.manifest.safetyStatus, findings: entry.manifest.redactionFindings, sha256: entry.manifest.sha256, chainPreviousHash: entry.manifest.chainPreviousHash, chainEventHash: entry.manifest.chainEventHash)
+                    if (try? await s3StorageService.upload(capture, settings: settings, credentials: credentials, binding: binding)) != nil { completed += 1 }
+                }
+            } catch {
+                await MainActor.run { self.showError(error) }
             }
             await MainActor.run {
                 self.s3RetryTask = nil
@@ -795,7 +809,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let save = NSSavePanel(); save.title = "Save Assessor Package"; save.allowedContentTypes = [.zip]; save.nameFieldStringValue = "Scopeproof-Assessor-Package-\(ComplianceCatalog.safeFileBase(name.stringValue)).zip"
         guard save.runModal() == .OK, let destination = save.url else { return }
         do {
-            let result = try AssessorPackageExporter.export(entries: selected, to: destination, preparedBy: preparedBy.stringValue, packageName: name.stringValue, jiraSettings: preferences.jiraHandoff)
+            let result = try AssessorPackageExporter.export(entries: selected, completeHistory: allEntries, to: destination, preparedBy: preparedBy.stringValue, packageName: name.stringValue, jiraSettings: preferences.jiraHandoff)
             setReady("Exported \(result.evidenceCount) approved evidence items")
             NSWorkspace.shared.activateFileViewerSelecting([result.zipURL, result.checksumURL])
             notify(title: "Assessor package ready", body: "\(result.evidenceCount) approved artifacts were validated and packaged.")
@@ -812,12 +826,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func applyRetention() {
         let alert = NSAlert()
         alert.messageText = "Apply local retention policy?"
-        alert.informativeText = "PNG, manifest, review lifecycle, and receipt files older than \(preferences.retentionDays) days will be moved to Trash. Hosted evidence is not affected."
+        alert.informativeText = "Expired local evidence will be moved to Trash only when no active or invalid legal-hold marker exists and a receipt proves that the exact screenshot and manifest versions remain protected by S3 Object Lock. Evidence without a validated durable copy stays on this Mac. Hosted evidence is not affected."
         alert.alertStyle = .warning
         alert.addButton(withTitle: "Move Expired Files to Trash")
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn else { return }
-        do { let count = try CaptureHistory.removeExpired(in: captureService.outputDirectory, retentionDays: preferences.retentionDays); setReady("Moved \(count) expired capture(s) to Trash") }
+        do {
+            let report = try CaptureHistory.removeExpired(
+                in: captureService.outputDirectory, retentionDays: preferences.retentionDays
+            )
+            setReady("Moved \(report.movedToTrash) expired capture(s) to Trash; preserved \(report.skippedLegalHold) on hold, \(report.skippedWithoutDurableCopy) without a locked durable copy, and \(report.skippedInvalidEvidence) with invalid evidence")
+        }
         catch { showError(error) }
     }
 
@@ -890,7 +909,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.accessoryView = tabs
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         let serverValue = server.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let url = serverValue.isEmpty ? nil : URL(string: serverValue).flatMap(BackendTrust.normalizedOrigin)
+        let url = serverValue.isEmpty ? nil : URL(string: serverValue).flatMap { BackendTrust.normalizedOrigin($0) }
         if !serverValue.isEmpty && url == nil { showError(UploadFailure.invalidServer); return }
         let jiraSiteValue = jiraSite.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         let jiraProjectValue = jiraProject.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
@@ -922,11 +941,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let alert = NSAlert()
         alert.icon = NSImage(systemSymbolName: "externaldrive.badge.icloud", accessibilityDescription: "AWS S3 evidence storage")
         alert.messageText = "AWS S3 evidence storage"
-        alert.informativeText = "Verify an existing bucket or create a hardened evidence bucket. Production compliance mode requires temporary STS credentials, KMS, Object Lock, versioning, private ownership, and a prefix-scoped destination."
+        alert.informativeText = "Choose manual STS credentials or a named IAM Identity Center profile, then verify an existing bucket or create a hardened evidence bucket. Production mode never accepts long-lived keys."
         alert.addButton(withTitle: "Save & Verify")
         alert.addButton(withTitle: "Create & Harden Bucket")
         alert.addButton(withTitle: "Cancel")
         alert.addButton(withTitle: "Disconnect")
+
+        let authenticationMethod = NSPopUpButton()
+        authenticationMethod.addItems(withTitles: S3AuthenticationMethod.allCases.map(\.rawValue))
+        authenticationMethod.selectItem(withTitle: current.authentication.method.rawValue)
+        authenticationMethod.setAccessibilityLabel("S3 authentication method")
+        let identityCenterProfile = NSTextField(string: current.authentication.profileName)
+        identityCenterProfile.placeholderString = "Named AWS CLI profile, for example scopeproof-production"
+        identityCenterProfile.setAccessibilityLabel("AWS IAM Identity Center profile name")
+        let assumedRoleARN = NSTextField(string: current.authentication.roleARN)
+        assumedRoleARN.placeholderString = "arn:aws:iam::123456789012:role/scopeproof-evidence"
+        assumedRoleARN.setAccessibilityLabel("AWS role ARN to assume")
+        let externalID = NSSecureTextField(string: current.authentication.externalID)
+        externalID.placeholderString = "Optional external ID"
+        externalID.setAccessibilityLabel("AWS role external ID")
+        let signInBeforeVerification = NSButton(
+            checkboxWithTitle: "Sign in with IAM Identity Center before verification",
+            target: nil, action: nil
+        )
+        signInBeforeVerification.state = .off
+        signInBeforeVerification.setAccessibilityLabel("Sign in to AWS IAM Identity Center before verification")
+        let authenticationHelp = NSTextField(wrappingLabelWithString: current.authentication.method.helpText)
+        authenticationHelp.textColor = .secondaryLabelColor
+        authenticationHelp.maximumNumberOfLines = 3
 
         let bucket = NSTextField(string: current.bucket)
         bucket.placeholderString = "company-compliance-evidence"
@@ -984,12 +1026,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         credentialExpiration.setAccessibilityLabel("AWS temporary credential expiration")
         let automatic = NSButton(checkboxWithTitle: "Copy new captures to S3 after the local safety scan", target: nil, action: nil)
         automatic.state = current.autoUpload ? .on : .off
-        let security = NSTextField(wrappingLabelWithString: "Production mode is fail-closed. Object Lock is irreversible once enabled. Bucket creation may also configure Deep Archive and replication when supplied. Remove all bucket-management permissions after setup; daily credentials remain in Keychain and are bound to the verified AWS account and destination.")
+        let security = NSTextField(wrappingLabelWithString: "Production compliance requires COMPLIANCE Object Lock and a customer KMS key bound to the verified bucket owner. Governance is non-production and bypassable. Scopeproof verifies both before enabling uploads.")
         security.textColor = .secondaryLabelColor
-        security.maximumNumberOfLines = 3
-        for field in [bucket, region, prefix, kmsKey, retentionDays, archiveDays, replicaBucket, replicaRole, replicaKMS, accessKey, secretKey, sessionToken, credentialExpiration] { field.frame = NSRect(x: 0, y: 0, width: 440, height: 26) }
-        security.frame = NSRect(x: 0, y: 0, width: 440, height: 72)
+        security.maximumNumberOfLines = 4
+        for field in [identityCenterProfile, assumedRoleARN, externalID, bucket, region, prefix, kmsKey, retentionDays, archiveDays, replicaBucket, replicaRole, replicaKMS, accessKey, secretKey, sessionToken, credentialExpiration] { field.frame = NSRect(x: 0, y: 0, width: 440, height: 26) }
+        authenticationHelp.frame = NSRect(x: 0, y: 0, width: 440, height: 62)
+        security.frame = NSRect(x: 0, y: 0, width: 440, height: 82)
+        let authenticationForm = S3AuthenticationFormController(
+            method: authenticationMethod, securityProfile: profile, retentionMode: retentionMode,
+            profileName: identityCenterProfile, roleARN: assumedRoleARN, externalID: externalID,
+            accessKey: accessKey, secretKey: secretKey, sessionToken: sessionToken,
+            expiration: credentialExpiration, signIn: signInBeforeVerification, help: authenticationHelp
+        )
+        authenticationMethod.target = authenticationForm
+        authenticationMethod.action = #selector(S3AuthenticationFormController.selectionChanged(_:))
+        profile.target = authenticationForm
+        profile.action = #selector(S3AuthenticationFormController.selectionChanged(_:))
+        authenticationForm.refresh()
         let grid = NSGridView(views: [
+            [label("Authentication"), authenticationMethod],
+            [label("AWS CLI profile"), identityCenterProfile], [label("Assume role ARN"), assumedRoleARN],
+            [label("External ID"), externalID], [NSTextField(labelWithString: ""), signInBeforeVerification],
+            [NSTextField(labelWithString: ""), authenticationHelp],
             [label("Security profile"), profile], [label("Bucket *"), bucket], [label("Region *"), region], [label("Object prefix *"), prefix],
             [label("Encryption"), encryption], [label("KMS key ARN"), kmsKey],
             [label("Object Lock"), retentionMode], [label("Retention days"), retentionDays], [label("Archive after days"), archiveDays],
@@ -1003,7 +1061,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         grid.columnSpacing = 12
         grid.column(at: 0).xPlacement = .trailing
         grid.column(at: 1).xPlacement = .fill
-        grid.frame = NSRect(x: 0, y: 0, width: 640, height: 650)
+        grid.frame = NSRect(x: 0, y: 0, width: 640, height: 880)
         let formScroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 660, height: 470))
         formScroll.documentView = grid
         formScroll.hasVerticalScroller = true
@@ -1014,26 +1072,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.accessoryView = formScroll
         alert.window.initialFirstResponder = bucket
 
-        let response = alert.runModal()
+        // AppKit controls do not retain their target. Keep the form controller
+        // alive for the complete modal interaction so every selector remains live.
+        let response = withExtendedLifetime(authenticationForm) { alert.runModal() }
         let accessValue = accessKey.stringValue
         let secretValue = secretKey.stringValue
         let sessionValue = sessionToken.stringValue
         let expirationValue = credentialExpiration.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let externalIDValue = externalID.stringValue
         accessKey.stringValue = ""
         secretKey.stringValue = ""
         sessionToken.stringValue = ""
         credentialExpiration.stringValue = ""
+        externalID.stringValue = ""
         let disconnectResponse = NSApplication.ModalResponse(rawValue: NSApplication.ModalResponse.alertFirstButtonReturn.rawValue + 3)
         if response == disconnectResponse {
             let confirmation = NSAlert()
             confirmation.alertStyle = .warning
             confirmation.messageText = "Disconnect AWS S3 storage?"
-            confirmation.informativeText = "This removes the bucket configuration and AWS credentials from this Mac. Existing S3 objects and local evidence are not deleted."
+            confirmation.informativeText = "Scopeproof removes its manual Keychain credential, verified binding, in-memory session, and S3 configuration. It does not sign out of IAM Identity Center or delete the AWS CLI SSO cache; run ‘aws sso logout’ separately when workstation access must end. Existing S3 objects and local evidence are not deleted."
             confirmation.addButton(withTitle: "Keep Configuration")
             confirmation.addButton(withTitle: "Disconnect")
             guard confirmation.runModal() == .alertSecondButtonReturn else { return }
             KeychainStore.deleteS3Credentials()
             preferences.s3Storage = .defaults
+            Task { await s3CredentialProvider.invalidate() }
             setReady("S3 storage disconnected")
             rebuildMenu()
             return
@@ -1044,8 +1107,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let settings: S3StorageSettings
         do {
             let selectedProfile = S3SecurityProfile(rawValue: profile.titleOfSelectedItem ?? "") ?? .production
+            let selectedAuthentication = S3AuthenticationMethod(
+                rawValue: authenticationMethod.titleOfSelectedItem ?? ""
+            ) ?? .manualCredentials
             let selectedEncryption = S3EncryptionMode.allCases.first(where: { $0.displayName == encryption.titleOfSelectedItem }) ?? .sseKMS
-            let selectedRetention = S3RetentionMode.allCases.first(where: { $0.displayName == retentionMode.titleOfSelectedItem }) ?? .governance
+            let selectedRetention = S3RetentionMode.allCases.first(where: { $0.displayName == retentionMode.titleOfSelectedItem }) ?? .compliance
+            let authentication = S3AuthenticationConfiguration(
+                method: selectedAuthentication, profileName: identityCenterProfile.stringValue,
+                roleARN: assumedRoleARN.stringValue, externalID: externalIDValue
+            )
             settings = try S3StorageSettings.validated(
                 bucket: bucket.stringValue, region: region.stringValue, prefix: prefix.stringValue,
                 autoUpload: automatic.state == .on, securityProfile: selectedProfile,
@@ -1054,45 +1124,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 archiveAfterDays: Int(archiveDays.stringValue) ?? -1,
                 downloadsAllowed: allowDownloads.state == .on, useFIPSEndpoint: useFIPS.state == .on,
                 replicationDestinationBucketARN: replicaBucket.stringValue,
-                replicationRoleARN: replicaRole.stringValue, replicationKMSKeyARN: replicaKMS.stringValue
+                replicationRoleARN: replicaRole.stringValue, replicationKMSKeyARN: replicaKMS.stringValue,
+                authentication: authentication
             )
         } catch { showError(error); return }
-        let suppliedAccess = accessValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let suppliedSecret = secretValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let credentials: S3Credentials
-        if suppliedAccess.isEmpty && suppliedSecret.isEmpty {
-            guard let existingCredentials else { showError(S3StorageFailure.invalidCredentials); return }
-            credentials = existingCredentials
-        } else {
-            let expiresAt: Date?
-            if expirationValue.isEmpty { expiresAt = nil }
-            else {
-                guard let parsed = ISO8601DateFormatter().date(from: expirationValue) else { showError(S3StorageFailure.invalidCredentials); return }
-                expiresAt = parsed
+        var manualCredentials: S3Credentials?
+        if settings.authentication.method == .manualCredentials {
+            let suppliedAccess = accessValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            let suppliedSecret = secretValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if suppliedAccess.isEmpty && suppliedSecret.isEmpty {
+                guard let existingCredentials else { showError(S3StorageFailure.invalidCredentials); return }
+                manualCredentials = existingCredentials
+            } else {
+                let expiresAt: Date?
+                if expirationValue.isEmpty { expiresAt = nil }
+                else {
+                    guard let parsed = ISO8601DateFormatter().date(from: expirationValue) else {
+                        showError(S3StorageFailure.invalidCredentials); return
+                    }
+                    expiresAt = parsed
+                }
+                do {
+                    manualCredentials = try S3Credentials.validated(
+                        accessKeyID: suppliedAccess, secretAccessKey: suppliedSecret,
+                        sessionToken: sessionValue, expiresAt: expiresAt
+                    )
+                } catch { showError(error); return }
             }
-            do { credentials = try S3Credentials.validated(accessKeyID: suppliedAccess, secretAccessKey: suppliedSecret, sessionToken: sessionValue, expiresAt: expiresAt) }
-            catch { showError(error); return }
+            if settings.securityProfile == .production
+                && (manualCredentials?.isTemporary != true || manualCredentials?.expiresAt == nil) {
+                showError(S3StorageFailure.temporaryCredentialsRequired); return
+            }
         }
-        if settings.securityProfile == .production && !credentials.isTemporary { showError(S3StorageFailure.temporaryCredentialsRequired); return }
-        if settings.securityProfile == .production && credentials.expiresAt == nil { showError(S3StorageFailure.invalidCredentials); return }
         if isCreatingBucket && settings.securityProfile == .production {
             let irreversible = NSAlert()
             irreversible.alertStyle = .critical
             irreversible.messageText = "Enable irreversible S3 Object Lock?"
-            irreversible.informativeText = "Scopeproof will enable \(settings.retentionMode.displayName) Object Lock for at least \(settings.retentionDays) days. Object Lock cannot later be disabled on this bucket. Confirm the retention policy with your compliance and records owners before continuing."
+            irreversible.informativeText = "Scopeproof will enable COMPLIANCE Object Lock for at least \(settings.retentionDays) days. Protected object versions cannot be shortened or deleted before expiry, even by privileged AWS users. Object Lock cannot later be disabled on this bucket. Confirm the retention policy with your compliance and records owners before continuing."
             irreversible.addButton(withTitle: "Enable Object Lock")
             irreversible.addButton(withTitle: "Cancel")
             guard irreversible.runModal() == .alertFirstButtonReturn else { return }
         }
-        do { try KeychainStore.saveS3Credentials(credentials) }
-        catch { showError(error); return }
+        if let manualCredentials {
+            do { try KeychainStore.saveS3Credentials(manualCredentials) }
+            catch { showError(error); return }
+        } else {
+            // CLI-derived credentials are deliberately memory-only. Remove any
+            // stale manually entered key before activating this source.
+            KeychainStore.deleteS3Credentials()
+        }
         var storedSettings = settings
         storedSettings.autoUpload = false
         storedSettings.uploadsAllowed = false
         preferences.s3Storage = storedSettings
         setBusy(isCreatingBucket ? "Creating and securing S3 bucket…" : "Testing S3 connection…")
+        let shouldSignIn = signInBeforeVerification.state == .on && settings.authentication.method.usesAWSCLI
         s3ConfigurationTask = Task {
             do {
+                await s3CredentialProvider.invalidate()
+                if shouldSignIn {
+                    try await s3CredentialProvider.signIn(profileName: settings.authentication.profileName)
+                }
+                let credentials = try await s3CredentialProvider.credentials(for: settings, binding: nil)
                 let binding: S3VerifiedDestination
                 if isCreatingBucket {
                     binding = try await s3StorageService.createAndSecureBucket(settings: settings, credentials: credentials)
@@ -1109,7 +1202,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         self.setReady(isCreatingBucket ? "Secure S3 bucket ready · \(settings.bucket)" : "S3 verified · \(settings.bucket)")
                         self.notify(
                             title: isCreatingBucket ? "Secure S3 bucket ready" : "AWS S3 destination verified",
-                            body: "AWS account \(binding.accountID) · \(settings.securityProfile.rawValue) · \(settings.encryptionMode.displayName)"
+                            body: "AWS account \(binding.accountID) · \(settings.authentication.method.rawValue) · \(settings.encryptionMode.displayName)"
                         )
                         self.rebuildMenu()
                     } catch {
@@ -1117,6 +1210,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                         self.showError(error)
                         self.rebuildMenu()
                     }
+                }
+            } catch is CancellationError {
+                await MainActor.run {
+                    self.s3ConfigurationTask = nil
+                    self.setReady("AWS S3 setup canceled · automatic upload remains off")
+                    self.rebuildMenu()
                 }
             } catch {
                 await MainActor.run {
@@ -1128,6 +1227,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
         rebuildMenu()
+    }
+
+    @objc private func cancelS3Configuration() {
+        guard let task = s3ConfigurationTask else { return }
+        task.cancel()
+        setBusy("Canceling AWS S3 setup…")
     }
 
     @objc private func checkForUpdatesAction() { checkForUpdates(silent: false) }
@@ -1184,9 +1289,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func s3StorageStatusTitle() -> String {
         let settings = preferences.s3Storage
-        guard settings.isConfigured, KeychainStore.readS3Credentials() != nil else { return "S3 storage: Not connected" }
+        guard settings.isConfigured, S3CredentialProvider.hasConfiguredSource(settings) else { return "S3 storage: Not connected" }
         guard settings.canUpload, KeychainStore.readS3VerifiedDestination()?.matches(settings) == true else { return "S3 storage: Needs verification · \(settings.bucket)" }
-        return settings.autoUpload ? "S3 storage: Automatic · \(settings.bucket)" : "S3 storage: Manual · \(settings.bucket)"
+        let source = settings.authentication.method == .manualCredentials ? "keys" : "Identity Center"
+        return settings.autoUpload ? "S3 storage: Automatic · \(source) · \(settings.bucket)" : "S3 storage: Manual · \(source) · \(settings.bucket)"
     }
 
     private func setBusy(_ value: String) { statusMenuItem.title = value; statusItem.button?.image = NSImage(systemSymbolName: "camera.metering.center.weighted", accessibilityDescription: value) }
@@ -1211,4 +1317,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.runModal()
     }
     private func notify(title: String, body: String) { NSSound(named: "Glass")?.play(); let content = UNMutableNotificationContent(); content.title = title; content.body = body; content.sound = .default; UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)) }
+}
+
+@MainActor
+private final class S3AuthenticationFormController: NSObject {
+    private let method: NSPopUpButton
+    private let securityProfile: NSPopUpButton
+    private let retentionMode: NSPopUpButton
+    private let profileName: NSTextField
+    private let roleARN: NSTextField
+    private let externalID: NSTextField
+    private let accessKey: NSTextField
+    private let secretKey: NSTextField
+    private let sessionToken: NSTextField
+    private let expiration: NSTextField
+    private let signIn: NSButton
+    private let help: NSTextField
+
+    init(
+        method: NSPopUpButton, securityProfile: NSPopUpButton, retentionMode: NSPopUpButton,
+        profileName: NSTextField, roleARN: NSTextField, externalID: NSTextField,
+        accessKey: NSTextField, secretKey: NSTextField, sessionToken: NSTextField,
+        expiration: NSTextField, signIn: NSButton, help: NSTextField
+    ) {
+        self.method = method
+        self.securityProfile = securityProfile
+        self.retentionMode = retentionMode
+        self.profileName = profileName
+        self.roleARN = roleARN
+        self.externalID = externalID
+        self.accessKey = accessKey
+        self.secretKey = secretKey
+        self.sessionToken = sessionToken
+        self.expiration = expiration
+        self.signIn = signIn
+        self.help = help
+    }
+
+    @objc func selectionChanged(_ sender: Any?) { refresh() }
+
+    func refresh() {
+        let selected = S3AuthenticationMethod(rawValue: method.titleOfSelectedItem ?? "") ?? .manualCredentials
+        let isManual = selected == .manualCredentials
+        let usesProfile = selected.usesAWSCLI
+        let assumesRole = selected == .identityCenterAssumeRole
+        profileName.isEnabled = usesProfile
+        roleARN.isEnabled = assumesRole
+        externalID.isEnabled = assumesRole
+        signIn.isEnabled = usesProfile
+        if !usesProfile { signIn.state = .off }
+        for field in [accessKey, secretKey, sessionToken, expiration] { field.isEnabled = isManual }
+
+        let production = securityProfile.titleOfSelectedItem == S3SecurityProfile.production.rawValue
+        retentionMode.isEnabled = !production
+        if production { retentionMode.selectItem(withTitle: S3RetentionMode.compliance.displayName) }
+        if isManual && production {
+            help.stringValue = "Paste an expiring STS access key, secret, session token, and exact expiration. Long-lived IAM keys are rejected in Production compliance mode."
+        } else if isManual {
+            help.stringValue = selected.helpText
+        } else {
+            help.stringValue = selected.helpText + " Scopeproof invokes only a fixed, trusted AWS CLI path and never uses a shell."
+        }
+    }
 }

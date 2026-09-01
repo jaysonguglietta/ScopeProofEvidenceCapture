@@ -57,7 +57,7 @@ actor JiraCloudService {
     private struct ConnectionEnvelope: Decodable { let connection: JiraCloudConnection }
     private struct IssueEnvelope: Decodable { let issue: JiraCloudIssue }
     private struct ReceiptEnvelope: Decodable { let receipt: JiraCloudUploadReceipt }
-    private var appVersion: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.8.1" }
+    private var appVersion: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.9.0" }
 
     func connection(serverURL: URL?) async throws -> JiraCloudConnection {
         let (request, audience) = try authorizedRequest(serverURL: serverURL, path: "api/native/jira/status")
@@ -77,10 +77,13 @@ actor JiraCloudService {
 
     func upload(entry: CaptureHistoryEntry, serverURL: URL?) async throws -> URL {
         guard let audience = BackendTrust.normalizedOrigin(serverURL), let token = KeychainStore.readToken(for: audience), !token.isEmpty else { throw JiraCloudFailure.notConnected }
+        let artifact: ValidatedEvidenceArtifact
+        do { artifact = try ValidatedEvidenceArtifact.load(entry, requireLifecycle: true) }
+        catch { throw JiraCloudFailure.rejected(error.localizedDescription) }
         let lifecycleURL = EvidenceLifecycleStore.url(for: entry.manifestURL)
-        let screenshot = try Data(contentsOf: entry.imageURL)
-        let manifest = try Data(contentsOf: entry.manifestURL)
-        let lifecycle = try Data(contentsOf: lifecycleURL)
+        let screenshot = artifact.imageData
+        let manifest = artifact.manifestData
+        guard let lifecycle = artifact.lifecycleData else { throw JiraCloudFailure.invalidResponse }
         let files: [(String, String, String, Data)] = [
             ("screenshot", entry.imageURL.lastPathComponent, "image/png", screenshot),
             ("manifest", entry.manifestURL.lastPathComponent, "application/json", manifest),

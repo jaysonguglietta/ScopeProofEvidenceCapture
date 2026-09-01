@@ -513,6 +513,7 @@ function exactPresignInput(intent: ControlledUploadIntent, signingTime: Date): E
       "x-amz-meta-control-id": intent.controlId,
       "x-amz-meta-evidence-id": intent.resourceId,
       "x-amz-meta-expected-sha256": intent.expectedSha256,
+      "x-amz-meta-upload-nonce-digest": intent.nonceDigest,
       "x-amz-meta-tenant-id": intent.tenantId,
       "x-amz-meta-upload-intent-id": intent.id,
       "x-amz-server-side-encryption": "aws:kms",

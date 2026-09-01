@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import { redactText } from "../lib/server/redaction.ts";
+import { redactJson, redactText } from "../lib/server/redaction.ts";
 import { csvCell } from "../lib/server/csv.ts";
 import { configuredMacRelease, releaseSigningPayload } from "../lib/server/releases.ts";
 import type { ScopeproofEnv } from "../lib/server/env.ts";
@@ -42,7 +42,7 @@ test("production hardening bounds abuse, claims jobs atomically, and enforces re
   assert.match(outbound, /allowedOrigins/); assert.match(outbound, /maximumBytes/); assert.match(outbound, /redirect: "error"/);
   assert.match(retention, /retention\.purge_started/); assert.match(retention, /evidence\.purged/); assert.match(retention, /retention_holds/);
   assert.match(evidence, /This evidence has expired/); assert.match(evidence, /Expired evidence cannot be approved/);
-  assert.match(packages, /status = 'approved' AND expires_at > \?/); assert.match(packages, /csvCell/);
+  assert.match(packages, /e\.status = 'approved' AND e\.expires_at > \?/); assert.match(packages, /csvCell/);
   for (const table of ["rate_limit_buckets", "retention_holds"]) assert.ok(migration.includes(`CREATE TABLE \`${table}\``));
   assert.match(backend, /productionOrigins/); assert.match(backend, /completionHandler\(nil\)/); assert.match(backend, /sameOrigin/);
   assert.match(updater, /isValidSignature/); assert.match(updater, /codesign/); assert.match(updater, /TeamIdentifier/); assert.match(updater, /stapler/); assert.match(updater, /previousRelease/);
@@ -65,6 +65,26 @@ test("redacts high-confidence credentials and private keys", () => {
   ].join("\n"));
   assert.ok(result.total >= 4);
   assert.doesNotMatch(result.value, /AKIAIOSFODNN7EXAMPLE|very-sensitive-token-value|BEGIN PRIVATE KEY/);
+});
+
+test("redacts secrets bound to quoted JSON, XML, and YAML keys", () => {
+  const json = redactJson({ api_key: "abcdefghijklmnop1234", nested: { password: "short" }, safe: "retained" });
+  assert.deepEqual(json.value, { api_key: "[REDACTED]", nested: { password: "[REDACTED]" }, safe: "retained" });
+  assert.equal(json.total, 2);
+  const text = redactText([
+    '"client_secret": "abcdefghijklmnop1234"',
+    "'refresh_token': abcdefghijklmnop1234",
+    "<api_key>abcdefghijklmnop1234</api_key>",
+    'password="abcdefghijklmnop1234"',
+  ].join("\n"));
+  assert.equal(text.total, 4);
+  assert.doesNotMatch(text.value, /abcdefghijklmnop1234/);
+});
+
+test("structured redaction rejects pathological depth", () => {
+  let value: unknown = "leaf";
+  for (let index = 0; index < 70; index += 1) value = { nested: value };
+  assert.throws(() => redactJson(value), /complexity limit/);
 });
 
 test("migration makes audit events append-only at the database layer", async () => {
@@ -104,11 +124,13 @@ test("native upload route derives metadata from a signed manifest and strictly d
 });
 
 test("screenshot pipelines scan the exact persisted pixels and fail closed", async () => {
-  const [capture, scanner, sourceUrl, collectors, evidence, nativeRoute, migration] = await Promise.all([
+  const [capture, scanner, sourceUrl, collectors, imageSafety, imageSafetyConfig, evidence, nativeRoute, migration] = await Promise.all([
     readFile(new URL("../macos/ScopeproofCapture/Sources/ScopeproofCapture/CaptureService.swift", import.meta.url), "utf8"),
     readFile(new URL("../macos/ScopeproofCapture/Sources/ScopeproofCapture/SensitiveDataScanner.swift", import.meta.url), "utf8"),
     readFile(new URL("../macos/ScopeproofCapture/Sources/ScopeproofCapture/EvidenceSourceURL.swift", import.meta.url), "utf8"),
     readFile(new URL("../lib/server/collectors.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/server/image-safety.ts", import.meta.url), "utf8"),
+    readFile(new URL("../lib/server/image-safety-config.ts", import.meta.url), "utf8"),
     readFile(new URL("../lib/server/evidence.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/api/native/evidence/route.ts", import.meta.url), "utf8"),
     readFile(new URL("../drizzle/0008_real_nebula.sql", import.meta.url), "utf8"),
@@ -127,17 +149,22 @@ test("screenshot pipelines scan the exact persisted pixels and fail closed", asy
   assert.match(capture, /captureDate: pixels\.capturedAt/);
   assert.match(capture, /let liveMenuBar = try await liveMenuBarPixels/);
   assert.ok(capture.indexOf("let composite = try scrollingComposite") < capture.indexOf("let liveMenuBar = try await liveMenuBarPixels"));
-  assert.match(capture, /FULL URL/);
+  assert.match(capture, /SOURCE ORIGIN/);
   assert.match(sourceUrl, /components\.user = nil/);
   assert.match(sourceUrl, /components\.password = nil/);
-  assert.match(sourceUrl, /value: "REDACTED"/);
+  assert.match(sourceUrl, /components\.path = ""/);
+  assert.match(sourceUrl, /components\.query = nil/);
+  assert.match(sourceUrl, /components\.fragment = nil/);
   assert.match(scanner, /vision-ocr-sensitive-patterns-v1/);
   assert.doesNotMatch(collectors, /\/content`/);
   assert.match(collectors, /scanExactBrowserPixels/);
-  assert.match(collectors, /result\.sha256 !== digest/);
-  assert.match(collectors, /BROWSER_OCR_ALLOWED_HOSTS/);
+  assert.match(imageSafety, /result\.sha256 !== digest/);
+  assert.match(imageSafetyConfig, /BROWSER_OCR_ALLOWED_HOSTS/);
+  assert.match(imageSafety, /SENSITIVE_CONTENT/);
   assert.match(evidence, /Safety scan digest does not match the evidence artifact/);
   assert.match(nativeRoute, /manifest\.safetyScanSha256 !== imageDigest/);
+  assert.match(nativeRoute, /scanExactEvidencePixels\(image, getEnv\(\)\)/);
+  assert.match(nativeRoute, /serverSafetyScan,/);
   for (const column of ["safety_scan_sha256", "safety_scan_policy", "safety_scan_completed_at"]) assert.ok(migration.includes(column));
 });
 
@@ -282,7 +309,7 @@ test("security mutations are atomic with audit events and timestamps require pin
     readFile(new URL("../macos/ScopeproofCapture/Sources/ScopeproofCapture/KeychainStore.swift", import.meta.url), "utf8"),
   ]);
   assert.match(audit, /executeAuditedBatch/);
-  assert.match(audit, /env\.DB\.batch\(\[/);
+  assert.match(audit, /env\.DB\.batch\(statements\)/);
   assert.match(audit, /scopeproof_audited_batch_failure/);
   for (const source of [evidence, devices, jobs, jira, users, collectors, packages]) assert.match(source, /executeAuditedBatch/);
   assert.doesNotMatch(jira, /await appendAuditEvent/);
@@ -297,7 +324,9 @@ test("security mutations are atomic with audit events and timestamps require pin
   assert.match(lifecycle, /var status: EvidenceReviewStatus \{ events\.last\?\.status/);
   assert.match(lifecycle, /artifactSha256/);
   assert.match(lifecycle, /policyVersion/);
-  assert.match(exporter, /verify\(entry\.lifecycle, artifactSha256:/);
+  assert.match(exporter, /ValidatedEvidenceArtifact\.load\([\s\S]*entry, requireLifecycle: true, trustedAnchor: captureAnchorOverride/);
+  assert.doesNotMatch(exporter, /loadForLegacyBrowsing/);
+  assert.match(exporter, /guard let lifecycle = artifact\.lifecycle, lifecycle\.status == \.approved/);
   assert.match(keychain, /SecAccessControlCreateWithFlags/);
   assert.match(keychain, /userPresence/);
 });

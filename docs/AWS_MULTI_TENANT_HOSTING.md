@@ -6,7 +6,7 @@ Scopeproof's production hosted service will use AWS-managed resources. The local
 
 The initial architecture is a **shared control plane with an isolated evidence plane per tenant**. This keeps idle cost low while placing customer evidence behind separate AWS authorization and encryption boundaries.
 
-`jsontechology.com` is the exact placeholder domain for infrastructure configuration. It is not a claim of domain ownership and must remain configurable. Example customer hostnames are:
+`jsontechology.com` is an illustrative planning placeholder, not checked-in infrastructure configuration or a claim of ownership. The CDK `rootDomain` and `deploymentEnvironment` defaults are deliberately empty; every run must also supply the complete tenant list and an explicit recovery object. Example customer hostnames are:
 
 - `acme.jsontechology.com`
 - `northwind.jsontechology.com`
@@ -63,7 +63,8 @@ Route 53 Alias -> regional API Gateway + WAF
         +---- API Gateway mock integration (/health; no Lambda/STS)
         |
         +---- per-tenant data and legal-control Lambdas
-              (/v1/me, /v1/upload-intents, /v1/legal-hold-*)
+              (/v1/me, /v1/upload-intents, /v1/evidence/search,
+               /v1/evidence-download-intents, /v1/legal-hold-*)
                     |
               tenant resolver + membership authorization
                     |
@@ -200,8 +201,8 @@ account.
 | Area | Implemented in this repository | Still required before customer use |
 | --- | --- | --- |
 | AWS infrastructure | Synthable shared and per-tenant CDK stacks, DynamoDB global control table, explicit tenant resources, Cognito clients, WAF, budgets, alarms, release distribution, provisioning workflow, quarantine scanning resources, and retained audit storage. | Controlled account deployment, safe migration of any existing single-region control table, verified domain and certificates, real alert recipients, UI source/release connection, integration tests, restore drills, and penetration testing. |
-| Tenant request boundary | Strongly consistent exact-host resolution, strict Cognito RS256/JWKS access-token verification, exact app-client binding, RDS Data active-membership/RBAC lookup, safe API errors, an API Gateway mock `GET /health`, and authenticated Lambda routes for `GET /v1/me` and `POST /v1/upload-intents`. Upload issuance atomically limits each member/tenant to 60/300 requests per minute and 500/5,000 new reservations per UTC day. | Deploy it, connect the approved customer UI/auth callback, validate quota and replay behavior under real concurrency, migrate the remaining product routes, and prove the boundary against two tenants. |
-| Relational data | PostgreSQL baseline, tenant-aware keys, forced RLS, four separate runtime/ingest/evidence-control-worker/legal-hold-API logins, execute-only procedure allowlists with no direct application table grants, an offline renderer, and an AWS provisioning implementation. | Port remaining D1 repositories/queries, run the provisioner in an isolated AWS account, verify all role boundaries and RLS with two tenants, test backup/restore, and reconcile imported production data. |
+| Tenant request boundary | Strongly consistent exact-host resolution, strict Cognito RS256/JWKS access-token verification, exact web/native app-client allowlist, operation OAuth scopes, RDS Data active-membership/RBAC lookup, safe API errors, an API Gateway mock `GET /health`, and authenticated upload, Aurora-backed metadata search, 60-second exact-version download, and two-person legal-hold routes. Upload issuance atomically limits each member/tenant to 60/300 requests per minute and 500/5,000 new reservations per UTC day. | Deploy it, connect the approved customer UI and native OAuth callback/session controller, validate quota/pagination/download/replay behavior under real concurrency, migrate the remaining product routes, and prove the boundary against two tenants. |
+| Relational data | PostgreSQL baseline, tenant-aware keys, forced RLS, six separate upload/ingest/evidence-control-worker/legal-hold-API/evidence-read/API-audit-signer logins, execute-only procedure allowlists with no direct application table grants, an offline renderer, and an AWS provisioning implementation. | Port remaining D1 repositories/queries, run the provisioner in an isolated AWS account, verify all role boundaries and RLS with two tenants, test backup/restore, and reconcile imported production data. |
 | Evidence storage | Per-tenant KMS, quarantine and Object-Locked buckets, server-managed tenant retention, a write-only/no-list upload IAM boundary, composed upload-intent route, Dynamo/Aurora ambiguous-commit reconciliation, replay-safe KMS-signed promotion receipts, and CDK-wired two-person `REQUESTED` → `APPROVED` → `APPLYING` → `APPLIED` exact-version S3 legal-hold routes plus terminal `REQUESTED` → `EXPIRED`, durable signed audit/recovery-publication outboxes, bounded retry/backoff, and age/failure/expiry alarms. The public legal-hold API can only request/approve in SQL; only the separate worker role can expire/reconcile and use S3/KMS/audit state. | Deploy/test the upload and active clean paths, add the legal-hold UI/operating process, prove independent authorization and KMS audit emission in AWS, and complete replay/chaos/operational canaries before accepting evidence. |
 | Recovery and native release | DynamoDB global control table, same-account cross-region S3 Object-Lock live replication, deterministic S3 Batch backfill, recurring 24-hour exact-version checksum/metadata/KMS/Object-Lock verification with 36-hour freshness alarms, Aurora AWS Backup/Vault Lock plus regional recovery-freshness alarms, a protected Developer ID/notarization workflow, and advanced CodeQL with a manual Swift build plus JavaScript/TypeScript/Actions coverage. GitHub default CodeQL setup was disabled on 2026-08-27 so the advanced workflow can upload results. | Safely migrate any existing control table, deploy bootstrap/enabled recovery phases, perform backfill/restore/RPO/RTO/cutover drills, configure protected environments and Apple credentials, merge the advanced workflow promptly so `main` regains continuous scanning, require all language checks, and explicitly publish an approved release. |
 | Native authentication | Cognito authorization-code/PKCE transaction validation, exact callback/issuer/audience constraints, tenant binding, and refresh-token Keychain abstraction. | Discovery/enrollment protocol, production UI wiring, JWT verification/server exchange integration, device-key lifecycle, suspension/revocation tests, and signed update/release validation against the deployed service. |
@@ -240,8 +241,9 @@ Follow the [AWS platform runbook](AWS_PLATFORM_RUNBOOK.md) for the exact sequenc
    never deploy that resource-type change directly. Fresh stacks skip this step.
 3. Convert vinext to an Amplify-supported Next.js runtime, connect it to the
    implemented per-tenant API, and replace Worker cron with EventBridge/SQS/Lambda.
-4. Extend the strict Cognito/exact-host/membership boundary from `/v1/me` and
-   `/v1/upload-intents` to every migrated API; add membership administration and
+4. Extend the strict Cognito/exact-host/scope/membership boundary from the
+   implemented identity, upload, evidence-read, and legal-hold routes to every
+   migrated API; add membership administration and
    tenant-bound Mac enrollment.
 5. Port D1/SQLite to PostgreSQL, add tenant constraints and forced RLS, and remove direct database access from route handlers.
 6. Replace R2 with the implemented tenant S3/KMS upload, reconciliation,

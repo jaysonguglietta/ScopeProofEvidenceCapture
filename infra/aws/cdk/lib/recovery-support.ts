@@ -419,13 +419,30 @@ export function configureEvidenceRecovery(scope: Stack, props: EvidenceRecoveryP
 
   const backfillReportBucket = new s3.Bucket(scope, "EvidenceRecoveryBackfillReports", {
     blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
-    encryption: s3.BucketEncryption.S3_MANAGED,
+    bucketKeyEnabled: true,
+    encryption: s3.BucketEncryption.KMS,
+    encryptionKey: evidenceKey,
     enforceSSL: true,
-    lifecycleRules: [{ expiration: Duration.days(365), id: "expire-recovery-backfill-reports" }],
+    lifecycleRules: [{
+      id: "archive-recovery-backfill-reports",
+      noncurrentVersionTransitions: [{ storageClass: s3.StorageClass.GLACIER, transitionAfter: Duration.days(30) }],
+      transitions: [{ storageClass: s3.StorageClass.GLACIER, transitionAfter: Duration.days(90) }],
+    }],
+    objectLockDefaultRetention: tenant.retentionMode === "COMPLIANCE"
+      ? s3.ObjectLockRetention.compliance(Duration.days(tenant.retentionDays ?? 365))
+      : s3.ObjectLockRetention.governance(Duration.days(tenant.retentionDays ?? 365)),
+    objectLockEnabled: true,
     objectOwnership: s3.ObjectOwnership.BUCKET_OWNER_ENFORCED,
     removalPolicy: RemovalPolicy.RETAIN,
     versioned: true,
   });
+  backfillReportBucket.policy?.applyRemovalPolicy(RemovalPolicy.RETAIN);
+  backfillReportBucket.addToResourcePolicy(new iam.PolicyStatement({
+    actions: ["s3:BypassGovernanceRetention", "s3:DeleteObject", "s3:DeleteObjectVersion"],
+    effect: iam.Effect.DENY,
+    principals: [new iam.AnyPrincipal()],
+    resources: [backfillReportBucket.arnForObjects("*")],
+  }));
   const batchRole = new iam.Role(scope, "EvidenceRecoveryBatchRole", {
     assumedBy: new iam.ServicePrincipal("batchoperations.s3.amazonaws.com"),
     description: `Initiates exact existing-version evidence replication for ${tenant.id}`,

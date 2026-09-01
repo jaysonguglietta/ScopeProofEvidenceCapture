@@ -172,6 +172,7 @@ enum LocalConsoleAssets {
         const periodParts=[item.environment,item.assessmentPeriod,item.jiraIssueKey].filter(Boolean); const period=node('p','',periodParts.join(' · '));
         const source=item.sourceURL ? node('p','',`URL · ${item.sourceURL}`) : null;
         const tags=node('div','tag-row'); item.tags.slice(0,6).forEach((tag) => tags.append(node('span','tag',tag)));
+        if (item.safetyStatus === 'Legacy unsigned · browsing only') tags.append(node('span','integrity','Legacy unsigned · browsing only'));
         if (!item.lifecycleValid) tags.append(node('span','integrity','Lifecycle integrity requires attention'));
         if (item.s3IntegrityStatus) tags.append(node('span',item.s3IntegrityVerified?'tag':'integrity',item.s3IntegrityStatus));
         if(item.s3Available){ const versions=item.s3VersionCount>1?` · ${item.s3VersionCount} versions`:''; body.append(node('p','storage-meta',`S3 · ${formatBytes(item.s3SizeBytes)}${versions}`)); }

@@ -194,7 +194,8 @@ export async function authorizeVerifiedTenantIdentity(input: Readonly<{
   permission: TenantPermission;
 }>): Promise<Readonly<{ actor: TenantActor; principal: AuthenticatedPrincipal }>> {
   if (input.identity.signatureVerified !== true || input.identity.tokenUse !== "access") throw new TenantSecurityError("INVALID_PRINCIPAL", "Authentication token is invalid.", 401);
-  if (input.identity.clientId !== input.resolved.tenant.appClientId) {
+  const authorizedClients = input.resolved.tenant.appClientIds ?? [input.resolved.tenant.appClientId];
+  if (!authorizedClients.includes(input.identity.clientId)) {
     throw new TenantSecurityError("INVALID_PRINCIPAL", "Authentication token is invalid for this tenant.", 401);
   }
   const record = await input.memberships.findActiveByIdentity({ tenantId: input.resolved.tenant.id, identitySubject: input.identity.subject });

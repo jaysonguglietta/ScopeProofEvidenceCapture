@@ -1,4 +1,4 @@
-import { asResourceId, asTenantId, assertSafeJson, canonicalInstant, sha256Hex, stableJson, type JsonValue, type Sha256Hex, TenantSecurityError } from "../contracts.ts";
+import { asMembershipId, asResourceId, asTenantId, assertSafeJson, canonicalInstant, sha256Hex, stableJson, type JsonValue, type Sha256Hex, TenantSecurityError } from "../contracts.ts";
 import type { TenantAuditEvent } from "../audit.ts";
 import type { RdsDataApiExecutor } from "../http/membership.ts";
 import type {
@@ -11,6 +11,11 @@ import type {
   UploadIntentRecoveryProjection,
   UploadIntentReservation,
 } from "./upload-intent-issuer.ts";
+import type {
+  ExactGetObjectPresignInput,
+  ExactGetObjectPresigner,
+  ExactPresignedGetObject,
+} from "./evidence-access.ts";
 import type {
   AtomicPromotionCommand,
   AtomicPromotionResult,
@@ -26,6 +31,7 @@ import type {
   ExactVersionLegalHoldOperationStore,
   ExactVersionLegalHoldReceipt,
   ExactVersionLegalHoldApplicationAttempt,
+  ExactVersionLegalHoldApiAuditContext,
   GetObjectLegalHoldInput,
   PutObjectLegalHoldInput,
   ExpiredExactVersionLegalHoldSweepItem,
@@ -473,20 +479,93 @@ export interface DynamoUploadRequestRateLimiterOptions {
   readonly maximumRequestsPerTenantMinute?: number;
 }
 
-/** Atomically consumes tenant and principal request budgets before expensive upload work. */
-export class DynamoUploadRequestRateLimiter {
+export interface TenantRouteRateLimitRequest {
+  readonly tenantId: string;
+  readonly requestedBy: string;
+  /** Stable low-cardinality route name, never a raw URL or attacker input. */
+  readonly route: string;
+  readonly maximumRequestsPerPrincipalMinute: number;
+  readonly maximumRequestsPerTenantMinute: number;
+  readonly now: Date;
+}
+
+/**
+ * Consumes both a tenant-wide and per-principal budget in one transaction.
+ * The principal counter prevents one authenticated user from exhausting a
+ * whole tenant's read/legal-hold capacity; the tenant counter still protects
+ * shared downstream services from a distributed account-level attack.
+ */
+export class DynamoTenantRouteRateLimiter {
   readonly #client: AwsCommandClient;
   readonly #TransactWriteItemsCommand: AwsCommandConstructor<DynamoTransactWriteInput>;
   readonly #tableName: string;
-  readonly #limits: UploadCounterLimits;
 
-  constructor(options: DynamoUploadRequestRateLimiterOptions) {
+  constructor(options: Pick<DynamoUploadRequestRateLimiterOptions, "client" | "TransactWriteItemsCommand" | "tableName">) {
     if (!options.client || typeof options.client.send !== "function") throw new Error("DynamoDB rate-limit client is required.");
     if (typeof options.TransactWriteItemsCommand !== "function") throw new Error("DynamoDB rate-limit command constructor is required.");
     if (!/^[A-Za-z0-9_.-]{3,255}$/.test(options.tableName)) throw new Error("DynamoDB table name is invalid.");
     this.#client = options.client;
     this.#TransactWriteItemsCommand = options.TransactWriteItemsCommand;
     this.#tableName = options.tableName;
+  }
+
+  async consume(input: TenantRouteRateLimitRequest): Promise<void> {
+    const tenantId = asTenantId(input.tenantId);
+    const requestedBy = String(input.requestedBy || "");
+    if (!/^usr_[a-f0-9]{32}$/.test(requestedBy)) throw new TenantSecurityError("INVALID_PRINCIPAL", "Rate-limit principal is invalid.");
+    if (!/^[a-z][a-z0-9_.-]{2,63}$/.test(input.route)) throw new Error("Rate-limit route name is invalid.");
+    if (!(input.now instanceof Date) || !Number.isFinite(input.now.getTime())) throw new Error("Rate-limit time is invalid.");
+    const principalLimit = exactQuotaLimit(input.maximumRequestsPerPrincipalMinute, "Principal minute request quota");
+    const tenantLimit = exactQuotaLimit(input.maximumRequestsPerTenantMinute, "Tenant minute request quota");
+    const minuteWindow = input.now.toISOString().slice(0, 16);
+    const minuteStart = Date.parse(`${minuteWindow}:00.000Z`);
+    const ttlEpochSeconds = Math.floor(minuteStart / 1_000) + (2 * 60 * 60);
+    const tenantKey = `TENANT#${tenantId}`;
+    const routeKey = input.route.toUpperCase().replaceAll(".", "_");
+    const counters = [
+      uploadCounterUpdate({
+        tableName: this.#tableName,
+        tenantKey,
+        sortKey: `RATE#${routeKey}#MINUTE#${minuteWindow}#TENANT`,
+        kind: "TenantRouteMinuteRate",
+        subject: `TENANT:${input.route}`,
+        tenantId,
+        window: minuteWindow,
+        ttlEpochSeconds,
+        limit: tenantLimit,
+      }),
+      uploadCounterUpdate({
+        tableName: this.#tableName,
+        tenantKey,
+        sortKey: `RATE#${routeKey}#MINUTE#${minuteWindow}#PRINCIPAL#${requestedBy}`,
+        kind: "PrincipalRouteMinuteRate",
+        subject: `${input.route}:${requestedBy}`,
+        tenantId,
+        window: minuteWindow,
+        ttlEpochSeconds,
+        limit: principalLimit,
+      }),
+    ];
+    try {
+      await this.#client.send(new this.#TransactWriteItemsCommand({
+        TransactItems: counters.map((Update) => ({ Update })),
+      }));
+    } catch (error) {
+      if (conditionalCancellationCodes(error, 2)) {
+        throw new TenantSecurityError("RATE_LIMITED", "Too many requests were submitted for this operation.", 429);
+      }
+      throw error;
+    }
+  }
+}
+
+/** Atomically consumes tenant and principal request budgets before expensive upload work. */
+export class DynamoUploadRequestRateLimiter {
+  readonly #limiter: DynamoTenantRouteRateLimiter;
+  readonly #limits: UploadCounterLimits;
+
+  constructor(options: DynamoUploadRequestRateLimiterOptions) {
+    this.#limiter = new DynamoTenantRouteRateLimiter(options);
     this.#limits = Object.freeze({
       principal: exactQuotaLimit(
         options.maximumRequestsPerPrincipalMinute ?? DEFAULT_MAXIMUM_UPLOAD_REQUESTS_PER_PRINCIPAL_MINUTE,
@@ -500,48 +579,12 @@ export class DynamoUploadRequestRateLimiter {
   }
 
   async consume(input: Readonly<{ tenantId: string; requestedBy: string; now: Date }>): Promise<void> {
-    const tenantId = asTenantId(input.tenantId);
-    const requestedBy = String(input.requestedBy || "");
-    if (!/^usr_[a-f0-9]{32}$/.test(requestedBy)) throw new TenantSecurityError("INVALID_PRINCIPAL", "Upload principal is invalid.");
-    if (!(input.now instanceof Date) || !Number.isFinite(input.now.getTime())) throw new Error("Upload rate-limit time is invalid.");
-    const minuteWindow = input.now.toISOString().slice(0, 16);
-    const minuteStart = Date.parse(`${minuteWindow}:00.000Z`);
-    const ttlEpochSeconds = Math.floor(minuteStart / 1_000) + (2 * 60 * 60);
-    const tenantKey = `TENANT#${tenantId}`;
-    const counters = [
-      uploadCounterUpdate({
-        tableName: this.#tableName,
-        tenantKey,
-        sortKey: `RATE#UPLOAD_REQUEST#MINUTE#${minuteWindow}#TENANT`,
-        kind: "UploadRequestTenantMinuteRate",
-        subject: "TENANT",
-        tenantId,
-        window: minuteWindow,
-        ttlEpochSeconds,
-        limit: this.#limits.tenant,
-      }),
-      uploadCounterUpdate({
-        tableName: this.#tableName,
-        tenantKey,
-        sortKey: `RATE#UPLOAD_REQUEST#MINUTE#${minuteWindow}#PRINCIPAL#${requestedBy}`,
-        kind: "UploadRequestPrincipalMinuteRate",
-        subject: requestedBy,
-        tenantId,
-        window: minuteWindow,
-        ttlEpochSeconds,
-        limit: this.#limits.principal,
-      }),
-    ];
-    try {
-      await this.#client.send(new this.#TransactWriteItemsCommand({
-        TransactItems: counters.map((Update) => ({ Update })),
-      }));
-    } catch (error) {
-      if (conditionalCancellationCodes(error, 2)) {
-        throw new TenantSecurityError("RATE_LIMITED", "Too many upload requests were submitted in this minute.", 429);
-      }
-      throw error;
-    }
+    await this.#limiter.consume({
+      ...input,
+      route: "upload_request",
+      maximumRequestsPerPrincipalMinute: this.#limits.principal,
+      maximumRequestsPerTenantMinute: this.#limits.tenant,
+    });
   }
 }
 
@@ -641,6 +684,7 @@ export class AwsSdkV3ExactPutObjectPresigner implements ExactPutObjectPresigner 
       "control-id": requiredHeader(headers, "x-amz-meta-control-id"),
       "evidence-id": requiredHeader(headers, "x-amz-meta-evidence-id"),
       "expected-sha256": requiredHeader(headers, "x-amz-meta-expected-sha256"),
+      "upload-nonce-digest": requiredHeader(headers, "x-amz-meta-upload-nonce-digest"),
       "tenant-id": requiredHeader(headers, "x-amz-meta-tenant-id"),
       "upload-intent-id": requiredHeader(headers, "x-amz-meta-upload-intent-id"),
     });
@@ -676,6 +720,64 @@ export class AwsSdkV3ExactPutObjectPresigner implements ExactPutObjectPresigner 
       key: input.key,
       expiresAt: input.expiresAt,
       requiredHeaders: Object.freeze({ ...headers }),
+    });
+  }
+}
+
+interface GetObjectCommandInput {
+  readonly Bucket: string;
+  readonly Key: string;
+  readonly VersionId: string;
+  readonly ExpectedBucketOwner: string;
+  readonly ChecksumMode: "ENABLED";
+  readonly ResponseContentType: string;
+  readonly ResponseContentDisposition: string;
+}
+
+export interface AwsSdkV3GetObjectPresignerOptions {
+  readonly client: unknown;
+  readonly GetObjectCommand: AwsCommandConstructor<GetObjectCommandInput>;
+  readonly getSignedUrl: AwsSdkV3PutObjectPresignerOptions["getSignedUrl"];
+}
+
+/** AWS SDK v3 bridge for one immutable S3 version and no caller-selected key. */
+export class AwsSdkV3ExactGetObjectPresigner implements ExactGetObjectPresigner {
+  readonly #options: AwsSdkV3GetObjectPresignerOptions;
+
+  constructor(options: AwsSdkV3GetObjectPresignerOptions) {
+    if (!options.client || typeof options.getSignedUrl !== "function") throw new Error("S3 download presigner dependencies are required.");
+    this.#options = options;
+  }
+
+  async presignGetObject(input: ExactGetObjectPresignInput): Promise<ExactPresignedGetObject> {
+    const expectedOwner = requiredHeader(input.requiredHeaders, "x-amz-expected-bucket-owner");
+    if (expectedOwner !== input.expectedBucketOwner || requiredHeader(input.requiredHeaders, "x-amz-checksum-mode") !== "ENABLED") {
+      throw new TenantSecurityError("INVALID_IDENTIFIER", "Exact-version download headers are invalid.", 500);
+    }
+    const command = new this.#options.GetObjectCommand({
+      Bucket: input.bucket,
+      Key: input.key,
+      VersionId: input.versionId,
+      ExpectedBucketOwner: expectedOwner,
+      ChecksumMode: "ENABLED",
+      ResponseContentType: input.responseContentType,
+      ResponseContentDisposition: input.responseContentDisposition,
+    });
+    const signedHeaderNames = new Set(Object.keys(input.requiredHeaders));
+    const url = await this.#options.getSignedUrl(this.#options.client, command, {
+      expiresIn: input.expiresInSeconds,
+      signingDate: new Date(input.signingAt),
+      signableHeaders: signedHeaderNames,
+      unhoistableHeaders: signedHeaderNames,
+    });
+    return Object.freeze({
+      method: "GET",
+      url,
+      bucket: input.bucket,
+      key: input.key,
+      versionId: input.versionId,
+      expiresAt: input.expiresAt,
+      requiredHeaders: Object.freeze({ ...input.requiredHeaders }),
     });
   }
 }
@@ -767,12 +869,34 @@ const requestLegalHoldSql = [
   ")",
 ].join("\n");
 
+const requestLegalHoldWithAuditSql = [
+  "SELECT operation_state, operation_revision, committed_canonical_approval, committed_approval_digest,",
+  "       committed_canonical_receipt, committed_receipt_sha256, committed_application_attempt_id,",
+  "       committed_application_prior_status, committed_application_observed_request_id, committed_application_started_at",
+  "FROM scopeproof.reserve_exact_version_legal_hold_with_audit(",
+  "  CAST(:operation_id AS scopeproof.resource_identifier), CAST(:hold_id AS scopeproof.resource_identifier),",
+  "  CAST(:evidence_id AS scopeproof.resource_identifier), :control_id, :evidence_bucket, :object_key, :object_version_id,",
+  "  :desired_status, :hold_kind, :reason, CAST(:requested_by AS scopeproof.resource_identifier),",
+  "  CAST(:expected_hold_revision AS integer), CAST(:changed_at AS timestamptz), :canonical_request, :request_digest,",
+  "  CAST(:membership_id AS scopeproof.resource_identifier), :request_id",
+  ")",
+].join("\n");
+
 const approveLegalHoldSql = [
   "SELECT operation_state, operation_revision, committed_canonical_approval, committed_approval_digest",
   "FROM scopeproof.approve_exact_version_legal_hold(",
   "  CAST(:operation_id AS scopeproof.resource_identifier), :request_digest,",
   "  CAST(:approved_by AS scopeproof.resource_identifier), CAST(:approved_at AS timestamptz),",
   "  :canonical_approval, :approval_digest",
+  ")",
+].join("\n");
+
+const approveLegalHoldWithAuditSql = [
+  "SELECT operation_state, operation_revision, committed_canonical_approval, committed_approval_digest",
+  "FROM scopeproof.approve_exact_version_legal_hold_with_audit(",
+  "  CAST(:operation_id AS scopeproof.resource_identifier), :request_digest,",
+  "  CAST(:approved_by AS scopeproof.resource_identifier), CAST(:approved_at AS timestamptz),",
+  "  :canonical_approval, :approval_digest, CAST(:membership_id AS scopeproof.resource_identifier), :request_id",
   ")",
 ].join("\n");
 
@@ -801,6 +925,23 @@ const applyLegalHoldSql = [
   ")",
 ].join("\n");
 
+const legalHoldApiRequestIdPattern = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/;
+
+function normalizeLegalHoldApiAuditContext(
+  context: ExactVersionLegalHoldApiAuditContext | undefined,
+): readonly { name: string; value: { stringValue: string } }[] {
+  if (!context) return Object.freeze([]);
+  const membershipId = asMembershipId(context.membershipId);
+  const requestId = String(context.requestId || "");
+  if (!legalHoldApiRequestIdPattern.test(requestId)) {
+    throw new TenantSecurityError("INVALID_IDENTIFIER", "API request identifier is invalid.", 400);
+  }
+  return Object.freeze([
+    stringParameter("membership_id", membershipId),
+    stringParameter("request_id", requestId),
+  ]);
+}
+
 /**
  * RDS Data API bridge for the durable legal-hold boundaries. Each method uses
  * its own transaction so REQUESTED and APPROVED commit before any S3 mutation.
@@ -813,8 +954,12 @@ export class RdsDataExactVersionLegalHoldOperationStore implements ExactVersionL
     this.#options = options;
   }
 
-  async request(operation: ExactVersionLegalHoldOperation): Promise<ReservedExactVersionLegalHold> {
-    const response = await this.#execute(operation.tenantId, requestLegalHoldSql, [
+  async request(
+    operation: ExactVersionLegalHoldOperation,
+    apiAudit?: ExactVersionLegalHoldApiAuditContext,
+  ): Promise<ReservedExactVersionLegalHold> {
+    const auditParameters = normalizeLegalHoldApiAuditContext(apiAudit);
+    const response = await this.#execute(operation.tenantId, auditParameters.length ? requestLegalHoldWithAuditSql : requestLegalHoldSql, [
       stringParameter("operation_id", operation.operationId),
       stringParameter("hold_id", operation.holdId),
       stringParameter("evidence_id", operation.evidenceId),
@@ -830,18 +975,24 @@ export class RdsDataExactVersionLegalHoldOperationStore implements ExactVersionL
       stringParameter("changed_at", operation.changedAt),
       stringParameter("canonical_request", operation.canonicalRequest),
       stringParameter("request_digest", operation.requestDigest),
+      ...auditParameters,
     ]);
     return await parseLegalHoldReservation(response.formattedRecords, operation);
   }
 
-  async approve(approval: ExactVersionLegalHoldApproval): Promise<ApprovedExactVersionLegalHold> {
-    const response = await this.#execute(approval.tenantId, approveLegalHoldSql, [
+  async approve(
+    approval: ExactVersionLegalHoldApproval,
+    apiAudit?: ExactVersionLegalHoldApiAuditContext,
+  ): Promise<ApprovedExactVersionLegalHold> {
+    const auditParameters = normalizeLegalHoldApiAuditContext(apiAudit);
+    const response = await this.#execute(approval.tenantId, auditParameters.length ? approveLegalHoldWithAuditSql : approveLegalHoldSql, [
       stringParameter("operation_id", approval.operationId),
       stringParameter("request_digest", approval.requestDigest),
       stringParameter("approved_by", approval.approvedBy),
       stringParameter("approved_at", approval.approvedAt),
       stringParameter("canonical_approval", approval.canonicalApproval),
       stringParameter("approval_digest", approval.approvalDigest),
+      ...auditParameters,
     ]);
     const row = parseSingleLegalHoldRow(response.formattedRecords);
     if ((row.operation_state !== "APPROVED" && row.operation_state !== "APPLYING" && row.operation_state !== "APPLIED") ||

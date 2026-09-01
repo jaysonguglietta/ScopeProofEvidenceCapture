@@ -1,4 +1,4 @@
-import { DynamoDBClient, GetItemCommand } from "@aws-sdk/client-dynamodb";
+import { DynamoDBClient, GetItemCommand, TransactWriteItemsCommand } from "@aws-sdk/client-dynamodb";
 import {
   BeginTransactionCommand,
   CommitTransactionCommand,
@@ -22,6 +22,7 @@ import {
   type TenantApiRequestRuntime,
 } from "../../../../../lib/aws-runtime/http/index.ts";
 import {
+  DynamoTenantRouteRateLimiter,
   RdsDataExactVersionLegalHoldOperationStore,
   approveExactVersionLegalHoldChange,
   requestExactVersionLegalHoldChange,
@@ -30,7 +31,7 @@ import type { AuthorizedApiRequest } from "../../../../../lib/aws-runtime/http/a
 
 const requiredEnvironment = [
   "API_HOSTNAME",
-  "COGNITO_APP_CLIENT_ID",
+  "COGNITO_APP_CLIENT_IDS",
   "COGNITO_ISSUER",
   "CONTROL_TABLE_NAME",
   "DATABASE_CLUSTER_ARN",
@@ -61,19 +62,33 @@ function environment(): Readonly<Record<RequiredEnvironmentName, string>> {
 }
 
 const config = environment();
+const cognitoAppClientIds = (() => {
+  let parsed: unknown;
+  try { parsed = JSON.parse(config.COGNITO_APP_CLIENT_IDS); } catch { throw new Error("Cognito app-client allowlist is invalid."); }
+  if (!Array.isArray(parsed) || parsed.length !== 2 || new Set(parsed).size !== parsed.length || parsed.some((value) => typeof value !== "string" || !/^[A-Za-z0-9_.:+/=_~-]{3,128}$/.test(value))) {
+    throw new Error("Cognito app-client allowlist is invalid.");
+  }
+  return Object.freeze([...parsed].sort()) as readonly string[];
+})();
 const region = process.env.AWS_REGION;
 if (!region || !/^[a-z]{2}(?:-gov)?-[a-z]+-\d$/.test(region)) throw new Error("Lambda AWS region is invalid.");
 
 const baseDynamo = new DynamoDBClient({ region });
+type RouteRateLimiterOptions = ConstructorParameters<typeof DynamoTenantRouteRateLimiter>[0];
 const sts = new STSClient({ region });
 const tenants = new DynamoTenantAuthorityResolver({
   client: baseDynamo,
   commands: { GetItemCommand },
   tableName: config.CONTROL_TABLE_NAME,
 });
+const routeLimiter = new DynamoTenantRouteRateLimiter({
+  client: baseDynamo,
+  TransactWriteItemsCommand: compatibleAwsCommand<CommandInput<RouteRateLimiterOptions["TransactWriteItemsCommand"]>>(TransactWriteItemsCommand as never),
+  tableName: config.CONTROL_TABLE_NAME,
+});
 const jwt = new CognitoJwtVerifier({
   issuer: config.COGNITO_ISSUER,
-  clientIds: [config.COGNITO_APP_CLIENT_ID],
+  clientIds: cognitoAppClientIds,
   maximumAuthenticationAgeSeconds: 60 * 60,
   maximumTokenLifetimeSeconds: 60 * 60,
   jwksTimeoutMilliseconds: 3_000,
@@ -130,8 +145,9 @@ function executor(credentials: ReturnType<typeof assumedCredentialProvider>): Aw
 
 function createRequestRuntime(requestId: string): TenantApiRequestRuntime {
   const workflowCredentials = assumedCredentialProvider(config.LEGAL_HOLD_API_ROLE_ARN, "legal-workflow", requestId);
+  const rds = executor(workflowCredentials);
   const membership = new RdsDataMembershipRepository({
-    executor: executor(workflowCredentials),
+    executor: rds,
     resourceArn: config.DATABASE_CLUSTER_ARN,
     secretArn: config.LEGAL_HOLD_DATABASE_SECRET_ARN,
     database: config.DATABASE_NAME,
@@ -144,7 +160,7 @@ function createRequestRuntime(requestId: string): TenantApiRequestRuntime {
     tenants,
   });
   const legalHoldStore = new RdsDataExactVersionLegalHoldOperationStore({
-    executor: executor(workflowCredentials),
+    executor: rds,
     resourceArn: config.DATABASE_CLUSTER_ARN,
     secretArn: config.LEGAL_HOLD_DATABASE_SECRET_ARN,
     database: config.DATABASE_NAME,
@@ -153,21 +169,39 @@ function createRequestRuntime(requestId: string): TenantApiRequestRuntime {
     authentication,
     async requestLegalHold(request: AuthorizedApiRequest, payload: LegalHoldRequestApiPayload) {
       assertBoundary(request);
+      await consumeLegalQuota(request, "legal_hold.request");
       return await requestExactVersionLegalHoldChange(
         legalHoldStore,
         { ...payload, tenantId: request.actor.tenantId },
         request.actor,
         { evidenceBucket: config.EVIDENCE_BUCKET_NAME },
+        { membershipId: request.actor.membershipId, requestId: request.requestId },
       );
     },
     async approveLegalHold(request: AuthorizedApiRequest, payload: LegalHoldApprovalApiPayload) {
       assertBoundary(request);
+      await consumeLegalQuota(request, "legal_hold.approve");
       return await approveExactVersionLegalHoldChange(
         legalHoldStore,
         { ...payload, tenantId: request.actor.tenantId },
         request.actor,
+        { membershipId: request.actor.membershipId, requestId: request.requestId },
       );
     },
+  });
+}
+
+async function consumeLegalQuota(
+  request: AuthorizedApiRequest,
+  route: "legal_hold.request" | "legal_hold.approve",
+): Promise<void> {
+  await routeLimiter.consume({
+    tenantId: request.actor.tenantId,
+    requestedBy: request.actor.userId,
+    route,
+    maximumRequestsPerPrincipalMinute: 10,
+    maximumRequestsPerTenantMinute: 50,
+    now: new Date(),
   });
 }
 

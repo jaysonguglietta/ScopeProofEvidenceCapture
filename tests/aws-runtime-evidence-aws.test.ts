@@ -8,6 +8,7 @@ import {
   AwsSdkV3ExactVersionLegalHoldClient,
   AwsSdkV3KmsAsymmetricSigningClient,
   DynamoConditionalUploadIntentStore,
+  DynamoTenantRouteRateLimiter,
   DynamoUploadRequestRateLimiter,
   RdsDataAtomicPromotionStore,
   RdsDataExactVersionLegalHoldOperationStore,
@@ -23,6 +24,7 @@ import type { TenantActor } from "../lib/aws-runtime/tenancy.ts";
 
 const TENANT = `ten_${"a".repeat(32)}`;
 const USER = `usr_${"b".repeat(32)}`;
+const MEMBERSHIP = `mem_${"5".repeat(32)}`;
 const INTENT = `upl_${"c".repeat(32)}`;
 const EVIDENCE = `evd_${"d".repeat(32)}`;
 const RECEIPT = `rcp_${"e".repeat(32)}`;
@@ -304,6 +306,41 @@ test("Dynamo upload creation quota fails closed and minute limits bind tenant pl
   );
 });
 
+test("Dynamo route quotas isolate principal and tenant budgets by stable operation", async () => {
+  let transaction: TransactWriteItemsCommand<Record<string, unknown>> | undefined;
+  const limiter = new DynamoTenantRouteRateLimiter({
+    client: { async send(command) { transaction = command as typeof transaction; return {}; } },
+    TransactWriteItemsCommand,
+    tableName: "scopeproof-control",
+  });
+  await limiter.consume({
+    tenantId: TENANT,
+    requestedBy: USER,
+    route: "evidence.download",
+    maximumRequestsPerPrincipalMinute: 60,
+    maximumRequestsPerTenantMinute: 300,
+    now: new Date("2026-08-27T16:04:59.999Z"),
+  });
+  const input = transaction!.input as { TransactItems: Array<{ Update: { Key: Record<string, { S?: string }>; ExpressionAttributeValues: Record<string, { N?: string; S?: string }> } }> };
+  assert.equal(input.TransactItems.length, 2);
+  assert.equal(input.TransactItems[0].Update.Key.SK.S, "RATE#EVIDENCE_DOWNLOAD#MINUTE#2026-08-27T16:04#TENANT");
+  assert.equal(input.TransactItems[1].Update.Key.SK.S, `RATE#EVIDENCE_DOWNLOAD#MINUTE#2026-08-27T16:04#PRINCIPAL#${USER}`);
+  assert.equal(input.TransactItems[0].Update.ExpressionAttributeValues[":limit"].N, "300");
+  assert.equal(input.TransactItems[1].Update.ExpressionAttributeValues[":limit"].N, "60");
+  assert.equal(input.TransactItems[1].Update.ExpressionAttributeValues[":subject"].S, `evidence.download:${USER}`);
+  await assert.rejects(
+    limiter.consume({
+      tenantId: TENANT,
+      requestedBy: USER,
+      route: "../../../unbounded",
+      maximumRequestsPerPrincipalMinute: 1,
+      maximumRequestsPerTenantMinute: 1,
+      now: new Date(),
+    }),
+    /route name is invalid/,
+  );
+});
+
 test("Dynamo upload creation quota recovers an exact reservation committed at the limit", async () => {
   const recovery = await recoveryProjection();
   const persisted = new Map<string, Record<string, { S?: string; N?: string }>>();
@@ -361,6 +398,7 @@ test("AWS S3 presigner bridge makes all security headers unhoistable and exact",
     "x-amz-meta-expected-sha256": "f".repeat(64),
     "x-amz-meta-tenant-id": TENANT,
     "x-amz-meta-upload-intent-id": INTENT,
+    "x-amz-meta-upload-nonce-digest": "1".repeat(64),
     "x-amz-server-side-encryption": "aws:kms",
     "x-amz-server-side-encryption-aws-kms-key-id": EVIDENCE_KEY,
     "x-amz-server-side-encryption-context": "eyJ0ZXN0Ijp0cnVlfQ==",
@@ -390,6 +428,7 @@ test("AWS S3 presigner bridge makes all security headers unhoistable and exact",
   assert.deepEqual([...options!.unhoistableHeaders].sort(), Object.keys(headers).sort());
   assert.equal(command?.input.SSEKMSKeyId, EVIDENCE_KEY);
   assert.equal((command?.input.Metadata as Record<string, string>)["control-id"], CONTROL);
+  assert.equal((command?.input.Metadata as Record<string, string>)["upload-nonce-digest"], "1".repeat(64));
 });
 
 test("KMS and exact-version legal-hold bridges construct only approved commands", async () => {
@@ -505,7 +544,10 @@ test("RDS legal-hold store commits request and independent approval before CAS-c
     secretArn: "arn:aws:secretsmanager:us-east-1:111111111111:secret:tenant-runtime-AbCd",
     database: "scopeproof_acme",
   });
-  assert.deepEqual(await store.request(operation), { state: "REQUESTED", operationRevision: 0 });
+  assert.deepEqual(await store.request(operation, {
+    membershipId: MEMBERSHIP,
+    requestId: "request-legal-hold-0001",
+  }), { state: "REQUESTED", operationRevision: 0 });
   const approval = await prepareExactVersionLegalHoldApproval({
     tenantId: TENANT,
     operationId: HOLD_OPERATION,
@@ -516,7 +558,10 @@ test("RDS legal-hold store commits request and independent approval before CAS-c
     userId: APPROVER as TenantActor["userId"],
     role: "admin",
   });
-  assert.equal((await store.approve(approval)).state, "APPROVED");
+  assert.equal((await store.approve(approval, {
+    membershipId: MEMBERSHIP,
+    requestId: "request-legal-hold-0002",
+  })).state, "APPROVED");
   assert.equal((await store.read(operation)).state, "APPROVED");
   const receipt = {
     schemaVersion: 1 as const,
@@ -555,8 +600,8 @@ test("RDS legal-hold store commits request and independent approval before CAS-c
   const readStatement = calls[10].input;
   const beginApplyStatement = calls[14].input;
   const applyStatement = calls[18].input;
-  assert.match(String(reserveStatement.sql), /reserve_exact_version_legal_hold/);
-  assert.match(String(approvalStatement.sql), /approve_exact_version_legal_hold/);
+  assert.match(String(reserveStatement.sql), /reserve_exact_version_legal_hold_with_audit/);
+  assert.match(String(approvalStatement.sql), /approve_exact_version_legal_hold_with_audit/);
   assert.match(String(readStatement.sql), /read_exact_version_legal_hold_operation/);
   assert.match(String(beginApplyStatement.sql), /begin_exact_version_legal_hold_application/);
   assert.match(String(applyStatement.sql), /confirm_exact_version_legal_hold/);
@@ -565,6 +610,24 @@ test("RDS legal-hold store commits request and independent approval before CAS-c
     (reserveStatement.parameters as Array<{ name: string; value: { stringValue: string } }>).
       find((entry) => entry.name === "object_version_id")?.value.stringValue,
     "evidence-version-1",
+  );
+  assert.equal(
+    (reserveStatement.parameters as Array<{ name: string; value: { stringValue: string } }>).
+      find((entry) => entry.name === "membership_id")?.value.stringValue,
+    MEMBERSHIP,
+  );
+  assert.equal(
+    (approvalStatement.parameters as Array<{ name: string; value: { stringValue: string } }>).
+      find((entry) => entry.name === "request_id")?.value.stringValue,
+    "request-legal-hold-0002",
+  );
+  assert.deepEqual(await store.request(operation), { state: "REQUESTED", operationRevision: 0 });
+  const internalReplayStatement = calls.at(-2)?.input;
+  assert.match(String(internalReplayStatement?.sql), /reserve_exact_version_legal_hold\(/);
+  assert.doesNotMatch(String(internalReplayStatement?.sql), /reserve_exact_version_legal_hold_with_audit/);
+  assert.equal(
+    (internalReplayStatement?.parameters as Array<{ name: string }>).some((entry) => entry.name === "membership_id"),
+    false,
   );
 });
 

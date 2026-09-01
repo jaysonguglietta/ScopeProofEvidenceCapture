@@ -50,7 +50,7 @@ function buildPdf(lines: string[]): Uint8Array {
 export async function buildAssessorPackage(actor: AuthenticatedUser, assessmentId: string): Promise<{ id: string; evidenceCount: number; excludedCount: number; sha256: string; signature: string }> {
   const env = getEnv();
   if (!/^asm_[a-f0-9]{32}$/.test(assessmentId)) throw new Response(JSON.stringify({ error: "A valid assessment is required." }), { status: 400, headers: { "content-type": "application/json" } });
-  const assessment = await env.DB.prepare("SELECT id, name, framework, period_start, period_end, systems_json, controls_json, status FROM assessments WHERE id = ?").bind(assessmentId).first<Record<string, unknown>>();
+  const assessment = await env.DB.prepare("SELECT id, name, framework, period_start, period_end, systems_json, controls_json, status, updated_at FROM assessments WHERE id = ?").bind(assessmentId).first<Record<string, unknown>>();
   if (!assessment || assessment.status === "draft") throw new Response(JSON.stringify({ error: "Only active or closed assessments can be exported." }), { status: 409, headers: { "content-type": "application/json" } });
   const id = randomId("pkg");
   let pendingR2Key: string | null = null;
@@ -61,19 +61,56 @@ export async function buildAssessorPackage(actor: AuthenticatedUser, assessmentI
   try {
     const generatedAt = new Date().toISOString();
     const counts = await env.DB.prepare(`SELECT COUNT(*) AS total,
-      SUM(CASE WHEN e.status = 'approved' AND e.expires_at > ? AND e.coverage_status != 'partial' THEN 1 ELSE 0 END) AS eligible,
+      SUM(CASE WHEN e.status = 'approved' AND e.expires_at > ? AND e.coverage_status != 'partial'
+        AND (e.type != 'screenshot' OR (
+          e.server_safety_scan_sha256 = e.sha256 AND e.server_safety_scan_policy IS NOT NULL AND e.server_safety_scan_completed_at IS NOT NULL
+          AND e.server_safety_scanner_origin IS NOT NULL AND e.server_safety_receipt_sha256 IS NOT NULL
+        ))
+        AND (e.device_id IS NULL OR EXISTS (
+          SELECT 1 FROM native_evidence_manifests n JOIN capture_devices d ON d.id = n.device_id
+          WHERE n.artifact_id = e.id AND n.device_id = e.device_id AND n.image_sha256 = e.sha256 AND n.manifest_sha256 = e.manifest_sha256
+            AND n.chain_sequence IS NOT NULL AND n.chain_sequence > 0 AND n.chain_event_hash = e.chain_event_hash
+            AND n.provenance_key_id IS NOT NULL AND d.provenance_key_id = n.provenance_key_id AND d.chain_sequence >= n.chain_sequence
+        )) THEN 1 ELSE 0 END) AS eligible,
+      SUM(CASE WHEN e.type = 'screenshot' AND e.status = 'approved' AND e.expires_at > ? AND e.coverage_status != 'partial'
+        AND NOT (
+          e.server_safety_scan_sha256 = e.sha256 AND e.server_safety_scan_policy IS NOT NULL AND e.server_safety_scan_completed_at IS NOT NULL
+          AND e.server_safety_scanner_origin IS NOT NULL AND e.server_safety_receipt_sha256 IS NOT NULL
+        ) THEN 1 ELSE 0 END) AS pending_safety,
+      SUM(CASE WHEN e.device_id IS NOT NULL AND e.status = 'approved' AND e.expires_at > ? AND e.coverage_status != 'partial'
+        AND NOT EXISTS (
+          SELECT 1 FROM native_evidence_manifests n JOIN capture_devices d ON d.id = n.device_id
+          WHERE n.artifact_id = e.id AND n.device_id = e.device_id AND n.image_sha256 = e.sha256 AND n.manifest_sha256 = e.manifest_sha256
+            AND n.chain_sequence IS NOT NULL AND n.chain_sequence > 0 AND n.chain_event_hash = e.chain_event_hash
+            AND n.provenance_key_id IS NOT NULL AND d.provenance_key_id = n.provenance_key_id AND d.chain_sequence >= n.chain_sequence
+        ) THEN 1 ELSE 0 END) AS pending_native,
       SUM(CASE WHEN e.coverage_status = 'partial' AND e.status IN ('needs_review','expiring') AND e.expires_at > ?
         AND NOT EXISTS (SELECT 1 FROM evidence_artifacts newer WHERE newer.assessment_id = e.assessment_id AND newer.control_id = e.control_id
           AND newer.source = e.source AND newer.system = e.system AND newer.coverage_status != 'partial' AND newer.captured_at > e.captured_at
           AND newer.status NOT IN ('rejected','expired','purged') AND newer.expires_at > ?) THEN 1 ELSE 0 END) AS partial
-      FROM evidence_artifacts e WHERE e.assessment_id = ?`).bind(generatedAt, generatedAt, generatedAt, assessmentId).first<{ total: number; eligible: number; partial: number }>();
+      FROM evidence_artifacts e WHERE e.assessment_id = ?`).bind(generatedAt, generatedAt, generatedAt, generatedAt, generatedAt, assessmentId).first<{ total: number; eligible: number; pending_safety: number; pending_native: number; partial: number }>();
     const eligibleCount = Number(counts?.eligible || 0);
     const totalCount = Number(counts?.total || 0);
     const excludedCount = totalCount - eligibleCount;
+    if (Number(counts?.pending_safety || 0) > 0) throw new Error("Assessment contains screenshot evidence without an independent digest-bound server safety receipt. Recollect browser evidence or retry the original device upload before export.");
+    if (Number(counts?.pending_native || 0) > 0) throw new Error("Assessment contains native evidence whose signed device-chain link is not finalized. Retry those uploads before export.");
     if (Number(counts?.partial || 0) > 0) throw new Error("Assessment contains partial-coverage evidence. Recollect it completely before export.");
     if (eligibleCount > 100) throw new Error(`Assessment contains ${eligibleCount} eligible artifacts, exceeding the 100-artifact package limit. Split the assessment scope explicitly; Scopeproof will not truncate it.`);
-    const rows = (await env.DB.prepare(`SELECT id, control_id, framework, catalog_version, title, description, type, source, system, environment, assessment_period, evidence_owner, tags_json, expected_evidence, mapped_controls_json, jira_issue_key, jira_issue_url, content_type, byte_size, sha256, captured_at, expires_at, redaction_count, manual_redactions, safety_scan_sha256, safety_scan_policy, safety_scan_completed_at, approved_by, approved_at, coverage_status, coverage_json
-      FROM evidence_artifacts WHERE assessment_id = ? AND status = 'approved' AND expires_at > ? AND coverage_status != 'partial' ORDER BY control_id, captured_at DESC, id`).bind(assessmentId, generatedAt).all<Record<string, unknown>>()).results;
+    const rows = (await env.DB.prepare(`SELECT e.id, e.control_id, e.framework, e.catalog_version, e.title, e.description, e.type, e.source, e.system, e.environment, e.assessment_period, e.evidence_owner, e.tags_json, e.expected_evidence, e.mapped_controls_json, e.jira_issue_key, e.jira_issue_url, e.content_type, e.byte_size, e.sha256, e.captured_at, o.expires_at, e.redaction_count, e.manual_redactions, e.safety_scan_sha256, e.safety_scan_policy, e.safety_scan_completed_at, e.server_safety_scan_sha256, e.server_safety_scan_policy, e.server_safety_scan_completed_at, e.server_safety_scanner_origin, e.server_safety_receipt_sha256, o.approved_by, o.approved_at, o.coverage_status, o.coverage_json, o.id AS occurrence_id, o.received_at AS occurrence_received_at
+      FROM evidence_artifacts e JOIN evidence_occurrences o ON o.id = (
+        SELECT latest.id FROM evidence_occurrences latest WHERE latest.artifact_id = e.id ORDER BY latest.received_at DESC, latest.id DESC LIMIT 1
+      ) WHERE e.assessment_id = ? AND o.status = 'approved' AND o.expires_at > ? AND o.coverage_status != 'partial'
+        AND (e.type != 'screenshot' OR (
+          e.server_safety_scan_sha256 = e.sha256 AND e.server_safety_scan_policy IS NOT NULL AND e.server_safety_scan_completed_at IS NOT NULL
+          AND e.server_safety_scanner_origin IS NOT NULL AND e.server_safety_receipt_sha256 IS NOT NULL
+        ))
+        AND (e.device_id IS NULL OR EXISTS (
+          SELECT 1 FROM native_evidence_manifests n JOIN capture_devices d ON d.id = n.device_id
+          WHERE n.artifact_id = e.id AND n.device_id = e.device_id AND n.image_sha256 = e.sha256 AND n.manifest_sha256 = e.manifest_sha256
+            AND n.chain_sequence IS NOT NULL AND n.chain_sequence > 0 AND n.chain_event_hash = e.chain_event_hash
+            AND n.provenance_key_id IS NOT NULL AND d.provenance_key_id = n.provenance_key_id AND d.chain_sequence >= n.chain_sequence
+        ))
+      ORDER BY e.control_id, o.captured_at DESC, e.id`).bind(assessmentId, generatedAt).all<Record<string, unknown>>()).results;
     if (rows.length !== eligibleCount) throw new Error("Assessment evidence changed while the package was being selected. Retry the export.");
     if (!rows.length) throw new Error("No approved evidence is available for export.");
     const files: Record<string, Uint8Array> = {};
@@ -127,9 +164,30 @@ export async function buildAssessorPackage(actor: AuthenticatedUser, assessmentI
     await env.EVIDENCE_BUCKET.put(r2Key, encrypted.ciphertext, { customMetadata: { packageId: id, sha256: digest, encryptionIv: encrypted.iv, encryptionVersion: "2", encryptionKeyId: encrypted.keyId } });
     const completedAt = new Date().toISOString();
     const expiresAt = new Date(Date.now() + 7 * 86_400_000).toISOString();
-    await executeAuditedBatch(actor, "package.created", "export_package", id, { evidenceCount: rows.length, sha256: digest, byteSize: zip.byteLength, expiresAt }, [
-      env.DB.prepare("UPDATE export_packages SET status = 'ready', r2_key = ?, sha256 = ?, signature = ?, evidence_count = ?, excluded_count = ?, encryption_key_id = ?, byte_size = ?, completed_at = ?, expires_at = ?, error_message = NULL WHERE id = ? AND status = 'building'").bind(r2Key, digest, signature, rows.length, excludedCount, encrypted.keyId, zip.byteLength, completedAt, expiresAt, id),
+    const occurrenceConditions = rows.map(() => `EXISTS (SELECT 1 FROM evidence_occurrences selected
+      WHERE selected.id = ? AND selected.artifact_id = ? AND selected.status = 'approved' AND selected.expires_at > ? AND selected.coverage_status != 'partial'
+        AND selected.id = (SELECT latest.id FROM evidence_occurrences latest WHERE latest.artifact_id = selected.artifact_id ORDER BY latest.received_at DESC, latest.id DESC LIMIT 1)
+        AND EXISTS (SELECT 1 FROM evidence_artifacts e WHERE e.id = selected.artifact_id
+          AND (e.type != 'screenshot' OR (
+            e.server_safety_scan_sha256 = e.sha256 AND e.server_safety_scan_policy IS NOT NULL AND e.server_safety_scan_completed_at IS NOT NULL
+            AND e.server_safety_scanner_origin IS NOT NULL AND e.server_safety_receipt_sha256 IS NOT NULL
+          ))
+          AND (e.device_id IS NULL OR EXISTS (
+          SELECT 1 FROM native_evidence_manifests n JOIN capture_devices d ON d.id = n.device_id
+          WHERE n.artifact_id = e.id AND n.device_id = e.device_id AND n.image_sha256 = e.sha256 AND n.manifest_sha256 = e.manifest_sha256
+            AND n.chain_sequence IS NOT NULL AND n.chain_sequence > 0 AND n.chain_event_hash = e.chain_event_hash
+            AND n.provenance_key_id IS NOT NULL AND d.provenance_key_id = n.provenance_key_id AND d.chain_sequence >= n.chain_sequence
+        ))))`).join(" AND ");
+    const occurrenceBindings = rows.flatMap((row) => [row.occurrence_id, row.id, completedAt]);
+    const [published] = await executeAuditedBatch(actor, "package.created", "export_package", id, { evidenceCount: rows.length, occurrenceIds: rows.map((row) => row.occurrence_id), sha256: digest, byteSize: zip.byteLength, expiresAt }, [
+      env.DB.prepare(`UPDATE export_packages SET status = 'ready', r2_key = ?, sha256 = ?, signature = ?, evidence_count = ?, excluded_count = ?, encryption_key_id = ?, byte_size = ?, completed_at = ?, expires_at = ?, error_message = NULL
+        WHERE id = ? AND status = 'building'
+          AND EXISTS (SELECT 1 FROM assessments WHERE id = ? AND status = ? AND updated_at = ?)
+          AND ${occurrenceConditions}`)
+        .bind(r2Key, digest, signature, rows.length, excludedCount, encrypted.keyId, zip.byteLength, completedAt, expiresAt, id,
+          assessmentId, assessment.status, assessment.updated_at, ...occurrenceBindings),
     ], { sql: "EXISTS (SELECT 1 FROM export_packages WHERE id = ? AND status = 'ready' AND sha256 = ?)", bindings: [id, digest] });
+    if (!published.meta.changes) throw new Error("Assessment scope or evidence approval changed while the package was being built. Retry the export.");
     return { id, evidenceCount: rows.length, excludedCount, sha256: digest, signature };
   } catch (error) {
     if (pendingR2Key) await env.EVIDENCE_BUCKET.delete(pendingR2Key);
