@@ -621,6 +621,7 @@ The following issues were confirmed earlier in the review and are remediated in 
 - Inject faults after native chain reservation, R2/D1 artifact persistence, and during link finalization; pending metadata must remain visible only as pending, while bytes/approval/Jira/export fail. Verify exact retry finalizes once, conflicting retry fails, orphan cleanup is bounded/audited, and migration 0022 rejects link mutation/deletion/duplicate device sequence.
 - Test Local Console DNS rebinding, wrong Host/Origin/fetch metadata, stolen/expired/replayed bearer, replayed launch nonce, slowloris, excessive connections, oversized headers/body, and arbitrary ID/path/key input. Confirm that no localhost authentication cookie is created.
 - Verify source URLs persist origin only and no secret appears in logs, receipts, index, crash reports, or browser payloads.
+- Exercise CryptoKit-to-Worker schema-8 provenance signatures across canonical DER scalar widths, including short magnitudes that require a leading `00` sign octet; accept canonical signatures and reject redundant or missing padding, negative, zero, over-width, invalid-length, and trailing encodings.
 
 ### S3, retention, and legal holds
 

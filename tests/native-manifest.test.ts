@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import { NativeManifestError, parseNativeManifest, validatePng, verifyNativeManifestProvenance } from "../lib/server/native-manifest.ts";
+import { derEcdsaToP1363, NativeManifestError, parseNativeManifest, validatePng, verifyNativeManifestProvenance } from "../lib/server/native-manifest.ts";
 import { stableJson } from "../lib/server/canonical-json.ts";
 
 function manifest(overrides: Record<string, unknown> = {}): Uint8Array {
@@ -107,6 +107,46 @@ function p1363ToDer(signature: Uint8Array): Uint8Array {
   return der;
 }
 
+test("ECDSA DER parser accepts required short sign padding and rejects non-canonical integers", () => {
+  const shortSignPadding = Uint8Array.of(0x30, 0x07, 0x02, 0x02, 0x00, 0x80, 0x02, 0x01, 0x01);
+  const converted = derEcdsaToP1363(shortSignPadding);
+  assert.equal(converted.byteLength, 64);
+  assert.equal(converted[31], 0x80);
+  assert.equal(converted[63], 0x01);
+  assert.ok(converted.subarray(0, 31).every((value) => value === 0));
+  assert.ok(converted.subarray(32, 63).every((value) => value === 0));
+
+  const shortSignPaddingInS = derEcdsaToP1363(Uint8Array.of(0x30, 0x07, 0x02, 0x01, 0x01, 0x02, 0x02, 0x00, 0x80));
+  assert.equal(shortSignPaddingInS[31], 0x01);
+  assert.equal(shortSignPaddingInS[63], 0x80);
+
+  const fullWidthInteger = Uint8Array.of(0x02, 0x21, 0x00, 0x80, ...new Uint8Array(31));
+  const maximumLengthSignature = new Uint8Array(72);
+  maximumLengthSignature.set([0x30, 0x46]);
+  maximumLengthSignature.set(fullWidthInteger, 2);
+  maximumLengthSignature.set(fullWidthInteger, 2 + fullWidthInteger.byteLength);
+  const maximumConverted = derEcdsaToP1363(maximumLengthSignature);
+  assert.equal(maximumConverted[0], 0x80);
+  assert.equal(maximumConverted[32], 0x80);
+
+  assert.throws(
+    () => derEcdsaToP1363(Uint8Array.of(0x30, 0x07, 0x02, 0x02, 0x00, 0x01, 0x02, 0x01, 0x01)),
+    NativeManifestError,
+  );
+  assert.throws(
+    () => derEcdsaToP1363(Uint8Array.of(0x30, 0x06, 0x02, 0x01, 0x80, 0x02, 0x01, 0x01)),
+    NativeManifestError,
+  );
+  assert.throws(
+    () => derEcdsaToP1363(Uint8Array.of(0x30, 0x06, 0x02, 0x01, 0x00, 0x02, 0x01, 0x01)),
+    NativeManifestError,
+  );
+  assert.throws(
+    () => derEcdsaToP1363(Uint8Array.of(0x30, 0x08, 0x02, 0x02, 0x00, 0x80, 0x02, 0x01, 0x01, 0x00)),
+    NativeManifestError,
+  );
+});
+
 test("schema-8 device provenance binds the exact tenant and workspace", async () => {
   const unsigned = JSON.parse(new TextDecoder().decode(manifest())) as Record<string, unknown>;
   delete unsigned.provenance;
@@ -122,6 +162,7 @@ test("schema-8 device provenance binds the exact tenant and workspace", async ()
   let p1363: Uint8Array | null = null;
   for (let attempt = 0; attempt < 64; attempt += 1) {
     const candidate = new Uint8Array(await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, keys.privateKey, signed));
+    assert.equal(candidate.byteLength, 64, "P-256 WebCrypto signatures must use fixed-width IEEE-P1363 encoding");
     if ((candidate[0] & 0x80) !== 0 || (candidate[32] & 0x80) !== 0) { p1363 = candidate; break; }
   }
   assert.ok(p1363, "test fixture should exercise DER's required positive-integer sign padding");

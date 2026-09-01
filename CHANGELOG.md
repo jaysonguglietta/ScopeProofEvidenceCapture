@@ -4,6 +4,7 @@
 
 - Advanced the unreleased macOS build from 24 to 25 so the hardened binary has a unique bundle identity and cannot be confused with an earlier local 1.10.0 build containing different bytes.
 - Restored current Mac-to-hosted compatibility by accepting only signed schema-8 native manifests at the hosted boundary and requiring their customer/workspace identifiers to exactly match the isolated deployment's `LEGACY_TENANT_ID` and `LEGACY_WORKSPACE_ID`; schema-7 evidence cannot be silently rebound across this boundary.
+- Fixed hosted schema-8 provenance verification to accept canonical DER-encoded P-256 signatures whose minimally encoded `r` or `s` value is shorter than 32 bytes and requires a leading positive sign octet. Redundant padding, negative or zero integers, over-width values, invalid lengths, and trailing bytes remain rejected, removing intermittent rejection of valid CryptoKit signatures without widening the signature trust boundary.
 
 ### 2026-09-01 security and product hardening
 

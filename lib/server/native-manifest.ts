@@ -264,7 +264,7 @@ export function parseNativeManifest(bytes: Uint8Array): NativeCaptureManifest {
   };
 }
 
-function derEcdsaToP1363(der: Uint8Array): Uint8Array {
+export function derEcdsaToP1363(der: Uint8Array): Uint8Array {
   if (der.length < 8 || der.length > 72 || der[0] !== 0x30 || der[1] !== der.length - 2) throw new NativeManifestError("Manifest provenance signature encoding is invalid.");
   let offset = 2;
   const readInteger = (): Uint8Array => {
@@ -274,13 +274,13 @@ function derEcdsaToP1363(der: Uint8Array): Uint8Array {
     if (!length || length > 33 || offset + length > der.length) throw new NativeManifestError("Manifest provenance signature encoding is invalid.");
     let value = der.subarray(offset, offset + length);
     offset += length;
-    if (value.length === 33) {
-      // DER uses one leading zero when the unsigned scalar's high bit is set.
-      // After removing that sign byte the high bit is expected, not invalid.
-      if (value[0] !== 0 || (value[1] & 0x80) === 0) throw new NativeManifestError("Manifest provenance signature encoding is invalid.");
+    if (value[0] === 0) {
+      // DER requires one sign byte whenever the minimal unsigned magnitude starts
+      // with a high bit, including magnitudes shorter than the curve width.
+      if (value.length < 2 || (value[1] & 0x80) === 0) throw new NativeManifestError("Manifest provenance signature encoding is invalid.");
       value = value.subarray(1);
-    } else if (value[0] === 0 || (value[0] & 0x80) !== 0) {
-      // Reject redundant zeroes, negative INTEGERs, and missing sign padding.
+    } else if ((value[0] & 0x80) !== 0) {
+      // Reject negative INTEGERs and positive values missing their sign padding.
       throw new NativeManifestError("Manifest provenance signature encoding is invalid.");
     }
     if (value.length > 32 || value.every((byte) => byte === 0)) throw new NativeManifestError("Manifest provenance signature encoding is invalid.");
