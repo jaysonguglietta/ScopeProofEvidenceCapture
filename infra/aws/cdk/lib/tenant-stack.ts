@@ -2105,7 +2105,12 @@ export class TenantStack extends Stack {
           conditions: {
             Null: { "dynamodb:LeadingKeys": "false" },
             "ForAllValues:StringEquals": {
-              "dynamodb:LeadingKeys": [`TENANT#${tenant.id}`, `DOMAIN#${hostname}`, `DOMAIN#${apiHostname}`],
+              "dynamodb:LeadingKeys": [
+                `TENANT#${tenant.id}`,
+                "MAINTENANCE#TENANT_DIRECTORY",
+                `DOMAIN#${hostname}`,
+                `DOMAIN#${apiHostname}`,
+              ],
             },
             StringEquals: { "dynamodb:EnclosingOperation": "TransactWriteItems" },
             StringEqualsIfExists: { "dynamodb:ReturnValues": "NONE" },

@@ -905,6 +905,43 @@ test("tenant stack is isolated, immutable, and remains provisioning", () => {
   assert.match(JSON.stringify(synthesized), /DOMAIN#acme\.evidence\.example\.com/);
   assert.doesNotMatch(JSON.stringify(synthesized), /AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9]{20,}/);
 
+  const registerTenantResource = Object.entries(synthesized.Resources).find(([logicalId, resource]) =>
+    logicalId.startsWith("RegisterTenant") && resource.Type === "Custom::AWS");
+  assert.ok(registerTenantResource, "expected the tenant registration custom resource");
+  const registerTenantProperties = registerTenantResource[1].Properties as Record<string, unknown>;
+  for (const phase of ["Create", "Update"]) {
+    const transactionJson = JSON.stringify(registerTenantProperties[phase]);
+    assert.match(transactionJson, /MAINTENANCE#TENANT_DIRECTORY/);
+    assert.match(transactionJson, /TENANT#ten_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/);
+    assert.match(transactionJson, /TenantMaintenanceRegistration/);
+  }
+
+  const registerTenantPolicy = Object.entries(synthesized.Resources).find(([logicalId, resource]) =>
+    logicalId.startsWith("RegisterTenantCustomResourcePolicy") && resource.Type === "AWS::IAM::Policy");
+  assert.ok(registerTenantPolicy, "expected the tenant registration custom-resource policy");
+  const registerPolicyDocument = (registerTenantPolicy[1].Properties as {
+    PolicyDocument: { Statement: Array<Record<string, unknown>> };
+  }).PolicyDocument;
+  assert.equal(registerPolicyDocument.Statement.length, 1);
+  const registerStatement = registerPolicyDocument.Statement[0];
+  assert.equal(registerStatement.Action, "dynamodb:UpdateItem");
+  assert.equal(registerStatement.Effect, "Allow");
+  assert.notEqual(registerStatement.Resource, "*");
+  assert.deepEqual(registerStatement.Condition, {
+    Null: { "dynamodb:LeadingKeys": "false" },
+    "ForAllValues:StringEquals": {
+      "dynamodb:LeadingKeys": [
+        "TENANT#ten_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "MAINTENANCE#TENANT_DIRECTORY",
+        "DOMAIN#acme.evidence.example.com",
+        "DOMAIN#api-acme.evidence.example.com",
+      ],
+    },
+    StringEquals: { "dynamodb:EnclosingOperation": "TransactWriteItems" },
+    StringEqualsIfExists: { "dynamodb:ReturnValues": "NONE" },
+  });
+  assert.doesNotMatch(JSON.stringify(registerStatement), /MAINTENANCE#ACTION_REQUIRED|MAINTENANCE#\*/);
+
   const evidenceBucketPolicies = JSON.stringify(
     Object.values(synthesized.Resources).filter((resource) => resource.Type === "AWS::S3::BucketPolicy"),
   );
