@@ -49,16 +49,15 @@ actor UploadService {
             ("screenshot", manifestModel.screenshotFilename, "image/png", image),
             ("manifest", capture.manifestURL.lastPathComponent, "application/json", manifest),
         ])
-        let (data, response) = try await BackendHTTP.data(for: request, audience: serverURL)
+        let (data, response) = try await BackendHTTP.data(for: request, audience: serverURL, maximumBytes: 512 * 1024)
         guard let http = response as? HTTPURLResponse else { throw UploadFailure.invalidResponse }
         guard (200..<300).contains(http.statusCode) else {
             let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
             throw UploadFailure.rejected(String(describing: body?["error"] ?? "HTTP \(http.statusCode)"))
         }
-        guard let body = try JSONSerialization.jsonObject(with: data) as? [String: Any], body["receipt"] != nil else { throw UploadFailure.invalidResponse }
         let receiptURL = capture.manifestURL.deletingPathExtension().appendingPathExtension("receipt.json")
-        try data.write(to: receiptURL, options: [.atomic, .completeFileProtection])
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: receiptURL.path)
+        try TransferReceipt.record(payload: data, kind: .hosted, artifact: artifact,
+            manifestURL: capture.manifestURL, destination: ["origin": serverURL.absoluteString], receiptURL: receiptURL)
         return receiptURL
     }
 

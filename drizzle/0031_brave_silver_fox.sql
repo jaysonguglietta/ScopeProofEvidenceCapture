@@ -1,0 +1,1 @@
+ALTER TABLE `findings` ADD `resolution_evidence_json` text DEFAULT '[]' NOT NULL;

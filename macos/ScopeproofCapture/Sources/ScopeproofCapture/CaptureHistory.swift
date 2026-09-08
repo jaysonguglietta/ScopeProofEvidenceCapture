@@ -1,6 +1,14 @@
 import CryptoKit
 import Foundation
 
+enum LocalRetentionFailure: LocalizedError {
+    case durableHistoryRequired
+
+    var errorDescription: String? {
+        "Legacy whole-record cleanup is disabled. Use Archive & Expire Old Payloads to preserve signed history and revalidate exact S3 versions before moving only PNGs to Trash. No local files were changed."
+    }
+}
+
 struct LocalRetentionReport: Equatable, Sendable {
     var movedToTrash = 0
     var skippedLegalHold = 0
@@ -27,8 +35,12 @@ struct CaptureHistoryEntry: Sendable {
     }
     var jiraReceiptURL: URL { manifestURL.deletingPathExtension().appendingPathExtension("jira.json") }
     var s3ReceiptURL: URL { manifestURL.deletingPathExtension().appendingPathExtension("s3.json") }
-    var isUploaded: Bool { FileManager.default.fileExists(atPath: receiptURL.path) }
-    var isStoredInS3: Bool { FileManager.default.fileExists(atPath: s3ReceiptURL.path) }
+    var isUploaded: Bool { TransferReceipt.isVerified(for: self, kind: .hosted) }
+    var isStoredInS3: Bool { TransferReceipt.isVerified(for: self, kind: .s3) }
+    var isPayloadArchived: Bool {
+        guard !FileManager.default.fileExists(atPath: imageURL.path), let binding = manifest.tenantBinding else { return false }
+        return (try? LocalEvidenceArchive.load(for: self, expectedBinding: binding)) != nil
+    }
     var lifecycle: EvidenceLifecycleRecord { EvidenceLifecycleStore.load(for: self) }
 }
 
@@ -46,30 +58,35 @@ enum CaptureHistory {
     }
 
     static func readableRoots(
-        for primaryDirectory: URL,
+        for primaryDirectory: URL, expectedBinding: TenantWorkspaceBinding,
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
     ) -> [URL] {
-        let primary = primaryDirectory.standardizedFileURL.resolvingSymlinksInPath()
-        guard primary == defaultEvidenceRoot(homeDirectory: homeDirectory).standardizedFileURL.resolvingSymlinksInPath() else { return [primary] }
-        return [primary, legacyEvidenceRoot(homeDirectory: homeDirectory).standardizedFileURL.resolvingSymlinksInPath()]
+        // Preserve configured path spelling for path-bound trust heads. Resolve
+        // symlinks for containment only, never to silently move evidence identity.
+        let primary = primaryDirectory.standardizedFileURL
+        guard expectedBinding == .localDefault, primary.resolvingSymlinksInPath() == defaultEvidenceRoot(homeDirectory: homeDirectory).standardizedFileURL.resolvingSymlinksInPath() else { return [primary] }
+        return [primary, legacyEvidenceRoot(homeDirectory: homeDirectory).standardizedFileURL]
     }
 
     static func isWithinReadableRoots(
         _ url: URL,
-        primaryDirectory: URL,
+        primaryDirectory: URL, expectedBinding: TenantWorkspaceBinding,
         homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
     ) -> Bool {
         let candidate = url.standardizedFileURL.resolvingSymlinksInPath().path
-        return readableRoots(for: primaryDirectory, homeDirectory: homeDirectory).contains { root in
-            candidate.hasPrefix(root.path + "/")
+        return readableRoots(for: primaryDirectory, expectedBinding: expectedBinding, homeDirectory: homeDirectory).contains { root in
+            let rootPath = root.resolvingSymlinksInPath().path
+            return candidate.hasPrefix(rootPath + "/")
+                && (expectedBinding != .localDefault || !candidate.hasPrefix(rootPath + "/tenants/"))
         }
     }
 
-    static func entries(in directory: URL) -> [CaptureHistoryEntry] {
-        var seenEvidenceIDs = Set<String>()
-        return readableRoots(for: directory).flatMap { entriesOnly(in: $0) }.filter { entry in
-            seenEvidenceIDs.insert(entry.manifest.evidenceID).inserted
-        }.sorted { left, right in
+    static func entries(in directory: URL, expectedBinding: TenantWorkspaceBinding) -> [CaptureHistoryEntry] {
+        let candidates = readableRoots(for: directory, expectedBinding: expectedBinding)
+            .flatMap { entriesOnly(in: $0, expectedBinding: expectedBinding) }
+        // Ambiguous IDs are not addressable capabilities. Omit every duplicate.
+        let grouped = Dictionary(grouping: candidates, by: { $0.manifest.evidenceID })
+        return candidates.filter { grouped[$0.manifest.evidenceID]?.count == 1 }.sorted { left, right in
             if left.manifest.capturedAt != right.manifest.capturedAt {
                 return left.manifest.capturedAt > right.manifest.capturedAt
             }
@@ -80,7 +97,7 @@ enum CaptureHistory {
         }
     }
 
-    private static func entriesOnly(in directory: URL) -> [CaptureHistoryEntry] {
+    private static func entriesOnly(in directory: URL, expectedBinding: TenantWorkspaceBinding) -> [CaptureHistoryEntry] {
         guard let enumerator = FileManager.default.enumerator(
             at: directory,
             includingPropertiesForKeys: [.isRegularFileKey, .contentModificationDateKey],
@@ -88,79 +105,54 @@ enum CaptureHistory {
         ) else { return [] }
         var urls: [URL] = []
         for case let url as URL in enumerator {
+            if expectedBinding == .localDefault,
+               url.standardizedFileURL.path == directory.standardizedFileURL.appendingPathComponent("tenants").path {
+                enumerator.skipDescendants()
+                continue
+            }
             guard urls.count < ValidatedEvidenceArtifact.maximumManifestCount else { break }
             if url.pathExtension == "json" && !url.lastPathComponent.hasSuffix(".receipt.json")
                 && !url.lastPathComponent.hasSuffix(".review.json") && !url.lastPathComponent.hasSuffix(".s3.json")
-                && !url.lastPathComponent.hasSuffix(".jira.json") && !url.lastPathComponent.hasSuffix(".hold.json") {
+                && !url.lastPathComponent.hasSuffix(".jira.json") && !url.lastPathComponent.hasSuffix(".hold.json")
+                && !url.lastPathComponent.hasSuffix(".archive.json") {
                 urls.append(url)
             }
         }
         return urls.compactMap { url in
             guard let data = try? ValidatedEvidenceArtifact.readBoundedRegularFile(
                 at: url, within: directory, maximumBytes: ValidatedEvidenceArtifact.maximumManifestBytes
-            ), let manifest = try? JSONDecoder().decode(CaptureManifest.self, from: data) else { return nil }
+            ), let manifest = try? JSONDecoder().decode(CaptureManifest.self, from: data),
+                  manifest.belongs(to: expectedBinding) else { return nil }
             let image = url.deletingLastPathComponent().appendingPathComponent(URL(fileURLWithPath: manifest.screenshotFilename).lastPathComponent)
             let receipt = url.deletingPathExtension().appendingPathExtension("receipt.json")
-            guard (try? ValidatedEvidenceArtifact.validateRegularFile(
-                at: image, within: directory, maximumBytes: ValidatedEvidenceArtifact.maximumImageBytes
-            )) != nil else { return nil }
-            return CaptureHistoryEntry(
+            let entry = CaptureHistoryEntry(
                 manifest: manifest, manifestURL: url, imageURL: image,
                 receiptURL: receipt, evidenceRoot: directory
             )
+            if (try? ValidatedEvidenceArtifact.validateRegularFile(at: image, within: directory, maximumBytes: ValidatedEvidenceArtifact.maximumImageBytes)) != nil { return entry }
+            return entry.isPayloadArchived ? entry : nil
         }
     }
 
     @MainActor
     static func removeExpired(
-        in directory: URL, retentionDays: Int, now: Date = Date(),
+        in directory: URL, expectedBinding: TenantWorkspaceBinding,
+        retentionDays: Int, now: Date = Date(),
         remoteDurabilityVerifier: (CaptureHistoryEntry) async throws -> Bool
     ) async throws -> LocalRetentionReport {
-        let cutoff = now.addingTimeInterval(-Double(retentionDays) * 86_400)
-        var report = LocalRetentionReport()
-        for entry in entries(in: directory) {
-            guard let date = ISO8601DateFormatter().date(from: entry.manifest.capturedAt), date < cutoff else { continue }
-            switch LocalEvidenceHoldStore.state(for: entry) {
-            case .active, .invalid:
-                report.skippedLegalHold += 1
-                continue
-            case .none, .released:
-                break
-            }
-            guard hasDurableLockedCopy(for: entry, now: now) else {
-                report.skippedWithoutDurableCopy += 1
-                continue
-            }
-            guard try await remoteDurabilityVerifier(entry) else {
-                report.skippedWithoutDurableCopy += 1
-                continue
-            }
-            guard (try? ValidatedEvidenceArtifact.load(entry, requireLifecycle: true)) != nil else {
-                report.skippedInvalidEvidence += 1
-                continue
-            }
-            let lifecycleURL = EvidenceLifecycleStore.url(for: entry.manifestURL)
-            let holdURL = LocalEvidenceHoldStore.url(for: entry.manifestURL)
-            for url in [entry.imageURL, entry.manifestURL, entry.receiptURL, entry.jiraReceiptURL, entry.s3ReceiptURL, lifecycleURL, holdURL] where FileManager.default.fileExists(atPath: url.path) {
-                try FileManager.default.trashItem(at: url, resultingItemURL: nil)
-            }
-            report.movedToTrash += 1
-        }
-        return report
+        // A PNG/manifest receipt cannot prove recoverability of lifecycle/hold
+        // records or complete-chain continuity. Fail before network or mutation.
+        throw LocalRetentionFailure.durableHistoryRequired
     }
 
     static func hasDurableLockedCopy(
         for entry: CaptureHistoryEntry, now: Date = Date(),
         trustedAnchor: LocalCaptureChainAnchor? = nil
     ) -> Bool {
-        let root = entry.evidenceRoot ?? entry.manifestURL.deletingLastPathComponent()
         guard let artifact = try? ValidatedEvidenceArtifact.load(
                 entry, requireLifecycle: false, trustedAnchor: trustedAnchor
               ),
-              let receiptData = try? ValidatedEvidenceArtifact.readBoundedRegularFile(
-                at: entry.s3ReceiptURL, within: root,
-                maximumBytes: ValidatedEvidenceArtifact.maximumSidecarBytes
-              ),
+              let receiptData = try? TransferReceipt.verified(for: entry, kind: .s3, artifact: artifact).receipt.payload,
               let receipt = try? JSONDecoder().decode(S3UploadReceipt.self, from: receiptData),
               receipt.schemaVersion == 3,
               receipt.evidenceID == artifact.manifest.evidenceID,
@@ -202,10 +194,10 @@ enum CaptureHistory {
         return sawImage && sawManifest
     }
 
-    static func captureChainIntegrity(_ entries: [CaptureHistoryEntry]) -> Bool {
+    static func captureChainIntegrity(_ entries: [CaptureHistoryEntry], expectedBinding: TenantWorkspaceBinding) -> Bool {
         let anchor: LocalCaptureChainAnchor?
-        let binding = entries.first?.manifest.tenantBinding ?? .localDefault
-        guard entries.allSatisfy({ ($0.manifest.tenantBinding ?? .localDefault) == binding }) else {
+        let binding = expectedBinding
+        guard entries.allSatisfy({ $0.manifest.belongs(to: expectedBinding) }) else {
             return false
         }
         do { anchor = try KeychainStore.captureChainAnchor(binding: binding) }

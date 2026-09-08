@@ -3,6 +3,8 @@
 <plist version="1.0">
 <dict>
   <key>ScopeproofHostedAPIOrigins</key><array/>
+  <key>ScopeproofAWSHostedTenants</key><array/>
+  <key>CFBundleURLTypes</key><array><dict><key>CFBundleURLName</key><string>Scopeproof customer sign-in</string><key>CFBundleURLSchemes</key><array><string>scopeproof-capture</string></array></dict></array>
   <key>ScopeproofUpdatePublicKeys</key><array/>
   <key>ScopeproofUpdateTeamIdentifier</key><string></string>
   <key>ScopeproofUpdateDesignatedRequirement</key><string></string>
@@ -14,7 +16,7 @@
   <key>CFBundleName</key><string>Scopeproof Capture</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>1.10.0</string>
-  <key>CFBundleVersion</key><string>25</string>
+  <key>CFBundleVersion</key><string>26</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><true/>
   <key>NSScreenCaptureUsageDescription</key><string>Scopeproof Capture needs Screen Recording access to create explicit compliance evidence screenshots requested from the menu bar.</string>

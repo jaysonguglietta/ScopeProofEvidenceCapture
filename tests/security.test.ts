@@ -348,7 +348,7 @@ test("security mutations are atomic with audit events and timestamps require pin
   assert.match(lifecycle, /var status: EvidenceReviewStatus \{ events\.last\?\.status/);
   assert.match(lifecycle, /artifactSha256/);
   assert.match(lifecycle, /policyVersion/);
-  assert.match(exporter, /ValidatedEvidenceArtifact\.load\([\s\S]*entry, requireLifecycle: true, trustedAnchor: captureAnchorOverride/);
+  assert.match(exporter, /ValidatedEvidenceArtifact\.load\([\s\S]*entry, requireLifecycle: true, expectedBinding: expectedBinding, trustedAnchor: captureAnchorOverride/);
   assert.doesNotMatch(exporter, /loadForLegacyBrowsing/);
   assert.match(exporter, /guard let lifecycle = artifact\.lifecycle, lifecycle\.status == \.approved/);
   assert.match(keychain, /SecAccessControlCreateWithFlags/);

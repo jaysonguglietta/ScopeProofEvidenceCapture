@@ -41,6 +41,8 @@ export interface RdsUploadIntentProjectionOptions {
   readonly resourceArn: string;
   readonly secretArn: string;
   readonly database: string;
+  /** Worker-only mode; its database login must not be usable by public APIs. */
+  readonly mode?: "issue" | "repair";
 }
 
 export interface UploadIntentProjectionResult {
@@ -71,10 +73,13 @@ const createIntentSql = [
 export class RdsDataUploadIntentProjection {
   readonly #executor: RdsDataApiExecutor;
   readonly #connection: Readonly<{ resourceArn: string; secretArn: string; database: string }>;
+  readonly #mode: "issue" | "repair";
 
   constructor(options: RdsUploadIntentProjectionOptions) {
     this.#executor = options.executor;
     this.#connection = validateRdsConnection(options.resourceArn, options.secretArn, options.database);
+    this.#mode = options.mode ?? "issue";
+    if (this.#mode !== "issue" && this.#mode !== "repair") throw new Error("Invalid upload projection mode.");
   }
 
   async project(intent: ControlledUploadIntent, evidence: UploadIntentEvidenceProjection): Promise<UploadIntentProjectionResult> {
@@ -94,8 +99,14 @@ export class RdsDataUploadIntentProjection {
       const result = await this.#executor.executeStatement({
         ...this.#connection,
         transactionId,
-        sql: createIntentSql,
-        parameters: projectionParameters(normalized),
+        sql: this.#mode === "repair"
+          ? createIntentSql.replace("scopeproof.create_upload_intent(", "scopeproof.repair_upload_intent(")
+            .replace("CAST(:metadata AS jsonb)", "CAST(:metadata AS jsonb), CAST(:reserved_at AS timestamptz)")
+          : createIntentSql,
+        parameters: [
+          ...projectionParameters(normalized),
+          ...(this.#mode === "repair" ? [parameter("reserved_at", canonicalInstant(intent.issuedAt, "Reservation time"))] : []),
+        ],
         formatRecordsAs: "JSON",
       });
       const committed = parseProjectionResult(result.formattedRecords, normalized.id, normalized.evidenceId);

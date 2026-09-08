@@ -53,7 +53,7 @@ export interface CollectionRun {
   id: string;
   source: string;
   startedAt: string;
-  status: "Completed" | "Partial" | "Running" | "Failed";
+  status: "Completed" | "Partial" | "Queued" | "Retrying" | "Running" | "Failed";
   artifacts: number;
   controls: number;
   duration: string;

@@ -30,7 +30,7 @@ Route 53 creates an explicit record only after the tenant database boundary pass
 | Concern | AWS service | Cost and isolation rationale |
 | --- | --- | --- |
 | DNS | Route 53 | Explicit tenant records; the domain is configurable. |
-| Web UI hosting | Amplify Hosting compute | Intended managed UI/SSR host; the current Amplify app has no source/release connection. |
+| Web UI hosting | Amplify Hosting static WEB | Separate Cognito customer portal; Node-only static build with exact public host mappings, no source/release connection yet. |
 | Tenant API | Regional API Gateway + per-tenant Lambda/custom domain | A dedicated `api-<tenant>.<domain>` boundary, disabled default execute endpoint, exact-domain registry key, tenant-specific assume role, request validation, throttling, and no always-running server. |
 | Edge security | Amplify/CloudFront/API Gateway, AWS WAF, Shield Standard | TLS termination, caching only for public/static assets, baseline managed rules, and rate controls. |
 | Authentication | Cognito User Pools | MFA, OIDC/SAML federation, authorization-code flow, and PKCE for public/native clients. |
@@ -246,17 +246,20 @@ Follow the [AWS platform runbook](AWS_PLATFORM_RUNBOOK.md) for the exact sequenc
 2. If an earlier AWS stack exists, perform the runbook's retain/remove/convert/
    import migration from `AWS::DynamoDB::Table` to the global control table;
    never deploy that resource-type change directly. Fresh stacks skip this step.
-3. Convert vinext to an Amplify-supported Next.js runtime, connect it to the
-   implemented per-tenant API, and replace Worker cron with EventBridge/SQS/Lambda.
+3. Build the separate static AWS customer portal with its exact public tenant
+   outputs. Do not deploy vinext/D1/R2 as a shared AWS frontend. Follow
+   [AWS customer portal](AWS_CUSTOMER_PORTAL.md); additional legacy feature ports
+   require their own AWS API/storage/job adapters.
 4. Extend the strict Cognito/exact-host/scope/membership boundary from the
    implemented identity, upload, evidence-read, and legal-hold routes to every
-   migrated API; add membership administration and
-   tenant-bound Mac enrollment.
+   migrated API. Membership administration and tenant-bound Mac enrollment,
+   submission and review now exist in source; qualify them with two real staging
+   tenants before activation.
 5. Port D1/SQLite to PostgreSQL, add tenant constraints and forced RLS, and remove direct database access from route handlers.
 6. Replace R2 with the implemented tenant S3/KMS upload, reconciliation,
    receipt, and exact-version legal-hold adapters; require a canonical 256-bit
    client idempotency key and rotate the 32-64 byte tenant HMAC with overlap.
-7. Add the customer/admin UI and operating procedure for the CDK-wired,
+7. Qualify the source customer/admin UI and operating procedure for the CDK-wired,
    separately authenticated legal-hold request/approval routes and scheduled
    reconciler; source infrastructure alone is not an available service.
 8. Create a legacy tenant and import every current row under explicit ownership. No row may have a null or ambiguous tenant.

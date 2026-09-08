@@ -13,11 +13,13 @@ import {
   CognitoJwtVerifier,
   DynamoTenantAuthorityResolver,
   RdsDataMembershipRepository,
+  RdsDataCustomerRepository,
   createTenantApiHandler,
   type ApiAuthenticationDependencies,
   type ApiGatewayRestEvent,
   type LegalHoldApprovalApiPayload,
   type LegalHoldRequestApiPayload,
+  type EvidenceLegalHoldApiPayload,
   type RdsDataApiCommandConstructors,
   type TenantApiRequestRuntime,
 } from "../../../../../lib/aws-runtime/http/index.ts";
@@ -165,8 +167,26 @@ function createRequestRuntime(requestId: string): TenantApiRequestRuntime {
     secretArn: config.LEGAL_HOLD_DATABASE_SECRET_ARN,
     database: config.DATABASE_NAME,
   });
+  const customer = new RdsDataCustomerRepository({ tenantId: config.TENANT_ID, executor: rds, resourceArn: config.DATABASE_CLUSTER_ARN, secretArn: config.LEGAL_HOLD_DATABASE_SECRET_ARN, database: config.DATABASE_NAME });
   return Object.freeze({
     authentication,
+    async legalHoldStatus(request: AuthorizedApiRequest, evidenceId: string) {
+      assertBoundary(request);
+      await consumeLegalQuota(request, "legal_hold.status");
+      return await customer.legalHoldStatus(request, evidenceId);
+    },
+    async requestEvidenceLegalHold(request: AuthorizedApiRequest, payload: EvidenceLegalHoldApiPayload) {
+      assertBoundary(request);
+      await consumeLegalQuota(request, "legal_hold.request");
+      const location = await customer.legalHoldTarget(request, payload.evidenceId, payload.expectedEvidenceRevision);
+      // The private tuple comes only from tenant SQL. No browser location is accepted.
+      return await requestExactVersionLegalHoldChange(legalHoldStore, {
+        tenantId: request.actor.tenantId, evidenceId: payload.evidenceId,
+        operationId: payload.operationId, holdId: payload.holdId, expectedHoldRevision: payload.expectedHoldRevision,
+        kind: payload.kind, status: payload.status, reason: payload.reason, changedAt: payload.changedAt,
+        controlId: String(location.controlId), contentType: String(location.contentType), bucket: String(location.bucket), key: String(location.key), versionId: String(location.versionId),
+      }, request.actor, { evidenceBucket: config.EVIDENCE_BUCKET_NAME }, { membershipId: request.actor.membershipId, requestId: request.requestId });
+    },
     async requestLegalHold(request: AuthorizedApiRequest, payload: LegalHoldRequestApiPayload) {
       assertBoundary(request);
       await consumeLegalQuota(request, "legal_hold.request");
@@ -193,7 +213,7 @@ function createRequestRuntime(requestId: string): TenantApiRequestRuntime {
 
 async function consumeLegalQuota(
   request: AuthorizedApiRequest,
-  route: "legal_hold.request" | "legal_hold.approve",
+  route: "legal_hold.request" | "legal_hold.approve" | "legal_hold.status",
 ): Promise<void> {
   await routeLimiter.consume({
     tenantId: request.actor.tenantId,

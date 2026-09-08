@@ -21,6 +21,7 @@ import {
   recoveryEvidenceReplicationRoleName,
 } from "./recovery-config";
 import { configureBackupVaultNotifications } from "./recovery-support";
+import { createAuditRecoveryDestination } from "./audit-recovery";
 
 export interface RecoveryStackProps extends StackProps {
   readonly alertEmail?: string;
@@ -119,6 +120,7 @@ export class RecoveryStack extends Stack {
       versioned: true,
     });
 
+    createAuditRecoveryDestination(this, configuration, accessLogs);
     for (const tenant of tenants) {
       const replicationRoleArn = this.formatArn({
         region: "",

@@ -45,9 +45,10 @@ export async function queueCollection(collectorId: string, actor: AuthenticatedU
   if (!collector) throw new Error("Collector is unavailable or disabled.");
   if (assessmentId && !(await env.DB.prepare("SELECT 1 FROM assessments WHERE id = ? AND status = 'active' AND scope_mode = 'explicit' AND catalog_id IS NOT NULL AND json_array_length(systems_json) > 0 AND json_array_length(controls_json) > 0").bind(assessmentId).first())) throw new Response(JSON.stringify({ error: "Collections require an active assessment with an explicit, non-empty, versioned scope." }), { status: 409, headers: { "content-type": "application/json" } });
   const id = randomId("job");
-  await executeAuditedBatch(actor, "collection.queued", "collection_job", id, { collectorId, triggerType }, [
-    env.DB.prepare("INSERT INTO collection_jobs (id, collector_id, requested_by, trigger_type, assessment_id) VALUES (?, ?, ?, ?, ?)").bind(id, collectorId, actor.id, triggerType, assessmentId || null),
-  ]);
+  const [queued] = await executeAuditedBatch(actor, "collection.queued", "collection_job", id, { collectorId, triggerType }, [
+    env.DB.prepare("INSERT INTO collection_jobs (id, collector_id, requested_by, trigger_type, assessment_id) SELECT ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM collectors WHERE id = ? AND enabled = 1 AND (? <> 'scheduled' OR (scheduled_assessment_id = ? AND schedule_cron IS NOT NULL))) AND (? IS NULL OR EXISTS (SELECT 1 FROM assessments WHERE id = ? AND status = 'active' AND scope_mode = 'explicit' AND catalog_id IS NOT NULL AND json_array_length(systems_json) > 0 AND json_array_length(controls_json) > 0))").bind(id, collectorId, actor.id, triggerType, assessmentId || null, collectorId, triggerType, assessmentId || null, assessmentId || null, assessmentId || null),
+  ], { sql: "EXISTS (SELECT 1 FROM collection_jobs WHERE id = ?)", bindings: [id] });
+  if (!queued.meta.changes) throw new Response(JSON.stringify({ error: "Collector availability, schedule assignment, or assessment scope changed before collection was queued. Refresh and try again." }), { status: 409, headers: { "content-type": "application/json" } });
   return id;
 }
 
@@ -145,11 +146,11 @@ export async function processDueWork(now = new Date()): Promise<void> {
   await isolate("sbom_jobs", async () => { await processDueSbomWork(now); });
   await isolate("native_provenance_reconciliation", async () => { await reconcileNativeProvenanceOrphans(now); });
   await isolate("scheduled_collectors", async () => {
-    const collectors = (await env.DB.prepare("SELECT id, schedule_cron, last_run_at FROM collectors WHERE enabled = 1 AND schedule_cron IS NOT NULL").all<{ id: string; schedule_cron: string; last_run_at: string | null }>()).results;
+    const collectors = (await env.DB.prepare("SELECT id, schedule_cron, scheduled_assessment_id, last_run_at FROM collectors WHERE enabled = 1 AND schedule_cron IS NOT NULL").all<{ id: string; schedule_cron: string; scheduled_assessment_id: string | null; last_run_at: string | null }>()).results;
     for (const collector of collectors) await isolate("scheduled_collector", async () => {
       if (!isCronDue(collector.schedule_cron, now, collector.last_run_at ? new Date(collector.last_run_at) : null)) return;
-      const assessment = await env.DB.prepare("SELECT id FROM assessments WHERE status = 'active' ORDER BY period_end DESC LIMIT 1").first<{ id: string }>();
-      if (!assessment) { console.error("scopeproof_scheduled_collection_skipped", { collectorId: collector.id, reason: "no_active_assessment" }); return; }
+      const assessment = collector.scheduled_assessment_id ? await env.DB.prepare("SELECT id FROM assessments WHERE id = ? AND status = 'active' AND scope_mode = 'explicit' AND catalog_id IS NOT NULL AND json_array_length(systems_json) > 0 AND json_array_length(controls_json) > 0").bind(collector.scheduled_assessment_id).first<{ id: string }>() : null;
+      if (!assessment) { console.error("scopeproof_scheduled_collection_skipped", { collectorId: collector.id, reason: "explicit_scheduled_assessment_unavailable" }); return; }
       const jobId = await queueCollection(collector.id, systemActor, "scheduled", assessment.id);
       await processJob(jobId, systemActor);
     }, collector.id);

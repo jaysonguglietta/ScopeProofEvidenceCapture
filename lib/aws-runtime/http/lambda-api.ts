@@ -13,6 +13,7 @@ import type {
 } from "../evidence/exact-version-legal-hold.ts";
 import {
   handleAuthorizedApiRequest,
+  authorizeInvitationAcceptance,
   safeProblemResponse,
   type ApiAuthenticationDependencies,
   type ApiGatewayV2Event,
@@ -20,6 +21,8 @@ import {
 } from "./api.ts";
 import { parseStrictJsonObject } from "./jwt.ts";
 import type { HostedApiAuditRecord, RecordedHostedApiAudit } from "./audit-outbox.ts";
+import { customerRoute, customerRoutes, validateCustomerBody, type CustomerAction, type CustomerBody, type CustomerReply } from "./customer-contracts.ts";
+import type { VerifiedCognitoAccessToken } from "./jwt.ts";
 
 export interface ApiGatewayRestEvent {
   readonly body?: string | null;
@@ -73,9 +76,17 @@ export type LegalHoldRequestApiPayload = Omit<DurableExactVersionLegalHoldReques
 
 /** The approver tenant and identity are both derived from the second request. */
 export type LegalHoldApprovalApiPayload = Omit<ExactVersionLegalHoldApprovalRequest, "tenantId">;
+export type EvidenceLegalHoldApiPayload = Omit<LegalHoldRequestApiPayload, "bucket" | "key" | "versionId" | "contentType" | "controlId"> & { readonly expectedEvidenceRevision: number };
 
 export interface TenantApiRequestRuntime {
   readonly authentication: ApiAuthenticationDependencies;
+  /** Customer mutations atomically append immutable audit outbox records in SQL. */
+  readonly customer?: (request: AuthorizedApiRequest, action: CustomerAction, body: CustomerBody) => Promise<CustomerReply>;
+  readonly acceptInvitation?: (request: Readonly<{ tenantId: string; identity: VerifiedCognitoAccessToken; requestId: string }>) => Promise<CustomerReply>;
+  readonly requestEvidenceLegalHold?: (request: AuthorizedApiRequest, payload: EvidenceLegalHoldApiPayload) => Promise<RequestedExactVersionLegalHold>;
+  readonly legalHoldStatus?: (request: AuthorizedApiRequest, evidenceId: string) => Promise<CustomerReply>;
+  /** Must atomically revoke the authenticated actor's sessions and audit it. */
+  readonly revokeOwnSessions?: (request: AuthorizedApiRequest) => Promise<Readonly<{ sessionEpoch: number; revokedThrough: string }>>;
   /** Required by every state/capability-producing API route; absence fails closed. */
   readonly recordApiAudit?: (record: HostedApiAuditRecord) => Promise<RecordedHostedApiAudit>;
   readonly issueUploadIntent?: (
@@ -421,6 +432,36 @@ export function createTenantApiHandler(options: TenantApiHandlerOptions): (event
       let response: Response;
       if (path === "/health" && method === "GET") {
         response = jsonResponse({ status: "ok" });
+      } else if (path === "/v1/customer/invitations/accept" && method === "POST") {
+        const runtime = options.createRequestRuntime(envelope.v2.requestContext.requestId);
+        parseJsonBody(event.body, envelope.headers, [], "Invitation acceptance");
+        const request = await authorizeInvitationAcceptance(envelope.v2, runtime.authentication);
+        if (!runtime.acceptInvitation) throw new Error("Invitation runtime is unavailable.");
+        response = jsonResponse(await runtime.acceptInvitation(request));
+      } else if (customerRoute(path) && method === "POST") {
+        const route = customerRoute(path)!;
+        const runtime = options.createRequestRuntime(envelope.v2.requestContext.requestId);
+        response = await handleAuthorizedApiRequest(envelope.v2, route.permission, runtime.authentication, async (request) => {
+          const body = validateCustomerBody(parseJsonBody(event.body, envelope.headers, route.keys, "Customer operation"), route.keys);
+          if (!runtime.customer) throw new Error("Customer runtime is unavailable.");
+          return jsonResponse(await runtime.customer(request, route.action, body));
+        }, options.onInternalError);
+      } else if ((path === "/v1/legal-hold-requests/by-evidence" || path === "/v1/legal-hold-requests/status") && method === "POST") {
+        const runtime = options.createRequestRuntime(envelope.v2.requestContext.requestId);
+        response = await handleAuthorizedApiRequest(envelope.v2, "retention:manage", runtime.authentication, async (request) => {
+          if (path.endsWith("/status")) {
+            const body = parseJsonBody(event.body, envelope.headers, ["evidenceId"], "Legal-hold status");
+            if (!runtime.legalHoldStatus) throw new Error("Legal-hold status runtime is unavailable.");
+            return jsonResponse(await runtime.legalHoldStatus(request, stringField(body.evidenceId)));
+          }
+          const keys = ["evidenceId", "expectedEvidenceRevision", "operationId", "holdId", "expectedHoldRevision", "kind", "status", "reason", "changedAt"];
+          const body = validateCustomerBody(parseJsonBody(event.body, envelope.headers, keys, "Evidence legal-hold request"), keys);
+          if (!runtime.requestEvidenceLegalHold) throw new Error("Evidence legal-hold runtime is unavailable.");
+          const changedAt = new Date(stringField(body.changedAt));
+          if (!Number.isFinite(changedAt.getTime())) throw new TenantSecurityError("INVALID_IDENTIFIER", "Legal-hold change time is invalid.");
+          const result = await runtime.requestEvidenceLegalHold(request, { evidenceId: stringField(body.evidenceId), expectedEvidenceRevision: Number(body.expectedEvidenceRevision), operationId: stringField(body.operationId), holdId: stringField(body.holdId), expectedHoldRevision: Number(body.expectedHoldRevision), kind: stringField(body.kind) as LegalHoldKind, status: stringField(body.status) as S3LegalHoldStatus, reason: stringField(body.reason), changedAt });
+          return jsonResponse({ operationId: result.operation.operationId, requestDigest: result.operation.requestDigest, state: result.reservation.state, operationRevision: result.reservation.operationRevision }, 202);
+        }, options.onInternalError);
       } else if ((path === "/v1/me" || path === "/v1/collector/me") && method === "GET") {
         const runtime = options.createRequestRuntime(envelope.v2.requestContext.requestId);
         response = await handleAuthorizedApiRequest(
@@ -434,7 +475,21 @@ export function createTenantApiHandler(options: TenantApiHandlerOptions): (event
             membershipId: actor.membershipId,
             role: actor.role,
             tokenExpiresAt: identity.expiresAt,
+            ...(path === "/v1/collector/me" ? { uploadProofChallenge: identity.jwtId ?? null } : {}),
           }),
+          options.onInternalError,
+        );
+      } else if ((path === "/v1/sessions/revoke" || path === "/v1/collector/sessions/revoke") && method === "POST") {
+        const runtime = options.createRequestRuntime(envelope.v2.requestContext.requestId);
+        response = await handleAuthorizedApiRequest(
+          envelope.v2,
+          path === "/v1/collector/sessions/revoke" ? "evidence:collect" : "evidence:read",
+          runtime.authentication,
+          async (request) => {
+            parseJsonBody(event.body, envelope.headers, [], "Session revocation");
+            if (!runtime.revokeOwnSessions) throw new Error("Session revocation runtime is unavailable.");
+            return jsonResponse({ status: "revoked", ...await runtime.revokeOwnSessions(request) });
+          },
           options.onInternalError,
         );
       } else if (path === "/v1/upload-intents" && method === "POST") {
@@ -597,6 +652,10 @@ export function createTenantApiHandler(options: TenantApiHandlerOptions): (event
           options.onInternalError,
         );
       } else if ([
+        ...Object.keys(customerRoutes),
+        "/v1/customer/invitations/accept",
+        "/v1/legal-hold-requests/by-evidence",
+        "/v1/legal-hold-requests/status",
         "/health",
         "/v1/me",
         "/v1/collector/me",
@@ -605,6 +664,8 @@ export function createTenantApiHandler(options: TenantApiHandlerOptions): (event
         "/v1/evidence-download-intents",
         "/v1/legal-hold-requests",
         "/v1/legal-hold-approvals",
+        "/v1/sessions/revoke",
+        "/v1/collector/sessions/revoke",
       ].includes(path)) {
         response = routeProblem(405, "Method not allowed", "METHOD_NOT_ALLOWED", envelope.v2.requestContext.requestId);
       } else {

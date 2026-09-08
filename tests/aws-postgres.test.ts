@@ -366,9 +366,11 @@ test("runtime database role is non-owner, forced-RLS, and has no destructive gra
   ]);
   assert.match(sql, /rolsuper/);
   assert.match(sql, /rolbypassrls/);
-  assert.match(sql, /ALTER ROLE %I SET row_security = on/);
-  assert.match(sql, /statement_timeout/);
-  assert.match(sql, /idle_in_transaction_session_timeout/);
+  assert.doesNotMatch(sql, /ALTER ROLE/);
+  const bootstrap = await readFile(new URL("../infra/aws/cdk/runtime/bootstrap-database/index.mjs", import.meta.url), "utf8");
+  assert.match(bootstrap, /\["row_security", "on"\]/);
+  assert.match(bootstrap, /statement_timeout/);
+  assert.match(bootstrap, /idle_in_transaction_session_timeout/);
   assert.doesNotMatch(sql, /GRANT[^;]*\bDELETE\b/i);
   assert.doesNotMatch(sql, /GRANT[^;]*\bTRUNCATE\b/i);
   assert.doesNotMatch(sql, /GRANT[^;]*UPDATE[^;]*audit_heads/i);
@@ -400,7 +402,7 @@ test("evidence-read database role has only membership and exact evidence read pr
   const sql = await readFile(readGrantsPath, "utf8");
   assert.match(sql, /REVOKE ALL ON ALL TABLES IN SCHEMA scopeproof/);
   assert.match(sql, /REVOKE ALL ON ALL FUNCTIONS IN SCHEMA scopeproof/);
-  assert.match(sql, /ALTER ROLE %I SET row_security = on/);
+  assert.doesNotMatch(sql, /ALTER ROLE/);
   assert.doesNotMatch(sql, /GRANT (?:SELECT|INSERT|UPDATE|DELETE) ON/i);
   assert.doesNotMatch(sql, /GRANT EXECUTE ON FUNCTION scopeproof\.(?:create_upload_intent|reserve_exact_version_legal_hold|approve_exact_version_legal_hold|append_signed_audit_event)/);
   const grants = [...sql.matchAll(/GRANT EXECUTE ON FUNCTION scopeproof\.([a-z_]+)/g)]
@@ -412,6 +414,7 @@ test("evidence-read database role has only membership and exact evidence read pr
     "read_accessible_evidence",
     "record_api_audit_event",
     "resolve_active_membership",
+    "resolve_active_session_membership",
   ]);
 });
 
@@ -448,7 +451,7 @@ test("evidence-control database role can only reconcile approved legal holds and
   assert.match(sql, /GRANT EXECUTE ON FUNCTION scopeproof\.list_unaudited_expired_legal_holds/);
   assert.match(sql, /GRANT EXECUTE ON FUNCTION scopeproof\.record_exact_version_legal_hold_reconciliation_failure/);
   assert.match(sql, /REVOKE ALL ON ALL FUNCTIONS IN SCHEMA scopeproof/);
-  assert.match(sql, /ALTER ROLE %I SET row_security = on/);
+  assert.doesNotMatch(sql, /ALTER ROLE/);
   assert.doesNotMatch(sql, /GRANT (?:SELECT|INSERT|UPDATE|DELETE) ON/i);
   assert.doesNotMatch(sql, /GRANT EXECUTE ON FUNCTION scopeproof\.create_upload_intent/);
   assert.doesNotMatch(sql, /GRANT EXECUTE ON FUNCTION scopeproof\.reconcile_promoted_evidence/);
@@ -488,8 +491,11 @@ test("legal-hold API database role is an execute-only authentication/request/app
   assert.deepEqual(grants, [
     "approve_exact_version_legal_hold_with_audit",
     "current_tenant_id",
+    "customer_legal_hold_status",
+    "customer_legal_hold_target",
     "reserve_exact_version_legal_hold_with_audit",
     "resolve_active_membership",
+    "resolve_active_session_membership",
   ]);
 });
 
@@ -500,7 +506,7 @@ test("ingest database role can only execute exact reconciliation", async () => {
   assert.match(sql, /GRANT EXECUTE ON FUNCTION scopeproof\.reconcile_promoted_evidence/);
   assert.match(sql, /GRANT EXECUTE ON FUNCTION scopeproof\.claim_promotion_fence/);
   assert.match(sql, /GRANT EXECUTE ON FUNCTION scopeproof\.read_promoted_evidence_receipt/);
-  assert.match(sql, /ALTER ROLE %I SET row_security = on/);
+  assert.doesNotMatch(sql, /ALTER ROLE/);
   assert.match(sql, /REVOKE ALL ON ALL TABLES IN SCHEMA scopeproof/);
   assert.match(sql, /REVOKE ALL ON ALL SEQUENCES IN SCHEMA scopeproof/);
   assert.match(sql, /REVOKE ALL ON ALL FUNCTIONS IN SCHEMA scopeproof/);

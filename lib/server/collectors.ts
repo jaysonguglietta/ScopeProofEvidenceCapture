@@ -244,7 +244,7 @@ async function cloudflareCollector(env: ScopeproofEnv, budget: CollectionBudget)
   }
   if (zoneIds.length > scopedZoneIds.length) omissions.push(`Only ${scopedZoneIds.length} explicitly configured zones fit the collection safety budget.`);
   const rulesets: Array<Record<string, unknown>> = [];
-  for (let offset = 0; offset < scopedZoneIds.length; offset += 10) {
+  for (let offset = 0; offset < scopedZoneIds.length; offset += 5) {
     try { rulesets.push(...await Promise.all(scopedZoneIds.slice(offset, offset + 5).map(async (zoneId) => {
       const response = await providerFetch(`https://api.cloudflare.com/client/v4/zones/${encodeURIComponent(zoneId)}/rulesets/phases/http_request_firewall_managed/entrypoint`, { headers }, `Cloudflare managed rules for ${zoneId}`, 1024 * 1024, [], budget);
       budget.consumeItems(1);

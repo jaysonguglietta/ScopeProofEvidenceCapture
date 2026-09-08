@@ -18,6 +18,9 @@ struct LocalEvidenceHoldRecord: Codable, Equatable, Sendable {
     var authenticationMethod: String? = nil
     var authenticatedAt: String? = nil
     var provenance: LocalProvenanceSignature?
+    // Bounded, flat JSON encodings of earlier independently signed events.
+    // The current event's previous-hash chain binds their order and identity.
+    var history: [Data]? = nil
 }
 
 enum LocalEvidenceHoldState: Equatable, Sendable {
@@ -74,7 +77,7 @@ enum LocalEvidenceHoldStore {
               !record.reason.isEmpty, record.reason.count <= 2_000,
               (record.schemaVersion != 1 || entry.manifest.schemaVersion < 7
                 || record.provenance?.keyID == entry.manifest.provenance?.keyID),
-              LocalProvenance.verifyHold(record),
+              LocalProvenance.verifyHold(record), historyChainValid(record, entry: entry),
               record.schemaVersion == 2
                 ? verifyV2(record, entry: entry)
                 : verifyAndAnchorLegacy(record, entry: entry) else { return .invalid }
@@ -85,9 +88,10 @@ enum LocalEvidenceHoldStore {
     static func set(
         entry: CaptureHistoryEntry, active: Bool, actor: String = NSFullUserName(),
         reason: String, reviewerIdentity: LocalReviewerIdentity? = nil,
-        privateKeyDataOverride: Data? = nil
+        privateKeyDataOverride: Data? = nil,
+        expectedBinding: TenantWorkspaceBinding? = nil
     ) throws -> LocalEvidenceHoldRecord {
-        _ = try ValidatedEvidenceArtifact.load(entry, requireLifecycle: false)
+        _ = try ValidatedEvidenceArtifact.load(entry, requireLifecycle: false, expectedBinding: expectedBinding)
         if FileManager.default.fileExists(atPath: url(for: entry.manifestURL).path),
            state(for: entry) == .invalid {
             throw LocalEvidenceHoldFailure.invalidRecord
@@ -145,6 +149,13 @@ enum LocalEvidenceHoldStore {
             authenticatedAt: identity.authenticatedAt,
             provenance: nil
         )
+        if var previousRecord {
+            record.history = previousRecord.history ?? []
+            previousRecord.history = nil
+            record.history?.append(try JSONEncoder().encode(previousRecord))
+        } else {
+            record.history = []
+        }
         record.provenance = try LocalProvenance.signHold(record, privateKeyData: privateKeyDataOverride)
         guard let keyID = record.provenance?.keyID else {
             throw LocalEvidenceHoldFailure.invalidRecord
@@ -157,7 +168,11 @@ enum LocalEvidenceHoldStore {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
         let markerURL = url(for: entry.manifestURL)
         do {
-            try encoder.encode(record).write(to: markerURL, options: [.atomic, .completeFileProtection])
+            let data = try encoder.encode(record)
+            guard data.count <= ValidatedEvidenceArtifact.maximumSidecarBytes else {
+                throw LocalEvidenceHoldFailure.invalidRecord
+            }
+            try data.write(to: markerURL, options: [.atomic, .completeFileProtection])
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: markerURL.path)
         } catch {
             KeychainStore.cancelLocalTrustAdvance(advance, scope: scope)
@@ -165,6 +180,74 @@ enum LocalEvidenceHoldStore {
         }
         try KeychainStore.commitLocalTrustAdvance(advance, scope: scope)
         return record
+    }
+
+    /// A valid latest hold is not proof that older decisions are recoverable.
+    /// Legacy missing prefixes remain incomplete; no unsigned tombstone can
+    /// replace the complete signed event chain required for archive disposal.
+    static func hasCompleteHistory(for entry: CaptureHistoryEntry) -> Bool {
+        switch state(for: entry) {
+        case .none: return true
+        case .invalid: return false
+        case .active(let record), .released(let record):
+            return recordHasCompleteHistory(record, entry: entry)
+        }
+    }
+
+    static func recordHasCompleteHistory(_ record: LocalEvidenceHoldRecord, entry: CaptureHistoryEntry) -> Bool {
+            guard record.schemaVersion == 2, let sequence = record.sequence,
+                  let history = record.history, history.count == sequence - 1,
+                  historyChainValid(record, entry: entry) else { return false }
+            if let first = history.first.flatMap({ try? JSONDecoder().decode(LocalEvidenceHoldRecord.self, from: $0) }) {
+                return first.schemaVersion == 2 && first.sequence == 1 && first.previousHash == "GENESIS"
+            }
+            return sequence == 1 && record.previousHash == "GENESIS"
+    }
+
+    private static func historyChainValid(_ record: LocalEvidenceHoldRecord, entry: CaptureHistoryEntry) -> Bool {
+        // Old sidecars did not retain history. Preserve their current-state
+        // verification, but hasCompleteHistory will deny destructive retention.
+        guard let history = record.history else { return true }
+        guard history.count <= 5_000, record.schemaVersion == 2 else { return false }
+        var previous: LocalEvidenceHoldRecord?
+        for data in history {
+            guard data.count <= 64 * 1024,
+                  let event = try? JSONDecoder().decode(LocalEvidenceHoldRecord.self, from: data),
+                  event.history == nil, event.evidenceID == record.evidenceID,
+                  event.artifactSha256 == record.artifactSha256,
+                  LocalProvenance.verifyHold(event) else { return false }
+            if event.schemaVersion == 1 {
+                guard previous == nil, entry.manifest.provenance?.keyID == event.provenance?.keyID else { return false }
+            } else {
+                guard event.schemaVersion == 2, event.provenance?.keyID == record.provenance?.keyID,
+                      eventHashValid(event) else { return false }
+            }
+            if let previous, !follows(event, previous: previous) { return false }
+            previous = event
+        }
+        if let previous { return follows(record, previous: previous) }
+        return eventHashValid(record)
+    }
+
+    private static func follows(_ event: LocalEvidenceHoldRecord, previous: LocalEvidenceHoldRecord) -> Bool {
+        let previousSequence = previous.schemaVersion == 1 ? 1 : previous.sequence
+        let previousEventHash = previous.schemaVersion == 1 ? digest([
+            "legacy-v1", previous.evidenceID, previous.artifactSha256,
+            String(previous.active), previous.updatedAt, previous.actor, previous.reason,
+        ]) : previous.eventHash
+        return event.sequence == previousSequence.map { $0 + 1 } && event.previousHash == previousEventHash
+    }
+
+    private static func eventHashValid(_ event: LocalEvidenceHoldRecord) -> Bool {
+        guard let sequence = event.sequence, sequence > 0, let previousHash = event.previousHash,
+              let subjectID = event.actorSubjectID, !subjectID.isEmpty,
+              let method = event.authenticationMethod, !method.isEmpty,
+              let authenticatedAt = event.authenticatedAt,
+              ISO8601DateFormatter().date(from: authenticatedAt) != nil,
+              ISO8601DateFormatter().date(from: event.updatedAt) != nil,
+              !event.actor.isEmpty, event.actor.count <= 160, !event.reason.isEmpty, event.reason.count <= 2_000 else { return false }
+        return event.eventHash == digest([previousHash, event.evidenceID, String(sequence), String(event.active),
+            event.updatedAt, subjectID, event.actor, event.reason])
     }
 
     private static func verifyV2(_ record: LocalEvidenceHoldRecord, entry: CaptureHistoryEntry) -> Bool {

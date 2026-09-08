@@ -6,6 +6,7 @@ import {
 } from "@aws-sdk/client-rds-data";
 import { AwsSdkV3RdsDataApiExecutor, type RdsDataApiCommandConstructors } from "../../../../../lib/aws-runtime/http/index.ts";
 import { RdsDataUploadIntentProjection, type ControlledUploadIntent, type UploadIntentEvidenceProjection } from "../../../../../lib/aws-runtime/evidence/index.ts";
+import { repairDue, repairFailure, REPAIR_HORIZON_MS } from "./retry-policy.ts";
 
 const required = ["CONTROL_TABLE_NAME", "DATABASE_CLUSTER_ARN", "DATABASE_NAME", "DATABASE_SECRET_ARN", "TENANT_ID"] as const;
 const env = Object.fromEntries(required.map((name) => {
@@ -30,9 +31,10 @@ const executor = new AwsSdkV3RdsDataApiExecutor(rdsClient, {
 });
 const projection = new RdsDataUploadIntentProjection({
   executor, resourceArn: env.DATABASE_CLUSTER_ARN, secretArn: env.DATABASE_SECRET_ARN, database: env.DATABASE_NAME,
+  mode: "repair",
 });
 
-export async function handler(event: unknown): Promise<{ repaired: number; examined: number }> {
+export async function handler(event: unknown): Promise<{ repaired: number; examined: number; failed: number }> {
   assertScheduleMessage(event);
   const cursorKey = { PK: { S: `TENANT#${env.TENANT_ID}` }, SK: { S: "REPAIR#UPLOAD_PROJECTION_CURSOR" } };
   const cursor = (await dynamo.send(new GetItemCommand({ ConsistentRead: true, Key: cursorKey, TableName: env.CONTROL_TABLE_NAME }))).Item;
@@ -46,6 +48,7 @@ export async function handler(event: unknown): Promise<{ repaired: number; exami
     : undefined;
   let examined = 0;
   let repaired = 0;
+  let failed = 0;
   do {
     const page = await dynamo.send(new QueryCommand({
       ConsistentRead: true,
@@ -59,8 +62,12 @@ export async function handler(event: unknown): Promise<{ repaired: number; exami
     for (const item of page.Items ?? []) {
       examined += 1;
       if (item.databaseProjectionStatus?.S === "READY") continue;
+      if (item.projectionRepairStatus?.S === "ACTION_REQUIRED") { failed += 1; continue; }
+      try {
+      if (!repairDue({ status: item.projectionRepairStatus?.S, retryAt: item.projectionRepairRetryAt?.S }, new Date())) continue;
       const parsed = parseLifecycle(item);
       if (!parsed) continue;
+      if (Date.parse(parsed.intent.issuedAt) < Date.now() - REPAIR_HORIZON_MS) throw new Error("Upload repair horizon expired.");
       await projection.project(parsed.intent, parsed.evidence);
       await dynamo.send(new UpdateItemCommand({
         ConditionExpression: "evidenceProjectionDigest = :digest AND #status = :status AND (attribute_not_exists(databaseProjectionStatus) OR databaseProjectionStatus <> :ready)",
@@ -71,9 +78,30 @@ export async function handler(event: unknown): Promise<{ repaired: number; exami
         },
         Key: { PK: item.PK!, SK: item.SK! },
         TableName: env.CONTROL_TABLE_NAME,
-        UpdateExpression: "SET databaseProjectionStatus = :ready, databaseProjectedAt = :when",
+        UpdateExpression: "SET databaseProjectionStatus = :ready, databaseProjectedAt = :when REMOVE projectionRepairStatus, projectionRepairRetryAt, projectionRepairAttempts",
       }));
       repaired += 1;
+      } catch {
+        failed += 1;
+        // Poison records must not abort the page or reset its cursor. A failure
+        // to persist backoff still allows later records to progress; the final
+        // alarm signal below reports that operator reconciliation is necessary.
+        try {
+          const prior = Number(item.projectionRepairAttempts?.N ?? "0");
+          const failure = repairFailure(prior, new Date());
+          await dynamo.send(new UpdateItemCommand({
+            TableName: env.CONTROL_TABLE_NAME,
+            Key: { PK: item.PK!, SK: item.SK! },
+            ConditionExpression: "attribute_exists(PK) AND attribute_exists(SK) AND (attribute_not_exists(databaseProjectionStatus) OR databaseProjectionStatus <> :ready)",
+            UpdateExpression: "SET projectionRepairStatus = :status, projectionRepairAttempts = :attempts, projectionRepairRetryAt = :retryAt, projectionRepairFailureCode = :code",
+            ExpressionAttributeValues: {
+              ":ready": { S: "READY" }, ":status": { S: failure.status },
+              ":attempts": { N: String(failure.attemptCount) }, ":retryAt": { S: failure.retryAt },
+              ":code": { S: "EXACT_PROJECTION_REPAIR_FAILED" },
+            },
+          }));
+        } catch { /* Continue; metric/error below covers a failed backoff write. */ }
+      }
     }
     lastKey = page.LastEvaluatedKey;
     if (examined >= 1_000) break;
@@ -90,7 +118,9 @@ export async function handler(event: unknown): Promise<{ repaired: number; exami
     UpdateExpression: "SET #kind = :kind, tenantId = :tenant, lastEvaluatedSortKey = :last, updatedAt = :when",
     ExpressionAttributeNames: { "#kind": "kind" },
   }));
-  return { repaired, examined };
+  // Cursor has committed before surfacing failure to existing Lambda alarms.
+  if (failed > 0) throw new Error(`Upload projection repair requires attention (${failed} records).`);
+  return { repaired, examined, failed };
 }
 
 function parseLifecycle(item: Record<string, AttributeValue>): { intent: ControlledUploadIntent; evidence: UploadIntentEvidenceProjection; digest: string; sourceStatus: string } | undefined {

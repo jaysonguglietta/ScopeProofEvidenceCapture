@@ -4,6 +4,14 @@ This runbook is the minimum operational control set for using the current Scopep
 
 ## Service objectives
 
+The current D1 chain includes 0029 requirement revisions, 0030 explicit
+assessment-bound schedules and 0031 exact-occurrence finding resolution proofs.
+Reassign and verify previously unbound collectors before enabling schedules;
+scheduled minutes must match the deployed quarter-hour timer. Do not manually
+rewrite review, finding proof, package plan or requirement history. Use
+[current workflows](READINESS_WORKFLOWS.md) and the
+[source/qualification ledger](READINESS_IMPLEMENTATION_STATUS.md) for release acceptance.
+
 Approve organization-specific objectives before launch. The recommended starting targets are a 24-hour recovery point objective for D1 metadata and R2 ciphertext, a 4-hour recovery time objective for read-only evidence access, and an 8-hour objective for resumed collection. Reduce the RPO when an active assessment cannot tolerate recreating one business day of evidence.
 
 ## Native hosted-ingestion production gate
@@ -12,7 +20,7 @@ Local-only capture is a separate availability boundary. A Mac may continue local
 
 Before accepting native evidence in production:
 
-1. Apply and verify every database migration through `0028_native_reconciliation_cursor.sql`. In particular, `0020_native_device_chain.sql` adds the device-chain state, `0022_native_provenance_quarantine.sql` adds immutable native provenance/finalization fields, `0023_independent_image_safety.sql` adds the exact-pixel server-scan binding, `0025_pink_malice.sql` adds immutable independent-checkpoint delivery attempts, `0026_omniscient_scarlet_witch.sql` adds durable per-record key-rotation retry state, `0027_lonely_guardian.sql` adds atomic checkpoint-delivery claims, bounded backoff, stale-lease recovery, and terminal action-required state, and `0028_native_reconciliation_cursor.sql` adds the bounded sparse native-reconciliation queue and independent durable cursor state.
+1. Apply and verify every database migration through `0031_brave_silver_fox.sql`. In particular, `0020_native_device_chain.sql` adds the device-chain state, `0022_native_provenance_quarantine.sql` adds immutable native provenance/finalization fields, `0023_independent_image_safety.sql` adds the exact-pixel server-scan binding, `0025_pink_malice.sql` adds immutable independent-checkpoint delivery attempts, `0026_omniscient_scarlet_witch.sql` adds durable per-record key-rotation retry state, `0027_lonely_guardian.sql` adds atomic checkpoint-delivery claims, bounded backoff, stale-lease recovery, and terminal action-required state, and `0028_native_reconciliation_cursor.sql` adds the bounded sparse native-reconciliation queue and independent durable cursor state.
 2. Configure `BROWSER_OCR_ENDPOINT`, `BROWSER_OCR_TOKEN`, and `BROWSER_OCR_ALLOWED_HOSTS` for an independently operated OCR/DLP processor. These names are retained for compatibility but govern all hosted screenshot ingestion, including native uploads. The endpoint must return the digest of the exact submitted PNG and an approved policy version. Recognized text is evaluated transiently and must not be stored, audited, logged, or sent to monitoring; persist only the digest-bound policy, scanner origin, completion time, and receipt digest.
 3. Set `REQUIRE_TRUSTED_TIMESTAMP=true` and configure the RFC 3161 issuer and verifier values, verifier host allowlist/public keys, and TSA trust-anchor fingerprint. A Scopeproof server clock signature alone is not the production timestamp control.
 4. Confirm `GET /api/admin/readiness` reports no failures. Readiness structurally parses the single trusted-origin configuration and bootstrap administrator allowlist; it also requires the security-monitoring endpoint/allowlist and the independent scanner's one clean HTTPS endpoint, exact hostname allowlist, and trimmed 16–4096-character control-free token. The `security_monitoring`, `independent_image_safety`, trusted-origin/bootstrap, trusted-timestamp-policy, and trusted-timestamp checks must pass. Missing or merely present-but-malformed settings, an unsafe endpoint/allowlist/token, disabled timestamp enforcement, or incomplete timestamp trust material makes the service not production-ready.
@@ -83,7 +91,7 @@ Close an incident only after root cause, evidence preservation, containment, era
 - Named application, security, backup, Jira, and assessment owners are assigned.
 - DPA/privacy review, data classification, retention schedule, legal-hold process, and data-residency decision are approved.
 - Production secrets are organization-owned; readiness has no failures; external audit checkpoint and monitoring delivery are tested.
-- Migrations are applied through `0028_native_reconciliation_cursor.sql`; the sparse native-reconciliation queue and independent pending/orphan cursor state are healthy; independent screenshot scanning is configured through the legacy-named `BROWSER_OCR_*` settings; recognized OCR text is not retained; and the required RFC 3161 trust boundary is configured and tested. Production readiness fails when either service is disabled, missing, unsafe, or unverifiable. The private Sites identity-header boundary and exclusive ingress are separately proven with deployed negative tests.
+- Migrations are applied through `0031_brave_silver_fox.sql`; the sparse native-reconciliation queue and independent pending/orphan cursor state are healthy; independent screenshot scanning is configured through the legacy-named `BROWSER_OCR_*` settings; recognized OCR text is not retained; and the required RFC 3161 trust boundary is configured and tested. Production readiness fails when either service is disabled, missing, unsafe, or unverifiable. The private Sites identity-header boundary and exclusive ingress are separately proven with deployed negative tests.
 - At least two named administrators and separate collector/reviewer identities exist; invitation expiry, suspension/revocation, 30-day device-token rotation, and break-glass access are exercised and reviewed.
 - Jira OAuth uses an organization-owned Atlassian app and least-privilege projects; a test attachment and reconciliation exercise succeeded.
 - Every required collector has complete pagination coverage and an approved least-privilege service identity.

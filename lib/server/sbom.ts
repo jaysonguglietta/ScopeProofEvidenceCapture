@@ -7,17 +7,17 @@ import { getEnv } from "./env";
 import { storeEvidence } from "./evidence";
 import { isValidGitHubOwner, isValidGitRef, isValidRepositoryName, SbomError, validateOneTimeGitHubToken } from "./sbom-input";
 import { decodePageCursor, pageLimit, pageMeta, type PageMeta } from "./pagination";
+import { analyzeDependencyManifests, buildCycloneDx, buildSpdx, comparison, SBOM_GENERATOR_NAME, SBOM_GENERATOR_VERSION, type SbomComponent } from "./sbom-inventory";
+export { parseDependencyManifests, type SbomComponent, type SbomComparison } from "./sbom-inventory";
 
 export { parseGitHubRepositoryUrl, SbomError, validateOneTimeGitHubToken } from "./sbom-input";
 
 export type SbomFormat = "cyclonedx_json" | "spdx_json";
-export type SbomComponent = { name: string; version: string; ecosystem: string; purl: string; direct: boolean; manifests: string[] };
-export type SbomComparison = { baseline: boolean; previousJobId?: string; added: number; removed: number; changed: number; addedComponents: string[]; removedComponents: string[]; changedComponents: string[] };
 export type SbomCredential = { mode: "managed" | "one_time"; owner: string; token?: string };
 
 const API_VERSION = "2022-11-28";
-const GENERATOR_NAME = "scopeproof-static-sbom";
-const GENERATOR_VERSION = "1.0.0";
+const GENERATOR_NAME = SBOM_GENERATOR_NAME;
+const GENERATOR_VERSION = SBOM_GENERATOR_VERSION;
 const sbomSystemActor: AuthenticatedUser = { id: "system:scheduler", email: "scheduler@scopeproof.internal", displayName: "Scopeproof Scheduler", role: "admin" };
 const MAX_ARCHIVE_BYTES = 20 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES = 5_000;
@@ -143,108 +143,6 @@ export function extractDependencyManifests(bytes: Uint8Array): Array<{ path: str
   }).sort((a, b) => a.path.localeCompare(b.path));
 }
 
-function purl(ecosystem: string, name: string, version: string): string {
-  const type: Record<string, string> = { npm: "npm", PyPI: "pypi", cargo: "cargo", golang: "golang", gem: "gem", composer: "composer" };
-  return `pkg:${type[ecosystem] || ecosystem.toLowerCase()}/${name.split("/").map(encodeURIComponent).join("/")}@${encodeURIComponent(version)}`;
-}
-
-function component(name: string, version: unknown, ecosystem: string, direct: boolean, manifest: string): SbomComponent | null {
-  const normalizedName = String(name || "").trim();
-  const normalizedVersion = String(version || "").trim().replace(/^=+/, "");
-  if (!normalizedName || !normalizedVersion || normalizedName.length > 300 || normalizedVersion.length > 200 || [...normalizedName + normalizedVersion].some((character) => character.charCodeAt(0) < 32)) return null;
-  return { name: normalizedName, version: normalizedVersion, ecosystem, purl: purl(ecosystem, normalizedName, normalizedVersion), direct, manifests: [manifest] };
-}
-
-function parseJson(text: string, path: string): Record<string, unknown> {
-  try { const value = JSON.parse(text); if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(); return value as Record<string, unknown>; }
-  catch { throw new SbomError(`${path} is malformed JSON.`, "INVALID_MANIFEST", false, 422); }
-}
-
-function packageLock(path: string, text: string): SbomComponent[] {
-  const data = parseJson(text, path);
-  const root = (data.packages && typeof data.packages === "object" ? (data.packages as Record<string, Record<string, unknown>>)[""] : undefined) || data;
-  const directNames = new Set(["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"].flatMap((key) => Object.keys((root[key] && typeof root[key] === "object" ? root[key] : {}) as object)));
-  const found: SbomComponent[] = [];
-  if (data.packages && typeof data.packages === "object") for (const [location, value] of Object.entries(data.packages as Record<string, Record<string, unknown>>)) {
-    if (!location || !value || typeof value !== "object") continue;
-    const marker = "/node_modules/";
-    const name = String(value.name || (location.includes(marker) ? location.slice(location.lastIndexOf(marker) + marker.length) : location.replace(/^node_modules\//, "")));
-    const item = component(name, value.version, "npm", directNames.has(name), path); if (item) found.push(item);
-  }
-  if (!found.length && data.dependencies && typeof data.dependencies === "object") for (const [name, value] of Object.entries(data.dependencies as Record<string, Record<string, unknown>>)) { const item = component(name, value?.version, "npm", directNames.has(name), path); if (item) found.push(item); }
-  return found;
-}
-
-function jsonDependencies(path: string, text: string): SbomComponent[] {
-  const data = parseJson(text, path);
-  if (basename(path) === "pipfile.lock") return ["default", "develop"].flatMap((group) => Object.entries((data[group] || {}) as Record<string, Record<string, unknown>>).map(([name, value]) => component(name, value.version, "PyPI", true, path)).filter(Boolean) as SbomComponent[]);
-  const rootRequires = new Set(Object.keys((data.require && typeof data.require === "object" ? data.require : {}) as object));
-  return ["packages", "packages-dev"].flatMap((group) => Array.isArray(data[group]) ? (data[group] as Array<Record<string, unknown>>).map((value) => component(String(value.name || "").replace(/^v/, ""), String(value.version || "").replace(/^v/, ""), "composer", rootRequires.has(String(value.name)), path)).filter(Boolean) as SbomComponent[] : []);
-}
-
-function blockPackages(path: string, text: string, ecosystem: "cargo" | "PyPI"): SbomComponent[] {
-  const found: SbomComponent[] = [];
-  for (const block of text.split(/^\s*\[\[package\]\]\s*$/m).slice(1)) {
-    const name = block.match(/^name\s*=\s*["']([^"']+)["']/m)?.[1];
-    const version = block.match(/^version\s*=\s*["']([^"']+)["']/m)?.[1];
-    const item = component(name || "", version, ecosystem, false, path); if (item) found.push(item);
-  }
-  return found;
-}
-
-function lineManifest(path: string, text: string): SbomComponent[] {
-  const name = basename(path);
-  const found: SbomComponent[] = [];
-  if (name === "requirements.txt") for (const line of text.split(/\r?\n/)) { const match = line.trim().match(/^([A-Za-z0-9_.-]+)\s*={2,3}\s*([^\s;#]+)/); const item = match && component(match[1], match[2], "PyPI", true, path); if (item) found.push(item); }
-  if (name === "go.sum") for (const line of text.split(/\r?\n/)) { const [module, raw] = line.trim().split(/\s+/); if (!module || !raw || raw.endsWith("/go.mod")) continue; const item = component(module, raw, "golang", false, path); if (item) found.push(item); }
-  if (name === "gemfile.lock") { let specs = false; for (const line of text.split(/\r?\n/)) { if (/^\s{2}specs:/.test(line)) { specs = true; continue; } if (specs && /^\S/.test(line)) specs = false; const match = specs && line.match(/^\s{4}([^ (]+) \(([^ )]+)\)/); const item = match && component(match[1], match[2], "gem", false, path); if (item) found.push(item); } }
-  if (name === "yarn.lock") for (const block of text.split(/\n(?=[^ \n][^\n]*:\n)/)) { const header = block.match(/^([^\n]+):\n/)?.[1]; const version = block.match(/^\s{2}version\s+["']?([^"'\s]+)["']?/m)?.[1]; if (!header || !version) continue; const first = header.split(",")[0].trim().replace(/^['"]|['"]$/g, ""); const packageName = first.startsWith("@") ? first.slice(0, first.indexOf("@", 1)) : first.split("@")[0]; const item = component(packageName, version, "npm", false, path); if (item) found.push(item); }
-  if (name === "pnpm-lock.yaml") for (const line of text.split(/\r?\n/)) { const match = line.match(/^\s{2,}["']?\/?((?:@[^/@\s]+\/)?[^@:'"\s]+)@([^:'"\s(]+)["']?:/); const item = match && component(match[1], match[2], "npm", false, path); if (item) found.push(item); }
-  return found;
-}
-
-export function parseDependencyManifests(manifests: Array<{ path: string; text: string }>): SbomComponent[] {
-  const all: SbomComponent[] = [];
-  for (const manifest of manifests) {
-    const name = basename(manifest.path);
-    if (["package-lock.json", "npm-shrinkwrap.json"].includes(name)) all.push(...packageLock(manifest.path, manifest.text));
-    else if (["pipfile.lock", "composer.lock"].includes(name)) all.push(...jsonDependencies(manifest.path, manifest.text));
-    else if (name === "cargo.lock") all.push(...blockPackages(manifest.path, manifest.text, "cargo"));
-    else if (name === "poetry.lock") all.push(...blockPackages(manifest.path, manifest.text, "PyPI"));
-    else all.push(...lineManifest(manifest.path, manifest.text));
-    if (all.length > MAX_COMPONENTS * 2) throw new SbomError("Repository dependency inventory exceeds the component safety limit.", "COMPONENT_LIMIT_EXCEEDED", false, 413);
-  }
-  const merged = new Map<string, SbomComponent>();
-  for (const item of all) {
-    const existing = merged.get(item.purl);
-    if (existing) { existing.direct ||= item.direct; existing.manifests = [...new Set([...existing.manifests, ...item.manifests])].sort(); }
-    else merged.set(item.purl, { ...item });
-  }
-  const result = [...merged.values()].sort((a, b) => a.purl.localeCompare(b.purl));
-  if (result.length > MAX_COMPONENTS) throw new SbomError("Repository dependency inventory exceeds the 5,000-component safety limit.", "COMPONENT_LIMIT_EXCEEDED", false, 413);
-  return result;
-}
-
-function comparison(current: SbomComponent[], previous: SbomComponent[] | null, previousJobId?: string): SbomComparison {
-  if (!previous) return { baseline: true, added: 0, removed: 0, changed: 0, addedComponents: [], removedComponents: [], changedComponents: [] };
-  const currentByName = new Map(current.map((item) => [`${item.ecosystem}:${item.name}`, item.version]));
-  const previousByName = new Map(previous.map((item) => [`${item.ecosystem}:${item.name}`, item.version]));
-  const added = [...currentByName.keys()].filter((key) => !previousByName.has(key));
-  const removed = [...previousByName.keys()].filter((key) => !currentByName.has(key));
-  const changed = [...currentByName.keys()].filter((key) => previousByName.has(key) && previousByName.get(key) !== currentByName.get(key));
-  return { baseline: false, previousJobId, added: added.length, removed: removed.length, changed: changed.length, addedComponents: added.slice(0, 100), removedComponents: removed.slice(0, 100), changedComponents: changed.slice(0, 100) };
-}
-
-function buildCycloneDx(repo: string, commit: string, generatedAt: string, archiveDigest: string, manifests: string[], components: SbomComponent[]) {
-  return { bomFormat: "CycloneDX", specVersion: "1.6", serialNumber: `urn:uuid:${crypto.randomUUID()}`, version: 1, metadata: { timestamp: generatedAt, tools: { components: [{ type: "application", name: GENERATOR_NAME, version: GENERATOR_VERSION }] }, component: { type: "application", name: repo, version: commit, bom_ref: `repository:${repo}@${commit}` }, properties: [{ name: "scopeproof:repository", value: `https://github.com/${repo}` }, { name: "scopeproof:commit", value: commit }, { name: "scopeproof:sourceArchiveSha256", value: archiveDigest }, { name: "scopeproof:manifests", value: manifests.join(",") }] }, components: components.map((item) => ({ type: "library", name: item.name, version: item.version, purl: item.purl, bom_ref: item.purl, properties: [{ name: "scopeproof:direct", value: String(item.direct) }, { name: "scopeproof:manifests", value: item.manifests.join(",") }] })) };
-}
-
-function spdxId(value: string, index: number): string { return `SPDXRef-Package-${index}-${value.replace(/[^A-Za-z0-9.-]+/g, "-").slice(0, 80)}`; }
-function buildSpdx(repo: string, commit: string, generatedAt: string, archiveDigest: string, manifests: string[], components: SbomComponent[]) {
-  const repoId = "SPDXRef-Repository";
-  const packages = components.map((item, index) => ({ SPDXID: spdxId(item.name, index), name: item.name, versionInfo: item.version, downloadLocation: "NOASSERTION", filesAnalyzed: false, externalRefs: [{ referenceCategory: "PACKAGE-MANAGER", referenceType: "purl", referenceLocator: item.purl }], annotations: [{ annotationType: "OTHER", annotator: `Tool: ${GENERATOR_NAME}-${GENERATOR_VERSION}`, annotationDate: generatedAt, comment: `direct=${item.direct}; manifests=${item.manifests.join(",")}` }] }));
-  return { spdxVersion: "SPDX-2.3", dataLicense: "CC0-1.0", SPDXID: "SPDXRef-DOCUMENT", name: `${repo}-${commit.slice(0, 12)}-sbom`, documentNamespace: `https://scopeproof.local/sbom/${crypto.randomUUID()}`, creationInfo: { created: generatedAt, creators: [`Tool: ${GENERATOR_NAME}-${GENERATOR_VERSION}`], comment: `Repository https://github.com/${repo}; commit ${commit}; source archive SHA-256 ${archiveDigest}; manifests ${manifests.join(",")}` }, packages: [{ SPDXID: repoId, name: repo, versionInfo: commit, downloadLocation: `https://github.com/${repo}`, filesAnalyzed: false }, ...packages], relationships: [{ spdxElementId: "SPDXRef-DOCUMENT", relationshipType: "DESCRIBES", relatedSpdxElement: repoId }, ...packages.map((item) => ({ spdxElementId: repoId, relationshipType: "DEPENDS_ON", relatedSpdxElement: item.SPDXID }))] };
-}
 
 async function downloadArchive(owner: string, repository: string, commit: string, token?: string): Promise<Uint8Array> {
   const first = await boundedFetch(`https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repository)}/zipball/${commit}`, { headers: githubHeaders(token) }, "GitHub repository archive", 64 * 1024);
@@ -309,20 +207,25 @@ export async function processSbom(jobId: string, actor: AuthenticatedUser, crede
     const archiveDigest = await sha256(archive);
     const manifests = extractDependencyManifests(archive);
     if (!manifests.length) throw new SbomError("No supported dependency lockfiles were found in this repository ref.", "NO_SUPPORTED_MANIFESTS", false, 422);
-    const components = parseDependencyManifests(manifests);
+    const inventory = analyzeDependencyManifests(manifests, MAX_COMPONENTS);
+    const components = inventory.components;
     if (!components.length) throw new SbomError("Supported lockfiles were found, but no pinned dependency versions could be parsed.", "NO_COMPONENTS", false, 422);
     const previous = await env.DB.prepare("SELECT id, components_json FROM sbom_jobs WHERE assessment_id = ? AND repository_full_name = ? AND status = 'completed' AND id != ? ORDER BY completed_at DESC LIMIT 1").bind(job.assessment_id, fullName, jobId).first<{ id: string; components_json: string }>();
-    const delta = comparison(components, previous ? JSON.parse(previous.components_json) as SbomComponent[] : null, previous?.id);
+    const delta = { ...comparison(components, previous ? JSON.parse(previous.components_json) as SbomComponent[] : null, previous?.id), inventoryCoverage: { complete: inventory.complete, directDependencyClassification: inventory.complete && components.every((item) => item.directKnown !== false) ? "complete" : "unknown", manifests: inventory.manifests, warnings: inventory.warnings } };
     const generatedAt = new Date().toISOString();
     const document = String(job.format) === "spdx_json" ? buildSpdx(fullName, commit.sha, generatedAt, archiveDigest, manifests.map((item) => item.path), components) : buildCycloneDx(fullName, commit.sha, generatedAt, archiveDigest, manifests.map((item) => item.path), components);
+    // Persist bounded parser/completeness facts inside the artifact as well as
+    // job coverage. The document remains a useful review aid when partial.
+    if ("metadata" in document) document.metadata.properties.push({ name: "scopeproof:inventoryCoverage", value: JSON.stringify({ complete: inventory.complete, manifests: inventory.manifests, warnings: inventory.warnings }) });
+    else document.creationInfo.comment += `; inventoryCoverage=${JSON.stringify({ complete: inventory.complete, manifests: inventory.manifests, warnings: inventory.warnings })}`;
     const bytes = new TextEncoder().encode(`${JSON.stringify(document, null, 2)}\n`);
     const assessment = await getAssessment(String(job.assessment_id));
     if (!assessment) throw new SbomError("Assessment no longer exists.", "ASSESSMENT_NOT_FOUND", false, 409);
     const systems = assessment.systems as string[];
     const system = systems.find((value) => value === fullName) || systems.find((value) => value === owner) || systems.find((value) => value.toLowerCase() === "github") || fullName;
-    const stored = await storeEvidence({ controlId: "6.3.2", framework: String(assessment.framework), title: `${String(job.format) === "spdx_json" ? "SPDX" : "CycloneDX"} SBOM — ${fullName}@${commit.sha.slice(0, 12)}`, description: `Static, non-executing dependency inventory generated from ${manifests.length} lockfile(s) at immutable Git commit ${commit.sha}.`, type: "report", source: "Scopeproof SBOM", system, environment: "source repository", assessmentPeriod: `${assessment.period_start} – ${assessment.period_end}`, evidenceOwner: actor.email, tags: ["SBOM", String(job.format) === "spdx_json" ? "SPDX 2.3" : "CycloneDX 1.6", `repository:${fullName}`, `commit:${commit.sha}`, `credential:${credentialMode}`, `generator:${GENERATOR_NAME}@${GENERATOR_VERSION}`], expectedEvidence: "Software inventory with immutable source provenance for PCI DSS 6.3.2.", contentType: String(job.format) === "spdx_json" ? "application/spdx+json" : "application/vnd.cyclonedx+json", bytes, jobId, capturedAt: generatedAt, validityDays: 365, createdBy: actor, assessmentId: String(job.assessment_id), coverageStatus: "complete", coverage: { complete: true, repository: fullName, requestedRef: job.requested_ref, resolvedCommitSha: commit.sha, sourceArchiveSha256: archiveDigest, manifests: manifests.map((item) => item.path), componentCount: components.length, directDependencyCount: components.filter((item) => item.direct).length, credentialMode, generator: `${GENERATOR_NAME}@${GENERATOR_VERSION}`, comparison: delta } });
+    const stored = await storeEvidence({ controlId: "6.3.2", framework: String(assessment.framework), title: `${String(job.format) === "spdx_json" ? "SPDX" : "CycloneDX"} SBOM — ${fullName}@${commit.sha.slice(0, 12)}`, description: `Static, non-executing dependency inventory generated from ${manifests.length} lockfile(s) at immutable Git commit ${commit.sha}.`, type: "report", source: "Scopeproof SBOM", system, environment: "source repository", assessmentPeriod: `${assessment.period_start} – ${assessment.period_end}`, evidenceOwner: actor.email, tags: ["SBOM", String(job.format) === "spdx_json" ? "SPDX 2.3" : "CycloneDX 1.6", `repository:${fullName}`, `commit:${commit.sha}`, `credential:${credentialMode}`, `generator:${GENERATOR_NAME}@${GENERATOR_VERSION}`], expectedEvidence: "Software inventory with immutable source provenance for PCI DSS 6.3.2.", contentType: String(job.format) === "spdx_json" ? "application/spdx+json" : "application/vnd.cyclonedx+json", bytes, jobId, capturedAt: generatedAt, validityDays: 365, createdBy: actor, assessmentId: String(job.assessment_id), coverageStatus: inventory.complete ? "complete" : "partial", coverage: { complete: inventory.complete, omissions: inventory.warnings, manifestCoverage: inventory.manifests, repository: fullName, requestedRef: job.requested_ref, resolvedCommitSha: commit.sha, sourceArchiveSha256: archiveDigest, manifests: manifests.map((item) => item.path), componentCount: components.length, directDependencyCount: components.filter((item) => item.direct).length, credentialMode, generator: `${GENERATOR_NAME}@${GENERATOR_VERSION}`, comparison: delta } });
     const completedAt = new Date().toISOString();
-    await executeAuditedBatch(actor, "sbom.completed", "sbom_job", jobId, { repository: fullName, resolvedCommitSha: commit.sha, evidenceId: stored.id, artifactSha256: stored.sha256, componentCount: components.length, manifestCount: manifests.length, credentialMode, comparison: delta }, [env.DB.prepare("UPDATE sbom_jobs SET status = 'completed', resolved_commit_sha = ?, evidence_id = ?, previous_job_id = ?, component_count = ?, direct_dependency_count = ?, manifest_count = ?, source_archive_sha256 = ?, artifact_sha256 = ?, manifests_json = ?, components_json = ?, comparison_json = ?, completed_at = ?, lease_id = NULL, lease_expires_at = NULL WHERE id = ? AND status = 'running' AND lease_id = ?").bind(commit.sha, stored.id, previous?.id || null, components.length, components.filter((item) => item.direct).length, manifests.length, archiveDigest, stored.sha256, stableJson(manifests.map((item) => item.path)), stableJson(components), stableJson(delta), completedAt, jobId, leaseId)], { sql: "EXISTS (SELECT 1 FROM sbom_jobs WHERE id = ? AND status = 'completed' AND evidence_id = ?)", bindings: [jobId, stored.id] });
+    await executeAuditedBatch(actor, "sbom.completed", "sbom_job", jobId, { repository: fullName, resolvedCommitSha: commit.sha, evidenceId: stored.id, artifactSha256: stored.sha256, componentCount: components.length, manifestCount: manifests.length, credentialMode, comparison: delta }, [env.DB.prepare("UPDATE sbom_jobs SET status = 'completed', generator_name = ?, generator_version = ?, resolved_commit_sha = ?, evidence_id = ?, previous_job_id = ?, component_count = ?, direct_dependency_count = ?, manifest_count = ?, source_archive_sha256 = ?, artifact_sha256 = ?, manifests_json = ?, components_json = ?, comparison_json = ?, completed_at = ?, lease_id = NULL, lease_expires_at = NULL WHERE id = ? AND status = 'running' AND lease_id = ?").bind(GENERATOR_NAME, GENERATOR_VERSION, commit.sha, stored.id, previous?.id || null, components.length, components.filter((item) => item.direct).length, manifests.length, archiveDigest, stored.sha256, stableJson(manifests.map((item) => item.path)), stableJson(components), stableJson(delta), completedAt, jobId, leaseId)], { sql: "EXISTS (SELECT 1 FROM sbom_jobs WHERE id = ? AND status = 'completed' AND evidence_id = ?)", bindings: [jobId, stored.id] });
     return (await getSbomJob(jobId)) || {};
   } catch (error) {
     const failure = error instanceof SbomError ? error : new SbomError(error instanceof Error ? error.message : "SBOM generation failed.", "INTERNAL_ERROR", true, 500);
@@ -336,7 +239,7 @@ export async function processSbom(jobId: string, actor: AuthenticatedUser, crede
 export async function getSbomJob(id: string): Promise<Record<string, unknown> | null> {
   if (!/^sbom_[a-f0-9]{32}$/.test(id)) return null;
   const row = await getEnv().DB.prepare("SELECT id, requested_by, assessment_id, repository_full_name, requested_ref, resolved_commit_sha, format, status, attempt, max_attempts, evidence_id, previous_job_id, component_count, direct_dependency_count, manifest_count, source_archive_sha256, artifact_sha256, generator_name, generator_version, manifests_json, comparison_json, error_code, error_message, created_at, started_at, completed_at FROM sbom_jobs WHERE id = ?").bind(id).first<Record<string, unknown>>();
-  return row ? { ...row, manifests: JSON.parse(String(row.manifests_json || "[]")), comparison: JSON.parse(String(row.comparison_json || "{}")), manifests_json: undefined, comparison_json: undefined } : null;
+  return row ? { ...row, inventoryCoverage: (JSON.parse(String(row.comparison_json || "{}")) as Record<string, unknown>).inventoryCoverage || null, manifests: JSON.parse(String(row.manifests_json || "[]")), comparison: JSON.parse(String(row.comparison_json || "{}")), manifests_json: undefined, comparison_json: undefined } : null;
 }
 
 export async function listSbomJobs(assessmentId?: string): Promise<Array<Record<string, unknown>>> {

@@ -130,6 +130,7 @@ function handler(input: {
   requestLegalHold?: (request: AuthorizedApiRequest, payload: LegalHoldRequestApiPayload) => Promise<RequestedExactVersionLegalHold>;
   approveLegalHold?: (request: AuthorizedApiRequest, payload: LegalHoldApprovalApiPayload) => Promise<ApprovedExactVersionLegalHold>;
   recordApiAudit?: (record: HostedApiAuditRecord) => void;
+  revokeOwnSessions?: (request: AuthorizedApiRequest) => Promise<{ sessionEpoch: number; revokedThrough: string }>;
   omitAuditRuntime?: boolean;
 } = {}) {
   let runtimeCreations = 0;
@@ -194,11 +195,32 @@ function handler(input: {
         issueEvidenceDownload: input.issueEvidenceDownload,
         requestLegalHold: input.requestLegalHold,
         approveLegalHold: input.approveLegalHold,
+        revokeOwnSessions: input.revokeOwnSessions,
       };
     },
   });
   return { api, runtimeCreations: () => runtimeCreations };
 }
+
+test("session revocation is authenticated, self-only, and requires the durable runtime", async () => {
+  for (const [path, role] of [["/v1/sessions/revoke", "reviewer"], ["/v1/collector/sessions/revoke", "collector"]] as const) {
+    let calls = 0;
+    const fixture = handler({ role, async revokeOwnSessions(request) {
+      calls += 1;
+      assert.equal(request.actor.userId, USER);
+      assert.equal(request.identity.subject, "8f1a75c0-example");
+      return { sessionEpoch: 1, revokedThrough: "2026-08-27T16:00:00.000Z" };
+    } });
+    const result = await fixture.api(postBody(path, {}));
+    assert.equal(result.statusCode, 200);
+    assert.equal(JSON.parse(result.body).status, "revoked");
+    assert.equal(calls, 1);
+    assert.equal((await fixture.api(postBody(path, { userId: USER }))).statusCode, 400);
+    assert.equal(calls, 1);
+    assert.equal((await fixture.api(event(path))).statusCode, 405);
+  }
+  assert.equal((await handler().api(postBody("/v1/collector/sessions/revoke", {}))).statusCode, 500);
+});
 
 function legalHoldRequestBody(): Record<string, unknown> {
   return {
@@ -251,6 +273,7 @@ test("authenticated me derives tenant and membership from verified adapters", as
     membershipId: MEMBERSHIP,
     role: "collector",
     tokenExpiresAt: "2026-08-27T16:55:00.000Z",
+    uploadProofChallenge: "token-id-12345678",
   });
   assert.equal(response.body.includes("8f1a75c0-example"), false);
 });

@@ -60,7 +60,10 @@ for migration in \
   drizzle/0025_pink_malice.sql \
   drizzle/0026_omniscient_scarlet_witch.sql \
   drizzle/0027_lonely_guardian.sql \
-  drizzle/0028_native_reconciliation_cursor.sql
+  drizzle/0028_native_reconciliation_cursor.sql \
+  drizzle/0029_wooden_jack_power.sql \
+  drizzle/0030_majestic_roxanne_simpson.sql \
+  drizzle/0031_brave_silver_fox.sql
 do
   test -f "$migration"
   sqlite3 "$database" ".read $migration"
@@ -226,7 +229,10 @@ for migration in \
   drizzle/0025_pink_malice.sql \
   drizzle/0026_omniscient_scarlet_witch.sql \
   drizzle/0027_lonely_guardian.sql \
-  drizzle/0028_native_reconciliation_cursor.sql
+  drizzle/0028_native_reconciliation_cursor.sql \
+  drizzle/0029_wooden_jack_power.sql \
+  drizzle/0030_majestic_roxanne_simpson.sql \
+  drizzle/0031_brave_silver_fox.sql
 do
   sqlite3 "$fresh_database" ".read $migration"
 done

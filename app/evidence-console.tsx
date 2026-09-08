@@ -4,8 +4,18 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import Image from "next/image";
 import type { CollectionRun, Evidence, EvidenceStatus } from "../lib/types";
 import type { CatalogControl, ControlCatalog } from "../lib/control-catalogs";
+import { evidenceQuery, mergeRecords, retryDelay, reviewActions, type ReviewAction } from "../lib/console-state";
+import { useDialogFocus } from "./use-dialog-focus";
+import { ReadinessPanel } from "./readiness-panel";
+import { PackagePartitionPanel } from "./package-partition-panel";
+import { rotatingWatchBatch } from "../lib/server/job-watch";
+import { SbomInventoryPanel } from "./sbom-inventory-panel";
+import { EvidenceRequirementsPanel } from "./evidence-requirements-panel";
+import { EvidenceHoldPanel } from "./evidence-hold-panel";
+import { AssessmentLifecyclePanel, CollectorAdminPanel, FindingAssignmentFields, FindingWorkflowPanel } from "./components/workflow-admin";
+import { ScopeCompatibilityPanel } from "./scope-compatibility-panel";
 
-type View = "Overview" | "Controls" | "Evidence" | "SBOMs" | "Collection runs" | "Findings" | "Connections" | "Settings" | "Help";
+type View = "Overview" | "Controls" | "Evidence" | "SBOMs" | "Collection runs" | "Findings" | "Packages" | "Connections" | "Settings" | "Help";
 type Modal = "run" | "add" | "sbom" | "export" | "device" | "assessment" | "finding" | null;
 
 const nav: { label: View; mark: string; section: "workspace" | "manage" }[] = [
@@ -15,6 +25,7 @@ const nav: { label: View; mark: string; section: "workspace" | "manage" }[] = [
   { label: "SBOMs", mark: "◫", section: "workspace" },
   { label: "Collection runs", mark: "↻", section: "workspace" },
   { label: "Findings", mark: "◇", section: "workspace" },
+  { label: "Packages", mark: "↓", section: "workspace" },
   { label: "Connections", mark: "⌘", section: "manage" },
   { label: "Settings", mark: "⚙", section: "manage" },
   { label: "Help", mark: "?", section: "manage" },
@@ -39,11 +50,19 @@ type ApiAssessment = { id: string; name: string; framework: string; period_start
 type ApiPage = { limit: number; total: number; hasMore: boolean; nextCursor: string | null };
 type ApiEvidenceSummary = { total: number; approved: number; needsReview: number; rejected: number; returned: number; superseded: number; expired: number; openFindings: number; controls: Array<{ controlId: string; total: number; approved: number; needsReview: number; partialCoverage: number }> };
 type ApiRepository = { name: string; fullName: string; defaultBranch: string; private: boolean; archived: boolean };
-type ApiSbom = { id: string; assessment_id: string; repository_full_name: string; requested_ref: string; resolved_commit_sha: string | null; format: "cyclonedx_json" | "spdx_json"; status: "queued" | "running" | "completed" | "retrying" | "failed"; attempt: number; max_attempts: number; evidence_id: string | null; component_count: number; direct_dependency_count: number; manifest_count: number; source_archive_sha256: string | null; artifact_sha256: string | null; generator_name: string; generator_version: string; manifests: string[]; comparison: { baseline?: boolean; previousJobId?: string; added?: number; removed?: number; changed?: number; addedComponents?: string[]; removedComponents?: string[]; changedComponents?: string[] }; error_code: string | null; error_message: string | null; created_at: string; completed_at: string | null };
+type ApiSbom = { id: string; assessment_id: string; repository_full_name: string; requested_ref: string; resolved_commit_sha: string | null; format: "cyclonedx_json" | "spdx_json"; status: "queued" | "running" | "completed" | "retrying" | "failed"; attempt: number; max_attempts: number; evidence_id: string | null; component_count: number; direct_dependency_count: number; manifest_count: number; source_archive_sha256: string | null; artifact_sha256: string | null; generator_name: string; generator_version: string; manifests: string[]; inventoryCoverage?: { complete: boolean; directDependencyClassification: string; warnings: string[] }; comparison: { baseline?: boolean; previousJobId?: string; added?: number; removed?: number; changed?: number; addedComponents?: string[]; removedComponents?: string[]; changedComponents?: string[]; detailsTruncated?: boolean; versionChanges?: Array<{ name: string; previous: string[]; current: string[] }> }; error_code: string | null; error_message: string | null; created_at: string; completed_at: string | null };
 type ApiFinding = { id: string; assessment_id: string; control_id: string | null; evidence_id: string | null; job_id: string | null; title: string; description: string; severity: "critical" | "high" | "medium" | "low"; status: "open" | "in_progress" | "accepted" | "resolved" | "closed"; owner_id: string | null; owner_email: string | null; due_at: string | null; resolution: string | null; created_by_email: string | null; created_at: string; updated_at: string; resolved_at: string | null };
 type ApiFindingSummary = { total: number; open: number; in_progress: number; accepted: number; resolved: number; critical: number; high: number };
-type PackagePreflight = { ready: boolean; assessmentId: string; total: number; eligible: number; excluded: number; blockers: Array<{ code: string; count: number; message: string }> };
+type PackagePreflight = { ready: boolean; assessmentId: string; total: number; eligible: number; excluded: number; eligibleBytes?: number; maximumBytes?: number; outOfScope?: number; blockers: Array<{ code: string; count: number; message: string }> };
+type ApiPackage = { selection_json?: string; id: string; status: string; sha256: string | null; evidence_count: number; excluded_count: number; byte_size: number | null; created_at: string; expires_at: string | null; error_message: string | null };
 type FindingTarget = { assessmentId: string; controlId?: string; evidenceId?: string; jobId?: string; title: string };
+
+function packagePartLabel(raw?: string): string | null {
+  try {
+    const partition = JSON.parse(raw || "{}").partition as { index: number; parts: number; planDigest: string } | undefined;
+    return partition ? `Part ${partition.index} of ${partition.parts} · Plan ${partition.planDigest}` : null;
+  } catch { return "Scope metadata unavailable — inspect the signed manifest."; }
+}
 
 function cls(...values: Array<string | false | null | undefined>) {
   return values.filter(Boolean).join(" ");
@@ -109,11 +128,11 @@ function mapApiEvidence(row: Record<string, unknown>): Evidence {
 }
 
 function mapApiRun(row: Record<string, unknown>): CollectionRun {
-  const statusMap: Record<string, CollectionRun["status"]> = { completed: "Completed", partial: "Partial", running: "Running", queued: "Running", retrying: "Partial", failed: "Failed" };
+  const statusMap: Record<string, CollectionRun["status"]> = { completed: "Completed", partial: "Partial", running: "Running", queued: "Queued", retrying: "Retrying", failed: "Failed" };
   const started = row.started_at ? new Date(String(row.started_at)).getTime() : 0;
   const completed = row.completed_at ? new Date(String(row.completed_at)).getTime() : 0;
   const duration = started && completed ? `${Math.max(1, Math.round((completed - started) / 1000))}s` : row.status === "running" ? "In progress" : "—";
-  return { id: String(row.id), source: String(row.display_name || row.provider || row.collector_id), startedAt: formatDate(row.created_at), status: statusMap[String(row.status)] || "Failed", artifacts: Number(row.artifact_count || 0), controls: Number(row.artifact_count || 0), duration, note: row.error_message ? String(row.error_message) : row.status === "retrying" ? `Retry ${row.attempt}/${row.max_attempts}` : undefined, assessmentId: row.assessment_id ? String(row.assessment_id) : undefined };
+  return { id: String(row.id), source: String(row.display_name || row.provider || row.collector_id), startedAt: formatDate(row.created_at), status: statusMap[String(row.status)] || "Failed", artifacts: Number(row.artifact_count || 0), controls: Number(row.control_count || 0), duration, note: row.error_message ? String(row.error_message) : row.status === "retrying" ? `Retry ${row.attempt}/${row.max_attempts}` : undefined, assessmentId: row.assessment_id ? String(row.assessment_id) : undefined };
 }
 
 function StatusPill({ status }: { status: string }) {
@@ -139,13 +158,8 @@ function EvidenceVisual({ item, compact = false }: { item: Evidence; compact?: b
     );
   }
   return (
-    <div className={cls("screen-preview", `accent-${item.accent || "blue"}`, compact && "compact")} aria-label={`Screenshot preview for ${item.title}`}>
-      <div className="browser-bar"><span /><span /><span /><b /></div>
-      <div className="fake-app">
-        <div className="fake-sidebar"><i /><i /><i /><i /></div>
-        <div className="fake-content"><em /><i className="fake-title" /><p /><div className="fake-grid"><i /><i /><i /></div><div className="fake-table"><span /><span /><span /></div></div>
-      </div>
-      <span className="capture-stamp">CAPTURED</span>
+    <div className={cls("screen-preview", "neutral-evidence", compact && "compact")} aria-label={`${item.type}: ${item.title}. Open to verify actual contents.`}>
+      <span aria-hidden="true">▱</span><strong>{item.type} artifact</strong><small>Open to inspect verified contents</small>
     </div>
   );
 }
@@ -159,8 +173,8 @@ function PaginationNotice({ noun, loaded, page, busy, onLoad }: { noun: string; 
   return <div className="info-callout pagination-callout"><span>i</span><div><strong>Showing {loaded} of {page.total} {noun}</strong><p>Load the next cursor-bound page to continue without skipping or duplicating records.</p></div><button className="button secondary" disabled={busy} onClick={onLoad}>{busy ? "Loading…" : "Load 50 more"}</button></div>;
 }
 
-export function EvidenceConsole() {
-  const [view, setView] = useState<View>("Overview");
+export function EvidenceConsole({ initialView = "Overview" }: { initialView?: string }) {
+  const [view, setView] = useState<View>(() => nav.some((item) => item.label === initialView) ? initialView as View : "Overview");
   const [modal, setModal] = useState<Modal>(null);
   const [selectedEvidence, setSelectedEvidence] = useState<Evidence | null>(null);
   const [search, setSearch] = useState("");
@@ -192,13 +206,28 @@ export function EvidenceConsole() {
   const [runPage, setRunPage] = useState<ApiPage | null>(null);
   const [sbomPage, setSbomPage] = useState<ApiPage | null>(null);
   const [evidenceSummary, setEvidenceSummary] = useState<ApiEvidenceSummary | null>(null);
-  const [findingItems, setFindingItems] = useState<ApiFinding[]>([]);
+  const [, setFindingItems] = useState<ApiFinding[]>([]);
   const [findingPage, setFindingPage] = useState<ApiPage | null>(null);
   const [findingSummary, setFindingSummary] = useState<ApiFindingSummary | null>(null);
   const [findingTarget, setFindingTarget] = useState<FindingTarget | null>(null);
   const [packagePreflight, setPackagePreflight] = useState<PackagePreflight | null>(null);
   const [workspaceRevision, setWorkspaceRevision] = useState(0);
-  const [loadingMore, setLoadingMore] = useState<"evidence" | "runs" | "sboms" | "findings" | null>(null);
+  const [loadingMore, setLoadingMore] = useState<"evidence" | "runs" | "sboms" | "findings" | "packages" | null>(null);
+  const [workspaceErrors, setWorkspaceErrors] = useState<Record<string, string>>({});
+  const [debouncedSearch, setDebouncedSearch] = useState("");
+  const [evidenceScope, setEvidenceScope] = useState<{ controlId?: string; system?: string }>({});
+  const [packageItems, setPackageItems] = useState<ApiPackage[]>([]);
+  const [packagePage, setPackagePage] = useState<ApiPage | null>(null);
+  const workspaceGeneration = useRef(0);
+  const watchedRuns = useRef<string[]>([]);
+  const watchedSboms = useRef<string[]>([]);
+  useEffect(() => { watchedRuns.current = runItems.filter((item) => item.assessmentId === selectedAssessmentId && ["Queued", "Running", "Retrying"].includes(item.status)).map((item) => item.id); }, [runItems, selectedAssessmentId]);
+  useEffect(() => { watchedSboms.current = sbomItems.filter((item) => item.assessment_id === selectedAssessmentId && ["queued", "running", "retrying"].includes(item.status)).map((item) => item.id); }, [sbomItems, selectedAssessmentId]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setDebouncedSearch(search), 250);
+    return () => window.clearTimeout(timer);
+  }, [search]);
 
   useEffect(() => {
     let cancelled = false;
@@ -208,24 +237,53 @@ export function EvidenceConsole() {
         // assessment therefore cannot disappear merely because 100 newer closed
         // assessments exist, while older pages remain an explicit user action.
         const [meResponse, collectorsResponse, auditResponse, assessmentData, activeAssessmentData] = await Promise.all([
-          fetch("/api/me"), fetch("/api/collectors"), fetch("/api/audit"), loadAssessmentPage(), loadAssessmentPage(null, "active"),
+          fetch("/api/me"), fetch("/api/collectors").catch(() => new Response(null, { status: 503 })), fetch("/api/audit").catch(() => new Response(null, { status: 503 })), loadAssessmentPage(), loadAssessmentPage(null, "active"),
         ]);
-        if (!meResponse.ok || !collectorsResponse.ok) throw new Error("Backend unavailable");
-        const [me, collectorData, auditData] = await Promise.all([meResponse.json(), collectorsResponse.json(), auditResponse.ok ? auditResponse.json() : Promise.resolve(null)]) as [{ user: ApiUser }, { collectors: ApiCollector[] }, { integrity: { valid: boolean; checked: number } } | null];
+        if (!meResponse.ok) throw new Error("Backend unavailable");
+        const [me, collectorData, auditData] = await Promise.all([meResponse.json(), collectorsResponse.ok ? collectorsResponse.json() : Promise.resolve({ collectors: [] }), auditResponse.ok ? auditResponse.json() : Promise.resolve(null)]) as [{ user: ApiUser }, { collectors: ApiCollector[] }, { integrity: { valid: boolean; checked: number } } | null];
         if (cancelled) return;
         setCurrentUser(me.user);
+        if (!collectorsResponse.ok) setToast("Source configuration could not be loaded. Evidence browsing remains available; retry Connections after recovery.");
         setCollectorItems(collectorData.collectors);
         const initialAssessments = appendUnique(activeAssessmentData.assessments, assessmentData.assessments);
+        const location = new URL(window.location.href);
+        const requestedAssessment = location.searchParams.get("assessment");
+        if (requestedAssessment && !initialAssessments.some((item) => item.id === requestedAssessment)) {
+          const response = await fetch(`/api/assessments?id=${encodeURIComponent(requestedAssessment)}`, { cache: "no-store" });
+          if (response.ok) initialAssessments.push(((await response.json()) as { assessment: ApiAssessment }).assessment);
+          else setToast("The linked assessment is unavailable or not accessible.");
+          if (cancelled) return;
+        }
         setAssessmentItems(initialAssessments);
         setAssessmentPage(assessmentData.page);
         setActiveAssessmentPage(activeAssessmentData.page);
         setCatalogItems(assessmentData.catalogs);
-        selectAssessment(initialAssessments.find((item) => item.status === "active")?.id || "");
+        const requestedView = location.searchParams.get("view");
+        const restoredAssessment = initialAssessments.find((item) => item.id === requestedAssessment)?.id || initialAssessments.find((item) => item.status === "active")?.id || "";
+        selectAssessment(restoredAssessment);
+        setSearch((location.searchParams.get("q") || "").slice(0, 120));
+        const restoredStatus = location.searchParams.get("status") || "";
+        const restoredType = location.searchParams.get("type") || "";
+        if (["Approved", "Needs review", "Expiring", "Expired", "Rejected", "Returned", "Superseded"].includes(restoredStatus)) setStatusFilter(restoredStatus);
+        if (["Screenshot", "Code", "Configuration", "Report"].includes(restoredType)) setTypeFilter(restoredType);
+        setEvidenceScope({ controlId: (location.searchParams.get("control") || "").slice(0, 64) || undefined, system: (location.searchParams.get("system") || "").slice(0, 250) || undefined });
+        const linkedEvidence = location.searchParams.get("evidence");
+        if (linkedEvidence && /^ev_[a-f0-9]{32}$/u.test(linkedEvidence)) {
+          const response = await fetch(`/api/evidence/${encodeURIComponent(linkedEvidence)}?view=metadata`, { cache: "no-store" });
+          if (cancelled) return;
+          if (response.ok) {
+            const evidence = mapApiEvidence(((await response.json()) as { evidence: Record<string, unknown> }).evidence);
+            if (evidence.assessmentId === restoredAssessment) setSelectedEvidence(evidence);
+            else setToast("The linked artifact is outside the selected assessment.");
+          } else setToast(await apiError(response));
+        }
+        if (nav.some((item) => item.label === requestedView)) setView(requestedView as View);
         setAuditIntegrity(auditData?.integrity || null);
+        setBackendState("live");
         if (["compliance_lead", "admin"].includes(me.user.role)) {
-          const deviceResponse = await fetch("/api/devices");
+          const deviceResponse = await fetch("/api/devices").catch(() => new Response(null, { status: 503 }));
           if (deviceResponse.ok) setDeviceItems(((await deviceResponse.json()) as { devices: ApiDevice[] }).devices);
-          const jiraResponse = await fetch("/api/jira/connection");
+          const jiraResponse = await fetch("/api/jira/connection").catch(() => new Response(null, { status: 503 }));
           if (jiraResponse.ok) setJiraConnection(((await jiraResponse.json()) as { connection: ApiJiraConnection }).connection);
         }
         setBackendState("live");
@@ -236,6 +294,19 @@ export function EvidenceConsole() {
     void load();
     return () => { cancelled = true; };
   }, []);
+
+  useEffect(() => {
+    if (backendState !== "live") return;
+    const url = new URL(window.location.href);
+    const values: Record<string, string | undefined> = { view, assessment: selectedAssessmentId,
+      q: search || undefined, status: statusFilter === "All statuses" ? undefined : statusFilter,
+      type: typeFilter === "All types" ? undefined : typeFilter, control: evidenceScope.controlId,
+      system: evidenceScope.system, evidence: selectedEvidence?.id };
+    for (const [key, value] of Object.entries(values)) {
+      if (value) url.searchParams.set(key, value); else url.searchParams.delete(key);
+    }
+    window.history.replaceState(null, "", url);
+  }, [backendState, view, selectedAssessmentId, search, statusFilter, typeFilter, evidenceScope, selectedEvidence]);
 
   async function loadMoreAssessments() {
     if (loadingAssessments) return;
@@ -255,46 +326,63 @@ export function EvidenceConsole() {
 
   useEffect(() => {
     if (!selectedAssessmentId || backendState !== "live") return;
+    const generation = ++workspaceGeneration.current;
     let cancelled = false;
     let timer: number | undefined;
+    let failures = 0;
+    let first = true;
+    let iteration = 0;
     const loadWorkspace = async () => {
-      try {
-        const assessment = encodeURIComponent(selectedAssessmentId);
-        const [evidenceResponse, runsResponse, sbomsResponse, findingsResponse, packageResponse] = await Promise.all([
-          fetch(`/api/evidence?assessmentId=${assessment}&limit=50`, { cache: "no-store" }),
-          fetch(`/api/runs?assessmentId=${assessment}&limit=50`, { cache: "no-store" }),
-          fetch(`/api/sboms?assessmentId=${assessment}&limit=50`, { cache: "no-store" }),
-          fetch(`/api/findings?assessmentId=${assessment}&limit=50`, { cache: "no-store" }),
-          fetch(`/api/packages?assessmentId=${assessment}&limit=1`, { cache: "no-store" }),
-        ]);
-        if (!evidenceResponse.ok || !runsResponse.ok || !sbomsResponse.ok || !findingsResponse.ok) throw new Error("Assessment workspace could not be loaded.");
-        const [evidenceData, runData, sbomData, findingData] = await Promise.all([evidenceResponse.json(), runsResponse.json(), sbomsResponse.json(), findingsResponse.json()]) as [
-          { evidence: Array<Record<string, unknown>>; page: ApiPage; summary: ApiEvidenceSummary },
-          { runs: Array<Record<string, unknown>>; page: ApiPage },
-          { jobs: ApiSbom[]; page: ApiPage; repositories: ApiRepository[]; configured: boolean; managedError: string | null },
-          { findings: ApiFinding[]; page: ApiPage; summary: ApiFindingSummary },
-        ];
-        const packageData = packageResponse.ok ? await packageResponse.json() as { preflight: PackagePreflight } : null;
-        if (cancelled) return;
-        setEvidenceItems(evidenceData.evidence.map(mapApiEvidence)); setEvidencePage(evidenceData.page); setEvidenceSummary(evidenceData.summary);
-        setRunItems(runData.runs.map(mapApiRun)); setRunPage(runData.page);
-        setSbomItems(sbomData.jobs); setSbomPage(sbomData.page); setRepositoryItems(sbomData.repositories); setSbomConfigured(sbomData.configured); setSbomManagedError(sbomData.managedError);
-        setFindingItems(findingData.findings); setFindingPage(findingData.page); setFindingSummary(findingData.summary);
-        setPackagePreflight(packageData?.preflight || null);
-        const active = runData.runs.some((item) => ["queued", "running", "retrying"].includes(String(item.status))) || sbomData.jobs.some((item) => ["queued", "running", "retrying"].includes(item.status));
-        if (active) timer = window.setTimeout(loadWorkspace, 4_000);
-      } catch (error) {
-        if (!cancelled) {
-          setEvidenceItems([]); setRunItems([]); setSbomItems([]); setFindingItems([]);
-          setEvidencePage(null); setRunPage(null); setSbomPage(null); setFindingPage(null);
-          setEvidenceSummary(null); setFindingSummary(null);
-          setToast(error instanceof Error ? error.message : "Assessment workspace could not be loaded.");
-        }
+      const replacePage = first;
+      const errors: Record<string, string> = {};
+      let active = false;
+      let delay = 4_000;
+      const assessment = encodeURIComponent(selectedAssessmentId);
+      const runWatch = encodeURIComponent(rotatingWatchBatch(watchedRuns.current, iteration).join(","));
+      const sbomWatch = encodeURIComponent(rotatingWatchBatch(watchedSboms.current, iteration++).join(","));
+      const query = evidenceQuery(selectedAssessmentId, { search: debouncedSearch, status: statusFilter, type: typeFilter, ...evidenceScope });
+      const current = () => !cancelled && generation === workspaceGeneration.current;
+      async function load<T>(domain: string, url: string, apply: (data: T) => void) {
+        try {
+          const response = await fetch(url, { cache: "no-store" });
+          if (!response.ok) { delay = Math.max(delay, retryDelay(response.headers.get("retry-after"))); throw new Error(await apiError(response)); }
+          const data = await response.json() as T;
+          if (current()) apply(data);
+        } catch (error) { errors[domain] = error instanceof Error ? error.message : "Request failed. Retry this workspace."; }
       }
+      await Promise.all([
+        load<{ evidence: Array<Record<string, unknown>>; page: ApiPage; summary: ApiEvidenceSummary }>("Evidence", `/api/evidence?${query}`, (data) => {
+          setEvidenceItems((items) => replacePage ? data.evidence.map(mapApiEvidence) : mergeRecords(items, data.evidence.map(mapApiEvidence)));
+          setEvidencePage((page) => replacePage || !page ? data.page : { ...page, total: data.page.total }); setEvidenceSummary(data.summary);
+        }),
+        load<{ runs: Array<Record<string, unknown>>; updates?: Array<Record<string, unknown>>; page: ApiPage; activeCount?: number }>("Collection runs", `/api/runs?assessmentId=${assessment}&limit=50&watch=${runWatch}`, (data) => {
+          active ||= (data.activeCount ?? data.runs.filter((item) => ["queued", "running", "retrying"].includes(String(item.status))).length) > 0;
+          setRunItems((items) => replacePage ? data.runs.map(mapApiRun) : mergeRecords(items, [...data.runs, ...(data.updates || [])].map(mapApiRun)));
+          setRunPage((page) => replacePage || !page ? data.page : { ...page, total: data.page.total });
+        }),
+        load<{ jobs: ApiSbom[]; updates?: ApiSbom[]; page: ApiPage; configured: boolean; activeCount?: number }>("SBOMs", `/api/sboms?assessmentId=${assessment}&limit=50&watch=${sbomWatch}`, (data) => {
+          active ||= (data.activeCount ?? data.jobs.filter((item) => ["queued", "running", "retrying"].includes(item.status)).length) > 0;
+          setSbomItems((items) => replacePage ? data.jobs : mergeRecords(items, [...data.jobs, ...(data.updates || [])])); setSbomConfigured(data.configured);
+          setSbomPage((page) => replacePage || !page ? data.page : { ...page, total: data.page.total });
+        }),
+        load<{ findings: ApiFinding[]; page: ApiPage; summary: ApiFindingSummary }>("Findings", `/api/findings?assessmentId=${assessment}&limit=50`, (data) => {
+          setFindingItems((items) => replacePage ? data.findings : mergeRecords(items, data.findings)); setFindingSummary(data.summary);
+          setFindingPage((page) => replacePage || !page ? data.page : { ...page, total: data.page.total });
+        }),
+        load<{ packages: ApiPackage[]; page: ApiPage; preflight: PackagePreflight }>("Packages", `/api/packages?assessmentId=${assessment}&limit=25`, (data) => {
+          setPackagePreflight(data.preflight); setPackageItems((items) => replacePage ? data.packages : mergeRecords(items, data.packages));
+          setPackagePage((page) => replacePage || !page ? data.page : { ...page, total: data.page.total });
+        }),
+      ]);
+      if (!current()) return;
+      first = false;
+      setWorkspaceErrors(errors);
+      failures = Object.keys(errors).length ? failures + 1 : 0;
+      if (active || failures || watchedRuns.current.length || watchedSboms.current.length) timer = window.setTimeout(loadWorkspace, Math.max(delay, failures ? Math.min(60_000, 4_000 * 2 ** Math.min(failures, 4)) : 4_000));
     };
     void loadWorkspace();
     return () => { cancelled = true; if (timer) window.clearTimeout(timer); };
-  }, [selectedAssessmentId, backendState, workspaceRevision]);
+  }, [selectedAssessmentId, backendState, workspaceRevision, debouncedSearch, statusFilter, typeFilter, evidenceScope]);
 
   useEffect(() => {
     const query = new URLSearchParams(window.location.search);
@@ -310,75 +398,107 @@ export function EvidenceConsole() {
   }, []);
 
   useEffect(() => {
-    if (toast) {
-      const timer = window.setTimeout(() => setToast(null), 3200);
-      return () => window.clearTimeout(timer);
-    }
-  }, [toast]);
-
-  useEffect(() => {
     const close = (event: KeyboardEvent) => {
-      if (event.key === "Escape") { setModal(null); setSelectedEvidence(null); setSidebarOpen(false); }
+      if (event.key === "Escape" && !busy) { setModal(null); setSelectedEvidence(null); setSidebarOpen(false); }
     };
     window.addEventListener("keydown", close);
     return () => window.removeEventListener("keydown", close);
-  }, []);
+  }, [busy]);
 
   const scopedEvidence = useMemo(() => evidenceItems.filter((item) => item.assessmentId === selectedAssessmentId), [evidenceItems, selectedAssessmentId]);
   const scopedRuns = useMemo(() => runItems.filter((item) => item.assessmentId === selectedAssessmentId), [runItems, selectedAssessmentId]);
   const scopedSboms = useMemo(() => sbomItems.filter((item) => item.assessment_id === selectedAssessmentId), [sbomItems, selectedAssessmentId]);
-  const filteredEvidence = useMemo(() => scopedEvidence.filter((item) => {
-    const q = search.trim().toLowerCase();
-    const matchesQuery = !q || [item.title, item.control, item.source, item.system, item.jiraIssueKey || "", item.tags.join(" ")].join(" ").toLowerCase().includes(q);
-    return matchesQuery && (statusFilter === "All statuses" || item.status === statusFilter) && (typeFilter === "All types" || item.type === typeFilter);
-  }), [scopedEvidence, search, statusFilter, typeFilter]);
+  const filteredEvidence = scopedEvidence;
 
   function navigate(next: View) {
     setView(next); setSidebarOpen(false); setSearch("");
+    const url = new URL(window.location.href); url.searchParams.set("view", next);
+    if (selectedAssessmentId) url.searchParams.set("assessment", selectedAssessmentId);
+    window.history.replaceState(null, "", url);
+  }
+
+  async function openEvidence(id: string) {
+    const generation = workspaceGeneration.current;
+    try {
+      const response = await fetch(`/api/evidence/${encodeURIComponent(id)}?view=metadata`, { cache: "no-store" });
+      if (!response.ok) throw new Error(await apiError(response));
+      const data = await response.json() as { evidence: Record<string, unknown> };
+      if (generation !== workspaceGeneration.current) return;
+      const item = mapApiEvidence(data.evidence);
+      if (item.assessmentId !== selectedAssessmentId) throw new Error("This artifact belongs to a different assessment. Switch to its assessment first.");
+      setSelectedEvidence(item);
+    } catch (error) { if (generation === workspaceGeneration.current) setToast(error instanceof Error ? error.message : "Evidence could not be loaded."); }
+  }
+
+  async function openSbom() {
+    setModal("sbom"); setSbomManagedError(null);
+    try {
+      const response = await fetch("/api/sboms?discoverRepositories=true", { cache: "no-store" });
+      if (!response.ok) throw new Error(await apiError(response));
+      const data = await response.json() as { repositories: ApiRepository[] };
+      setRepositoryItems(data.repositories);
+    } catch (error) { setSbomManagedError(error instanceof Error ? error.message : "Managed repository discovery failed; one-time repositories remain available."); }
   }
 
   function selectAssessment(id: string) {
-    setSelectedAssessmentId(id);
+    workspaceGeneration.current += 1;
+    setSelectedAssessmentId(id); setEvidenceScope({});
+    const url = new URL(window.location.href);
+    if (id) url.searchParams.set("assessment", id); else url.searchParams.delete("assessment");
+    window.history.replaceState(null, "", url);
     setSelectedEvidence(null);
     setEvidenceItems([]); setEvidencePage(null); setEvidenceSummary(null);
     setRunItems([]); setRunPage(null);
     setSbomItems([]); setSbomPage(null);
     setFindingItems([]); setFindingPage(null); setFindingSummary(null);
     setPackagePreflight(null);
+    setPackageItems([]); setPackagePage(null); setWorkspaceErrors({}); setLoadingMore(null);
   }
 
-  async function loadMoreWorkspace(kind: "evidence" | "runs" | "sboms" | "findings") {
-    const page = kind === "evidence" ? evidencePage : kind === "runs" ? runPage : kind === "sboms" ? sbomPage : findingPage;
+  async function loadMoreWorkspace(kind: "evidence" | "runs" | "sboms" | "findings" | "packages") {
+    const page = kind === "evidence" ? evidencePage : kind === "runs" ? runPage : kind === "sboms" ? sbomPage : kind === "packages" ? packagePage : findingPage;
     if (!selectedAssessmentId || !page?.nextCursor || loadingMore) return;
     setLoadingMore(kind);
+    const generation = workspaceGeneration.current;
     try {
-      const endpoint = kind === "evidence" ? "evidence" : kind === "runs" ? "runs" : kind === "sboms" ? "sboms" : "findings";
-      const response = await fetch(`/api/${endpoint}?assessmentId=${encodeURIComponent(selectedAssessmentId)}&limit=50&cursor=${encodeURIComponent(page.nextCursor)}`, { cache: "no-store" });
+      const endpoint = kind === "evidence" ? "evidence" : kind === "runs" ? "runs" : kind === "sboms" ? "sboms" : kind === "packages" ? "packages" : "findings";
+      const query = kind === "evidence" ? evidenceQuery(selectedAssessmentId, { search: debouncedSearch, status: statusFilter, type: typeFilter, ...evidenceScope }, page.nextCursor) : new URLSearchParams({ assessmentId: selectedAssessmentId, limit: "50", cursor: page.nextCursor });
+      const response = await fetch(`/api/${endpoint}?${query}`, { cache: "no-store" });
       if (!response.ok) throw new Error(await apiError(response));
+      const payload = await response.json();
+      if (generation !== workspaceGeneration.current) return;
       if (kind === "evidence") {
-        const data = await response.json() as { evidence: Array<Record<string, unknown>>; page: ApiPage; summary: ApiEvidenceSummary };
+        const data = payload as { evidence: Array<Record<string, unknown>>; page: ApiPage; summary: ApiEvidenceSummary };
         setEvidenceItems((items) => appendUnique(items, data.evidence.map(mapApiEvidence))); setEvidencePage(data.page); setEvidenceSummary(data.summary);
       } else if (kind === "runs") {
-        const data = await response.json() as { runs: Array<Record<string, unknown>>; page: ApiPage };
+        const data = payload as { runs: Array<Record<string, unknown>>; page: ApiPage };
         setRunItems((items) => appendUnique(items, data.runs.map(mapApiRun))); setRunPage(data.page);
       } else if (kind === "sboms") {
-        const data = await response.json() as { jobs: ApiSbom[]; page: ApiPage };
+        const data = payload as { jobs: ApiSbom[]; page: ApiPage };
         setSbomItems((items) => appendUnique(items, data.jobs)); setSbomPage(data.page);
+      } else if (kind === "packages") {
+        const data = payload as { packages: ApiPackage[]; page: ApiPage };
+        setPackageItems((items) => appendUnique(items, data.packages)); setPackagePage(data.page);
       } else {
-        const data = await response.json() as { findings: ApiFinding[]; page: ApiPage; summary: ApiFindingSummary };
+        const data = payload as { findings: ApiFinding[]; page: ApiPage; summary: ApiFindingSummary };
         setFindingItems((items) => appendUnique(items, data.findings)); setFindingPage(data.page); setFindingSummary(data.summary);
       }
-    } catch (error) { setToast(error instanceof Error ? error.message : "Older records could not be loaded."); }
-    finally { setLoadingMore(null); }
+    } catch (error) { if (generation === workspaceGeneration.current) setToast(error instanceof Error ? error.message : "Older records could not be loaded."); }
+    finally { if (generation === workspaceGeneration.current) setLoadingMore(null); }
   }
 
-  async function approveEvidence(item: Evidence, rationale: string) {
+  async function reviewEvidence(item: Evidence, action: ReviewAction, rationale: string, replacementEvidenceId?: string) {
     setBusy(true);
     try {
-      const response = await fetch(`/api/evidence/${encodeURIComponent(item.id)}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ action: "approve", expectedSha256: item.sha256, rationale, confirmedActualArtifact: true }) });
+      const response = await fetch(`/api/evidence/${encodeURIComponent(item.id)}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ action, expectedSha256: item.sha256, rationale, replacementEvidenceId, confirmedActualArtifact: true }) });
       if (!response.ok) throw new Error(await apiError(response));
-      const next = evidenceItems.map((entry) => entry.id === item.id ? { ...entry, status: "Approved" as EvidenceStatus } : entry);
-      setEvidenceItems(next); setSelectedEvidence({ ...item, status: "Approved" }); setToast(`${item.id} approved and written to the immutable audit chain.`);
+      const result = await response.json() as { changed: boolean; status: string };
+      if (!result.changed) throw new Error("The evidence was not changed. Reload and inspect its current review state.");
+      const states: Record<string, EvidenceStatus> = { approved: "Approved", rejected: "Rejected", returned: "Returned", needs_review: "Needs review", superseded: "Superseded" };
+      const status = states[result.status];
+      if (!status) throw new Error("Unexpected review state. Reload before continuing.");
+      setEvidenceItems((items) => items.map((entry) => entry.id === item.id ? { ...entry, status } : entry));
+      setSelectedEvidence({ ...item, status }); setToast(`${item.id}: ${status}. The review decision was recorded.`);
       setWorkspaceRevision((value) => value + 1);
     } catch (error) { setToast(error instanceof Error ? error.message : "Approval failed."); }
     finally { setBusy(false); }
@@ -392,7 +512,7 @@ export function EvidenceConsole() {
     try {
       const response = await fetch("/api/findings", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
         assessmentId: findingTarget.assessmentId, controlId: findingTarget.controlId, evidenceId: findingTarget.evidenceId,
-        jobId: findingTarget.jobId, title: form.get("title"), description: form.get("description"), severity: form.get("severity"), dueAt: form.get("dueAt") || undefined,
+        jobId: findingTarget.jobId, title: form.get("title"), description: form.get("description"), severity: form.get("severity"), ownerId: form.get("ownerId") || undefined, dueAt: form.get("dueAt") || undefined,
       }) });
       if (!response.ok) throw new Error(await apiError(response));
       const data = await response.json() as { finding: ApiFinding };
@@ -401,19 +521,6 @@ export function EvidenceConsole() {
       setWorkspaceRevision((value) => value + 1);
       setToast(`${data.finding.id} created and added to the audited remediation workflow.`);
     } catch (error) { setToast(error instanceof Error ? error.message : "Finding could not be created."); }
-    finally { setBusy(false); }
-  }
-
-  async function updateFinding(id: string, status: ApiFinding["status"], resolution: string) {
-    setBusy(true);
-    try {
-      const response = await fetch(`/api/findings/${encodeURIComponent(id)}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ status, resolution: resolution || undefined }) });
-      if (!response.ok) throw new Error(await apiError(response));
-      const data = await response.json() as { finding: ApiFinding };
-      setFindingItems((items) => items.map((item) => item.id === id ? { ...item, ...data.finding } : item));
-      setWorkspaceRevision((value) => value + 1);
-      setToast(`${id} moved to ${titleCase(status)} with an immutable audit event.`);
-    } catch (error) { setToast(error instanceof Error ? error.message : "Finding could not be updated."); }
     finally { setBusy(false); }
   }
 
@@ -494,7 +601,7 @@ export function EvidenceConsole() {
       document.body.appendChild(download);
       download.click();
       download.remove();
-      setModal(null); setToast(`Signed package ready with ${data.package.evidenceCount} encrypted artifacts.`);
+      setModal(null); setToast(`Signed package ready with ${data.package.evidenceCount} encrypted artifacts.`); setView("Packages"); setWorkspaceRevision((value) => value + 1);
     } catch (error) { setToast(error instanceof Error ? error.message : "Package generation failed."); }
     finally { setBusy(false); }
   }
@@ -519,18 +626,30 @@ export function EvidenceConsole() {
   async function createAssessment(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault(); const form = new FormData(event.currentTarget); setBusy(true);
     try {
-      const response = await fetch("/api/assessments", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: form.get("name"), catalogId: form.get("catalogId"), scopeMode: "explicit", periodStart: form.get("periodStart"), periodEnd: form.get("periodEnd"), systems: String(form.get("systems") || "").split(/[,\n]/).map((v) => v.trim()).filter(Boolean), controls: String(form.get("controls") || "").split(/[,\n]/).map((v) => v.trim()).filter(Boolean), status: "active" }) });
+      const response = await fetch("/api/assessments", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: form.get("name"), catalogId: form.get("catalogId"), scopeMode: "explicit", periodStart: form.get("periodStart"), periodEnd: form.get("periodEnd"), systems: String(form.get("systems") || "").split(/[,\n]/).map((v) => v.trim()).filter(Boolean), controls: String(form.get("controls") || "").split(/[,\n]/).map((v) => v.trim()).filter(Boolean), status: form.get("status") || "draft" }) });
       if (!response.ok) throw new Error(await apiError(response));
-      const data = await response.json() as { assessment: ApiAssessment }; setAssessmentItems((items) => [data.assessment, ...items]); selectAssessment(data.assessment.id); setModal(null); setToast(`${data.assessment.name} is now the active evidence scope.`);
+      const data = await response.json() as { assessment: ApiAssessment }; setAssessmentItems((items) => [data.assessment, ...items]); selectAssessment(data.assessment.id); setModal(null); setToast(`${data.assessment.name} created as ${data.assessment.status}. Manage its definition in Controls.`);
     } catch (error) { setToast(error instanceof Error ? error.message : "Assessment could not be created."); }
     finally { setBusy(false); }
+  }
+
+  async function refreshAssessmentDefinition() {
+    try {
+      const page = await loadAssessmentPage();
+      const response = await fetch(`/api/assessments?id=${encodeURIComponent(selectedAssessmentId)}`, { cache: "no-store" });
+      if (!response.ok) throw new Error(await apiError(response));
+      const data = await response.json() as { assessment?: ApiAssessment };
+      setAssessmentItems((items) => mergeRecords(items, data.assessment ? [...page.assessments, data.assessment] : page.assessments));
+      setCatalogItems(page.catalogs);
+      setWorkspaceRevision((value) => value + 1);
+    } catch (error) { setToast(error instanceof Error ? error.message : "Reload the assessment before making further changes."); }
   }
 
   async function closeAssessment() {
     if (!activeAssessment || activeAssessment.status !== "active" || !window.confirm(`Close ${activeAssessment.name}? New evidence can no longer be collected into it.`)) return;
     setBusy(true);
     try {
-      const response = await fetch("/api/assessments", { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: activeAssessment.id, status: "closed" }) });
+      const response = await fetch("/api/assessments", { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({ id: activeAssessment.id, status: "closed", expectedUpdatedAt: activeAssessment.updated_at }) });
       if (!response.ok) throw new Error(await apiError(response));
       const data = await response.json() as { assessment: ApiAssessment };
       setAssessmentItems((items) => items.map((item) => item.id === data.assessment.id ? data.assessment : item));
@@ -540,6 +659,7 @@ export function EvidenceConsole() {
   }
 
   async function revokeDevice(id: string) {
+    if (!window.confirm("Revoke this capture device? Its current token will stop working immediately.")) return;
     setBusy(true);
     try {
       const response = await fetch("/api/devices", { method: "DELETE", headers: { "content-type": "application/json" }, body: JSON.stringify({ id }) });
@@ -609,7 +729,7 @@ export function EvidenceConsole() {
   return (
     <div className="app-shell">
       <a className="skip-link" href="#main-content">Skip to content</a>
-      <aside className={cls("sidebar", sidebarOpen && "open")}>
+      <aside inert={Boolean(modal || selectedEvidence)} className={cls("sidebar", sidebarOpen && "open")}>
         <div className="brand"><div className="brand-mark">S</div><div><strong>Scopeproof</strong><span>PCI operations</span></div></div>
         <div className="workspace-switch"><span>AS</span><div><label className="sr-only" htmlFor="assessment-workspace">Assessment workspace</label><select id="assessment-workspace" value={selectedAssessmentId} onChange={(event) => selectAssessment(event.target.value)}><option value="">No assessment selected</option>{assessmentItems.map((item) => <option key={item.id} value={item.id}>{item.name} · {item.status}</option>)}</select><small>{activeAssessment?.framework || "Create a scope to begin"}</small></div>{activeAssessmentPage?.hasMore || assessmentPage?.hasMore ? <button className="workspace-load-more" disabled={loadingAssessments} onClick={() => void loadMoreAssessments()} title="Load more assessment workspaces" aria-label="Load more assessment workspaces">{loadingAssessments ? "…" : "+"}</button> : null}{activeAssessment?.status === "active" && canManageOperations ? <button disabled={busy} onClick={closeAssessment} title="Close this assessment">×</button> : <b>⌄</b>}</div>
         <nav aria-label="Primary navigation">
@@ -623,7 +743,7 @@ export function EvidenceConsole() {
       </aside>
       {sidebarOpen && <button className="sidebar-scrim" aria-label="Close navigation" onClick={() => setSidebarOpen(false)} />}
 
-      <main id="main-content">
+      <main id="main-content" inert={Boolean(modal || selectedEvidence)}>
         <header className="topbar">
           <button className="mobile-menu" onClick={() => setSidebarOpen(true)} aria-label="Open navigation">☰</button>
           <div className="breadcrumbs"><span>{activeAssessment?.name || "Scopeproof"}</span><b>/</b><strong>{view}</strong></div>
@@ -636,26 +756,33 @@ export function EvidenceConsole() {
 
         <section className="page-wrap">
           <div className={cls("security-strip", backendState)}><span>{backendState === "live" ? "✓" : backendState === "loading" ? "↻" : "!"}</span><div><strong>{backendState === "live" ? "Protected evidence workspace" : backendState === "loading" ? "Connecting to protected storage…" : "Protected services unavailable"}</strong><p>{backendState === "live" ? `AES-256-GCM storage · ${currentUser?.role?.replaceAll("_", " ")} access · audit chain ${auditIntegrity?.valid ? `verified (${auditIntegrity.checked} events)` : "pending"}` : backendState === "unavailable" ? "Authoritative data is hidden until authentication and protected storage recover." : "Authenticating and verifying storage bindings."}</p></div></div>
-          {backendState !== "live" ? <EmptyState message={backendState === "loading" ? "Authenticating and loading authoritative evidence…" : "Scopeproof could not verify the protected backend. Reload after restoring authentication or storage; no sample compliance data is displayed."} /> : <>
+          {view === "Help" ? <HelpView onNavigate={navigate} /> : backendState !== "live" ? <EmptyState message={backendState === "loading" ? "Authenticating and loading authoritative evidence…" : "Scopeproof could not verify the protected backend. Reload after restoring authentication or storage; no sample compliance data is displayed."} /> : <>
+          {view === "Evidence" && (evidenceScope.controlId || evidenceScope.system) && <div className="workspace-error">Filtered to {evidenceScope.controlId} · {evidenceScope.system} <button className="button secondary" onClick={() => setEvidenceScope({})}>Clear scope filter</button></div>}
           {view === "Evidence" && <PaginationNotice noun="evidence records" loaded={evidenceItems.length} page={evidencePage} busy={loadingMore === "evidence"} onLoad={() => void loadMoreWorkspace("evidence")} />}
           {view === "Collection runs" && <PaginationNotice noun="collection runs" loaded={runItems.length} page={runPage} busy={loadingMore === "runs"} onLoad={() => void loadMoreWorkspace("runs")} />}
           {view === "SBOMs" && <PaginationNotice noun="SBOM jobs" loaded={sbomItems.length} page={sbomPage} busy={loadingMore === "sboms"} onLoad={() => void loadMoreWorkspace("sboms")} />}
-          {view === "Findings" && <PaginationNotice noun="findings" loaded={findingItems.length} page={findingPage} busy={loadingMore === "findings"} onLoad={() => void loadMoreWorkspace("findings")} />}
+          {Object.entries(workspaceErrors).map(([domain, message]) => <div className="workspace-error" role="alert" key={domain}><strong>{domain} unavailable</strong><p>{message}</p><button className="button secondary" onClick={() => setWorkspaceRevision((value) => value + 1)}>Retry workspace</button></div>)}
+          {view === "Packages" && <><PageTitle eyebrow="Assessor handoff" title="Package history" description="Signed exports for this assessment. Only the requester and administrators can access a package." /><PaginationNotice noun="packages" loaded={packageItems.length} page={packagePage} busy={loadingMore === "packages"} onLoad={() => void loadMoreWorkspace("packages")} /><div className="panel package-history">{packageItems.length ? packageItems.map((item) => <article key={item.id}><div><strong>{item.id}</strong>{packagePartLabel(item.selection_json) && <p>{packagePartLabel(item.selection_json)}</p>}<p>{item.evidence_count} artifacts · {item.byte_size == null ? "Size pending" : `${(item.byte_size / 1_048_576).toFixed(1)} MiB`} · Created {formatDate(item.created_at)}</p><small>Expires {formatDate(item.expires_at)} · {item.sha256 || "Digest pending"}</small>{item.error_message && <p role="alert">{item.error_message}</p>}</div><StatusPill status={titleCase(item.status)} />{item.status === "ready" && item.expires_at && new Date(item.expires_at).getTime() > Date.now() ? <a className="button secondary" href={`/api/packages/${encodeURIComponent(item.id)}`} download>Download signed ZIP</a> : <span>{item.status === "ready" ? "Expired — generate a new package" : "Not ready to download"}</span>}</article>) : <EmptyState message="No packages yet. Export this assessment after the preflight checks pass." />}</div></>}
+          {view === "Packages" && <PackagePartitionPanel key={selectedAssessmentId} assessmentId={selectedAssessmentId} canExport={canExport} onChanged={() => setWorkspaceRevision((value) => value + 1)} />}
           {view === "Overview" && <Overview evidenceItems={scopedEvidence} runItems={scopedRuns} collectors={collectorItems} assessment={activeAssessment} summary={evidenceSummary} user={currentUser} canCollect={canCollect} onNavigate={navigate} onSelect={setSelectedEvidence} onRun={() => activeAssessment ? setModal("run") : setModal("assessment")} onCreateAssessment={() => setModal("assessment")} />}
           {view === "Controls" && <ControlsView assessment={activeAssessment} evidenceItems={scopedEvidence} summary={evidenceSummary} onNavigate={navigate} />}
+          {view === "Controls" && activeAssessment && <EvidenceRequirementsPanel key={selectedAssessmentId} assessmentId={selectedAssessmentId} onInspect={(controlId, system) => { setEvidenceScope({ controlId, system }); setSearch(""); setStatusFilter("All statuses"); setTypeFilter("All types"); setView("Evidence"); }} />}
+          {view === "Controls" && <AssessmentLifecyclePanel assessment={activeAssessment || null} catalogs={catalogItems} canManage={canManageOperations} onChanged={() => void refreshAssessmentDefinition()} />}
+          {view === "Controls" && activeAssessment && canManageOperations && <ScopeCompatibilityPanel key={`${activeAssessment.id}:${activeAssessment.updated_at}`} assessmentId={activeAssessment.id} />}
           {view === "Evidence" && <EvidenceView items={filteredEvidence} canCollect={canCollect} search={search} setSearch={setSearch} status={statusFilter} setStatus={setStatusFilter} type={typeFilter} setType={setTypeFilter} onSelect={setSelectedEvidence} onAdd={() => setModal("add")} />}
-          {view === "SBOMs" && <SbomView items={scopedSboms} configured={sbomConfigured} managedError={sbomManagedError} canGenerate={canCollect} onGenerate={() => setModal("sbom")} onOpenEvidence={(id) => { const item = evidenceItems.find((entry) => entry.id === id); if (item) setSelectedEvidence(item); else setToast("The evidence record is unavailable. Reload and try again."); }} />}
+          {view === "SBOMs" && <SbomView items={scopedSboms} configured={sbomConfigured} managedError={sbomManagedError} canGenerate={canCollect} onGenerate={() => void openSbom()} onOpenEvidence={(id) => void openEvidence(id)} />}
           {view === "Collection runs" && <RunsView items={scopedRuns} canCollect={canCollect} onRun={() => setModal("run")} onFlag={(run) => { setFindingTarget({ assessmentId: selectedAssessmentId, jobId: run.id, title: `${run.status} collection: ${run.source}` }); setModal("finding"); }} />}
-          {view === "Findings" && <FindingsView items={findingItems} summary={findingSummary} currentUser={currentUser} busy={busy} onUpdate={updateFinding} />}
+          {view === "Findings" && <><PageTitle eyebrow="Remediation" title="Findings" description="An accountable work queue with deadlines, disposition, and immutable history." /><FindingWorkflowPanel key={selectedAssessmentId} assessmentId={selectedAssessmentId} canManage={["reviewer", "compliance_lead", "admin"].includes(currentUser?.role || "")} canDispose={canManageOperations} currentUserId={currentUser?.id} assessmentClosed={activeAssessment?.status === "closed"} onChanged={() => setWorkspaceRevision((value) => value + 1)} /></>}
           {view === "Connections" && <ConnectionsView collectors={collectorItems} devices={deviceItems} jira={jiraConnection} canManageJira={canManageOperations} busy={busy} onConnectJira={connectJira} onTestJira={testJira} onDisconnectJira={disconnectJiraConnection} onEnroll={() => { setDeviceToken(null); setModal("device"); }} onRotate={rotateDevice} onRevoke={revokeDevice} onToast={setToast} />}
+          {view === "Connections" && <CollectorAdminPanel canManage={canManageOperations} onChanged={() => setWorkspaceRevision((value) => value + 1)} />}
           {view === "Settings" && <SettingsView auditIntegrity={auditIntegrity} currentUser={currentUser} onToast={setToast} />}
-          {view === "Help" && <HelpView onNavigate={navigate} />}</>}
+          </>}
         </section>
       </main>
 
-      {selectedEvidence && <EvidenceDrawer key={selectedEvidence.id} item={selectedEvidence} currentUser={currentUser} onClose={() => setSelectedEvidence(null)} onApprove={approveEvidence} onFlag={(item) => { if (!item.assessmentId) { setToast("This evidence is not bound to an assessment."); return; } setFindingTarget({ assessmentId: item.assessmentId, controlId: item.control, evidenceId: item.id, title: `Review required: ${item.title}` }); setSelectedEvidence(null); setModal("finding"); }} />}
+      {selectedEvidence && <EvidenceDrawer key={`${selectedEvidence.id}:${selectedEvidence.status}`} item={selectedEvidence} currentUser={currentUser} onClose={() => setSelectedEvidence(null)} busy={busy} onReview={reviewEvidence} onFlag={(item) => { if (!item.assessmentId) { setToast("This evidence is not bound to an assessment."); return; } setFindingTarget({ assessmentId: item.assessmentId, controlId: item.control, evidenceId: item.id, title: `Review required: ${item.title}` }); setSelectedEvidence(null); setModal("finding"); }} />}
       {modal && <Modal type={modal} collectors={collectorItems} repositories={repositoryItems} assessments={assessmentItems} catalogs={catalogItems} selectedAssessmentId={selectedAssessmentId} setSelectedAssessmentId={selectAssessment} deviceToken={deviceToken} findingTarget={findingTarget} packagePreflight={packagePreflight} onClose={() => { if (!busy) { setModal(null); setFindingTarget(null); } }} onRun={handleRun} onSbom={handleSbom} onAdd={handleAdd} onExport={exportPackage} onDevice={enrollDevice} onAssessment={createAssessment} onFinding={createFinding} busy={busy} />}
-      {toast && <div className="toast" role="status"><span>✓</span>{toast}</div>}
+      {toast && <div className="toast" role="status"><span aria-hidden="true">i</span>{toast}<button aria-label="Dismiss notification" onClick={() => setToast(null)}>×</button></div>}
     </div>
   );
 }
@@ -677,14 +804,14 @@ function Overview({ evidenceItems, runItems, collectors, assessment, summary, us
     <PageTitle eyebrow={new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" })} title={`Welcome, ${firstName}`} description={assessment ? `Authoritative status for ${assessment.name}.` : "Create an assessment before collecting or exporting evidence."} actions={<>{!assessment && <button className="button primary mobile-hide" onClick={onCreateAssessment}>＋ Create assessment</button>}<button className="button secondary mobile-hide" onClick={() => onNavigate("Evidence")}>Review evidence</button><button className="button primary mobile-hide" disabled={!canCollect} title={!canCollect ? "An active assessment and evidence-operations access are required." : undefined} onClick={onRun}>＋ Run collection</button></>} />
     <div className="attention-banner"><span>!</span><div><strong>{queue.length + collectorAttention} items need attention</strong><p>{queue.length} evidence item(s) await review and {collectorAttention} collector(s) are incomplete or unconfigured.</p></div><button onClick={() => onNavigate(queue.length ? "Evidence" : "Connections")}>Review details <b>→</b></button></div>
     <div className="metrics-grid">
-      <article className="metric-card featured"><Ring value={readiness} label="coverage" /><div><span>Assessment evidence coverage</span><strong>{assessment ? `${coveredControls} of ${scopedControls} controls` : "No active scope"}</strong><p>Approved evidence only</p></div></article>
+      <article className="metric-card featured"><Ring value={readiness} label="presence" /><div><span>Controls with approved evidence</span><strong>{assessment ? `${coveredControls} of ${scopedControls} controls` : "No active scope"}</strong><p>Presence is not a compliance determination</p></div></article>
       <article className="metric-card"><div className="metric-icon blue">▱</div><span>Approved evidence</span><strong>{approved} <small>/ {summary?.total ?? evidenceItems.length}</small></strong><p>{summary?.needsReview ?? queue.length} awaiting action</p></article>
       <article className="metric-card"><div className="metric-icon violet">↻</div><span>Configured collectors</span><strong>{configuredCollectors} <small>/ {collectors.length}</small></strong><p>{runItems.filter((item) => item.status === "Partial" || item.status === "Failed").length} run issue(s)</p></article>
       <article className="metric-card"><div className="metric-icon amber">◇</div><span>Coverage gaps</span><strong>{Math.max(0, scopedControls - coveredControls)}</strong><p><em>Derived from active scope</em></p></article>
     </div>
     <div className="dashboard-grid">
-      <section className="panel coverage-panel"><div className="panel-head"><div><h2>Control coverage</h2><p>PCI DSS 4.0.1 requirements in scope</p></div><button onClick={() => onNavigate("Controls")}>View controls →</button></div>
-        <div className="coverage-list">{(assessment?.catalog?.controls || []).slice(0, 12).map((control) => { const count = summary?.controls.find((item) => item.controlId === control.id)?.approved ?? evidenceItems.filter((item) => item.control === control.id && item.status === "Approved").length; const value = count ? 100 : 0; return <div className="coverage-row" key={control.id}><span className="req-badge">{control.id}</span><div><strong>{control.title}</strong><div className="progress-line"><i style={{ width: `${value}%` }} /></div></div><b className={!value ? "low" : ""}>{value}%</b></div>; })}{!assessment?.controls.length && <EmptyState message="No control list is defined for the active assessment." />}</div>
+      <section className="panel coverage-panel"><div className="panel-head"><div><h2>Approved evidence presence</h2><p>PCI DSS 4.0.1 requirements in scope</p></div><button onClick={() => onNavigate("Controls")}>View controls →</button></div>
+        <div className="coverage-list">{(assessment?.catalog?.controls || []).slice(0, 12).map((control) => { const count = summary?.controls.find((item) => item.controlId === control.id)?.approved ?? evidenceItems.filter((item) => item.control === control.id && item.status === "Approved").length; const value = count ? 100 : 0; return <div className="coverage-row" key={control.id}><span className="req-badge">{control.id}</span><div><strong>{control.title}</strong><div className="progress-line"><i style={{ width: `${value}%` }} /></div></div><b className={!value ? "low" : ""}>{value ? "Present" : "Missing"}</b></div>; })}{!assessment?.controls.length && <EmptyState message="No control list is defined for the active assessment." />}</div>
       </section>
       <section className="panel activity-panel"><div className="panel-head"><div><h2>Collection activity</h2><p>Latest automation runs</p></div><button onClick={() => onNavigate("Collection runs")}>View all →</button></div>
         <div className="activity-list">{runItems.slice(0, 4).map((run) => <div className="activity-item" key={run.id}><div className={cls("source-dot", run.status.toLowerCase())}>{run.source.slice(0, 2).toUpperCase()}</div><div><strong>{run.source}</strong><span>{run.artifacts ? `${run.artifacts} artifacts · ` : ""}{run.startedAt}</span></div><StatusPill status={run.status} /></div>)}</div>
@@ -700,12 +827,12 @@ function Overview({ evidenceItems, runItems, collectors, assessment, summary, us
 function ControlsView({ assessment, evidenceItems, summary, onNavigate }: { assessment?: ApiAssessment; evidenceItems: Evidence[]; summary: ApiEvidenceSummary | null; onNavigate: (view: View) => void }) {
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState("All");
-  const liveControls = (assessment?.catalog?.controls || []).map((control) => { const related = evidenceItems.filter((item) => item.control === control.id); const aggregate = summary?.controls.find((item) => item.controlId === control.id); const approved = aggregate?.approved ?? related.filter((item) => item.status === "Approved").length; const evidenceCount = aggregate?.total ?? related.length; return { ...control, owner: "Unassigned", systems: assessment?.systems || [], evidenceCount, status: approved ? "Covered" : evidenceCount ? "Partial" : "Gap", automation: related.length ? Math.round(related.filter((item) => item.collector !== "Manual submission").length / related.length * 100) : 0, nextDue: related.map((item) => item.expiresAt).sort()[0] || "No evidence" }; });
+  const liveControls = (assessment?.catalog?.controls || []).map((control) => { const related = evidenceItems.filter((item) => item.control === control.id); const aggregate = summary?.controls.find((item) => item.controlId === control.id); const approved = aggregate?.approved ?? related.filter((item) => item.status === "Approved").length; const evidenceCount = aggregate?.total ?? related.length; return { ...control, owner: "Unassigned", systems: assessment?.systems || [], evidenceCount, status: approved ? "Has approved evidence" : evidenceCount ? "Partial" : "Gap", automation: related.length ? Math.round(related.filter((item) => item.collector !== "Manual submission").length / related.length * 100) : 0, nextDue: related.map((item) => item.expiresAt).sort()[0] || "No evidence" }; });
   const items = liveControls.filter((control) => (!query || `${control.id} ${control.title} ${control.owner}`.toLowerCase().includes(query.toLowerCase())) && (filter === "All" || control.status === filter));
-  const covered = liveControls.filter((item) => item.status === "Covered").length; const partial = liveControls.filter((item) => item.status === "Partial").length; const gaps = liveControls.filter((item) => item.status === "Gap").length;
+  const covered = liveControls.filter((item) => item.status === "Has approved evidence").length; const partial = liveControls.filter((item) => item.status === "Partial").length; const gaps = liveControls.filter((item) => item.status === "Gap").length;
   return <><PageTitle eyebrow="PCI DSS 4.0.1" title="Control workspace" description="Track coverage, ownership, and collection automation for every control in scope." actions={<button className="button primary" onClick={() => onNavigate("Evidence")}>Review evidence</button>} />
     <div className="summary-strip"><div><strong>{liveControls.length}</strong><span>Catalog controls</span></div><div><strong>{covered}</strong><span>Fully covered</span></div><div><strong>{partial}</strong><span>Partially covered</span></div><div><strong>{gaps}</strong><span>Evidence gaps</span></div></div>
-    <section className="panel table-panel"><div className="toolbar"><label className="search-box"><span>⌕</span><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search control, owner, or requirement…" /></label><div className="segmented">{["All", "Covered", "Partial", "Gap"].map((item) => <button className={filter === item ? "active" : ""} key={item} onClick={() => setFilter(item)}>{item}</button>)}</div></div>
+    <section className="panel table-panel"><div className="toolbar"><label className="search-box"><span>⌕</span><input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search control, owner, or requirement…" /></label><div className="segmented">{["All", "Has approved evidence", "Partial", "Gap"].map((item) => <button className={filter === item ? "active" : ""} key={item} onClick={() => setFilter(item)}>{item}</button>)}</div></div>
       {items.length ? <div className="data-table controls-table"><div className="table-header"><span>Control</span><span>Owner</span><span>Coverage</span><span>Automation</span><span>Next due</span><span /></div>{items.map((control) => <div className="table-row" key={control.id}><div><span className="control-id">{control.id}</span><strong>{control.title}</strong><small>{control.systems.join(" · ")}</small></div><span>{control.owner}</span><div><StatusPill status={control.status} /><small>{control.evidenceCount} artifacts</small></div><div className="automation-cell"><strong>{control.automation}%</strong><div><i style={{ width: `${control.automation}%` }} /></div></div><span className={control.nextDue === "Overdue" ? "danger-text" : ""}>{control.nextDue}</span><button aria-label={`View control ${control.id}`} onClick={() => onNavigate("Evidence")}>→</button></div>)}</div> : <EmptyState message="Try a different control search or coverage filter." />}
     </section>
   </>;
@@ -713,7 +840,7 @@ function ControlsView({ assessment, evidenceItems, summary, onNavigate }: { asse
 
 function EvidenceView({ items, canCollect, search, setSearch, status, setStatus, type, setType, onSelect, onAdd }: { items: Evidence[]; canCollect: boolean; search: string; setSearch: (v: string) => void; status: string; setStatus: (v: string) => void; type: string; setType: (v: string) => void; onSelect: (item: Evidence) => void; onAdd: () => void }) {
   return <><PageTitle eyebrow="Evidence library" title="Collected evidence" description="Review, validate, and trace every artifact back to its source and PCI requirement." actions={<button className="button primary" disabled={!canCollect} title={!canCollect ? "Evidence-operations access is required." : undefined} onClick={onAdd}>＋ Add evidence</button>} />
-    <section className="panel evidence-library"><div className="toolbar"><label className="search-box wide"><span>⌕</span><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search loaded evidence…" /></label><select aria-label="Filter by evidence type" value={type} onChange={(e) => setType(e.target.value)}><option>All types</option><option>Screenshot</option><option>Code</option><option>Configuration</option><option>Report</option></select><select aria-label="Filter by review status" value={status} onChange={(e) => setStatus(e.target.value)}><option>All statuses</option><option>Approved</option><option>Needs review</option><option>Expiring</option><option>Expired</option><option>Rejected</option><option>Returned</option><option>Superseded</option></select></div>
+    <section className="panel evidence-library"><div className="toolbar"><label className="search-box wide"><span>⌕</span><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search the full assessment…" aria-label="Search the full assessment" /></label><select aria-label="Filter by evidence type" value={type} onChange={(e) => setType(e.target.value)}><option>All types</option><option>Screenshot</option><option>Code</option><option>Configuration</option><option>Report</option></select><select aria-label="Filter by review status" value={status} onChange={(e) => setStatus(e.target.value)}><option>All statuses</option><option>Approved</option><option>Needs review</option><option>Expiring</option><option>Expired</option><option>Rejected</option><option>Returned</option><option>Superseded</option></select></div>
       <div className="library-subhead"><span>{items.length} artifacts</span><span>Sorted by <b>most recent</b></span></div>
       {items.length ? <div className="library-grid">{items.map((item) => <button className="library-card" key={item.id} onClick={() => onSelect(item)}><EvidenceVisual item={item} /><div className="library-body"><div><span className="type-label">{item.type}</span><StatusPill status={item.status} /></div><h3>{item.title}</h3><p>{item.description}</p><div className="artifact-meta"><span><b>{item.control}</b> · {item.requirement}</span><span>{item.source} / {item.system}</span><span>{item.lastObservedAt || item.capturedAt}{(item.occurrenceCount || 1) > 1 ? ` · ${item.occurrenceCount} observations` : ""}</span></div></div></button>)}</div> : <EmptyState message="No evidence matches these filters." action="Clear filters" onAction={() => { setSearch(""); setStatus("All statuses"); setType("All types"); }} />}
     </section>
@@ -724,7 +851,7 @@ function SbomView({ items, configured, managedError, canGenerate, onGenerate, on
   const complete = items.filter((item) => item.status === "completed");
   const latest = complete[0];
   return <>
-    <PageTitle eyebrow="Software supply chain" title="SBOM workspace" description="Generate auditor-ready software inventories from an immutable GitHub commit without executing repository code." actions={<button className="button primary" disabled={!canGenerate} title={!canGenerate ? "An active assessment and SBOM permission are required." : undefined} onClick={onGenerate}>＋ Generate SBOM</button>} />
+    <PageTitle eyebrow="Software supply chain" title="SBOM workspace" description="Generate reviewable software inventories from one immutable GitHub commit. Partial inventories are explicitly excluded from approval and assessor packages." actions={<button className="button primary" disabled={!canGenerate} title={!canGenerate ? "An active assessment and SBOM permission are required." : undefined} onClick={onGenerate}>＋ Generate SBOM</button>} />
     {!configured && <div className="connection-alert optional"><span>i</span><div><strong>{managedError ? "Managed GitHub connection needs attention" : "Managed GitHub connection is optional"}</strong><p>{managedError ? `${managedError} One-time generation remains available.` : "Generate a one-time SBOM with an exact GitHub repository URL and short-lived read-only token. Scopeproof does not save that token."}</p></div></div>}
     <div className="summary-strip sbom-summary"><div><strong>{complete.length}</strong><span>Completed inventories</span></div><div><strong>{new Set(complete.map((item) => item.repository_full_name)).size}</strong><span>Repositories inventoried</span></div><div><strong>{latest?.component_count || 0}</strong><span>Components in latest</span></div><div><strong>{items.filter((item) => item.status === "failed" || item.status === "retrying").length}</strong><span>Jobs needing attention</span></div></div>
     <div className="info-callout"><span>i</span><div><strong>Auditable by design</strong><p>Every run records the requested ref, resolved 40-character commit SHA, source archive hash, generator version, parsed manifests, artifact hash, and differences from the prior inventory.</p></div></div>
@@ -732,8 +859,9 @@ function SbomView({ items, configured, managedError, canGenerate, onGenerate, on
       {items.length ? <div className="sbom-list">{items.map((item) => { const delta = item.comparison || {}; return <article className="sbom-row" key={item.id}>
         <div className="sbom-icon">{item.format === "spdx_json" ? "SP" : "CX"}</div>
         <div className="sbom-main"><div><strong>{item.repository_full_name}</strong><StatusPill status={titleCase(item.status)} /></div><p><code>{item.resolved_commit_sha ? item.resolved_commit_sha.slice(0, 12) : item.requested_ref}</code> · {item.format === "spdx_json" ? "SPDX 2.3 JSON" : "CycloneDX 1.6 JSON"} · {formatDate(item.created_at)}</p>{item.error_message && <small className="danger-text">{item.error_message}</small>}</div>
-        <dl><div><dt>Components</dt><dd>{item.component_count}</dd></div><div><dt>Direct</dt><dd>{item.direct_dependency_count}</dd></div><div><dt>Manifests</dt><dd>{item.manifest_count}</dd></div></dl>
+        <dl><div><dt>Components</dt><dd>{item.component_count}</dd></div><div><dt>Direct</dt><dd>{item.inventoryCoverage?.directDependencyClassification === "unknown" ? "Unknown" : item.direct_dependency_count}</dd></div><div><dt>Manifests</dt><dd>{item.manifest_count}</dd></div></dl>
         <div className="sbom-delta"><span className={delta.baseline ? "neutral" : "added"}>+{delta.added || 0}</span><span className={delta.baseline ? "neutral" : "changed"}>~{delta.changed || 0}</span><span className={delta.baseline ? "neutral" : "removed"}>−{delta.removed || 0}</span><small>{delta.baseline ? "Baseline" : "Since prior"}</small></div>
+        <details className="sbom-inspection"><summary>Coverage, manifests and changes</summary><p><strong>{item.inventoryCoverage?.complete ? "Supported inventory parsing complete" : "Partial or legacy coverage — review limitations"}</strong></p>{item.inventoryCoverage?.warnings.map((warning) => <p key={warning}>{warning}</p>)}<p>Commit: <code>{item.resolved_commit_sha || "Not resolved"}</code></p><p>Generator: {item.generator_name} {item.generator_version}</p><ul>{item.manifests.map((path) => <li key={path}><code>{path}</code></li>)}</ul><p>Added: {(delta.addedComponents || []).join(", ") || "None"}<br />Removed: {(delta.removedComponents || []).join(", ") || "None"}</p>{delta.versionChanges?.map((change) => <p key={change.name}><strong>{change.name}</strong>: {change.previous.join(", ")} → {change.current.join(", ")}</p>)}{delta.detailsTruncated && <p>Preview details are capped at 100 entries. Download the inventory JSON and prior inventory to compare the complete sets.</p>}{item.status === "completed" && <SbomInventoryPanel jobId={item.id} />}</details>
         <div className="sbom-actions">{item.evidence_id && <><button className="button secondary" onClick={() => onOpenEvidence(item.evidence_id!)}>Review</button><a className="button secondary" href={`/api/evidence/${encodeURIComponent(item.evidence_id)}`} download>↓ JSON</a></>}</div>
       </article>; })}</div> : <EmptyState message={configured ? "No SBOM has been generated for this assessment. Create a baseline from a managed or one-time GitHub repository." : "Generate a one-time inventory with a repository URL and short-lived token."} action={canGenerate ? "Generate baseline" : undefined} onAction={canGenerate ? onGenerate : undefined} />}
     </section>
@@ -751,30 +879,6 @@ function RunsView({ items, canCollect, onRun, onFlag }: { items: CollectionRun[]
     </section>
     <div className="info-callout"><span>i</span><div><strong>Evidence integrity is preserved automatically</strong><p>Every artifact receives a SHA-256 checksum, source timestamp, collector identity, and immutable audit event.</p></div></div>
   </>;
-}
-
-function FindingsView({ items, summary, currentUser, busy, onUpdate }: { items: ApiFinding[]; summary: ApiFindingSummary | null; currentUser: ApiUser | null; busy: boolean; onUpdate: (id: string, status: ApiFinding["status"], resolution: string) => void }) {
-  const active = (summary?.open || 0) + (summary?.in_progress || 0) + (summary?.accepted || 0) + (summary?.resolved || 0);
-  return <><PageTitle eyebrow="Remediation" title="Findings" description="Create, assign, disposition, and close durable findings with an auditable lifecycle." />
-    <div className="finding-stats"><article><span className="severity-dot high" /><strong>{summary?.critical || 0}</strong><p>Critical active</p></article><article><span className="severity-dot high" /><strong>{summary?.high || 0}</strong><p>High active</p></article><article><span className="severity-dot medium" /><strong>{active}</strong><p>Not closed</p></article><article><strong>{summary?.total || 0}</strong><p>Total finding register</p></article></div>
-    <section className="panel finding-list"><div className="panel-head padded"><div><h2>Finding register</h2><p>Persisted records—never inferred from the currently loaded evidence page</p></div></div>{items.length ? items.map((item) => <FindingRecord key={item.id} item={item} currentUser={currentUser} busy={busy} onUpdate={onUpdate} />) : <EmptyState message="No audited findings are recorded for this assessment. Flag an evidence record or collection run to create one." />}</section>
-  </>;
-}
-
-function FindingRecord({ item, currentUser, busy, onUpdate }: { item: ApiFinding; currentUser: ApiUser | null; busy: boolean; onUpdate: (id: string, status: ApiFinding["status"], resolution: string) => void }) {
-  const [expanded, setExpanded] = useState(false);
-  const [nextStatus, setNextStatus] = useState<ApiFinding["status"]>(item.status);
-  const [resolution, setResolution] = useState(item.resolution || "");
-  const mayDispose = ["compliance_lead", "admin"].includes(currentUser?.role || "");
-  const transitions = (item.status === "closed" ? []
-    : item.status === "resolved" || item.status === "accepted" ? ["in_progress", ...(mayDispose ? ["closed"] : [])]
-    : ["in_progress", "resolved", ...(mayDispose ? ["accepted"] : [])].filter((status) => status !== item.status)) as ApiFinding["status"][];
-  const requiresDisposition = ["accepted", "resolved", "closed"].includes(nextStatus);
-  const canSubmit = nextStatus !== item.status && (!requiresDisposition || resolution.trim().length >= 20);
-  return <article className="finding-record"><div className="finding-row"><span className={`severity-flag ${item.severity}`}>{titleCase(item.severity)}</span><div><strong>{item.title}</strong><p>{item.id}{item.control_id ? ` · Control ${item.control_id}` : ""}{item.evidence_id ? ` · Evidence ${item.evidence_id}` : item.job_id ? ` · Run ${item.job_id}` : ""}</p></div><div><small>Owner</small><span>{item.owner_email || "Unassigned"}</span></div><div><small>Due</small><span>{item.due_at ? formatDate(item.due_at) : "No due date"}</span></div><div className="finding-status-action"><StatusPill status={titleCase(item.status)} />{transitions.length ? <button className="button secondary" aria-expanded={expanded} onClick={() => setExpanded((value) => !value)}>{expanded ? "Cancel" : "Update"}</button> : null}</div></div>
-    <div className="finding-description"><p>{item.description}</p>{item.resolution ? <small><strong>Disposition:</strong> {item.resolution}</small> : null}</div>
-    {expanded ? <form className="finding-update" onSubmit={(event) => { event.preventDefault(); if (canSubmit) onUpdate(item.id, nextStatus, resolution.trim()); }}><label className="field"><span>Next status</span><select value={nextStatus} onChange={(event) => setNextStatus(event.target.value as ApiFinding["status"])}><option value={item.status} disabled>Select transition</option>{transitions.map((status) => <option value={status} key={status}>{titleCase(status)}</option>)}</select></label><label className="field finding-resolution"><span>Disposition or remediation evidence{requiresDisposition ? " *" : ""}</span><textarea rows={2} minLength={requiresDisposition ? 20 : undefined} maxLength={4000} value={resolution} onChange={(event) => setResolution(event.target.value)} placeholder="Describe the remediation, verification, or formally approved risk acceptance." /></label><button className="button primary" disabled={busy || !canSubmit}>{busy ? "Saving…" : "Save audited transition"}</button></form> : null}
-  </article>;
 }
 
 function ConnectionsView({ collectors, devices, jira, canManageJira, busy, onConnectJira, onTestJira, onDisconnectJira, onEnroll, onRotate, onRevoke, onToast }: { collectors: ApiCollector[]; devices: ApiDevice[]; jira: ApiJiraConnection | null; canManageJira: boolean; busy: boolean; onConnectJira: (event: React.FormEvent<HTMLFormElement>) => void; onTestJira: () => void; onDisconnectJira: () => void; onEnroll: () => void; onRotate: (id: string) => void; onRevoke: (id: string) => void; onToast: (message: string) => void }) {
@@ -872,7 +976,7 @@ function SettingsView({ auditIntegrity, currentUser, onToast }: { auditIntegrity
   }
 
   return <><PageTitle eyebrow="Workspace" title="Settings" description="Inspect enforced evidence policy, manage membership, and verify the audit record." />
-    <div className="settings-layout"><nav aria-label="Settings sections"><button className={tab === "policy" ? "active" : ""} onClick={() => setTab("policy")}>Evidence policy</button><button className={tab === "team" ? "active" : ""} onClick={() => void openTeam()}>Team & access</button><button className={tab === "audit" ? "active" : ""} onClick={() => void openAudit()}>Audit log</button></nav>
+    <div className="settings-layout">{currentUser?.role === "admin" && <ReadinessPanel />}<nav aria-label="Settings sections"><button className={tab === "policy" ? "active" : ""} onClick={() => setTab("policy")}>Evidence policy</button><button className={tab === "team" ? "active" : ""} onClick={() => void openTeam()}>Team & access</button><button className={tab === "audit" ? "active" : ""} onClick={() => void openAudit()}>Audit log</button></nav>
       {tab === "policy" && <section className="panel settings-panel"><h2>Evidence policy</h2><p>These are enforced server-side and cannot be weakened from the browser.</p><div className="integrity-setting"><span>{auditIntegrity?.valid ? "✓" : "↻"}</span><div><strong>{auditIntegrity?.valid ? "Tamper-evident audit tail verified" : "Audit verification pending"}</strong><p>{auditIntegrity?.valid ? `${auditIntegrity.checked} event(s) verified from the latest signed checkpoint.` : "Production readiness fails until the chain and independent checkpoint verify."}</p></div></div><div className="setting-row"><div><strong>Sensitive-data redaction</strong><span>Luhn-validated PAN, access tokens, API secrets, JWTs, private keys, and authorization headers are scanned before encryption. Screenshot approval additionally requires digest-bound exact-pixel scan metadata.</span></div><StatusPill status="Enforced" /></div><div className="setting-row"><div><strong>Evidence validity</strong><span>New evidence defaults to 90 days. Expired evidence cannot be approved or exported as current.</span></div><strong>90 days</strong></div><div className="setting-row"><div><strong>Retention and holds</strong><span>Expired bytes are retained while their assessment is draft or active, or while an explicit retention hold remains valid. Purge actions and failures are audited.</span></div><StatusPill status="Fail closed" /></div><div className="setting-row"><div><strong>Tenant boundary</strong><span>The legacy hosted runtime accepts exactly one canonical origin and one isolated D1/R2/key boundary. Multi-customer operation requires the tenant-aware AWS runtime.</span></div><StatusPill status="Single tenant" /></div></section>}
       {tab === "team" && <section className="panel settings-panel"><h2>Team & access</h2><p>Invitation-only membership with server-enforced roles, suspension, revocation, and final-administrator protection.</p>{!canReadTeam ? <div className="jira-access-note"><strong>Your role is {currentUser?.role?.replaceAll("_", " ") || "unknown"}</strong><p>An administrator or compliance lead can view membership. Only an administrator can invite people or change access.</p></div> : <>{canManageTeam && <form className="invite-form" onSubmit={inviteMember}><label className="field"><span>Email address</span><input name="email" type="email" required maxLength={254} autoComplete="off" placeholder="reviewer@example.com" /></label><label className="field"><span>Role</span><select name="role" defaultValue="auditor"><option value="auditor">Auditor</option><option value="reviewer">Reviewer</option><option value="compliance_lead">Compliance lead</option><option value="admin">Administrator</option></select></label><label className="field"><span>Expires</span><select name="expiresInDays" defaultValue="7"><option value="1">1 day</option><option value="7">7 days</option><option value="14">14 days</option><option value="30">30 days</option></select></label><button className="button primary" disabled={working}>Create invitation</button></form>}{loading ? <div className="artifact-state">Loading membership…</div> : <div className="member-list">{members.map((member) => <div className="member-row" key={member.id}><div><strong>{member.display_name || member.email}</strong><small>{member.email} · Last seen {formatDate(member.last_seen_at)}</small></div>{canManageTeam ? <select aria-label={`Role for ${member.email}`} value={member.role} disabled={working || member.status !== "active"} onChange={(event) => void changeMember(member, { role: event.target.value })}><option value="auditor">Auditor</option><option value="reviewer">Reviewer</option><option value="compliance_lead">Compliance lead</option><option value="admin">Administrator</option></select> : <span>{titleCase(member.role)}</span>}<StatusPill status={titleCase(member.status)} />{canManageTeam && <div className="member-actions"><button className="button secondary" disabled={working || member.status === "revoked"} onClick={() => void changeMember(member, { status: member.status === "active" ? "suspended" : "active" })}>{member.status === "active" ? "Suspend" : "Activate"}</button><button className="button secondary danger" disabled={working || member.status === "revoked" || member.id === currentUser?.id} onClick={() => void changeMember(member, { status: "revoked" })}>Revoke</button></div>}</div>)}</div>}{canManageTeam && invitations.filter((item) => item.status === "pending").length > 0 && <div className="pending-invitations"><h3>Pending invitations</h3>{invitations.filter((item) => item.status === "pending").map((invitation) => <div key={invitation.id}><span><strong>{invitation.email}</strong><small>{titleCase(invitation.role)} · Expires {formatDate(invitation.expires_at)}</small></span><button className="button secondary danger" disabled={working} onClick={() => void revokeInvitation(invitation)}>Revoke</button></div>)}</div>}</>}</section>}
       {tab === "audit" && <section className="panel settings-panel"><h2>Audit log</h2><p>The newest 250 material actions. Integrity is verified from the latest signed external checkpoint through the current tail.</p><div className="integrity-setting"><span>{auditIntegrity?.valid ? "✓" : "!"}</span><div><strong>{auditIntegrity?.valid ? "Audit verification passed" : "Audit verification has not passed"}</strong><p>{auditIntegrity ? `${auditIntegrity.checked} total event(s) covered by the verified chain.` : "Reload after protected services recover."}</p></div></div>{loading ? <div className="artifact-state">Loading audited actions…</div> : auditEvents.length ? <div className="audit-event-list">{auditEvents.map((event) => <div key={event.id}><span>{event.sequence}</span><div><strong>{event.action.replaceAll("_", " ")}</strong><small>{event.actor_email} · {event.resource_type}:{event.resource_id}</small></div><time dateTime={event.occurred_at}>{formatDate(event.occurred_at)}</time><code>{event.event_hash.slice(0, 12)}</code></div>)}</div> : <EmptyState message="No audit events are available yet." />}</section>}
@@ -886,16 +990,34 @@ function HelpView({ onNavigate }: { onNavigate: (view: View) => void }) {
       {[['1', 'Connect sources', 'Configure least-privilege provider credentials or enroll a Mac capture device.', 'Connections'], ['2', 'Collect safely', 'Run an API collector or review a locally scanned screenshot before it enters Scopeproof.', 'Collection runs'], ['3', 'Review evidence', 'Confirm control mapping, scope, freshness, redactions, and integrity before approval.', 'Evidence'], ['4', 'Export for assessment', 'Generate a signed ZIP with embedded artifacts, a PDF index, hashes, and verification material.', 'Overview']].map(([number, title, copy, destination]) => <article key={number}><span>{number}</span><div><h2>{title}</h2><p>{copy}</p><button onClick={() => onNavigate(destination as View)}>Open {destination} →</button></div></article>)}
     </section>
     <div className="help-grid">
-      <section className="panel help-panel"><h2>Mac screenshot quick start</h2><ol><li>Open <strong>Connections</strong>, enroll a Mac, and copy the one-time token.</li><li>In the Scopeproof shield menu, open <strong>Capture & Jira Settings</strong>; enter this workspace’s HTTPS URL and token.</li><li>Select PCI DSS, HIPAA, FedRAMP, SOC 2, ISO 27001, or an imported catalog; then choose the control, system, owner, period, evidence title, and optional Jira issue.</li><li>Select an exact window. Scopeproof runs local OCR, masks PANs and credentials, lets you add manual redactions, stamps the image, and shows a preview.</li><li>Use <strong>Search Evidence</strong> on the Mac to tag, review, approve, and copy a Jira-ready comment before building an assessor package.</li></ol><button className="button secondary" onClick={() => onNavigate('Connections')}>Manage capture devices</button></section>
+      <section className="panel help-panel"><h2>Mac screenshot quick start — this hosted workspace</h2><p>Local-only capture needs no hosted login. AWS customers use the separate approved AWS Customer Workspace sign-in, not this workspace’s one-time token.</p><ol><li>Open <strong>Connections</strong>, enroll a Mac, and copy the one-time token.</li><li>In the Scopeproof shield menu, open <strong>Capture & Jira Settings</strong>; enter this workspace’s HTTPS URL and token.</li><li>Select PCI DSS, HIPAA, FedRAMP, SOC 2, ISO 27001, or an imported catalog; then choose the control, system, owner, period, evidence title, and optional Jira issue.</li><li>Select an exact window. Scopeproof runs local OCR, masks PANs and credentials, lets you add manual redactions, stamps the image, and shows a preview.</li><li>Use <strong>Search Evidence</strong> on the Mac to tag, review, approve, and copy a Jira-ready comment before building an assessor package.</li></ol><button className="button secondary" onClick={() => onNavigate('Connections')}>Manage capture devices</button></section>
       <section className="panel help-panel"><h2>Jira Cloud evidence handoff</h2><ol><li>Open <strong>Connections → Jira Cloud</strong>, enter the site and allowed projects, then authorize Scopeproof through Atlassian OAuth.</li><li>Assign the destination issue key during capture; it flows into the banner, filename, manifest, search, and package index.</li><li>Approve the evidence locally, upload those exact bytes to Scopeproof, and have an authenticated web reviewer approve the hosted artifact.</li><li>Select it in <strong>Search Evidence</strong> and explicitly choose <strong>Upload to Jira Cloud</strong>. Scopeproof verifies both approvals, the issue, project allowlist, PNG hash, redaction status, and lifecycle chain before sending the complete evidence set and recording a signed receipt.</li></ol><p>The manual Copy Jira Comment workflow remains available. Confirm ticket permissions, classification, and retention before disclosure.</p></section>
-      <section className="panel help-panel"><h2>What proves integrity</h2><dl><div><dt>Visible stamp</dt><dd>Local date, time, timezone, control, system, environment, period, and evidence ID.</dd></div><div><dt>Local manifest</dt><dd>PNG SHA-256, source metadata, redaction counts, and previous/current chain hashes.</dd></div><div><dt>Server receipt</dt><dd>Signed server time, device identity, audit event, and optional RFC 3161 timestamp token.</dd></div><div><dt>Assessor package</dt><dd>ECDSA-signed manifest, public key, independent hashes, embedded evidence, and PDF index.</dd></div></dl></section>
+      <section className="panel help-panel"><h2>What proves integrity</h2><dl><div><dt>Visible stamp</dt><dd>Local date, time, timezone, control, system, environment, period, and evidence ID.</dd></div><div><dt>Local manifest</dt><dd>PNG SHA-256, source metadata, redaction counts, and previous/current chain hashes.</dd></div><div><dt>Server receipt</dt><dd>Signed server time, device identity and audit event. Production hosted native ingestion also requires a verified RFC 3161 timestamp; a disabled timestamp is diagnostic-only.</dd></div><div><dt>Assessor package</dt><dd>ECDSA-signed manifest, public key, independent hashes, embedded evidence, and PDF index.</dd></div></dl></section>
       <section className="panel help-panel"><h2>Safety & privacy</h2><ul><li>Captured OCR text is processed on the Mac and is not retained.</li><li>Device tokens are shown once, hashed server-side, stored in Keychain, and revocable.</li><li>Artifacts are encrypted with AES-256-GCM before R2 persistence.</li><li>Every material action is written to a tamper-evident, append-only audit chain.</li><li>Scopeproof never captures the screen without an explicit menu action.</li></ul></section>
-      <section className="panel help-panel"><h2>Troubleshooting</h2><dl><div><dt>Capture permission fails</dt><dd>Open the shield menu → Screen Recording Settings, enable Scopeproof Capture, then fully quit and reopen it.</dd></div><div><dt>Upload is pending</dt><dd>Confirm the HTTPS server URL and active device token, then choose Retry Pending Uploads.</dd></div><div><dt>A collector is paused</dt><dd>Open Connections and inspect its missing hosted secret or most recent provider error.</dd></div><div><dt>Evidence was blocked</dt><dd>Remove cardholder data or credentials from the source and collect again; unsafe automated captures are not stored.</dd></div></dl></section>
+      <section className="panel help-panel"><h2>Troubleshooting</h2><dl><div><dt>Capture permission fails</dt><dd>Open the shield menu → Screen Recording Settings, enable Scopeproof Capture, then fully quit and reopen it.</dd></div><div><dt>Upload is pending</dt><dd>Confirm the approved destination and active credentials, then open Transfer recovery on the Mac. Inspect each artifact’s verified receipt; reconcile an uncertain remote commit before retrying.</dd></div><div><dt>A collector is paused</dt><dd>Open Connections and inspect its missing hosted secret or most recent provider error.</dd></div><div><dt>Evidence was blocked</dt><dd>Remove cardholder data or credentials from the source and collect again; unsafe automated captures are not stored.</dd></div></dl></section>
     </div>
   </>;
 }
 
-function EvidenceDrawer({ item, currentUser, onClose, onApprove, onFlag }: { item: Evidence; currentUser: ApiUser | null; onClose: () => void; onApprove: (item: Evidence, rationale: string) => void; onFlag: (item: Evidence) => void }) {
+function EvidenceDrawer({ item, currentUser, busy, onClose, onReview, onFlag }: { item: Evidence; currentUser: ApiUser | null; busy: boolean; onClose: () => void; onReview: (item: Evidence, action: ReviewAction, rationale: string, replacementEvidenceId?: string) => void; onFlag: (item: Evidence) => void }) {
+  const dialogRef = useDialogFocus();
+  const [replacement, setReplacement] = useState("");
+  const [action, setAction] = useState<ReviewAction>("approve");
+  const [metadata, setMetadata] = useState<{ allowedActions: string[]; reviewBlockers: string[] } | null>(null);
+  const [reviews, setReviews] = useState<Array<{ id: string; action: string; actor_email: string; created_at: string; rationale: string }>>([]);
+  const [reviewError, setReviewError] = useState("");
+  useEffect(() => {
+    let cancelled = false;
+    void Promise.all([
+      fetch(`/api/evidence/${encodeURIComponent(item.id)}?view=metadata`, { cache: "no-store" }).then(async (response) => { if (!response.ok) throw new Error(await apiError(response)); return response.json(); }),
+      fetch(`/api/evidence/${encodeURIComponent(item.id)}/reviews`, { cache: "no-store" }).then(async (response) => { if (!response.ok) throw new Error(await apiError(response)); return response.json(); }),
+    ]).then(([currentData, historyData]) => {
+      const current = currentData as { evidence: { allowedActions: ReviewAction[]; reviewBlockers: string[] } };
+      const history = historyData as { reviews: Array<{ id: string; action: string; actor_email: string; created_at: string; rationale: string }> };
+      if (!cancelled) { setMetadata(current.evidence); setReviews(history.reviews); setAction(current.evidence.allowedActions[0] || "approve"); }
+    }).catch((error) => { if (!cancelled) setReviewError(error instanceof Error ? error.message : "Review state unavailable."); });
+    return () => { cancelled = true; };
+  }, [item.id]);
   const [artifact, setArtifact] = useState<{ state: "loading" | "ready" | "error"; url?: string; text?: string; error?: string }>({ state: "loading" });
   const [rationale, setRationale] = useState("");
   const [confirmed, setConfirmed] = useState(false);
@@ -923,11 +1045,11 @@ function EvidenceDrawer({ item, currentUser, onClose, onApprove, onFlag }: { ite
   const independentReviewer = Boolean(currentUser && item.createdBy && currentUser.id !== item.createdBy);
   const serverSafetyReady = item.type !== "Screenshot" || item.serverSafetyStatus === "verified";
   const nativeProvenanceReady = item.nativeProvenanceStatus !== "pending";
-  const canApprove = roleMayApprove && independentReviewer && serverSafetyReady && nativeProvenanceReady && artifact.state === "ready" && confirmed && rationale.trim().length >= 20 && item.status !== "Approved";
+  const canReview = !busy && roleMayApprove && artifact.state === "ready" && confirmed && rationale.trim().length >= 20 && metadata?.allowedActions.includes(action) && reviewActions(item.status).includes(action) && (action !== "supersede" || replacement.trim().length > 0);
   return <>
-    <button className="drawer-scrim" aria-label="Close evidence details" onClick={onClose} />
-    <aside className="drawer" aria-label="Evidence details">
-      <div className="drawer-head"><div><span>{item.id}</span><StatusPill status={item.status} /></div><button aria-label="Close evidence details" onClick={onClose}>×</button></div>
+    <button className="drawer-scrim" aria-label="Close evidence details" disabled={busy} onClick={onClose} />
+    <aside className="drawer" ref={dialogRef} role="dialog" aria-modal="true" tabIndex={-1} aria-label="Evidence details">
+      <div className="drawer-head"><div><span>{item.id}</span><StatusPill status={item.status} /></div><button aria-label="Close evidence details" disabled={busy} onClick={onClose}>×</button></div>
       <div className="drawer-scroll">
         <span className="eyebrow">{item.type} evidence</span><h2>{item.title}</h2><p className="drawer-description">{item.description}</p>
         <div className="actual-evidence" aria-live="polite">
@@ -942,9 +1064,11 @@ function EvidenceDrawer({ item, currentUser, onClose, onApprove, onFlag }: { ite
           {item.type !== "Screenshot" ? <div className="check-row"><span>i</span><div><strong>Server redaction completed before encryption</strong><p>Inspect the actual text above. Pattern matching supports—but does not replace—reviewer judgment.</p></div></div> : null}
         </section>
         <section className="detail-section"><h3>Tags</h3><div className="tag-row">{item.tags.map((tag) => <span key={tag}>{tag}</span>)}</div></section>
-        {item.status !== "Approved" && <section className="detail-section review-attestation"><h3>Independent review attestation</h3>{!roleMayApprove ? <p className="review-blocked">A reviewer or administrator role is required to approve evidence.</p> : !independentReviewer ? <p className="review-blocked">You collected or uploaded this artifact. A different reviewer must approve it.</p> : <><label className="field"><span>Review rationale</span><textarea value={rationale} onChange={(event) => setRationale(event.target.value)} minLength={20} maxLength={1000} rows={4} placeholder="Explain what you inspected, what this proves, and why the scope and redactions are acceptable." /></label><label className="checkbox-line"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /> I inspected the actual artifact above, confirmed its digest, scope, freshness, and redactions, and understand this approval is audited.</label></>}</section>}
+        {<section className="detail-section review-attestation"><h3>Independent review attestation</h3>{reviewError && <p role="alert">{reviewError}</p>}{metadata?.reviewBlockers.map((reason) => <p className="review-blocked" key={reason}>{reason}</p>)}<label className="field"><span>Review action</span><select value={action} disabled={busy || !metadata?.allowedActions.length} onChange={(event) => setAction(event.target.value as ReviewAction)}>{metadata?.allowedActions.length ? metadata.allowedActions.map((value) => <option key={value} value={value}>{titleCase(value)}</option>) : <option value="approve">No action currently permitted</option>}</select></label>{action === "supersede" && <label className="field"><span>Approved replacement evidence ID</span><input value={replacement} onChange={(event) => setReplacement(event.target.value)} maxLength={100} placeholder="Evidence ID in this assessment and control" /></label>}{!roleMayApprove ? <p className="review-blocked">A reviewer or administrator role is required to approve evidence.</p> : !independentReviewer ? <p className="review-blocked">You collected or uploaded this artifact. A different reviewer must approve it.</p> : <><label className="field"><span>Review rationale</span><textarea value={rationale} onChange={(event) => setRationale(event.target.value)} minLength={20} maxLength={1000} rows={4} placeholder="Explain what you inspected, what this proves, and why the scope and redactions are acceptable." /></label><label className="checkbox-line"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /> I inspected the actual artifact above, confirmed its digest, scope, freshness, and redactions, and understand this decision is audited.</label></>}</section>}
+        <section className="detail-section"><h3>Review history</h3>{reviews.length ? reviews.map((review) => <article className="review-event" key={review.id}><strong>{titleCase(review.action)}</strong><p>{review.rationale}</p><small>{review.actor_email} · {formatDate(review.created_at)}</small></article>) : <p>{reviewError ? "History unavailable." : "No recorded decisions."}</p>}</section>
+        {currentUser?.role === "admin" && <EvidenceHoldPanel evidenceId={item.id} />}
       </div>
-      <div className="drawer-actions"><button className="button secondary" disabled={!mayCreateFinding} title={!mayCreateFinding ? "Reviewer or evidence-operations access is required." : undefined} onClick={() => onFlag(item)}>Flag issue</button><button className="button primary" disabled={!canApprove} onClick={() => onApprove(item, rationale.trim())}>{item.status === "Approved" ? "✓ Approved" : !serverSafetyReady || !nativeProvenanceReady ? "Quarantined" : artifact.state !== "ready" ? "Verify artifact first" : "Approve evidence"}</button></div>
+      <div className="drawer-actions"><button className="button secondary" disabled={busy || !mayCreateFinding} onClick={() => onFlag(item)}>Flag issue</button><button className="button primary" disabled={!canReview} onClick={() => onReview(item, action, rationale.trim(), replacement.trim() || undefined)}>{busy ? "Recording…" : `Record ${action}`}</button></div>
     </aside>
   </>;
 }
@@ -953,23 +1077,8 @@ function Modal({ type, collectors, repositories, assessments, catalogs, selected
   const [sbomRepository, setSbomRepository] = useState(repositories.find((item) => !item.archived)?.name || "");
   const [sbomRef, setSbomRef] = useState(repositories.find((item) => !item.archived)?.defaultBranch || "main");
   const [sbomSourceMode, setSbomSourceMode] = useState<"managed" | "one_time">(repositories.length ? "managed" : "one_time");
-  const dialogRef = useRef<HTMLElement>(null);
+  const dialogRef = useDialogFocus();
   const activeAssessment = assessments.find((assessment) => assessment.id === selectedAssessmentId);
-  useEffect(() => {
-    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    const dialog = dialogRef.current;
-    dialog?.querySelector<HTMLElement>("button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled])")?.focus();
-    const trap = (event: KeyboardEvent) => {
-      if (event.key !== "Tab" || !dialog) return;
-      const focusable = [...dialog.querySelectorAll<HTMLElement>("button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href]")].filter((item) => item.offsetParent !== null);
-      if (!focusable.length) return;
-      const first = focusable[0]; const last = focusable.at(-1)!;
-      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
-      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
-    };
-    dialog?.addEventListener("keydown", trap);
-    return () => { dialog?.removeEventListener("keydown", trap); previous?.focus(); };
-  }, []);
   const titles = { run: "Run evidence collection", sbom: "Generate repository SBOM", add: "Add manual evidence", export: "Export evidence package", device: "Enroll Mac capture device", assessment: "Create assessment scope", finding: "Create audited finding" };
   return <div className="modal-layer"><button className="modal-scrim" onClick={onClose} aria-label="Close dialog" /><section className="modal" ref={dialogRef} role="dialog" aria-modal="true" aria-labelledby="modal-title" tabIndex={-1}><div className="modal-head"><div><span className="eyebrow">Scopeproof</span><h2 id="modal-title">{titles[type]}</h2></div><button onClick={onClose} aria-label="Close dialog">×</button></div>
     {type === "run" && <form onSubmit={onRun}><p className="modal-intro">Select configured sources to query. Scope, pagination, omissions, and API versions are recorded with every artifact.</p><label className="field"><span>Assessment</span><select name="assessmentId" required value={selectedAssessmentId} onChange={(e) => setSelectedAssessmentId(e.target.value)}>{assessments.filter((item) => item.status === "active").map((item) => <option value={item.id} key={item.id}>{item.name} · {item.period_start}–{item.period_end}</option>)}</select></label><fieldset className="source-select"><legend>Live evidence sources</legend>{sources.map((source, index) => { const collector = collectors.find((item) => item.id === source.id); const configured = collector?.configuration.configured === true; return <label key={source.name} className={!configured ? "disabled" : ""}><input type="checkbox" name="source" value={source.id} defaultChecked={configured && index < 3} disabled={!configured} /><span>{source.mark}</span><div><strong>{source.name}</strong><small>{configured ? `${source.detail} · ${collector?.schedule_cron || "On demand"} UTC` : `Missing ${collector?.configuration.missing.join(", ") || "hosted credentials"}`}</small></div></label>; })}</fieldset><label className="checkbox-line"><input type="checkbox" checked readOnly /> Block approval and export when provider coverage is partial</label><div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy || !selectedAssessmentId}>{busy ? <><span className="button-spinner" /> Collecting live evidence…</> : "Start live collection"}</button></div></form>}
@@ -980,7 +1089,7 @@ function Modal({ type, collectors, repositories, assessments, catalogs, selected
         <legend>Repository access</legend>
         <label className={repositories.length ? "" : "disabled"}>
           <input type="radio" aria-label="Managed organization" checked={sbomSourceMode === "managed"} onChange={() => setSbomSourceMode("managed")} disabled={!repositories.length} />
-          <span><strong>Managed organization</strong><small>{repositories.length ? "Choose from the administrator-configured GitHub organization." : "No managed GitHub connection is configured."}</small></span>
+          <span><strong>Managed organization</strong><small>{repositories.length ? "Choose from the administrator-configured GitHub organization." : "Managed repositories unavailable. Retry discovery or use a one-time repository."}</small></span>
         </label>
         <label>
           <input type="radio" aria-label="One-time repository" checked={sbomSourceMode === "one_time"} onChange={() => { setSbomSourceMode("one_time"); setSbomRef("main"); }} />
@@ -1000,9 +1109,9 @@ function Modal({ type, collectors, repositories, assessments, catalogs, selected
       <div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy || !selectedAssessmentId || (sbomSourceMode === "managed" && !sbomRepository)}>{busy ? <><span className="button-spinner" /> Resolving and generating…</> : "Generate & add to evidence"}</button></div>
     </form>}
     {type === "add" && <form onSubmit={onAdd} className="evidence-form"><div className="form-grid"><label className="field full"><span>Assessment</span><select name="assessmentId" required value={selectedAssessmentId} onChange={(e) => setSelectedAssessmentId(e.target.value)}>{assessments.filter((item) => item.status !== "closed").map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label><label className="field full"><span>Evidence title</span><input name="title" required placeholder="e.g. Production database encryption settings" /></label><label className="field"><span>Control</span><select name="control" required defaultValue=""><option value="" disabled>Select control</option>{(activeAssessment?.catalog?.controls || []).map((control) => <option key={control.id} value={control.id}>{control.id} — {control.title}</option>)}</select></label><label className="field"><span>Evidence type</span><select name="type"><option value="code">Code</option><option value="configuration">Configuration</option><option value="report">Text report</option></select></label><label className="field"><span>System or asset</span><select name="system" required defaultValue=""><option value="" disabled>Select scoped system</option>{(activeAssessment?.systems || []).map((system) => <option value={system} key={system}>{system}</option>)}</select></label><label className="field"><span>Code language</span><select name="language"><option>Text</option><option>HCL</option><option>YAML</option><option>JSON</option><option>Shell</option><option>TypeScript</option></select></label><label className="field full"><span>Description</span><textarea name="description" rows={3} placeholder="What this evidence proves and where it came from" /></label><label className="field full"><span>Code or configuration excerpt</span><textarea name="code" className="mono-input" rows={5} required placeholder="# Paste the focused excerpt here; server-side redaction runs before encryption" /></label></div><div className="upload-zone"><span>↑</span><div><strong>Attach an optional text-based artifact</strong><p>TXT, JSON, XML, or YAML up to 10 MB</p></div><label className="choose-file">Choose file<input name="attachment" type="file" accept="text/*,application/json,application/xml,application/yaml" /></label></div><div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy || !selectedAssessmentId}>{busy ? "Encrypting…" : "Scan, encrypt & add"}</button></div></form>}
-    {type === "finding" && findingTarget && <form onSubmit={onFinding} className="evidence-form"><p className="modal-intro">Create a durable remediation record bound to this assessment and source object. Status changes and dispositions are audited.</p><div className="form-grid"><label className="field full"><span>Finding title</span><input name="title" required minLength={5} maxLength={180} defaultValue={findingTarget.title.slice(0, 180)} /></label><label className="field"><span>Severity</span><select name="severity" defaultValue="medium"><option value="critical">Critical</option><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option></select></label><label className="field"><span>Due date</span><input name="dueAt" type="date" /></label><label className="field full"><span>Description</span><textarea name="description" required minLength={20} maxLength={4000} rows={5} placeholder="Describe the observed gap, expected control state, affected scope, and the evidence needed to verify remediation." /></label></div><div className="privacy-note"><span>i</span><p>Bound to {findingTarget.evidenceId ? `evidence ${findingTarget.evidenceId}` : `collection run ${findingTarget.jobId}`} {findingTarget.controlId ? `and control ${findingTarget.controlId}` : ""}. Risk acceptance and final closure require compliance-lead or administrator authority.</p></div><div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy}>{busy ? "Creating finding…" : "Create audited finding"}</button></div></form>}
-    {type === "export" && <div><p className="modal-intro">Generate a signed package for one explicit assessment. Scope and inclusion counts are bound into the manifest; truncation is forbidden.</p><label className="field"><span>Assessment</span><select required value={selectedAssessmentId} onChange={(e) => setSelectedAssessmentId(e.target.value)}>{assessments.filter((item) => item.status !== "draft").map((item) => <option value={item.id} key={item.id}>{item.name} · {item.framework}</option>)}</select></label><div className="export-summary"><div><span>▣</span><p><strong>{assessments.find((item) => item.id === selectedAssessmentId)?.name || "Select an assessment"}</strong><small>{packagePreflight ? `${packagePreflight.eligible} eligible · ${packagePreflight.excluded} excluded` : "Checking authoritative package eligibility…"}</small></p></div><StatusPill status={!packagePreflight ? "Checking" : packagePreflight.ready ? "Ready" : "Blocked"} /></div>{packagePreflight?.blockers.length ? <div className="package-blockers" role="alert"><strong>Resolve before export</strong><ul>{packagePreflight.blockers.map((blocker) => <li key={blocker.code}>{blocker.message}{blocker.count ? ` (${blocker.count})` : ""}</li>)}</ul></div> : null}<label className="checkbox-line"><input type="checkbox" checked readOnly /> Refuse partial or silently truncated evidence sets</label><label className="checkbox-line"><input type="checkbox" checked readOnly /> ECDSA-sign manifest and include public verification key</label><div className="privacy-note"><span>i</span><p>The package expires after seven days and every download is audited.</p></div><div className="modal-actions"><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy || !selectedAssessmentId || !packagePreflight?.ready} onClick={onExport}>{busy ? "Building signed package…" : "↓ Generate signed ZIP"}</button></div></div>}
-    {type === "assessment" && <form onSubmit={onAssessment} className="evidence-form"><p className="modal-intro">Define an explicit, version-bound scope. An active assessment cannot use implicit “all systems” or “all controls” semantics.</p><div className="form-grid"><label className="field full"><span>Assessment name</span><input name="name" required minLength={3} maxLength={180} placeholder="2026 PCI DSS annual assessment" /></label><label className="field full"><span>Versioned control catalog</span><select name="catalogId" required defaultValue={catalogs[0]?.id || ""}><option value="" disabled>Select an installed catalog</option>{catalogs.map((catalog) => <option value={catalog.id} key={catalog.id}>{catalog.title}</option>)}</select><small>Only installed, digest-verified catalogs are available. Other frameworks remain disabled until their exact catalog is installed.</small></label><label className="field"><span>Period start</span><input name="periodStart" type="date" required /></label><label className="field"><span>Period end</span><input name="periodEnd" type="date" required /></label><label className="field full"><span>Systems in scope</span><textarea name="systems" rows={3} required placeholder="payments-production, identity-production" /><small>At least one exact system is required.</small></label><label className="field full"><span>Control IDs</span><textarea name="controls" rows={3} required placeholder="1.2.5, 2.2.1, 6.3.2" /><small>At least one ID from the selected catalog is required; unknown IDs are rejected.</small></label></div><div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy || !catalogs.length}>{busy ? "Creating scope…" : "Create active assessment"}</button></div></form>}
-    {type === "device" && (deviceToken ? <div><p className="modal-intro">This token is shown once. Copy it into the Mac app under <strong>Scopeproof shield → Capture & Jira Settings</strong>, then close this dialog.</p><div className="token-reveal"><code>{deviceToken}</code><button className="button secondary" onClick={() => void navigator.clipboard.writeText(deviceToken)}>Copy token</button></div><div className="privacy-note"><span>!</span><p>Treat this token like a password. It is stored hashed on the server and in the Mac login Keychain. Revoke the device immediately if the token is exposed.</p></div><div className="modal-actions"><button className="button primary" onClick={onClose}>I saved the token</button></div></div> : <form onSubmit={onDevice}><p className="modal-intro">Create a revocable identity for one Mac. Evidence uploaded by this device is attributed to your user and written to the immutable audit chain.</p><label className="field"><span>Device name</span><input name="displayName" required maxLength={100} defaultValue="Jayson’s Mac" placeholder="e.g. Compliance MacBook Pro" /></label><div className="privacy-note"><span>i</span><p>The token is displayed only once. The Mac stores it in Keychain and sends it only to your configured Scopeproof server.</p></div><div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy}>{busy ? "Creating secure token…" : "Create device token"}</button></div></form>)}
+    {type === "finding" && findingTarget && <form onSubmit={onFinding} className="evidence-form"><p className="modal-intro">Create a durable remediation record bound to this assessment and source object. Status changes and dispositions are audited.</p><div className="form-grid"><label className="field full"><span>Finding title</span><input name="title" required minLength={5} maxLength={180} defaultValue={findingTarget.title.slice(0, 180)} /></label><label className="field"><span>Severity</span><select name="severity" defaultValue="medium"><option value="critical">Critical</option><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option></select></label><div className="field full"><FindingAssignmentFields /></div><label className="field full"><span>Description</span><textarea name="description" required minLength={20} maxLength={4000} rows={5} placeholder="Describe the observed gap, expected control state, affected scope, and the evidence needed to verify remediation." /></label></div><div className="privacy-note"><span>i</span><p>Bound to {findingTarget.evidenceId ? `evidence ${findingTarget.evidenceId}` : `collection run ${findingTarget.jobId}`} {findingTarget.controlId ? `and control ${findingTarget.controlId}` : ""}. Risk acceptance and final closure require compliance-lead or administrator authority.</p></div><div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy}>{busy ? "Creating finding…" : "Create audited finding"}</button></div></form>}
+    {type === "export" && <div><p className="modal-intro">Generate a signed package for one explicit assessment. Scope and inclusion counts are bound into the manifest; truncation is forbidden.</p><label className="field"><span>Assessment</span><select required value={selectedAssessmentId} onChange={(e) => setSelectedAssessmentId(e.target.value)}>{assessments.filter((item) => item.status !== "draft").map((item) => <option value={item.id} key={item.id}>{item.name} · {item.framework}</option>)}</select></label><div className="export-summary"><div><span>▣</span><p><strong>{assessments.find((item) => item.id === selectedAssessmentId)?.name || "Select an assessment"}</strong><small>{packagePreflight ? `${packagePreflight.eligible} eligible · ${packagePreflight.excluded} excluded · ${((packagePreflight.eligibleBytes || 0) / 1_048_576).toFixed(1)} MiB / ${((packagePreflight.maximumBytes || 0) / 1_048_576).toFixed(0)} MiB limit` : "Checking authoritative package eligibility…"}</small></p></div><StatusPill status={!packagePreflight ? "Checking" : packagePreflight.ready ? "Ready" : "Blocked"} /></div>{packagePreflight?.blockers.length ? <div className="package-blockers" role="alert"><strong>Resolve before export</strong><ul>{packagePreflight.blockers.map((blocker) => <li key={blocker.code}>{blocker.message}{blocker.count ? ` (${blocker.count})` : ""}</li>)}</ul></div> : null}<label className="checkbox-line"><input type="checkbox" checked readOnly /> Refuse partial or silently truncated evidence sets</label><label className="checkbox-line"><input type="checkbox" checked readOnly /> ECDSA-sign manifest and include public verification key</label><div className="privacy-note"><span>i</span><p>The package expires after seven days and every download is audited.</p></div><div className="modal-actions"><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy || !selectedAssessmentId || !packagePreflight?.ready} onClick={onExport}>{busy ? "Building signed package…" : "↓ Generate signed ZIP"}</button></div></div>}
+    {type === "assessment" && <form onSubmit={onAssessment} className="evidence-form"><p className="modal-intro">Define an explicit, version-bound scope. An active assessment cannot use implicit “all systems” or “all controls” semantics.</p><div className="form-grid"><label className="field"><span>Initial status</span><select name="status" defaultValue="draft"><option value="draft">Draft — review scope first</option><option value="active">Active — ready for collection</option></select></label><label className="field full"><span>Assessment name</span><input name="name" required minLength={3} maxLength={180} placeholder="2026 PCI DSS annual assessment" /></label><label className="field full"><span>Versioned control catalog</span><select name="catalogId" required defaultValue={catalogs[0]?.id || ""}><option value="" disabled>Select an installed catalog</option>{catalogs.map((catalog) => <option value={catalog.id} key={catalog.id}>{catalog.title}</option>)}</select><small>Only installed, digest-verified catalogs are available. Other frameworks remain disabled until their exact catalog is installed.</small></label><label className="field"><span>Period start</span><input name="periodStart" type="date" required /></label><label className="field"><span>Period end</span><input name="periodEnd" type="date" required /></label><label className="field full"><span>Systems in scope</span><textarea name="systems" rows={3} placeholder="payments-production, identity-production" /><small>Activation requires at least one exact system. Drafts may leave scope incomplete.</small></label><label className="field full"><span>Control IDs</span><textarea name="controls" rows={3} placeholder="1.2.5, 2.2.1, 6.3.2" /><small>Activation requires a control from the selected catalog; unknown IDs are rejected.</small></label></div><div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy || !catalogs.length}>{busy ? "Creating scope…" : "Create assessment"}</button></div></form>}
+    {type === "device" && (deviceToken ? <div><p className="modal-intro">This token is shown once. Copy it into the Mac app under <strong>Scopeproof shield → Capture & Jira Settings</strong>, then close this dialog.</p><div className="token-reveal"><code>{deviceToken}</code><button className="button secondary" onClick={() => void navigator.clipboard.writeText(deviceToken)}>Copy token</button></div><div className="privacy-note"><span>!</span><p>Treat this token like a password. It is stored hashed on the server and in the Mac login Keychain. Revoke the device immediately if the token is exposed.</p></div><div className="modal-actions"><button className="button primary" onClick={onClose}>I saved the token</button></div></div> : <form onSubmit={onDevice}><p className="modal-intro">Create a revocable identity for one Mac. Evidence uploaded by this device is attributed to your user and written to the immutable audit chain.</p><label className="field"><span>Device name</span><input name="displayName" required maxLength={100} defaultValue="Compliance Mac" placeholder="e.g. Compliance MacBook Pro" /></label><div className="privacy-note"><span>i</span><p>The token is displayed only once. The Mac stores it in Keychain and sends it only to your configured Scopeproof server.</p></div><div className="modal-actions"><button type="button" className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={busy}>{busy ? "Creating secure token…" : "Create device token"}</button></div></form>)}
   </section></div>;
 }

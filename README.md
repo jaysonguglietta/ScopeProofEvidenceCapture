@@ -5,9 +5,17 @@ Scopeproof is a private, multi-framework compliance evidence-operations applicat
 The repository contains two coordinated products:
 
 - A private web console for collection orchestration, review, encrypted storage, audit history, and signed exports.
-- The **Unreleased Scopeproof Capture 1.10.0 (build 25) source** for macOS, which postdates the public 1.8.1 preview: a local-first menu-bar application with a private evidence console, explicitly initiated timestamped/redacted screenshots, one-time repository SBOM export, KMS/Object-Lock S3 evidence storage, version-aware verified downloads, assessor packaging, optional hosted synchronization, and Jira handoff.
+- The **Unreleased Scopeproof Capture 1.10.0 (build 26) source** for macOS, which postdates the public 1.8.1 preview: a local-first menu-bar application with a private evidence console, explicitly initiated timestamped/redacted screenshots, one-time repository SBOM export, KMS/Object-Lock S3 evidence storage, version-aware verified downloads, assessor packaging, optional hosted synchronization, and Jira handoff.
 
 ## Documentation
+
+Current development work is tracked in the [17-item product / 13-finding implementation ledger](docs/READINESS_IMPLEMENTATION_STATUS.md).
+Read the [updated workflow guide](docs/READINESS_WORKFLOWS.md) for requirements,
+review actions, package history, SBOM coverage and transfer-receipt changes.
+Legacy destructive cleanup is disabled. The new complete-history archive moves
+only verified eligible PNGs to Trash and supports same-Mac restore; it preserves
+metadata and trust anchors. This work is not an AWS deployment, notarized release
+or production-readiness certification.
 
 | Audience | Guide |
 | --- | --- |
@@ -20,6 +28,8 @@ The repository contains two coordinated products:
 | AWS storage administrators | [AWS S3 evidence storage](docs/S3_STORAGE.md) |
 | AWS identity administrators | [Secretless S3 authentication CloudFormation templates](infra/aws/cloudformation/README.md) |
 | AWS platform and SaaS administrators | [AWS multi-tenant hosting](docs/AWS_MULTI_TENANT_HOSTING.md) |
+| AWS customers and reviewers | [Separate Cognito customer portal](docs/AWS_CUSTOMER_PORTAL.md) |
+| Bootstrap and recovery operators | [Authority boundaries and restore/cutover tools](docs/AWS_BOOTSTRAP_AND_RECOVERY_BOUNDARIES.md) |
 | AWS deployment operators | [AWS platform runbook](docs/AWS_PLATFORM_RUNBOOK.md) |
 | Hosted runtime engineers | [AWS runtime security and evidence lifecycle](docs/AWS_RUNTIME_IMPLEMENTATION.md) |
 | Recovery and release operators | [AWS recovery and production macOS release](docs/AWS_RECOVERY_AND_MACOS_RELEASE.md) |
@@ -68,13 +78,17 @@ models; they are not intended to be deployed together by default.
 
 These are source- and template-tested components, not a live AWS service. No AWS
 stack was deployed, no live PostgreSQL/AWS recovery drill was run, and no Apple
-artifact was submitted or notarized by this work. The Amplify customer UI still
-has no approved source/release connection; membership administration and most
-product routes remain absent. The CDK wires authenticated
+artifact was submitted or notarized by this work. The separate static Cognito
+portal implements invitations, membership/device administration, assessment
+scope, evidence browsing/download/review and two-person legal holds. Its Mac
+companion implements approved-tenant sign-in, enrollment, upload and status.
+Amplify still has no approved source/release connection. The CDK wires authenticated
 `POST /v1/legal-hold-requests` and `POST /v1/legal-hold-approvals` to a separate
 least-privilege Lambda and schedules an approved-only exact-version reconciler
-with KMS-signed audit receipts and failure/age alarms. No legal-hold UI or live
-AWS two-tenant test exists; those remain production gates.
+with KMS-signed audit receipts and failure/age alarms. No live AWS two-tenant
+qualification exists. AWS package, SBOM, Jira and other legacy-console feature
+parity is not implied; see the [customer portal guide](docs/AWS_CUSTOMER_PORTAL.md)
+and [remaining implementation and qualification work](docs/READINESS_IMPLEMENTATION_STATUS.md).
 
 > **Existing AWS deployment stop:** the control-plane resource now synthesizes as
 > `AWS::DynamoDB::GlobalTable`. Never apply that template directly over a stack
@@ -93,7 +107,7 @@ The legacy Sites/D1/R2 source remains a single-tenant runtime until the staged m
 > **Release-state notice — 2026-09-01:** the public
 > [Scopeproof Capture 1.8.1 development preview](https://github.com/jaysonguglietta/ScopeProofEvidenceCapture/releases/tag/v1.8.1-development-preview.1)
 > was built from tag `v1.8.1-development-preview.1` at commit `8cd2d5c`. It
-> predates the current **Unreleased 1.10.0 (build 25)** native security, storage, authentication,
+> predates the current **Unreleased 1.10.0 (build 26)** native security, storage, authentication,
 > and local-library work and must not be represented as containing those
 > changes. In particular, that tagged build writes new evidence under
 > `~/Pictures/Scopeproof Evidence` and accepts manually entered AWS credentials;
@@ -214,7 +228,7 @@ npm run typecheck
 npm test
 ```
 
-Apply all D1 migrations in journal order through `drizzle/0028_native_reconciliation_cursor.sql`. Before deploying application code, run `npm run db:verify`; it replays the complete migration chain against both fresh and populated databases and checks native provenance, the sparse orphan-reconciliation queue, independent durable reconciliation cursors, independent screenshot safety, explicit scope/review/hold workflows, immutable checkpoint delivery attempts, atomic checkpoint retry leases, and durable key-rotation retry state. D1 and R2 logical bindings are declared in `.openai/hosting.json` for a separately authorized conditional Sites deployment; the repository does not prove that deployment exists.
+Apply all D1 migrations in journal order through `drizzle/0031_brave_silver_fox.sql`. Before deploying application code, run `npm run db:verify`; it replays the complete migration chain against both fresh and populated databases and checks native provenance, the sparse orphan-reconciliation queue, independent durable reconciliation cursors, independent screenshot safety, explicit scope/review/hold workflows, immutable checkpoint delivery attempts, atomic checkpoint retry leases, and durable key-rotation retry state. D1 and R2 logical bindings are declared in `.openai/hosting.json` for a separately authorized conditional Sites deployment; the repository does not prove that deployment exists.
 
 To build the local menu-bar app without installing or launching it, use:
 

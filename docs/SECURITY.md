@@ -1,10 +1,33 @@
 # Scopeproof security model
 
+See the [2026-09-08 implementation ledger](READINESS_IMPLEMENTATION_STATUS.md)
+for the current source status and remaining acceptance gates, and
+[AWS session and repair migration](AWS_SESSION_AND_REPAIR_MIGRATION.md) for the
+resource-server revocation and delayed-repair boundary. Source fixes do not
+establish that the legacy ingress identity boundary is safe in a deployment.
+
 > The conditional legacy hosted source is single-tenant. If separately authorized and deployed, it requires one exact canonical origin, one isolated D1/R2/key boundary, and `LEGACY_SINGLE_TENANT_ACKNOWLEDGEMENT=single-tenant-only`; this guard does not create multi-tenant isolation. The repository does not establish that a Sites deployment or its expected private identity dispatcher exists. The future AWS production boundary and its required tenant-isolation tests are documented in [AWS multi-tenant hosting](AWS_MULTI_TENANT_HOSTING.md); confirmed gaps and release blockers are tracked in the [AWS adversarial security review](AWS_SECURITY_REVIEW.md). Authentication or a Route 53 subdomain alone does not make the global legacy data paths safe for unrelated customers. The AWS source and templates in this repository have not been deployed. See [Security and product remediation status — 2026-09-01](SECURITY_REMEDIATION_2026-09-01.md) for the current source-control matrix and live-validation prerequisites.
 
 Scopeproof handles security and compliance evidence that may expose sensitive configuration, identities, infrastructure, and control gaps. Deploy it as a high-sensitivity internal system and assume browsers, endpoints, provider responses, uploaded metadata, and assessors’ workstations may be compromised.
 
 ## Protected assets
+
+The September 8 AWS customer client is a separate static Cognito PKCE application
+with server-verified JWT/membership authority, not the legacy identity-header
+console. Its public host mapping is immutable release configuration; access
+tokens remain in memory. Tenant API functions enforce exact body/role/scope,
+device key possession, current assessment revisions, independent review and
+evidence-ID-resolved legal holds. Tenant provisioners use their own restricted
+owner login; shared administrator authority belongs only to the independently
+approved central bootstrap. See the [customer portal](AWS_CUSTOMER_PORTAL.md)
+and [bootstrap/recovery boundaries](AWS_BOOTSTRAP_AND_RECOVERY_BOUNDARIES.md).
+
+Native transfer seals prove response/artifact/destination integrity under the
+original Mac's independently stored Keychain key, not an independently verified
+remote provider signature. Complete-history archive revalidation and PNG-only
+disposal preserve local signed metadata/anchors; same-Mac restore cannot replace
+an approved device-loss trust-recovery design. Missing legacy history stays
+blocked. None of these source changes closes SEC-11's external ingress gate.
 
 - Evidence plaintext and decrypted assessor packages.
 - Provider credentials and macOS device tokens.
@@ -68,7 +91,7 @@ Scopeproof handles security and compliance evidence that may expose sensitive co
 
 1. Use a private Sites access policy and grant the minimum role required.
 2. Configure `BOOTSTRAP_ADMIN_EMAILS`, one exact canonical `TRUSTED_APP_ORIGINS`, `LEGACY_SINGLE_TENANT_ACKNOWLEDGEMENT=single-tenant-only`, and exact lowercase `LEGACY_TENANT_ID`/`LEGACY_WORKSPACE_ID` values before hosted use. The application has no cryptographically verifiable dispatcher assertion; prove the external identity-header overwrite/exclusive-ingress gate separately. Missing or unsafe tenant/workspace values make current native ingestion unavailable by design. After bootstrap, create users only through **Settings → Team & access**.
-3. Apply D1 migrations in journal order through `drizzle/0028_native_reconciliation_cursor.sql`, then run `npm run db:verify` before deploying the corresponding application build. Do not skip either the fresh-database or populated upgrade-path replay.
+3. Apply D1 migrations in journal order through `drizzle/0031_brave_silver_fox.sql`, then run `npm run db:verify` before deploying the corresponding application build. Do not skip either the fresh-database or populated upgrade-path replay.
 4. Use distinct, high-entropy encryption, audit, and signing keys. Store them only in the hosted secret manager.
 5. Configure the required security-monitoring endpoint and exact host allowlist; any optional bearer token must be trimmed, 16–4096 characters, and control-free. Configure the independent screenshot scanner with all three legacy-named `BROWSER_OCR_*` settings and the exact clean HTTPS host contract. Configure the approved RFC 3161 TSA/verifier, pinned verifier key, allowlist, token, and trust anchor; keep `REQUIRE_TRUSTED_TIMESTAMP=true` for every production environment.
 6. Use least-privilege, read-only provider credentials and dedicated accounts where supported. The legacy AWS collector requires a complete temporary STS access-key/secret/session-token set and rejects long-lived two-part credentials.

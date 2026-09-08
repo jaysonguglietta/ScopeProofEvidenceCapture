@@ -1,5 +1,5 @@
 import { jsonError, requireApiPermission, requireApiUser, requireSameOrigin } from "../../../../lib/server/auth";
-import { approveEvidence, readEvidenceBytes, transitionEvidenceReview, type EvidenceReviewAction } from "../../../../lib/server/evidence";
+import { approveEvidence, getEvidenceMetadata, readEvidenceBytes, transitionEvidenceReview, type EvidenceReviewAction } from "../../../../lib/server/evidence";
 import { enforceRateLimit, requireBoundedContentLength } from "../../../../lib/server/rate-limit";
 import { evidenceResponseHeaders } from "../../../../lib/server/evidence-response";
 import { appendAuditEvent } from "../../../../lib/server/audit";
@@ -9,6 +9,12 @@ export async function GET(request: Request, context: { params: Promise<{ id: str
     const user = await requireApiUser(request);
     await enforceRateLimit(request, user.id, "evidence:read", 120, 60);
     const { id } = await context.params;
+    if (new URL(request.url).searchParams.get("view") === "metadata") {
+      const evidence = await getEvidenceMetadata(id, user);
+      if (!evidence) return Response.json({ error: "Evidence not found" }, { status: 404, headers: { "cache-control": "private, no-store" } });
+      await appendAuditEvent(user, "evidence.metadata_viewed", "evidence", id, { artifactSha256: evidence.sha256 });
+      return Response.json({ evidence }, { headers: { "cache-control": "private, no-store" } });
+    }
     const artifact = await readEvidenceBytes(id, user);
     if (!artifact) return Response.json({ error: "Evidence not found" }, { status: 404 });
     const inline = new URL(request.url).searchParams.get("view") === "inline";
@@ -36,9 +42,12 @@ export async function PATCH(request: Request, context: { params: Promise<{ id: s
     if (body.confirmedActualArtifact !== true) return Response.json({ error: "A review transition requires explicit confirmation that the actual artifact was inspected." }, { status: 400 });
     if (body.action === "approve") {
       const changed = await approveEvidence(id, user, { expectedSha256: String(body.expectedSha256 || ""), rationale: String(body.rationale || "") });
+      if (!changed) return Response.json({ error: "Evidence review state changed or this transition is not available. Reload the current evidence.", changed: false, evidence: await getEvidenceMetadata(id, user) }, { status: 409, headers: { "cache-control": "private, no-store" } });
       return Response.json({ changed, status: "approved" });
     }
     if (!["reject", "return", "reopen", "supersede"].includes(String(body.action))) return Response.json({ error: "Review action must be approve, reject, return, reopen, or supersede." }, { status: 400 });
-    return Response.json(await transitionEvidenceReview(id, user, { action: body.action as EvidenceReviewAction, expectedSha256: String(body.expectedSha256 || ""), rationale: String(body.rationale || ""), replacementEvidenceId: body.replacementEvidenceId }));
+    const result = await transitionEvidenceReview(id, user, { action: body.action as EvidenceReviewAction, expectedSha256: String(body.expectedSha256 || ""), rationale: String(body.rationale || ""), replacementEvidenceId: body.replacementEvidenceId });
+    if (!result.changed) return Response.json({ error: "Evidence changed concurrently. Reload before reviewing it.", changed: false, evidence: await getEvidenceMetadata(id, user) }, { status: 409, headers: { "cache-control": "private, no-store" } });
+    return Response.json(result);
   } catch (error) { return jsonError(error); }
 }

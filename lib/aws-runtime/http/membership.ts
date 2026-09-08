@@ -3,6 +3,7 @@ import {
   asTenantId,
   asUserId,
   assertBoundedText,
+  canonicalInstant,
   TenantSecurityError,
   type TenantId,
 } from "../contracts.ts";
@@ -22,9 +23,14 @@ export interface MembershipIdentityRecord {
   readonly membership: TenantMembership;
 }
 
+export interface RevokedSessionEpoch {
+  readonly sessionEpoch: number;
+  readonly revokedThrough: string;
+}
+
 export interface TenantMembershipRepository {
   /** The implementation must parameterize both values and apply the tenant RLS context. */
-  findActiveByIdentity(input: Readonly<{ tenantId: TenantId; identitySubject: string }>): Promise<MembershipIdentityRecord | null>;
+  findActiveByIdentity(input: Readonly<{ tenantId: TenantId; identitySubject: string; authenticatedAt: string }>): Promise<MembershipIdentityRecord | null>;
 }
 
 export interface DataApiStringParameter {
@@ -78,12 +84,13 @@ const findMembershipSql = [
   "WHERE m.tenant_id = CAST(:tenant_id AS scopeproof.tenant_identifier)",
   "  AND p.cognito_sub = :identity_subject",
   "  AND p.status = 'ACTIVE' AND m.status = 'ACTIVE'",
+  "  AND CAST(:authenticated_at AS timestamptz) > p.sessions_revoked_through",
   "LIMIT 2",
 ].join("\n");
 const findMembershipFunctionSql = [
   "SELECT tenant_id::text AS tenant_id, identity_subject,",
   "       membership_id::text AS membership_id, principal_id::text AS principal_id, role",
-  "FROM scopeproof.resolve_active_membership(:identity_subject)",
+  "FROM scopeproof.resolve_active_session_membership(:identity_subject, CAST(:authenticated_at AS timestamptz))",
 ].join("\n");
 
 function parseRows(value: string | undefined): readonly MembershipJsonRow[] {
@@ -131,9 +138,51 @@ export class RdsDataMembershipRepository implements TenantMembershipRepository {
     });
   }
 
-  async findActiveByIdentity(input: Readonly<{ tenantId: TenantId; identitySubject: string }>): Promise<MembershipIdentityRecord | null> {
+  async revokeOwnSessions(input: Readonly<{
+    tenantId: TenantId; identitySubject: string; authenticatedAt: string; requestId: string;
+  }>): Promise<RevokedSessionEpoch> {
+    const tenantId = asTenantId(input.tenantId);
+    const identitySubject = assertBoundedText(input.identitySubject, "Identity subject", 8, 200);
+    const authenticatedAt = canonicalInstant(input.authenticatedAt, "Authentication time");
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/.test(input.requestId)) throw new Error("Invalid session revocation request id.");
+    const transaction = await this.#executor.beginTransaction(this.#connection);
+    const transactionId = transaction.transactionId;
+    if (!transactionId || !/^[A-Za-z0-9-]{8,256}$/.test(transactionId)) throw new Error("Session revocation transaction failed.");
+    try {
+      await this.#executor.executeStatement({
+        ...this.#connection, transactionId, sql: setTenantSql,
+        parameters: [{ name: "tenant_id", value: { stringValue: tenantId } }],
+      });
+      const response = await this.#executor.executeStatement({
+        ...this.#connection, transactionId,
+        sql: "SELECT session_epoch, sessions_revoked_through FROM scopeproof.revoke_own_sessions(:identity_subject, CAST(:authenticated_at AS timestamptz), :request_id)",
+        parameters: [
+          { name: "identity_subject", value: { stringValue: identitySubject } },
+          { name: "authenticated_at", value: { stringValue: authenticatedAt } },
+          { name: "request_id", value: { stringValue: input.requestId } },
+        ], formatRecordsAs: "JSON",
+      });
+      if (!response.formattedRecords || response.formattedRecords.length > 2048) throw new Error("Invalid session revocation receipt.");
+      const rows: unknown = JSON.parse(response.formattedRecords);
+      if (!Array.isArray(rows) || rows.length !== 1 || !Number.isSafeInteger(rows[0]?.session_epoch) ||
+          rows[0].session_epoch < 1 || typeof rows[0].sessions_revoked_through !== "string") throw new Error("Invalid session revocation receipt.");
+      const result = Object.freeze({
+        sessionEpoch: rows[0].session_epoch as number,
+        revokedThrough: canonicalInstant(rows[0].sessions_revoked_through, "Session revocation cutoff"),
+      });
+      await this.#executor.commitTransaction({ resourceArn: this.#connection.resourceArn, secretArn: this.#connection.secretArn, transactionId });
+      return result;
+    } catch (error) {
+      try { await this.#executor.rollbackTransaction({ resourceArn: this.#connection.resourceArn, secretArn: this.#connection.secretArn, transactionId }); } catch { /* Preserve the failure. */ }
+      throw error;
+    }
+  }
+
+  async findActiveByIdentity(input: Readonly<{ tenantId: TenantId; identitySubject: string; authenticatedAt: string }>): Promise<MembershipIdentityRecord | null> {
     const tenantId = asTenantId(input.tenantId);
     const identitySubject = assertBoundedText(input.identitySubject, "Identity subject", 3, 200);
+    // This is the verified Cognito auth_time, never iat or a caller body field.
+    const authenticatedAt = canonicalInstant(input.authenticatedAt, "Authentication time");
     const transaction = await this.#executor.beginTransaction(this.#connection);
     if (!transaction.transactionId || !/^[A-Za-z0-9-]{8,256}$/.test(transaction.transactionId)) throw new TenantSecurityError("INVALID_PRINCIPAL", "Membership transaction could not be established.", 500);
     const transactionId = transaction.transactionId;
@@ -149,10 +198,14 @@ export class RdsDataMembershipRepository implements TenantMembershipRepository {
         transactionId,
         sql: this.#lookupMode === "security_definer_function" ? findMembershipFunctionSql : findMembershipSql,
         parameters: this.#lookupMode === "security_definer_function"
-          ? [{ name: "identity_subject", value: { stringValue: identitySubject } }]
+          ? [
+              { name: "identity_subject", value: { stringValue: identitySubject } },
+              { name: "authenticated_at", value: { stringValue: authenticatedAt } },
+            ]
           : [
               { name: "tenant_id", value: { stringValue: tenantId } },
               { name: "identity_subject", value: { stringValue: identitySubject } },
+              { name: "authenticated_at", value: { stringValue: authenticatedAt } },
             ],
         formatRecordsAs: "JSON",
       });
@@ -198,7 +251,7 @@ export async function authorizeVerifiedTenantIdentity(input: Readonly<{
   if (!authorizedClients.includes(input.identity.clientId)) {
     throw new TenantSecurityError("INVALID_PRINCIPAL", "Authentication token is invalid for this tenant.", 401);
   }
-  const record = await input.memberships.findActiveByIdentity({ tenantId: input.resolved.tenant.id, identitySubject: input.identity.subject });
+  const record = await input.memberships.findActiveByIdentity({ tenantId: input.resolved.tenant.id, identitySubject: input.identity.subject, authenticatedAt: input.identity.authenticatedAt });
   if (!record || record.tenantId !== input.resolved.tenant.id || record.identitySubject !== input.identity.subject) {
     throw new TenantSecurityError("MEMBERSHIP_REQUIRED", "Active tenant membership is required.", 403);
   }

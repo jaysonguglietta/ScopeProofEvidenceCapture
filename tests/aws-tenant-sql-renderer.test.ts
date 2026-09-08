@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { PGlite } from "@electric-sql/pglite";
+import { readFile } from "node:fs/promises";
 
 import { renderTenantSql, validateTenantSqlOptions } from "../Scripts/render_aws_tenant_sql.mjs";
 
@@ -15,6 +17,7 @@ const valid = {
   controlRole: "tenant_acme_control",
   legalApiRole: "tenant_acme_legal_api",
   readRole: "tenant_acme_read",
+  apiAuditRole: "tenant_acme_audit_signer",
   awsAccountId: "123456789012",
   awsRegion: "us-east-1",
   quarantineBucket: "scopeproof-acme-quarantine",
@@ -39,6 +42,9 @@ test("tenant SQL renderer emits a complete, non-secret bootstrap bundle", async 
   assert.doesNotMatch(sql, /__SCOPEPROOF_LEGAL_API_ROLE__/);
   assert.match(sql, /read_role CONSTANT text := 'tenant_acme_read'/);
   assert.doesNotMatch(sql, /__SCOPEPROOF_EVIDENCE_READ_ROLE__/);
+  assert.doesNotMatch(sql, /__SCOPEPROOF_API_AUDIT_SIGNER_ROLE__/);
+  assert.match(sql, /signer_role CONSTANT text := 'tenant_acme_audit_signer'/);
+  assert.ok(sql.indexOf("$validate_scopeproof$") < sql.indexOf("runtime_role CONSTANT text"));
   assert.doesNotMatch(sql, /password|secret_access_key|client_secret/i);
 });
 
@@ -61,6 +67,8 @@ test("tenant SQL renderer rejects identifier and hostname injection", () => {
     { ...valid, legalApiRole: valid.controlRole },
     { ...valid, readRole: "tenant_acme_read;GRANT ALL" },
     { ...valid, readRole: valid.runtimeRole },
+    { ...valid, apiAuditRole: "tenant_acme_audit_signer;GRANT ALL" },
+    { ...valid, apiAuditRole: valid.readRole },
     { ...valid, awsAccountId: "123" },
     { ...valid, evidenceBucket: "scopeproof-acme-quarantine" },
     { ...valid, evidenceBucket: "scopeproof..evidence" },
@@ -71,6 +79,31 @@ test("tenant SQL renderer rejects identifier and hostname injection", () => {
   ]) {
     assert.throws(() => validateTenantSqlOptions(candidate));
   }
+});
+
+test("rendered production SQL executes in real PostgreSQL with exact catalogs and execute-only grants", async () => {
+  const pg = new PGlite();
+  try {
+    for (const role of [valid.runtimeRole, valid.ingestRole, valid.controlRole, valid.legalApiRole, valid.readRole, valid.apiAuditRole]) await pg.exec(`CREATE ROLE ${role} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS`);
+    await pg.exec("CREATE ROLE scopeproof_test_owner NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS; CREATE ROLE scopeproof_test_provisioner LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS; GRANT scopeproof_test_owner TO scopeproof_test_provisioner WITH ADMIN FALSE, INHERIT FALSE, SET TRUE; ALTER DATABASE postgres OWNER TO scopeproof_test_owner; SET SESSION AUTHORIZATION scopeproof_test_provisioner; SET ROLE scopeproof_test_owner;");
+    await pg.exec(await renderTenantSql(valid));
+    assert.deepEqual((await pg.query("SELECT version FROM scopeproof.schema_migrations ORDER BY version")).rows, [1, 2, 3, 4, 5].map((version) => ({ version })));
+    const source = await readFile(new URL("../infra/aws/cdk/runtime/provision-tenant/index.mjs", import.meta.url), "utf8");
+    const functionNames = [...source.match(/const baselineFunctions = Object.freeze\(\[([\s\S]*?)\]\);/)![1].matchAll(/"([a-z_]+)"/g)].map((m) => m[1]).sort();
+    const actualFunctions = (await pg.query<{ proname: string }>("SELECT p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='scopeproof' ORDER BY p.proname")).rows.map((r) => r.proname);
+    assert.deepEqual(actualFunctions, functionNames, "production verifier must inventory every installed function");
+    assert.equal((await pg.query<{ count: number }>("SELECT count(*)::integer FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='scopeproof' AND pg_get_userbyid(p.proowner)<>'scopeproof_test_owner'")).rows[0].count, 0);
+    const triggers = (await pg.query<{ count: number }>("SELECT count(*)::integer FROM pg_trigger t JOIN pg_class c ON c.oid=t.tgrelid JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname='scopeproof' AND NOT t.tgisinternal")).rows[0].count;
+    assert.equal(triggers, 29);
+    await pg.exec("RESET SESSION AUTHORIZATION");
+    for (const [role, count] of [[valid.runtimeRole, 9], [valid.legalApiRole, 7], [valid.ingestRole, 6], [valid.readRole, 6], [valid.apiAuditRole, 6]] as const) {
+      const grants = (await pg.query<{ count: number }>("SELECT count(*)::integer FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname='scopeproof' AND has_function_privilege($1,p.oid,'EXECUTE')", [role])).rows[0].count;
+      assert.equal(grants, count, role);
+      await pg.exec(`SET SESSION AUTHORIZATION ${role}`);
+      for (const table of ["tenant_identity", "memberships", "evidence_artifacts", "customer_control_catalogs", "schema_migrations"]) await assert.rejects(pg.query(`SELECT * FROM scopeproof.${table}`));
+      await pg.exec("RESET SESSION AUTHORIZATION");
+    }
+  } finally { await pg.close(); }
 });
 
 test("tenant SQL renderer rejects unsafe retention values", () => {

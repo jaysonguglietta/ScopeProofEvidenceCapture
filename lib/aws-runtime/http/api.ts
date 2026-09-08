@@ -2,6 +2,7 @@ import { TenantSecurityError } from "../contracts.ts";
 import { type HostAuthority, type TenantActor, type TenantAuthorityResolver, type TenantPermission } from "../tenancy.ts";
 import { exactBearerToken, type CognitoAccessTokenVerifier, type VerifiedCognitoAccessToken } from "./jwt.ts";
 import { authorizeVerifiedTenantIdentity, type TenantMembershipRepository } from "./membership.ts";
+import { databaseProblem } from "./database-errors.ts";
 
 export interface ApiGatewayV2Event {
   readonly headers?: Readonly<Record<string, string | undefined>>;
@@ -109,7 +110,24 @@ export async function authorizeApiGatewayRequest(
   return Object.freeze({ requestId, method, path, actor, identity });
 }
 
+/** The only pre-membership path. SQL must accept an unexpired invitation for this exact subject. */
+export async function authorizeInvitationAcceptance(event: ApiGatewayV2Event, dependencies: ApiAuthenticationDependencies): Promise<Readonly<{ tenantId: string; identity: VerifiedCognitoAccessToken; requestId: string }>> {
+  const requestId = String(event.requestContext?.requestId || "");
+  if (!requestIdPattern.test(requestId) || event.requestContext.http.method !== "POST" || event.rawPath !== "/v1/customer/invitations/accept") throw new TenantSecurityError("INVALID_IDENTIFIER", "Invitation request context is invalid.", 400);
+  const headers = normalizedHeaders(event.headers);
+  const authority: HostAuthority = dependencies.authority.mode === "api_gateway_domain"
+    ? { source: "direct", host: event.requestContext.domainName }
+    : { source: "trusted_edge", viewerHost: (await dependencies.authority.verifier.verify(event)).viewerHost, edgeProofVerified: true };
+  const resolved = await dependencies.tenants.resolve(authority);
+  const identity = await dependencies.jwt.verify(exactBearerToken(headers.get("authorization")));
+  const clients = resolved.tenant.appClientIds ?? [resolved.tenant.appClientId];
+  if (identity.signatureVerified !== true || identity.tokenUse !== "access" || !clients.includes(identity.clientId)) throw new TenantSecurityError("INVALID_PRINCIPAL", "Authentication token is invalid for this tenant.", 401);
+  if (!identity.scopes.includes("scopeproof/evidence.read") && !identity.scopes.includes("scopeproof/evidence.collect")) throw new TenantSecurityError("OAUTH_SCOPE_REQUIRED", "An authorized customer token is required.", 403);
+  return Object.freeze({ tenantId: resolved.tenant.id, identity, requestId });
+}
+
 function problemFor(error: unknown, requestId: string): ApiProblem {
+  error = databaseProblem(error);
   const status = error instanceof TenantSecurityError && [400, 401, 403, 404, 409, 410, 413, 415, 421, 429].includes(error.safeStatus) ? error.safeStatus : 500;
   const title = status === 401 ? "Authentication required"
     : status === 403 ? "Access denied"

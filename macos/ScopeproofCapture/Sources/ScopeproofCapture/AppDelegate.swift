@@ -23,10 +23,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     )
     private let helpController = HelpController()
     private let evidenceSearchController = EvidenceSearchController()
+    private let awsCollectorController = AWSCollectorController()
+    private var transferRecoveryController: TransferRecoveryController?
+    private var transferRecoveryFingerprint: String?
     private let logger = Logger(subsystem: "com.scopeproof.capture", category: "application")
     private var statusMenuItem = NSMenuItem(title: "Ready to capture", action: nil, keyEquivalent: "")
     private var repositorySBOMTask: Task<Void, Never>?
     private var s3RetryTask: Task<Void, Never>?
+    private var evidenceArchiveTask: Task<Void, Never>?
     private var s3ConfigurationTask: Task<Void, Never>?
     private var s3WorkspaceGeneration = 0
     private lazy var localConsole = makeLocalConsole()
@@ -46,7 +50,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func invalidateS3WorkspaceState(for binding: TenantWorkspaceBinding) {
         s3WorkspaceGeneration += 1
+        awsCollectorController.cancelWork()
+        transferRecoveryController?.invalidateForWorkspaceChange()
+        transferRecoveryController = nil; transferRecoveryFingerprint = nil
         s3RetryTask?.cancel()
+        evidenceArchiveTask?.cancel()
+        evidenceArchiveTask = nil
         s3ConfigurationTask?.cancel()
         s3RetryTask = nil
         s3ConfigurationTask = nil
@@ -100,7 +109,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         repositorySBOMTask?.cancel()
+        transferRecoveryController?.invalidateForWorkspaceChange()
+        awsCollectorController.cancelWork()
         s3RetryTask?.cancel()
+        evidenceArchiveTask?.cancel()
         s3ConfigurationTask?.cancel()
         localConsole.stop()
     }
@@ -226,15 +238,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(repositorySBOM)
         let historyItem = NSMenuItem(title: "Recent Captures", action: nil, keyEquivalent: "")
         let historyMenu = NSMenu()
-        let entries = Array(CaptureHistory.entries(in: captureService.outputDirectory).prefix(10))
+        let entries = Array(CaptureHistory.entries(in: captureService.outputDirectory, expectedBinding: preferences.tenantBinding).prefix(10))
         if entries.isEmpty {
             let empty = NSMenuItem(title: "No captures yet", action: nil, keyEquivalent: ""); empty.isEnabled = false; historyMenu.addItem(empty)
         } else {
             for entry in entries {
-                let marker = entry.isUploaded ? "✓" : "↥"
+                let marker = entry.isPayloadArchived ? "▣" : (entry.isUploaded ? "✓" : "↥")
                 let framework = ComplianceCatalog.framework(named: entry.manifest.complianceArea).fileCode
                 let item = NSMenuItem(title: "\(marker) \(framework) \(entry.manifest.controlID) · \(entry.manifest.evidenceID) · \(entry.manifest.localTimestamp)", action: #selector(openHistoryEntry(_:)), keyEquivalent: "")
-                item.representedObject = entry.imageURL.path
+                item.representedObject = (entry.isPayloadArchived ? LocalEvidenceArchive.url(for: entry.manifestURL) : entry.imageURL).path
                 item.target = self
                 historyMenu.addItem(item)
             }
@@ -260,7 +272,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             KeychainStore.readS3VerifiedDestination()?.matches(preferences.s3Storage) == true
         menu.addItem(retryS3)
         addItem("Open Evidence Folder", action: #selector(openEvidenceFolder), key: "o")
-        addItem("Apply \(preferences.retentionDays)-Day Local Retention…", action: #selector(applyRetention))
+        let archive = NSMenuItem(title: evidenceArchiveTask == nil ? "Archive & Expire Old Payloads…" : "Archiving / Restoring Evidence…", action: #selector(applyRetention), keyEquivalent: "")
+        archive.target = self; archive.isEnabled = evidenceArchiveTask == nil && s3ConfigurationTask == nil
+        menu.addItem(archive)
+        let restore = NSMenuItem(title: "Restore Archived Evidence…", action: #selector(restoreArchivedEvidence), keyEquivalent: "")
+        restore.target = self; restore.isEnabled = evidenceArchiveTask == nil && s3ConfigurationTask == nil
+        menu.addItem(restore)
         menu.addItem(.separator())
 
         let login = NSMenuItem(title: "Launch at Login", action: #selector(toggleLaunchAtLogin(_:)), keyEquivalent: "")
@@ -276,6 +293,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         s3Settings.isEnabled = true
         menu.addItem(s3Settings)
         addItem("Capture & Jira Settings…", action: #selector(openSettings), key: ",", modifiers: [.command])
+        addItem("AWS Customer Workspace…", action: #selector(openAWSCollector))
+        addItem("Transfer Recovery…", action: #selector(openTransferRecovery))
         addItem(hostedConnectionAvailable ? "Check for Updates…" : "Open GitHub Releases…", action: #selector(checkForUpdatesAction))
         addItem("Help & How to Use…", action: #selector(showHelp), key: "?", modifiers: [.command, .shift])
         addItem("Screen Recording Settings…", action: #selector(openPermissionSettings))
@@ -560,8 +579,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func retryPendingUploads() {
         let activeBinding = preferences.tenantBinding
-        let pending = CaptureHistory.entries(in: captureService.outputDirectory).filter {
-            !$0.isUploaded && $0.manifest.tenantBinding == activeBinding
+        let pending = CaptureHistory.entries(in: captureService.outputDirectory, expectedBinding: preferences.tenantBinding).filter {
+            !$0.isPayloadArchived && !TransferReceipt.isVerified(for: $0, kind: .hosted,
+                expectedDestination: ["origin": BackendTrust.normalizedOrigin(preferences.serverURL)?.absoluteString ?? ""])
+                && $0.manifest.tenantBinding == activeBinding
         }
         guard !pending.isEmpty else { setReady("No pending uploads"); return }
         setBusy("Retrying \(pending.count) upload(s)…")
@@ -618,8 +639,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard settings.tenantBinding == preferences.tenantBinding else {
             showError(S3StorageFailure.destinationBindingMismatch); return
         }
-        let pending = Array(CaptureHistory.entries(in: captureService.outputDirectory).filter {
-            !$0.isStoredInS3 && $0.manifest.tenantBinding == settings.tenantBinding
+        let pending = Array(CaptureHistory.entries(in: captureService.outputDirectory, expectedBinding: preferences.tenantBinding).filter {
+            !$0.isPayloadArchived && !TransferReceipt.isVerified(for: $0, kind: .s3,
+                expectedDestination: TransferReceipt.s3Destination(settings, accountID: binding.accountID))
+                && $0.manifest.tenantBinding == settings.tenantBinding
         }.prefix(100))
         guard !pending.isEmpty else { setReady("No pending S3 uploads"); return }
         setBusy("Uploading \(pending.count) capture(s) to S3…")
@@ -653,7 +676,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func openHistoryEntry(_ sender: NSMenuItem) { if let path = sender.representedObject as? String { NSWorkspace.shared.open(URL(fileURLWithPath: path)) } }
-    @objc private func searchEvidence() { evidenceSearchController.show(evidenceRoot: captureService.outputDirectory, jiraSettings: preferences.jiraHandoff, serverURL: preferences.serverURL) }
+    @objc private func searchEvidence() { evidenceSearchController.show(evidenceRoot: captureService.outputDirectory, expectedBinding: preferences.tenantBinding, jiraSettings: preferences.jiraHandoff, serverURL: preferences.serverURL) }
     @objc private func openS3Browser() {
         let settings = preferences.s3Storage
         guard settings.isBound(to: preferences.tenantBinding) else {
@@ -768,7 +791,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApplication.shared.activate(ignoringOtherApps: true)
         let panel = NSSavePanel()
         panel.title = "Save Repository SBOM"
-        panel.message = "Save the auditor-facing JSON and its SHA-256 checksum."
+        panel.message = result.coverageComplete ? "Save the static manifest inventory and its SHA-256 checksum."
+            : "Coverage is incomplete. Save this review aid and checksum; validate missing inventory before assessor use."
         panel.allowedContentTypes = [.json]
         panel.canCreateDirectories = true
         panel.nameFieldStringValue = result.suggestedFilename
@@ -784,13 +808,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destination.path)
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: checksumURL.path)
             let completion = NSAlert()
-            completion.messageText = "Repository SBOM saved"
-            completion.informativeText = "\(result.repository) at \(result.resolvedCommit.prefix(12))\n\(result.componentCount) components from \(result.manifestPaths.count) lockfile(s)\nSHA-256: \(result.artifactSHA256)"
+            completion.messageText = result.coverageComplete ? "Repository SBOM saved" : "Partial repository inventory saved"
+            completion.alertStyle = result.coverageComplete ? .informational : .warning
+            let coverageNotes = result.coverage.filter { !$0.complete }.map { "\($0.path): \($0.warnings.joined(separator: " "))" }.joined(separator: "\n")
+            completion.informativeText = "\(result.repository) at \(result.resolvedCommit.prefix(12))\n\(result.componentCount) components from \(result.manifestPaths.count) lockfile(s)\nSHA-256: \(result.artifactSHA256)\n\n\(coverageNotes)"
             completion.addButton(withTitle: "Reveal in Finder")
             completion.addButton(withTitle: "Done")
             if completion.runModal() == .alertFirstButtonReturn { NSWorkspace.shared.activateFileViewerSelecting([destination, checksumURL]) }
-            setReady("Saved SBOM · \(result.componentCount) components")
-            notify(title: "Repository SBOM ready", body: "\(result.repository) at \(result.resolvedCommit.prefix(12)) was saved with a checksum.")
+            setReady("Saved \(result.coverageComplete ? "SBOM" : "partial inventory") · \(result.componentCount) components")
+            notify(title: result.coverageComplete ? "Repository SBOM ready" : "Partial repository inventory", body: "\(result.repository) at \(result.resolvedCommit.prefix(12)) was saved with a checksum.\(result.coverageComplete ? "" : " Review the manifest coverage warnings before assessor use.")")
         } catch {
             try? FileManager.default.trashItem(at: destination, resultingItemURL: nil)
             try? FileManager.default.trashItem(at: checksumURL, resultingItemURL: nil)
@@ -871,7 +897,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func exportAssessorPackage() {
-        let allEntries = CaptureHistory.entries(in: captureService.outputDirectory)
+        let allEntries = CaptureHistory.entries(in: captureService.outputDirectory, expectedBinding: preferences.tenantBinding)
         let approved = allEntries.filter { $0.lifecycle.status == .approved }
         guard !approved.isEmpty else { showError(AssessorPackageFailure.noApprovedEvidence); return }
         let frameworks = Array(Set(approved.map { $0.manifest.complianceArea ?? "PCI DSS 4.0.1" })).sorted()
@@ -893,7 +919,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let save = NSSavePanel(); save.title = "Save Assessor Package"; save.allowedContentTypes = [.zip]; save.nameFieldStringValue = "Scopeproof-Assessor-Package-\(ComplianceCatalog.safeFileBase(name.stringValue)).zip"
         guard save.runModal() == .OK, let destination = save.url else { return }
         do {
-            let result = try AssessorPackageExporter.export(entries: selected, completeHistory: allEntries, to: destination, preparedBy: preparedBy.stringValue, packageName: name.stringValue, jiraSettings: preferences.jiraHandoff)
+            let result = try AssessorPackageExporter.export(entries: selected, completeHistory: allEntries, expectedBinding: preferences.tenantBinding, to: destination, preparedBy: preparedBy.stringValue, packageName: name.stringValue, jiraSettings: preferences.jiraHandoff)
             setReady("Exported \(result.evidenceCount) approved evidence items")
             NSWorkspace.shared.activateFileViewerSelecting([result.zipURL, result.checksumURL])
             notify(title: "Assessor package ready", body: "\(result.evidenceCount) approved artifacts were validated and packaged.")
@@ -902,48 +928,218 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func selectBrowser(_ sender: NSMenuItem) { let bundleID = (sender.representedObject as? String).flatMap { $0.isEmpty ? nil : $0 }; if let browser = BrowserChoice.supported.first(where: { $0.bundleIdentifier == bundleID }) { preferences.browser = browser }; rebuildMenu() }
     @objc private func selectDelay(_ sender: NSMenuItem) { preferences.delay = sender.tag; rebuildMenu() }
 
+    @objc private func openAWSCollector() {
+        awsCollectorController.evidenceProvider = { [weak self] in
+            guard let self else { return [] }
+            return CaptureHistory.entries(in: self.captureService.outputDirectory, expectedBinding: self.preferences.tenantBinding)
+        }
+        awsCollectorController.selectionProvider = { [weak self] in
+            guard let self, let data = UserDefaults.standard.data(forKey: "capture.awsCollectorSelection.v1"), data.count <= 32_768,
+                  let selection = try? JSONDecoder().decode(AWSCollectorSelection.self, from: data),
+                  self.preferences.tenantBinding == TenantWorkspaceBinding(tenantID: selection.tenantId, workspaceID: selection.assessmentId) else { return nil }
+            return selection
+        }
+        awsCollectorController.onSelection = { [weak self] selection, context in
+            guard let self, let binding = context.resolvedTenantBinding else { return }
+            self.preferences.autoUpload = false
+            if binding != self.preferences.tenantBinding {
+                self.invalidateS3WorkspaceState(for: binding)
+                self.preferences.tenantBinding = binding
+                self.evidenceSearchController.invalidateForWorkspaceChange()
+                self.rebindLocalConsole(reopen: false)
+            }
+            self.preferences.activeContext = context
+            UserDefaults.standard.set(try? JSONEncoder().encode(selection), forKey: "capture.awsCollectorSelection.v1")
+            self.setReady("AWS device enrolled · assessment selected for local capture")
+            self.rebuildMenu()
+        }
+        awsCollectorController.show()
+    }
+
+    @objc private func openTransferRecovery() {
+        let workspace = preferences.tenantBinding
+        let generation = s3WorkspaceGeneration
+        let root = captureService.outputDirectory
+        let origin = BackendTrust.normalizedOrigin(preferences.serverURL)
+        let settings = preferences.s3Storage
+        let destination = KeychainStore.readS3VerifiedDestination()
+        let jira = preferences.jiraHandoff
+        let fingerprint = [workspace.tenantID, workspace.workspaceID, origin?.absoluteString ?? "", settings.securityBindingDigest, destination?.accountID ?? "", jira.baseURL].joined(separator: "\n")
+        if fingerprint == transferRecoveryFingerprint, let controller = transferRecoveryController { controller.show(); return }
+        transferRecoveryController?.invalidateForWorkspaceChange()
+        let expected: (CaptureHistoryEntry, TransferReceiptKind) -> [String: String]? = { entry, kind in
+            switch kind {
+            case .hosted: return origin.map { ["origin": $0.absoluteString] }
+            case .s3: return destination.map { TransferReceipt.s3Destination(settings, accountID: $0.accountID) }
+            case .jira:
+                guard let origin, let site = jira.validatedBaseURL, let issue = entry.manifest.jiraIssueKey else { return nil }
+                return ["origin": origin.absoluteString, "siteURL": site.absoluteString, "issueKey": issue]
+            }
+        }
+        let verified: (CaptureHistoryEntry, TransferReceiptKind) -> Bool = { [weak self] entry, kind in
+            guard let self, generation == self.s3WorkspaceGeneration, workspace == self.preferences.tenantBinding,
+                  entry.manifest.belongs(to: workspace), let binding = expected(entry, kind) else { return false }
+            return TransferReceipt.isVerified(for: entry, kind: kind, expectedDestination: binding)
+        }
+        let controller = TransferRecoveryController(entries: CaptureHistory.entries(in: root, expectedBinding: workspace),
+            destinationLabel: { kind in
+                switch kind {
+                case .hosted: return origin?.absoluteString ?? "Hosted destination not configured"
+                case .s3: return settings.isConfigured ? "\(settings.bucket) / \(settings.region)" : "S3 destination not configured"
+                case .jira: return jira.baseURL.isEmpty ? "Jira site not configured" : jira.baseURL
+                }
+            }, verified: verified, retry: { [weak self] entry, kind in
+                guard let self, generation == self.s3WorkspaceGeneration, workspace == self.preferences.tenantBinding,
+                      entry.manifest.belongs(to: workspace), !entry.isPayloadArchived else { throw EvidenceArtifactFailure.workspaceMismatch }
+                try Task.checkCancellation()
+                _ = try ValidatedEvidenceArtifact.load(entry, requireLifecycle: true, expectedBinding: workspace)
+                if verified(entry, kind) { return }
+                let capture = Self.captureResult(for: entry)
+                switch kind {
+                case .hosted:
+                    guard let origin, BackendTrust.normalizedOrigin(self.preferences.serverURL) == origin else { throw UploadFailure.invalidServer }
+                    _ = try await self.uploadService.upload(capture, serverURL: origin)
+                case .s3:
+                    guard let destination, self.preferences.s3Storage == settings, settings.isBound(to: workspace),
+                          destination.matches(settings), KeychainStore.readS3VerifiedDestination()?.matches(settings) == true else { throw S3StorageFailure.destinationBindingMismatch }
+                    // Resolve and, when near expiry, refresh STS/Identity Center
+                    // credentials for EACH explicit item attempt, not one batch.
+                    let credentials = try await self.s3CredentialProvider.credentials(for: settings, binding: destination)
+                    try Task.checkCancellation()
+                    guard generation == self.s3WorkspaceGeneration, workspace == self.preferences.tenantBinding,
+                          self.preferences.s3Storage == settings else { throw S3StorageFailure.destinationBindingMismatch }
+                    _ = try await self.s3StorageService.upload(capture, settings: settings, credentials: credentials, binding: destination)
+                case .jira: throw AWSCollectorFailure.invalidSelection
+                }
+                guard verified(entry, kind) else { throw UploadFailure.invalidResponse }
+            }, onReconcileJira: { [weak self] entry in
+                guard let self, generation == self.s3WorkspaceGeneration, workspace == self.preferences.tenantBinding else { return }
+                let alert = NSAlert(); alert.messageText = "Reconcile existing Jira attachments"
+                alert.informativeText = "Compare the intended issue and both exact attachment filenames and sizes before deciding to upload again. This action does not send or replace attachments. An old or unverified receipt is not proof of non-delivery."
+                alert.addButton(withTitle: "Open Intended Jira Issue"); alert.addButton(withTitle: "Cancel")
+                guard alert.runModal() == .alertFirstButtonReturn, let issue = entry.manifest.jiraIssueKey,
+                      let url = jira.issueURL(for: issue) else { return }
+                NSWorkspace.shared.open(url)
+            })
+        transferRecoveryController = controller
+        transferRecoveryFingerprint = fingerprint
+        controller.show()
+    }
+
+    private static func captureResult(for entry: CaptureHistoryEntry) -> CaptureResult {
+        let m = entry.manifest
+        return CaptureResult(imageURL: entry.imageURL, manifestURL: entry.manifestURL, evidenceID: m.evidenceID,
+            context: CaptureContext(sessionID: m.sessionID, sessionName: m.sessionName, controlID: m.controlID, title: m.title,
+                system: m.system, environment: m.environment, assessmentPeriod: m.assessmentPeriod, description: m.description,
+                complianceArea: m.complianceArea, controlTitle: m.controlTitle, customFileName: m.customFileName, evidenceOwner: m.evidenceOwner,
+                tags: m.tags, expectedEvidence: m.expectedEvidence, jiraIssueKey: m.jiraIssueKey, sourceURL: m.sourceURL, tenantID: m.tenantID, workspaceID: m.workspaceID),
+            capturedAt: m.capturedAt, safetyStatus: m.safetyStatus, findings: m.redactionFindings, sha256: m.sha256,
+            chainPreviousHash: m.chainPreviousHash, chainEventHash: m.chainEventHash)
+    }
+
     @objc private func openEvidenceFolder() {
         try? FileManager.default.createDirectory(at: captureService.outputDirectory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         NSWorkspace.shared.open(captureService.outputDirectory)
     }
 
     @objc private func applyRetention() {
-        let alert = NSAlert()
-        alert.messageText = "Apply local retention policy?"
-        alert.informativeText = "Expired local evidence will be moved to Trash only after Scopeproof re-authenticates to S3 and verifies the exact object versions, checksums, KMS key, and unexpired COMPLIANCE Object Lock immediately before deletion. A local receipt alone never authorizes deletion."
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "Move Expired Files to Trash")
-        alert.addButton(withTitle: "Cancel")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard evidenceArchiveTask == nil else { return }
+        let workspace = preferences.tenantBinding
+        let root = captureService.outputDirectory
         let settings = preferences.s3Storage
-        guard settings.securityProfile == .production,
-              settings.retentionMode == .compliance,
-              let destination = KeychainStore.readS3VerifiedDestination(),
-              destination.matches(settings) else {
-            showError(S3StorageFailure.verificationRequired)
-            return
+        guard settings.isBound(to: workspace), settings.securityProfile == .production,
+              settings.retentionMode == .compliance, settings.downloadsAllowed,
+              S3CredentialProvider.hasConfiguredSource(settings),
+              let binding = KeychainStore.readS3VerifiedDestination(), binding.matches(settings) else {
+            showError(EvidenceArchiveFailure.destinationMismatch); return
         }
-        setBusy("Re-verifying exact S3 versions before retention…")
-        Task { @MainActor in
+        let history = CaptureHistory.entries(in: root, expectedBinding: workspace)
+        guard CaptureHistory.captureChainIntegrity(history, expectedBinding: workspace) else {
+            showError(EvidenceArchiveFailure.incompleteHistory); return
+        }
+        let cutoff = Date().addingTimeInterval(-Double(preferences.retentionDays) * 86_400)
+        let candidates = Array(history.filter { !$0.isPayloadArchived && ISO8601DateFormatter().date(from: $0.manifest.capturedAt).map { $0 < cutoff } == true }.prefix(100))
+        guard !candidates.isEmpty else { setReady("No local payloads older than \(preferences.retentionDays) days"); return }
+        let alert = NSAlert()
+        alert.messageText = "Archive up to \(candidates.count) old evidence payloads?"
+        alert.informativeText = "Complete signed review and hold histories and verified receipts will be uploaded to \(settings.bucket). Only each PNG moves to Trash, after every exact S3 version and COMPLIANCE retention is revalidated. Full signed manifests, decisions, receipts, and restore descriptors stay here. Held, legacy-incomplete, or changed evidence is preserved. Restore requires this Mac's existing trust keys, the original workspace location, and S3 access. At most 100 items are processed per confirmed run."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Archive & Move Verified PNGs to Trash")
+        alert.addButton(withTitle: "Keep Local Payloads")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let generation = s3WorkspaceGeneration
+        setBusy("Archiving complete signed histories…")
+        evidenceArchiveTask = Task {
+            var completed = 0
+            var failures: [String] = []
             do {
-                let credentials = try await s3CredentialProvider.credentials(
-                    for: settings, binding: destination
-                )
-                let report = try await CaptureHistory.removeExpired(
-                    in: captureService.outputDirectory,
-                    retentionDays: preferences.retentionDays
-                ) { [s3StorageService] entry in
-                    try await s3StorageService.verifyRemoteDurableCopy(
-                        for: entry, settings: settings, credentials: credentials,
-                        binding: destination
-                    )
+                let credentials = try await s3CredentialProvider.credentials(for: settings, binding: binding)
+                for entry in candidates {
+                    try Task.checkCancellation()
+                    guard generation == s3WorkspaceGeneration, workspace == preferences.tenantBinding else { throw CancellationError() }
+                    do {
+                        _ = try await s3StorageService.archiveHistory(entry: entry, settings: settings, credentials: credentials, binding: binding)
+                        try await LocalEvidenceArchive.expirePayload(for: entry, expectedBinding: workspace,
+                            remoteRevalidator: { record in
+                                try Task.checkCancellation()
+                                return try await self.s3StorageService.revalidateArchive(record, evidenceRoot: root, expectedBinding: workspace,
+                                    settings: settings, credentials: credentials, binding: binding)
+                            }, trashPayload: { imageURL in
+                                try Task.checkCancellation()
+                                guard generation == self.s3WorkspaceGeneration, workspace == self.preferences.tenantBinding else { throw CancellationError() }
+                                try FileManager.default.trashItem(at: imageURL, resultingItemURL: nil)
+                            })
+                        completed += 1
+                    } catch is CancellationError { throw CancellationError() }
+                    catch { failures.append("\(entry.manifest.evidenceID): \(error.localizedDescription)") }
                 }
-                setReady("Moved \(report.movedToTrash) expired capture(s) to Trash; preserved \(report.skippedLegalHold) on hold, \(report.skippedWithoutDurableCopy) without a remotely verified locked copy, and \(report.skippedInvalidEvidence) with invalid evidence")
-            } catch {
-                setReady("Retention stopped without deleting unverified evidence")
-                showError(error)
-            }
+            } catch { failures.append(error.localizedDescription) }
+            guard generation == s3WorkspaceGeneration else { return }
+            evidenceArchiveTask = nil
+            setReady("Archived \(completed) payloads; \(candidates.count - completed) preserved")
+            let result = NSAlert(); result.messageText = "Evidence archive run finished"
+            result.informativeText = "\(completed) verified PNGs moved to Trash; signed history remains local. \(candidates.count - completed) payloads were preserved.\n\n" + failures.prefix(8).joined(separator: "\n")
+            result.runModal(); rebuildMenu()
         }
+        rebuildMenu()
+    }
+
+    @objc private func restoreArchivedEvidence() {
+        guard evidenceArchiveTask == nil else { return }
+        let workspace = preferences.tenantBinding
+        let root = captureService.outputDirectory
+        let settings = preferences.s3Storage
+        guard settings.isBound(to: workspace), settings.downloadsAllowed,
+              S3CredentialProvider.hasConfiguredSource(settings),
+              let binding = KeychainStore.readS3VerifiedDestination(), binding.matches(settings) else {
+            showError(EvidenceArchiveFailure.destinationMismatch); return
+        }
+        let panel = NSOpenPanel(); panel.title = "Restore an original evidence archive"
+        panel.message = "Select its .archive.json in this workspace. The original evidence ID, exact S3 versions, and existing device trust must match. Differing local files will never be overwritten."
+        panel.directoryURL = root; panel.allowedContentTypes = [.json]
+        panel.allowsMultipleSelection = false; panel.canChooseDirectories = false
+        guard panel.runModal() == .OK, let descriptor = panel.url else { return }
+        do { _ = try LocalEvidenceArchive.load(at: descriptor, evidenceRoot: root, expectedBinding: workspace) }
+        catch { showError(error); return }
+        let generation = s3WorkspaceGeneration
+        setBusy("Restoring verified exact S3 versions…")
+        evidenceArchiveTask = Task {
+            do {
+                let credentials = try await s3CredentialProvider.credentials(for: settings, binding: binding)
+                try Task.checkCancellation()
+                let entry = try await s3StorageService.restoreArchive(at: descriptor, evidenceRoot: root, expectedBinding: workspace,
+                    settings: settings, credentials: credentials, binding: binding)
+                guard generation == s3WorkspaceGeneration, workspace == preferences.tenantBinding else { return }
+                setReady("Restored original evidence \(entry.manifest.evidenceID)")
+                NSWorkspace.shared.activateFileViewerSelecting([entry.imageURL])
+            } catch {
+                guard generation == s3WorkspaceGeneration else { return }
+                setReady("Archive restore stopped; existing files preserved"); showError(error)
+            }
+            guard generation == s3WorkspaceGeneration else { return }
+            evidenceArchiveTask = nil; rebuildMenu()
+        }
+        rebuildMenu()
     }
 
     @objc private func toggleLaunchAtLogin(_ sender: NSMenuItem) {
@@ -1035,8 +1231,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let bindingChanged = newBinding != preferences.tenantBinding
         if bindingChanged {
-            let currentEntries = CaptureHistory.entries(in: captureService.outputDirectory)
-            guard !currentEntries.contains(where: { !$0.isUploaded || !$0.isStoredInS3 }) else {
+            let currentEntries = CaptureHistory.entries(in: captureService.outputDirectory, expectedBinding: preferences.tenantBinding)
+            guard !currentEntries.contains(where: { !$0.isPayloadArchived && (!$0.isUploaded || !$0.isStoredInS3) }) else {
                 showError(NSError(domain: "Scopeproof", code: 25, userInfo: [
                     NSLocalizedDescriptionKey: "Finish or explicitly resolve pending uploads in the current customer workspace before switching workspaces."
                 ])); return
@@ -1064,6 +1260,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let reopenLocalConsole = bindingChanged && localConsole.isRunning
         if bindingChanged {
+            evidenceSearchController.invalidateForWorkspaceChange()
             invalidateS3WorkspaceState(for: newBinding)
         }
         preferences.tenantBinding = newBinding

@@ -11,15 +11,18 @@ import {
 } from "../contracts.ts";
 import type { TenantActor } from "../tenancy.ts";
 import type { RdsDataApiExecutor } from "./membership.ts";
+import type { customerAuditActions } from "./customer-contracts.ts";
 
 export type HostedApiAuditAction =
+  | typeof customerAuditActions[number]
   | "evidence.upload_intent_issued"
   | "evidence.search_performed"
   | "evidence.download_intent_issued"
   | "evidence.legal_hold_requested"
-  | "evidence.legal_hold_approved";
+  | "evidence.legal_hold_approved"
+  | "session.all_revoked";
 
-export type HostedApiAuditResourceType = "evidence" | "evidence_collection" | "legal_hold_operation";
+export type HostedApiAuditResourceType = "evidence" | "evidence_collection" | "legal_hold_operation" | "principal" | "device" | "assessment";
 
 export interface HostedApiAuditRecord {
   readonly action: HostedApiAuditAction;
@@ -141,7 +144,10 @@ function normalizeRecord(input: HostedApiAuditRecord): Readonly<{
   const requestId = exactBounded(input.requestId, "Audit request id", 8, 128, /^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$/);
   const idempotencyKey = exactBounded(input.idempotencyKey, "Audit idempotency key", 16, 200);
   let resourceId: string;
-  if (input.action === "evidence.search_performed") {
+  if (input.action === "session.all_revoked") {
+    if (input.resourceType !== "principal" || input.resourceId !== actorUserId) throw invalidResource();
+    resourceId = actorUserId;
+  } else if (input.action === "evidence.search_performed") {
     if (input.resourceType !== "evidence_collection" || input.resourceId !== tenantId) throw invalidResource();
     resourceId = tenantId;
   } else if (input.action === "evidence.upload_intent_issued" || input.action === "evidence.download_intent_issued") {

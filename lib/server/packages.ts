@@ -7,12 +7,14 @@ import { readEvidenceBytes } from "./evidence";
 import { csvCell } from "./csv";
 import {
   PACKAGE_ELIGIBILITY_COUNTS_SQL,
-  PACKAGE_ELIGIBILITY_PUBLISH_FENCE_SQL,
+  PACKAGE_ELIGIBLE_EVIDENCE_SQL,
+  PACKAGE_MAXIMUM_EVIDENCE_BYTES,
   packageEligibilityBindings,
-  packageEligibilityPublishFenceBindings,
   type PackageEligibilityCounts,
 } from "./package-eligibility";
 import { classifyPackagePublication, type ExpectedPackagePublication, type PackagePublicationDisposition, type PackagePublicationState } from "./package-publication-reconciliation";
+import { packagePublicationQuery } from "./package-publication";
+import { loadPackagePlan, type PartitionRequest } from "./package-plan";
 
 export type PackagePreflight = {
   ready: boolean;
@@ -20,6 +22,9 @@ export type PackagePreflight = {
   total: number;
   eligible: number;
   excluded: number;
+  eligibleBytes: number;
+  maximumBytes: number;
+  outOfScope: number;
   blockers: Array<{ code: string; count: number; message: string }>;
 };
 
@@ -68,14 +73,16 @@ export async function preflightAssessorPackage(assessmentId: string): Promise<Pa
   const counts = await packageEligibilityCounts(assessmentId, now);
   const total = Number(counts?.total || 0);
   const eligible = Number(counts?.eligible || 0);
+  const eligibleBytes = Number(counts?.eligible_bytes || 0);
   const blockers: PackagePreflight["blockers"] = [];
   if (assessment.status === "draft") blockers.push({ code: "ASSESSMENT_DRAFT", count: 1, message: "Activate or close the assessment before export." });
   if (!eligible) blockers.push({ code: "NO_ELIGIBLE_EVIDENCE", count: 0, message: "No approved, current, complete evidence is eligible." });
   if (eligible > 100) blockers.push({ code: "PACKAGE_LIMIT", count: eligible, message: "The package limit is 100 artifacts; split scope explicitly." });
+  if (eligibleBytes > PACKAGE_MAXIMUM_EVIDENCE_BYTES) blockers.push({ code: "PACKAGE_BYTES_LIMIT", count: eligibleBytes, message: "Eligible evidence exceeds the 25 MiB package limit. Use Large assessment handoff to plan all parts; evidence will not be truncated." });
   if (Number(counts?.partial || 0)) blockers.push({ code: "PARTIAL_COVERAGE", count: Number(counts?.partial || 0), message: "Recollect partial-coverage evidence." });
   if (Number(counts?.pending_safety || 0)) blockers.push({ code: "SAFETY_PENDING", count: Number(counts?.pending_safety || 0), message: "Complete independent screenshot safety verification." });
   if (Number(counts?.pending_native || 0)) blockers.push({ code: "PROVENANCE_PENDING", count: Number(counts?.pending_native || 0), message: "Finalize native device provenance." });
-  return { ready: blockers.length === 0, assessmentId, total, eligible, excluded: total - eligible, blockers };
+  return { ready: blockers.length === 0, assessmentId, total, eligible, excluded: total - eligible, eligibleBytes, maximumBytes: PACKAGE_MAXIMUM_EVIDENCE_BYTES, outOfScope: Number(counts?.out_of_scope || 0), blockers };
 }
 
 function safeName(value: string): string {
@@ -119,16 +126,19 @@ function buildPdf(lines: string[]): Uint8Array {
   return strToU8(pdf);
 }
 
-export async function buildAssessorPackage(actor: AuthenticatedUser, assessmentId: string): Promise<PackageBuildResult> {
+export async function buildAssessorPackage(actor: AuthenticatedUser, assessmentId: string, partition?: PartitionRequest): Promise<PackageBuildResult> {
   const env = getEnv();
   if (!/^asm_[a-f0-9]{32}$/.test(assessmentId)) throw new Response(JSON.stringify({ error: "A valid assessment is required." }), { status: 400, headers: { "content-type": "application/json" } });
   const assessment = await env.DB.prepare("SELECT id, name, framework, period_start, period_end, systems_json, controls_json, status, updated_at FROM assessments WHERE id = ?").bind(assessmentId).first<Record<string, unknown>>();
   if (!assessment || assessment.status === "draft") throw new Response(JSON.stringify({ error: "Only active or closed assessments can be exported." }), { status: 409, headers: { "content-type": "application/json" } });
+  const plan = partition ? await loadPackagePlan(assessmentId) : null;
+  const part = plan?.parts.find((item) => item.index === partition?.index);
+  if (partition && (!part || plan?.digest !== partition.digest || plan.assessment.updated_at !== assessment.updated_at)) throw new Response(JSON.stringify({ error: "The package selection changed. Generate a new plan and rebuild its parts; do not mix plan digests." }), { status: 409 });
   const id = randomId("pkg");
   let pendingR2Key: string | null = null;
   let expectedPublication: ExpectedPackagePublication | null = null;
   let completedResult: PackageBuildResult | null = null;
-  const selection = { assessmentId, name: assessment.name, framework: assessment.framework, periodStart: assessment.period_start, periodEnd: assessment.period_end, systems: JSON.parse(String(assessment.systems_json || "[]")), controls: JSON.parse(String(assessment.controls_json || "[]")), inclusion: "approved, unexpired, complete coverage" };
+  const selection = { assessmentId, name: assessment.name, framework: assessment.framework, periodStart: assessment.period_start, periodEnd: assessment.period_end, systems: JSON.parse(String(assessment.systems_json || "[]")), controls: JSON.parse(String(assessment.controls_json || "[]")), inclusion: "approved, unexpired, complete coverage", ...(plan && part ? { partition: { planDigest: plan.digest, index: part.index, parts: plan.parts.length, totalEligible: plan.eligible } } : {}) };
   await executeAuditedBatch(actor, "package.requested", "export_package", id, selection, [
     env.DB.prepare("INSERT INTO export_packages (id, requested_by, assessment_id, selection_json) VALUES (?, ?, ?, ?)").bind(id, actor.id, assessmentId, stableJson(selection)),
   ]);
@@ -141,23 +151,15 @@ export async function buildAssessorPackage(actor: AuthenticatedUser, assessmentI
     if (Number(counts?.pending_safety || 0) > 0) throw new Error("Assessment contains screenshot evidence without an independent digest-bound server safety receipt. Recollect browser evidence or retry the original device upload before export.");
     if (Number(counts?.pending_native || 0) > 0) throw new Error("Assessment contains native evidence whose signed device-chain link is not finalized. Retry those uploads before export.");
     if (Number(counts?.partial || 0) > 0) throw new Error("Assessment contains partial-coverage evidence. Recollect it completely before export.");
-    if (eligibleCount > 100) throw new Error(`Assessment contains ${eligibleCount} eligible artifacts, exceeding the 100-artifact package limit. Split the assessment scope explicitly; Scopeproof will not truncate it.`);
+    if (!part && eligibleCount > 100) throw new Error(`Assessment contains ${eligibleCount} eligible artifacts. Generate an explicit partition plan; Scopeproof will not truncate it.`);
+    if (!part && Number(counts?.eligible_bytes || 0) > PACKAGE_MAXIMUM_EVIDENCE_BYTES) throw new Error("Approved evidence exceeds the 25 MB package safety limit. Generate an explicit partition plan.");
     const rows = (await env.DB.prepare(`SELECT e.id, e.control_id, e.framework, e.catalog_version, e.title, e.description, e.type, e.source, e.system, e.environment, e.assessment_period, e.evidence_owner, e.tags_json, e.expected_evidence, e.mapped_controls_json, e.jira_issue_key, e.jira_issue_url, e.content_type, e.byte_size, e.sha256, e.captured_at, o.expires_at, e.redaction_count, e.manual_redactions, e.safety_scan_sha256, e.safety_scan_policy, e.safety_scan_completed_at, e.server_safety_scan_sha256, e.server_safety_scan_policy, e.server_safety_scan_completed_at, e.server_safety_scanner_origin, e.server_safety_receipt_sha256, o.approved_by, o.approved_at, o.coverage_status, o.coverage_json, o.id AS occurrence_id, o.received_at AS occurrence_received_at
       FROM evidence_artifacts e JOIN evidence_occurrences o ON o.id = (
         SELECT latest.id FROM evidence_occurrences latest WHERE latest.artifact_id = e.id ORDER BY latest.received_at DESC, latest.id DESC LIMIT 1
-      ) WHERE e.assessment_id = ? AND o.status = 'approved' AND o.expires_at > ? AND o.coverage_status != 'partial'
-        AND (e.type != 'screenshot' OR (
-          e.server_safety_scan_sha256 = e.sha256 AND e.server_safety_scan_policy IS NOT NULL AND e.server_safety_scan_completed_at IS NOT NULL
-          AND e.server_safety_scanner_origin IS NOT NULL AND e.server_safety_receipt_sha256 IS NOT NULL
-        ))
-        AND (e.device_id IS NULL OR EXISTS (
-          SELECT 1 FROM native_evidence_manifests n JOIN capture_devices d ON d.id = n.device_id
-          WHERE n.artifact_id = e.id AND n.device_id = e.device_id AND n.image_sha256 = e.sha256 AND n.manifest_sha256 = e.manifest_sha256
-            AND n.chain_sequence IS NOT NULL AND n.chain_sequence > 0 AND n.chain_event_hash = e.chain_event_hash
-            AND n.provenance_key_id IS NOT NULL AND d.provenance_key_id = n.provenance_key_id AND d.chain_sequence >= n.chain_sequence
-        ))
-      ORDER BY e.control_id, o.captured_at DESC, e.id`).bind(assessmentId, generatedAt).all<Record<string, unknown>>()).results;
-    if (rows.length !== eligibleCount) throw new Error("Assessment evidence changed while the package was being selected. Retry the export.");
+      ) WHERE e.assessment_id = ? AND ${PACKAGE_ELIGIBLE_EVIDENCE_SQL}
+      ${part ? "AND e.id IN (SELECT value FROM json_each(?))" : ""}
+      ORDER BY e.control_id, o.captured_at DESC, e.id`).bind(assessmentId, generatedAt, ...(part ? [stableJson(part.evidenceIds)] : [])).all<Record<string, unknown>>()).results;
+    if (rows.length !== (part?.evidenceIds.length ?? eligibleCount)) throw new Error("Assessment evidence changed while the package was being selected. Retry the export.");
     if (!rows.length) throw new Error("No approved evidence is available for export.");
     const files: Record<string, Uint8Array> = {};
     let totalEvidenceBytes = 0;
@@ -165,7 +167,7 @@ export async function buildAssessorPackage(actor: AuthenticatedUser, assessmentI
       const artifact = await readEvidenceBytes(String(row.id));
       if (!artifact) throw new Error(`Approved evidence ${String(row.id)} is missing its encrypted artifact.`);
       totalEvidenceBytes += artifact.bytes.byteLength;
-      if (totalEvidenceBytes > 25 * 1024 * 1024) throw new Error("Approved evidence exceeds the 25 MB package safety limit.");
+      if (totalEvidenceBytes > PACKAGE_MAXIMUM_EVIDENCE_BYTES) throw new Error("Approved evidence exceeds the 25 MB package safety limit.");
       files[`evidence/${safeName(String(row.framework || "PCI DSS 4.0.1"))}/${safeName(String(row.control_id))}/${String(row.id)}-${safeName(String(row.title))}.${extension(String(row.content_type))}`] = artifact.bytes;
     }
     const frameworks = [...new Set(rows.map((row) => String(row.framework || "PCI DSS 4.0.1")))].sort();
@@ -184,6 +186,10 @@ export async function buildAssessorPackage(actor: AuthenticatedUser, assessmentI
       ...rows.map((row: Record<string, unknown>) => `${String(row.framework || "PCI DSS 4.0.1").slice(0, 18)} | ${row.control_id} | ${row.id} | ${String(row.title).slice(0, 36)}`),
     ];
     files["assessor-report.pdf"] = buildPdf(reportLines);
+    if (plan && part) {
+      files["partition-plan.json"] = strToU8(JSON.stringify(plan, null, 2));
+      files["00-READ-ME.txt"] = strToU8(new TextDecoder().decode(files["00-READ-ME.txt"]) + `\nPART ${part.index} OF ${plan.parts.length} — NOT A COMPLETE ASSESSMENT PACKAGE BY ITSELF\nPlan SHA-256: ${plan.digest}\nCollect every numbered part with this exact plan digest. The signed manifest and partition-plan.json enumerate every eligible artifact exactly once and explain exclusions. Do not combine parts from different plans.\n`);
+    }
     const evidence = rows.map((row) => {
       const { tags_json: tagsJson, mapped_controls_json: mappedControlsJson, coverage_json: coverageJson, ...signedFields } = row;
       return {
@@ -194,7 +200,7 @@ export async function buildAssessorPackage(actor: AuthenticatedUser, assessmentI
         coverage: JSON.parse(String(coverageJson || "{}")),
       };
     });
-    const manifest = { schemaVersion: 4, packageId: id, assessment: selection, frameworks, assessmentPeriods: periods, generatedAt, generatedBy: actor.email, selectionCounts: { total: totalCount, included: rows.length, excluded: excludedCount }, inclusionPolicy: { status: "approved", coverage: "complete_or_not_applicable", expiration: `after:${generatedAt}`, maximumArtifacts: 100, truncation: "forbidden" }, readme: { filename: "00-READ-ME.txt", sha256: await sha256(files["00-READ-ME.txt"]) }, report: { filename: "assessor-report.pdf", sha256: await sha256(files["assessor-report.pdf"]) }, index: { filename: "01-Evidence-Index.csv", sha256: await sha256(files["01-Evidence-Index.csv"]) }, jiraHandoff: { filename: "02-Jira-Handoff.txt", sha256: await sha256(files["02-Jira-Handoff.txt"]) }, evidence };
+    const manifest = { schemaVersion: 4, packageId: id, assessment: selection, frameworks, assessmentPeriods: periods, generatedAt, generatedBy: actor.email, selectionCounts: { total: totalCount, included: rows.length, excluded: excludedCount, ...(plan ? { assignedToOtherParts: eligibleCount - rows.length, eligibleAcrossAllParts: eligibleCount } : {}) }, inclusionPolicy: { status: "approved", coverage: "complete_or_not_applicable", expiration: `after:${generatedAt}`, maximumArtifacts: 100, truncation: "forbidden" }, readme: { filename: "00-READ-ME.txt", sha256: await sha256(files["00-READ-ME.txt"]) }, report: { filename: "assessor-report.pdf", sha256: await sha256(files["assessor-report.pdf"]) }, index: { filename: "01-Evidence-Index.csv", sha256: await sha256(files["01-Evidence-Index.csv"]) }, jiraHandoff: { filename: "02-Jira-Handoff.txt", sha256: await sha256(files["02-Jira-Handoff.txt"]) }, ...(plan ? { partitionPlan: { filename: "partition-plan.json", sha256: await sha256(files["partition-plan.json"]), digest: plan.digest } } : {}), evidence };
     const manifestCanonical = stableJson(manifest);
     const signed = await signPackage(manifestCanonical);
     const signature = signed.signature;
@@ -215,30 +221,13 @@ export async function buildAssessorPackage(actor: AuthenticatedUser, assessmentI
       encryptionKeyId: encrypted.keyId, byteSize: zip.byteLength, completedAt, expiresAt,
     };
     completedResult = { id, evidenceCount: rows.length, excludedCount, sha256: digest, signature };
-    const occurrenceConditions = rows.map(() => `EXISTS (SELECT 1 FROM evidence_occurrences selected
-      WHERE selected.id = ? AND selected.artifact_id = ? AND selected.status = 'approved' AND selected.expires_at > ? AND selected.coverage_status != 'partial'
-        AND selected.id = (SELECT latest.id FROM evidence_occurrences latest WHERE latest.artifact_id = selected.artifact_id ORDER BY latest.received_at DESC, latest.id DESC LIMIT 1)
-        AND EXISTS (SELECT 1 FROM evidence_artifacts e WHERE e.id = selected.artifact_id
-          AND (e.type != 'screenshot' OR (
-            e.server_safety_scan_sha256 = e.sha256 AND e.server_safety_scan_policy IS NOT NULL AND e.server_safety_scan_completed_at IS NOT NULL
-            AND e.server_safety_scanner_origin IS NOT NULL AND e.server_safety_receipt_sha256 IS NOT NULL
-          ))
-          AND (e.device_id IS NULL OR EXISTS (
-          SELECT 1 FROM native_evidence_manifests n JOIN capture_devices d ON d.id = n.device_id
-          WHERE n.artifact_id = e.id AND n.device_id = e.device_id AND n.image_sha256 = e.sha256 AND n.manifest_sha256 = e.manifest_sha256
-            AND n.chain_sequence IS NOT NULL AND n.chain_sequence > 0 AND n.chain_event_hash = e.chain_event_hash
-            AND n.provenance_key_id IS NOT NULL AND d.provenance_key_id = n.provenance_key_id AND d.chain_sequence >= n.chain_sequence
-        ))))`).join(" AND ");
-    const occurrenceBindings = rows.flatMap((row) => [row.occurrence_id, row.id, completedAt]);
+    const publicationQuery = packagePublicationQuery({
+      id, assessmentId, assessmentStatus: String(assessment.status), assessmentUpdatedAt: String(assessment.updated_at),
+      publication: expectedPublication, occurrences: rows.map((row) => ({ artifactId: String(row.id), occurrenceId: String(row.occurrence_id) })),
+      totalCount, eligibleCount, ...(plan ? { snapshotJson: stableJson(plan.snapshot) } : {}),
+    });
     const [published] = await executeAuditedBatch(actor, "package.created", "export_package", id, { evidenceCount: rows.length, occurrenceIds: rows.map((row) => row.occurrence_id), sha256: digest, byteSize: zip.byteLength, expiresAt }, [
-      env.DB.prepare(`UPDATE export_packages SET status = 'ready', r2_key = ?, sha256 = ?, signature = ?, evidence_count = ?, excluded_count = ?, encryption_key_id = ?, byte_size = ?, completed_at = ?, expires_at = ?, error_message = NULL
-        WHERE id = ? AND status = 'building'
-          AND EXISTS (SELECT 1 FROM assessments WHERE id = ? AND status = ? AND updated_at = ?)
-          AND ${occurrenceConditions}
-          AND ${PACKAGE_ELIGIBILITY_PUBLISH_FENCE_SQL}`)
-        .bind(r2Key, digest, signature, rows.length, excludedCount, encrypted.keyId, zip.byteLength, completedAt, expiresAt, id,
-          assessmentId, assessment.status, assessment.updated_at, ...occurrenceBindings,
-          ...packageEligibilityPublishFenceBindings(assessmentId, completedAt, totalCount, rows.length)),
+      env.DB.prepare(publicationQuery.sql).bind(...publicationQuery.bindings),
     ], { sql: "EXISTS (SELECT 1 FROM export_packages WHERE id = ? AND status = 'ready' AND sha256 = ?)", bindings: [id, digest] });
     if (!published.meta.changes) throw new Error("Assessment scope or evidence approval changed while the package was being built. Retry the export.");
     pendingR2Key = null;

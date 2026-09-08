@@ -16,6 +16,7 @@ import {
 import { RecoveryStack } from "../lib/recovery-stack";
 import { SharedPlatformStack } from "../lib/shared-platform-stack";
 import { TenantStack } from "../lib/tenant-stack";
+import { DatabaseBootstrapStack } from "../lib/database-bootstrap-stack";
 
 const app = new App();
 const rootDomain = validateRootDomain(app.node.tryGetContext("rootDomain"));
@@ -87,6 +88,7 @@ if (recovery.mode === "bootstrap") {
   const tenantStacks: TenantStack[] = [];
   for (const tenant of tenants) {
     const stack = new TenantStack(app, `ScopeproofTenant-${tenant.slug}`, {
+      bootstrapMappingRevision: Number(app.node.tryGetContext("bootstrapMappingRevision") ?? 1),
       env,
       rootDomain,
       tenant,
@@ -99,7 +101,14 @@ if (recovery.mode === "bootstrap") {
     tenantStacks.push(stack);
   }
 
+  if (tenantStacks.length) new DatabaseBootstrapStack(app, "ScopeproofDatabaseBootstrap", {
+    env, shared, sources: tenantStacks.map((tenant) => tenant.databaseBootstrapSource),
+    operatorPrincipalArn: String(app.node.tryGetContext("databaseBootstrapOperatorPrincipalArn") ?? ""),
+    approverPrincipalArn: String(app.node.tryGetContext("databaseBootstrapApproverPrincipalArn") ?? ""),
+    description: "Separate operator-approved database/role preparation; no tenant invoker",
+  });
   const observability = new ObservabilityStack(app, "ScopeproofObservability", {
+    recovery,
     env,
     shared,
     tenants: tenantStacks,

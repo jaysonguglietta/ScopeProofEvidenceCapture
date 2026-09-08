@@ -190,7 +190,7 @@ enum LocalConsoleAssets {
         if(item.localAvailable){ image=node('img'); image.loading='lazy'; image.alt=`Screenshot preview for ${item.title}`; protectedImage(image,`/api/evidence/${encodeURIComponent(item.evidenceID)}/image`).catch(()=>{image.alt='Preview unavailable';}); }
         else {
           image=node('div','s3-placeholder'); const icon=node('span','', '☁');
-          image.append(icon,node('strong','', 'Stored in S3'),node('small','',item.s3PreviewAvailable?'Load this screenshot only when needed':'Validated S3 previews are disabled in the app configuration'));
+          image.append(icon,node('strong','', item.payloadArchived?'Archived payload':'Stored in S3'),node('small','',item.payloadArchived?'Signed history is preserved locally. Use the Capture menu → Restore Archived Evidence… before preview or export.':item.s3PreviewAvailable?'Load this screenshot only when needed':'Validated S3 previews are disabled in the app configuration'));
           if(item.s3PreviewAvailable){ const load=node('button','preview-button','Load secure preview'); load.type='button'; load.addEventListener('click',()=>{ load.disabled=true;load.textContent='Loading…';const preview=node('img');preview.alt=`S3 screenshot preview for ${item.title}`;preview.addEventListener('load',()=>image.replaceWith(preview),{once:true});protectedImage(preview,`/api/evidence/${encodeURIComponent(item.evidenceID)}/s3-image`).catch(()=>{load.disabled=false;load.textContent='Try preview again';showNotice('The S3 preview could not be loaded. Verify the AWS session and download permissions.',true);}); }); image.append(load); }
         }
         const body=node('div','card-body'); const kicker=node('div','card-kicker');

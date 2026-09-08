@@ -53,11 +53,6 @@ BEGIN
     signer_role
   );
 
-  EXECUTE format('ALTER ROLE %I SET search_path = pg_catalog, scopeproof', signer_role);
-  EXECUTE format('ALTER ROLE %I SET row_security = on', signer_role);
-  EXECUTE format('ALTER ROLE %I SET statement_timeout = %L', signer_role, '15s');
-  EXECUTE format('ALTER ROLE %I SET lock_timeout = %L', signer_role, '3s');
-  EXECUTE format('ALTER ROLE %I SET idle_in_transaction_session_timeout = %L', signer_role, '15s');
 END;
 $$;
 

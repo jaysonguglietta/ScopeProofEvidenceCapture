@@ -94,6 +94,15 @@ One-time work has `max_attempts = 1`. If the request fails or its lease expires,
 
 ## Bounded operations
 
+September 8 adds independent domain loading/backoff, assessment-bound schedules,
+audited queue-write fences, versioned requirements, exact-occurrence finding
+resolution and full-plan package publication fences. The native app adds
+workspace-bound readers, device-sealed transfer responses, complete-history
+archives/same-Mac restore and approved-tenant AWS submission. The separate
+static Cognito portal does not reuse the Sites dispatcher or D1/R2 backend.
+See the [implementation ledger](READINESS_IMPLEMENTATION_STATUS.md) and
+[AWS portal architecture](AWS_CUSTOMER_PORTAL.md) for boundaries and limits.
+
 - Provider inventories, zones, branch-protection checks, URLs, retries, and due jobs are capped.
 - Hosted repository SBOMs cap the compressed ZIP at 20 MB, archive entries at 5,000, selected manifests at 100 and 8 MB total, each manifest at 2 MB and 100:1 decompression, unique components at 5,000, generation at ten requests per user per hour, and due-job processing at three jobs per scheduler pass. Native generation caps the Git tree response at 8 MB/5,000 entries, selects at most 100 manifests at 2 MB each/8 MB total, emits at most 5,000 components, and permits one non-retrying run at a time.
 - Native screenshot and manifest request sizes are capped and only PNG evidence with a valid schema-8 provenance signature, exact configured tenant/workspace, exact device-chain successor, trusted timestamp, and independent server safety receipt is accepted for hosted use.
@@ -102,4 +111,4 @@ One-time work has `max_attempts = 1`. If the request fails or its lease expires,
 - Retry orchestration uses at most three attempts with bounded exponential backoff; authentication and unsafe-content failures do not retry automatically.
 - The production native updater admits at most 10,000 ZIP entries, 1,024 UTF-8 path bytes per entry, 512 MiB actually expanded per file, 1 GiB actually expanded total, and a 200:1 per-entry and aggregate compression ratio. Before extraction it strictly reconciles central/local headers and data descriptors, streams stored/raw-deflate bytes to verify actual size and CRC-32, and rejects overlapping records, unsafe/ambiguous paths, and non-ordinary files. It repeats bounds after extraction and requires the verified expanded total plus 256 MiB reported free capacity. Release subprocesses permit 180 seconds and 1 MiB each of stdout and stderr; unknown capacity, cancellation, timeout, output overflow, or any validation failure terminates the operation and fails closed.
 
-The D1 schema boundary for this architecture is `drizzle/0028_native_reconciliation_cursor.sql`. `npm run db:verify` must pass against fresh and populated fixtures before application deployment; it replays every migration in journal order and checks the native chain, sparse reconciliation queue and cursor state, immutable checkpoint, atomic checkpoint-retry, quarantine, independent-image-safety, explicit-scope, review-event, finding, and two-person hold-release invariants. See the [2026-09-01 remediation status](SECURITY_REMEDIATION_2026-09-01.md) for the source-versus-deployment boundary.
+The D1 schema boundary for this architecture is `drizzle/0031_brave_silver_fox.sql`. `npm run db:verify` must pass against fresh and populated fixtures before application deployment; it replays every migration in journal order and checks the native chain, sparse reconciliation queue and cursor state, immutable checkpoint, atomic checkpoint-retry, quarantine, independent-image-safety, explicit-scope, review-event, finding, and two-person hold-release invariants. See the [2026-09-01 remediation status](SECURITY_REMEDIATION_2026-09-01.md) for the source-versus-deployment boundary.

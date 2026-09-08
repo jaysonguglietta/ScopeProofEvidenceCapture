@@ -48,11 +48,9 @@ BEGIN
     legal_api_role
   );
 
-  EXECUTE format('ALTER ROLE %I SET search_path = pg_catalog, scopeproof', legal_api_role);
-  EXECUTE format('ALTER ROLE %I SET row_security = on', legal_api_role);
-  EXECUTE format('ALTER ROLE %I SET statement_timeout = %L', legal_api_role, '15s');
-  EXECUTE format('ALTER ROLE %I SET lock_timeout = %L', legal_api_role, '3s');
-  EXECUTE format('ALTER ROLE %I SET idle_in_transaction_session_timeout = %L', legal_api_role, '15s');
+  EXECUTE format('GRANT EXECUTE ON FUNCTION scopeproof.resolve_active_session_membership(text, timestamptz) TO %I', legal_api_role);
+  EXECUTE format('GRANT EXECUTE ON FUNCTION scopeproof.customer_legal_hold_target(text, timestamptz, scopeproof.resource_identifier, integer) TO %I', legal_api_role);
+  EXECUTE format('GRANT EXECUTE ON FUNCTION scopeproof.customer_legal_hold_status(text, timestamptz, scopeproof.resource_identifier) TO %I', legal_api_role);
 END;
 $$;
 

@@ -44,12 +44,14 @@ import {
 import { primaryEvidenceBucketName, RecoveryConfiguration } from "./recovery-config";
 import { configureEvidenceRecovery } from "./recovery-support";
 import { SharedPlatformStack } from "./shared-platform-stack";
+import type { TenantDatabaseBootstrapSource } from "./database-bootstrap-mapping";
 
 export interface TenantStackProps extends StackProps {
   readonly rootDomain: string;
   readonly tenant: TenantDefinition;
   readonly shared: SharedPlatformStack;
   readonly recovery: RecoveryConfiguration;
+  readonly bootstrapMappingRevision?: number;
 }
 
 export class TenantStack extends Stack {
@@ -57,6 +59,7 @@ export class TenantStack extends Stack {
   public readonly ingestBucket: s3.Bucket;
   public readonly ingestDeadLetterQueue: sqs.Queue;
   public readonly provisioningStateMachine: sfn.StateMachine;
+  public readonly databaseBootstrapSource: TenantDatabaseBootstrapSource;
 
   public constructor(scope: Construct, id: string, props: TenantStackProps) {
     super(scope, id, props);
@@ -74,6 +77,9 @@ export class TenantStack extends Stack {
     const legalApiDatabaseUsername = databaseIdentifiers.legalApiUsername;
     const readDatabaseUsername = databaseIdentifiers.readUsername;
     const databaseOwner = databaseIdentifiers.ownerUsername;
+    const provisioningDatabaseUsername = `tenant_${tenant.id.slice(4)}_provisioner`;
+    const bootstrapMappingRevision = props.bootstrapMappingRevision ?? 1;
+    if (!Number.isSafeInteger(bootstrapMappingRevision) || bootstrapMappingRevision < 1 || bootstrapMappingRevision > 1_000_000) throw new Error("Invalid bootstrap mapping revision.");
     const concurrency = validateTenantLambdaConcurrencyBudget(
       defaultTenantLambdaConcurrencyBudget,
       props.recovery.deploymentEnvironment,
@@ -101,6 +107,10 @@ export class TenantStack extends Stack {
           shared.oauthScopes.evidenceRead,
           shared.oauthScopes.evidenceCollect,
           shared.oauthScopes.retentionManage,
+          shared.oauthScopes.tenantManage,
+          shared.oauthScopes.deviceManage,
+          shared.oauthScopes.jobsManage,
+          shared.oauthScopes.evidenceApprove,
         ],
       },
       preventUserExistenceErrors: true,
@@ -256,6 +266,13 @@ export class TenantStack extends Stack {
       removalPolicy: RemovalPolicy.RETAIN,
     });
 
+    const provisioningDatabaseSecret = new secretsmanager.Secret(this, "TenantProvisioningDatabaseSecret", {
+      description: `Own-database-only provisioning login for ${tenant.id}; no cluster or role administration`,
+      encryptionKey: tenantSecretKey,
+      generateSecretString: { excludePunctuation: true, generateStringKey: "password", passwordLength: 40,
+        secretStringTemplate: JSON.stringify({ database: databaseIdentifier, username: provisioningDatabaseUsername }) },
+      removalPolicy: RemovalPolicy.RETAIN,
+    });
     const databaseSecret = new secretsmanager.Secret(this, "TenantDatabaseSecret", {
       description: `Database credentials reserved for ${tenant.id}`,
       encryptionKey: tenantSecretKey,
@@ -339,6 +356,21 @@ export class TenantStack extends Stack {
         }),
       },
       removalPolicy: RemovalPolicy.RETAIN,
+    });
+    const bootstrapRoles = [
+      { kind: "provisioning", username: provisioningDatabaseUsername, secret: provisioningDatabaseSecret },
+      { kind: "runtime", username: databaseUsername, secret: databaseSecret },
+      { kind: "ingest", username: ingestDatabaseUsername, secret: ingestDatabaseSecret },
+      { kind: "control", username: controlDatabaseUsername, secret: controlDatabaseSecret },
+      { kind: "legalApi", username: legalApiDatabaseUsername, secret: legalApiDatabaseSecret },
+      { kind: "read", username: readDatabaseUsername, secret: readDatabaseSecret },
+      { kind: "apiAudit", username: auditSignerDatabaseUsername, secret: auditSignerDatabaseSecret },
+    ];
+    this.databaseBootstrapSource = Object.freeze({
+      mapping: { schemaVersion: 1 as const, tenantId: tenant.id, revision: bootstrapMappingRevision, account: this.account, region: this.region,
+        clusterArn: shared.databaseCluster.clusterArn, databaseName: databaseIdentifier, ownerUsername: databaseOwner,
+        roles: bootstrapRoles.map(({ kind, username, secret }) => ({ kind, username, secretArn: secret.secretArn })) },
+      secrets: bootstrapRoles.map(({ secret }) => secret),
     });
     const uploadIdempotencySecret = new secretsmanager.Secret(this, "TenantUploadIdempotencySecret", {
       description: `Server-only HMAC material for retry-safe upload intents in ${tenant.id}`,
@@ -1127,6 +1159,8 @@ export class TenantStack extends Stack {
     me.addMethod("GET", integration, readAuthorization);
     const collector = version.addResource("collector");
     collector.addResource("me").addMethod("GET", integration, collectAuthorization);
+    version.addResource("sessions").addResource("revoke").addMethod("POST", integration, readAuthorization);
+    collector.addResource("sessions").addResource("revoke").addMethod("POST", integration, collectAuthorization);
     const uploadIntents = version.addResource("upload-intents");
     const uploadModel = api.addModel("UploadIntentRequestModel", {
       contentType: "application/json",
@@ -1250,6 +1284,33 @@ export class TenantStack extends Stack {
       }),
     });
     const legalHoldRequests = version.addResource("legal-hold-requests");
+    const customer = version.addResource("customer");
+    const customerResources = new Map<string, apigateway.IResource>();
+    const customerRoute = (route: string): apigateway.IResource => {
+      let resource: apigateway.IResource = customer;
+      let current = "";
+      for (const part of route.split("/")) {
+        current += `/${part}`;
+        const prior = customerResources.get(current);
+        resource = prior ?? resource.addResource(part);
+        customerResources.set(current, resource);
+      }
+      return resource;
+    };
+    // Explicit routes only. Runtime checks the same route-specific scope,
+    // tenant client, auth_time and SQL membership independently.
+    for (const [route, scopes] of [
+      ["members/search", ["tenant.manage"]], ["invitations", ["tenant.manage"]], ["members/update", ["tenant.manage"]],
+      ["devices/search", ["device.manage"]], ["devices/revoke", ["device.manage"]], ["devices/enroll", ["evidence.collect"]],
+      ["assessments/search", ["evidence.read"]], ["collector-assessments/search", ["evidence.collect"]],
+      ["assessments/create", ["jobs.manage"]], ["assessments/update", ["jobs.manage"]],
+      ["evidence/status", ["evidence.read"]], ["collector-evidence/status", ["evidence.collect"]], ["evidence/review", ["evidence.approve"]],
+      ["invitations/accept", ["evidence.read", "evidence.collect"]],
+    ] as const) customerRoute(route).addMethod("POST", integration, {
+      authorizationType: apigateway.AuthorizationType.COGNITO, authorizer: cognitoAuthorizer,
+      authorizationScopes: scopes.map((scope) => `scopeproof/${scope}`),
+    });
+    for (const route of ["by-evidence", "status"]) legalHoldRequests.addResource(route).addMethod("POST", legalHoldIntegration, retentionAuthorization);
     const legalHoldRequestModel = api.addModel("LegalHoldRequestModel", {
       contentType: "application/json",
       modelName: `Scopeproof${tenant.slug.replaceAll("-", "")}LegalHoldRequest`,
@@ -1366,10 +1427,6 @@ export class TenantStack extends Stack {
       alarm.addAlarmAction(new cloudwatchActions.SnsAction(shared.operationsTopic));
     }
 
-    const databaseAdminSecret = shared.databaseCluster.secret;
-    if (!databaseAdminSecret) {
-      throw new Error("The shared database cluster must expose an administrator secret.");
-    }
     const provisionerLogGroup = new logs.LogGroup(this, "TenantProvisionerLogs", {
       encryptionKey: tenantKey,
       removalPolicy: RemovalPolicy.RETAIN,
@@ -1385,7 +1442,7 @@ export class TenantStack extends Stack {
             const databaseOutput = `${outputDir}/database`;
             return [
               `mkdir -p "${databaseOutput}"`,
-              ...["001_tenant_schema.sql", "002_runtime_role.sql", "003_ingest_role.sql", "004_evidence_control_role.sql", "005_legal_hold_api_role.sql", "006_evidence_access_api.sql", "007_evidence_read_role.sql", "008_api_audit_signer_role.sql", "009_runtime_hardening.sql"].map(
+              ...["001_tenant_schema.sql", "002_runtime_role.sql", "003_ingest_role.sql", "004_evidence_control_role.sql", "005_legal_hold_api_role.sql", "006_evidence_access_api.sql", "007_evidence_read_role.sql", "008_api_audit_signer_role.sql", "009_runtime_hardening.sql", "010_session_and_repair_security.sql", "011_customer_runtime.sql"].map(
                 (name) => `cp -p "${inputDir}/../database/${name}" "${databaseOutput}/${name}"`,
               ),
             ];
@@ -1401,7 +1458,9 @@ export class TenantStack extends Stack {
       description: `Idempotently creates and verifies the PostgreSQL boundary for ${tenant.id}`,
       entry: path.join(__dirname, "..", "runtime", "provision-tenant", "index.mjs"),
       environment: {
-        ADMIN_SECRET_ARN: databaseAdminSecret.secretArn,
+        PROVISIONING_DATABASE_SECRET_ARN: provisioningDatabaseSecret.secretArn,
+        PROVISIONING_DATABASE_USERNAME: provisioningDatabaseUsername,
+        BOOTSTRAP_MAPPING_REVISION: String(bootstrapMappingRevision),
         API_AUDIT_DATABASE_SECRET_ARN: auditSignerDatabaseSecret.secretArn,
         API_AUDIT_DATABASE_USERNAME: auditSignerDatabaseUsername,
         API_HOSTNAME: apiHostname,
@@ -1480,7 +1539,7 @@ export class TenantStack extends Stack {
         ],
         resources: [
           shared.databaseCluster.clusterArn,
-          databaseAdminSecret.secretArn,
+          provisioningDatabaseSecret.secretArn,
           databaseSecret.secretArn,
           ingestDatabaseSecret.secretArn,
           controlDatabaseSecret.secretArn,
@@ -1490,27 +1549,9 @@ export class TenantStack extends Stack {
         ],
       }),
     );
-    provisioner.addToRolePolicy(
-      new iam.PolicyStatement({
-        actions: ["secretsmanager:DescribeSecret", "secretsmanager:GetSecretValue"],
-        resources: [databaseAdminSecret.secretArn],
-      }),
-    );
-    if (!databaseAdminSecret.encryptionKey) {
-      throw new Error("The shared database administrator secret must use a customer-managed KMS key.");
-    }
-    provisioner.addToRolePolicy(
-      new iam.PolicyStatement({
-        actions: ["kms:Decrypt"],
-        conditions: {
-          StringEquals: {
-            "kms:EncryptionContext:SecretARN": databaseAdminSecret.secretArn,
-            "kms:ViaService": `secretsmanager.${this.region}.amazonaws.com`,
-          },
-        },
-        resources: [databaseAdminSecret.encryptionKey.keyArn],
-      }),
-    );
+    provisioningDatabaseSecret.grantRead(provisioner);
+    provisioner.addToRolePolicy(new iam.PolicyStatement({ actions: ["dynamodb:GetItem"], resources: [shared.controlTable.tableArn],
+      conditions: { Null: { "dynamodb:LeadingKeys": "false" }, "ForAllValues:StringEquals": { "dynamodb:LeadingKeys": [`DATABASE_BOOTSTRAP#${tenant.id}`] } } }));
     databaseSecret.grantRead(provisioner);
     ingestDatabaseSecret.grantRead(provisioner);
     controlDatabaseSecret.grantRead(provisioner);
@@ -1847,7 +1888,7 @@ export class TenantStack extends Stack {
         CONTROL_TABLE_NAME: shared.controlTable.tableName,
         DATABASE_CLUSTER_ARN: shared.databaseCluster.clusterArn,
         DATABASE_NAME: databaseIdentifier,
-        DATABASE_SECRET_ARN: databaseSecret.secretArn,
+        DATABASE_SECRET_ARN: ingestDatabaseSecret.secretArn,
         TENANT_ID: tenant.id,
       },
       handler: "handler",
@@ -1872,9 +1913,9 @@ export class TenantStack extends Stack {
         "rds-data:BeginTransaction", "rds-data:CommitTransaction",
         "rds-data:ExecuteStatement", "rds-data:RollbackTransaction",
       ],
-      resources: [shared.databaseCluster.clusterArn, databaseSecret.secretArn],
+      resources: [shared.databaseCluster.clusterArn, ingestDatabaseSecret.secretArn],
     }));
-    databaseSecret.grantRead(projectionRepairer);
+    ingestDatabaseSecret.grantRead(projectionRepairer);
     new events.Rule(this, "UploadProjectionRepairSchedule", {
       description: `Periodically repairs cross-service upload projections for ${tenant.id}`,
       enabled: true,
@@ -2124,6 +2165,12 @@ export class TenantStack extends Stack {
     new CfnOutput(this, "TenantApiHostname", { value: apiHostname });
     new CfnOutput(this, "TenantApiOrigin", { value: `https://${apiHostname}` });
     new CfnOutput(this, "TenantId", { value: tenant.id });
+    new CfnOutput(this, "TenantPortalConfigJson", { value: this.toJsonString({
+      tenantId: tenant.id, webOrigin: tenantOrigin, apiOrigin: `https://${apiHostname}`,
+      oauthOrigin: `https://auth.${shared.rootDomain}`, clientId: userPoolClient.userPoolClientId,
+      scopes: ["openid", "email", "profile", "scopeproof/evidence.read", "scopeproof/evidence.collect", "scopeproof/retention.manage",
+        "scopeproof/tenant.manage", "scopeproof/device.manage", "scopeproof/jobs.manage", "scopeproof/evidence.approve"],
+    }) });
     new CfnOutput(this, "CognitoAppClientId", { value: userPoolClient.userPoolClientId });
     new CfnOutput(this, "CognitoNativeAppClientId", { value: nativeUserPoolClient.userPoolClientId });
     new CfnOutput(this, "TenantDataRoleArn", { value: tenantDataRole.roleArn });

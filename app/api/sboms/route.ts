@@ -1,7 +1,8 @@
 import { assertPermission, jsonError, requireApiPermission, requireApiUser, requireSameOrigin } from "../../../lib/server/auth";
 import { enforceRateLimit, requireBoundedContentLength } from "../../../lib/server/rate-limit";
 import { getEnv } from "../../../lib/server/env";
-import { listSbomJobsPage, listSbomRepositoriesCached, parseGitHubRepositoryUrl, processSbom, queueSbom, SbomError, validateOneTimeGitHubToken, type SbomFormat } from "../../../lib/server/sbom";
+import { getSbomJob, listSbomJobsPage, listSbomRepositoriesCached, parseGitHubRepositoryUrl, processSbom, queueSbom, SbomError, validateOneTimeGitHubToken, type SbomFormat } from "../../../lib/server/sbom";
+import { watchedJobIds } from "../../../lib/server/job-watch";
 
 const noStoreHeaders = { "cache-control": "no-store, max-age=0", pragma: "no-cache" };
 
@@ -18,20 +19,26 @@ export async function GET(request: Request) {
     const user = await requireApiUser(request);
     await enforceRateLimit(request, user.id, "sbom:list", 120, 60);
     const query = new URL(request.url).searchParams;
+    const discoveryValue = query.get("discoverRepositories");
+    if (discoveryValue !== null && discoveryValue !== "true" && discoveryValue !== "false") return Response.json({ error: "discoverRepositories must be true or false." }, { status: 400, headers: noStoreHeaders });
+    const repositoryDiscoveryRequested = discoveryValue === "true";
     const assessmentId = query.get("assessmentId") || undefined;
     if (assessmentId && !/^asm_[a-f0-9]{32}$/.test(assessmentId)) return Response.json({ error: "Assessment identifier is invalid." }, { status: 400 });
     const managedPresent = Boolean(getEnv().GITHUB_TOKEN && getEnv().GITHUB_ORG);
+    const watched = watchedJobIds(query.get("watch"), assessmentId || "", "sbom");
+    const scopedIds = watched.length ? (await getEnv().DB.prepare("SELECT id FROM sbom_jobs WHERE assessment_id=? AND id IN (SELECT value FROM json_each(?)) ORDER BY id LIMIT 50").bind(assessmentId, JSON.stringify(watched)).all<{ id: string }>()).results : [];
+    const updates = (await Promise.all(scopedIds.map((item) => getSbomJob(item.id)))).filter(Boolean);
     const jobPage = await listSbomJobsPage({ assessmentId, cursor: query.get("cursor") || undefined, limit: query.get("limit") || undefined });
     let repositories: Awaited<ReturnType<typeof listSbomRepositoriesCached>> = [];
     let managedError: string | null = null;
     let canDiscoverRepositories = true;
     try { assertPermission(user, "generate_sbom"); } catch { canDiscoverRepositories = false; }
-    if (managedPresent && canDiscoverRepositories) {
+    if (repositoryDiscoveryRequested && managedPresent && canDiscoverRepositories) {
       await enforceRateLimit(request, user.id, "sbom:repository-discovery", 10, 3_600);
       try { repositories = await listSbomRepositoriesCached(); }
       catch (error) { managedError = error instanceof SbomError ? error.message : "Managed GitHub repository access is unavailable."; }
     }
-    return Response.json({ ...jobPage, repositories, configured: managedPresent && canDiscoverRepositories && !managedError, managedError, repositoryDiscoveryAuthorized: canDiscoverRepositories }, { headers: noStoreHeaders });
+    return Response.json({ ...jobPage, updates, activeCount: Number(jobPage.summary.active || 0), repositories, configured: managedPresent && canDiscoverRepositories && !managedError, managedError, repositoryDiscoveryAuthorized: canDiscoverRepositories, repositoryDiscoveryRequested }, { headers: noStoreHeaders });
   } catch (error) { return sbomError(error); }
 }
 

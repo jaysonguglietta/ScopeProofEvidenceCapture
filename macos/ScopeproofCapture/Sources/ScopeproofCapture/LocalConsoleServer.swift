@@ -97,7 +97,7 @@ final class LocalConsoleServer {
     }
 
     func syncIndex(action: String = "index.synchronized") throws {
-        let entries = CaptureHistory.entries(in: evidenceRoot)
+        let entries = CaptureHistory.entries(in: evidenceRoot, expectedBinding: tenantBinding)
         let index = try evidenceIndex()
         try index.sync(entries: entries)
         try index.recordAudit(action: action, resourceID: "local-console", details: ["evidenceCount": String(entries.count)])
@@ -221,14 +221,14 @@ final class LocalConsoleServer {
             switch (request.method, request.path) {
             case ("GET", "/api/status"):
                 let index = try evidenceIndex()
-                let entries = CaptureHistory.entries(in: evidenceRoot)
+                let entries = CaptureHistory.entries(in: evidenceRoot, expectedBinding: tenantBinding)
                 try index.sync(entries: entries)
                 let server = preferences.serverURL?.absoluteString ?? ""
                 let hosted = BackendTrust.normalizedOrigin(preferences.serverURL).flatMap {
                     KeychainStore.readToken(for: $0, binding: preferences.tenantBinding)
                 } != nil
                 let auditValid = try index.verifyAuditChain()
-                let captureChainValid = CaptureHistory.captureChainIntegrity(entries)
+                let captureChainValid = CaptureHistory.captureChainIntegrity(entries, expectedBinding: tenantBinding)
                 let s3Settings = activeS3Settings()
                 return .codable(Status(
                     localUser: NSFullUserName(), evidenceRoot: evidenceRoot.path,
@@ -246,7 +246,7 @@ final class LocalConsoleServer {
                 return .codable(try await libraryPayload(forceS3Refresh: request.query["refreshS3"] == "1"))
             case ("GET", "/api/evidence"):
                 let index = try evidenceIndex()
-                try index.sync(entries: CaptureHistory.entries(in: evidenceRoot))
+                try index.sync(entries: CaptureHistory.entries(in: evidenceRoot, expectedBinding: tenantBinding))
                 let query = LocalEvidenceQuery(search: request.query["search"] ?? "", complianceArea: request.query["complianceArea"] ?? "", controlID: request.query["controlID"] ?? "", reviewStatus: request.query["reviewStatus"] ?? "")
                 let evidence = try index.search(query)
                 let all = try index.search(LocalEvidenceQuery(), limit: 1_000)
@@ -300,7 +300,7 @@ final class LocalConsoleServer {
     private func imageResponse(evidenceID: String) throws -> HTTPResponse {
         let entry = try entry(for: evidenceID)
         let artifact: ValidatedEvidenceArtifact
-        do { artifact = try ValidatedEvidenceArtifact.loadForLegacyBrowsing(entry, requireLifecycle: false) }
+        do { artifact = try ValidatedEvidenceArtifact.loadForLegacyBrowsing(entry, requireLifecycle: false, expectedBinding: tenantBinding) }
         catch { throw LocalConsoleFailure.invalidBody("The evidence image failed its integrity check.") }
         return .data(status: 200, contentType: "image/png", body: artifact.imageData, cache: "private, max-age=60")
     }
@@ -319,7 +319,7 @@ final class LocalConsoleServer {
         }
         let credentials = try await credentialProvider.credentials(for: settings, binding: binding)
         guard preferences.tenantBinding == activeBinding else { throw LocalConsoleFailure.unauthorized }
-        let entries = CaptureHistory.entries(in: evidenceRoot)
+        let entries = CaptureHistory.entries(in: evidenceRoot, expectedBinding: tenantBinding)
         let receiptBindings = EvidenceLibraryBuilder.verifiedReceiptBindings(
             entries: entries, settings: settings, destination: binding
         )
@@ -396,7 +396,7 @@ final class LocalConsoleServer {
 
     private func libraryPayload(forceS3Refresh: Bool) async throws -> EvidenceLibraryPayload {
         let index = try evidenceIndex()
-        let entries = CaptureHistory.entries(in: evidenceRoot)
+        let entries = CaptureHistory.entries(in: evidenceRoot, expectedBinding: tenantBinding)
         try index.sync(entries: entries)
         let local = try index.search(LocalEvidenceQuery(), limit: 5_000)
         let activeBinding = preferences.tenantBinding
@@ -478,7 +478,7 @@ final class LocalConsoleServer {
         let notes = body.notes.trimmingCharacters(in: .whitespacesAndNewlines)
         if [.approved, .rejected, .superseded].contains(status), notes.count < 20 { throw LocalConsoleFailure.invalidBody("Approval, rejection, and supersession require a rationale of at least 20 characters.") }
         let entry = try entry(for: evidenceID)
-        _ = try ValidatedEvidenceArtifact.load(entry, requireLifecycle: true)
+        _ = try ValidatedEvidenceArtifact.load(entry, requireLifecycle: true, expectedBinding: tenantBinding)
         guard EvidenceLifecycleStore.verify(entry.lifecycle, artifactSha256: entry.manifest.sha256) else { throw EvidenceLifecycleFailure.integrityFailure }
         let identity = try await LocalReviewerAuthorizer.authorize(
             reason: "Authenticate to record a lifecycle decision for \(evidenceID)."
@@ -489,10 +489,10 @@ final class LocalConsoleServer {
         _ = try EvidenceLifecycleStore.update(
             entry: entry, status: status, owner: body.owner,
             reviewer: identity.displayName, notes: notes, tags: body.tags,
-            reviewerIdentity: identity
+            reviewerIdentity: identity, expectedBinding: tenantBinding
         )
         let index = try evidenceIndex()
-        try index.sync(entries: CaptureHistory.entries(in: evidenceRoot))
+        try index.sync(entries: CaptureHistory.entries(in: evidenceRoot, expectedBinding: tenantBinding))
         try index.recordAudit(action: "evidence.reviewed", resourceID: evidenceID, details: [
             "status": status.rawValue,
             "reviewerSubject": identity.subjectID,
@@ -503,9 +503,9 @@ final class LocalConsoleServer {
 
     private func entry(for evidenceID: String) throws -> CaptureHistoryEntry {
         guard evidenceID.count <= 80, evidenceID.range(of: #"^EV-[A-Z0-9]+$"#, options: .regularExpression) != nil,
-              let entry = CaptureHistory.entries(in: evidenceRoot).first(where: { $0.manifest.evidenceID == evidenceID }),
-              CaptureHistory.isWithinReadableRoots(entry.imageURL, primaryDirectory: evidenceRoot),
-              CaptureHistory.isWithinReadableRoots(entry.manifestURL, primaryDirectory: evidenceRoot) else { throw LocalConsoleFailure.notFound }
+              let entry = CaptureHistory.entries(in: evidenceRoot, expectedBinding: tenantBinding).first(where: { $0.manifest.evidenceID == evidenceID }),
+              CaptureHistory.isWithinReadableRoots(entry.imageURL, primaryDirectory: evidenceRoot, expectedBinding: tenantBinding),
+              CaptureHistory.isWithinReadableRoots(entry.manifestURL, primaryDirectory: evidenceRoot, expectedBinding: tenantBinding) else { throw LocalConsoleFailure.notFound }
         return entry
     }
 
@@ -518,7 +518,7 @@ final class LocalConsoleServer {
         guard let supportRoot = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
             throw LocalConsoleFailure.startup("The Application Support folder is unavailable.")
         }
-        let binding = preferences.tenantBinding
+        let binding = tenantBinding
         let support = supportRoot
             .appendingPathComponent("Scopeproof Capture", isDirectory: true)
             .appendingPathComponent("tenants", isDirectory: true)
@@ -526,7 +526,7 @@ final class LocalConsoleServer {
             .appendingPathComponent("workspaces", isDirectory: true)
             .appendingPathComponent(binding.workspaceID, isDirectory: true)
         let index = try LocalEvidenceIndex(
-            databaseURL: support.appendingPathComponent("local-console.sqlite3"),
+            databaseURL: support.appendingPathComponent("local-console.sqlite3"), expectedBinding: tenantBinding,
             auditKeyData: KeychainStore.localAuditKey(binding: binding),
             anchorAuditToKeychain: true
         )

@@ -1,6 +1,24 @@
 import { sql } from "drizzle-orm";
 import { check, index, integer, primaryKey, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 
+// Append-only revisions: historical evidence expectations are never overwritten.
+export const evidenceRequirements = sqliteTable("evidence_requirements", {
+  id: text("id").primaryKey(),
+  assessmentId: text("assessment_id").notNull(),
+  controlId: text("control_id").notNull(),
+  system: text("system").notNull(),
+  revision: integer("revision").notNull(),
+  minimumArtifacts: integer("minimum_artifacts").notNull(),
+  ownerId: text("owner_id"),
+  reason: text("reason").notNull(),
+  createdBy: text("created_by").notNull(),
+  createdAt: text("created_at").notNull(),
+}, (table) => [
+  uniqueIndex("idx_evidence_requirements_revision").on(table.assessmentId, table.controlId, table.system, table.revision),
+  check("evidence_requirements_revision_positive", sql`${table.revision} > 0`),
+  check("evidence_requirements_minimum_bounded", sql`${table.minimumArtifacts} BETWEEN 1 AND 25`),
+]);
+
 export const users = sqliteTable("users", {
   id: text("id").primaryKey(),
   email: text("email").notNull(),
@@ -117,6 +135,7 @@ export const collectors = sqliteTable("collectors", {
   enabled: integer("enabled", { mode: "boolean" }).notNull().default(true),
   configJson: text("config_json").notNull().default("{}"),
   scheduleCron: text("schedule_cron"),
+  scheduledAssessmentId: text("scheduled_assessment_id"),
   status: text("status", { enum: ["not_configured", "healthy", "action_needed", "running"] }).notNull().default("not_configured"),
   lastRunAt: text("last_run_at"),
   lastError: text("last_error"),
@@ -329,6 +348,7 @@ export const findings = sqliteTable("findings", {
   ownerId: text("owner_id"),
   dueAt: text("due_at"),
   resolution: text("resolution"),
+  resolutionEvidenceJson: text("resolution_evidence_json").notNull().default("[]"),
   createdBy: text("created_by").notNull(),
   resolvedBy: text("resolved_by"),
   createdAt: text("created_at").notNull().default(sql`CURRENT_TIMESTAMP`),

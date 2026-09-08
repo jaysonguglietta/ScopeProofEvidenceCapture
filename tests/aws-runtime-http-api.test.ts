@@ -108,7 +108,7 @@ test("API request adapter binds exact gateway domain, verified subject, tenant m
   assert.equal(request.actor.tenantId, TENANT_A);
   assert.equal(request.actor.userId, USER_A);
   assert.equal(request.actor.role, "admin");
-  assert.deepEqual(observed, [{ tenantId: TENANT_A, identitySubject: identity().subject }]);
+  assert.deepEqual(observed, [{ tenantId: TENANT_A, identitySubject: identity().subject, authenticatedAt: identity().authenticatedAt }]);
 });
 
 test("API request adapter awaits a production tenant authority resolver", async () => {
@@ -254,14 +254,15 @@ test("RDS Data API membership adapter supports an explicit direct-table maintena
     database: "scopeproof",
     lookupMode: "direct_tables",
   });
-  const found = await adapter.findActiveByIdentity({ tenantId: TENANT_A, identitySubject: identity().subject });
+  const found = await adapter.findActiveByIdentity({ tenantId: TENANT_A, identitySubject: identity().subject, authenticatedAt: identity().authenticatedAt });
   assert.equal(found?.membership.role, "reviewer");
   assert.equal(committed, 1);
   assert.equal(statements.length, 2);
   assert.match(String(statements[0].sql), /set_config/);
   assert.match(String(statements[1].sql), /CAST\(:tenant_id AS scopeproof\.tenant_identifier\)/);
   assert.doesNotMatch(String(statements[1].sql), new RegExp(identity().subject));
-  assert.deepEqual((statements[1].parameters as Array<{ name: string }>).map((parameter) => parameter.name), ["tenant_id", "identity_subject"]);
+  assert.deepEqual((statements[1].parameters as Array<{ name: string }>).map((parameter) => parameter.name), ["tenant_id", "identity_subject", "authenticated_at"]);
+  assert.match(String(statements[1].sql), /sessions_revoked_through/);
 });
 
 test("RDS membership adapter securely defaults to an execute-only security-definer lookup", async () => {
@@ -288,10 +289,10 @@ test("RDS membership adapter securely defaults to an execute-only security-defin
     database: "scopeproof",
   });
 
-  assert.equal((await adapter.findActiveByIdentity({ tenantId: TENANT_A, identitySubject: identity().subject }))?.membership.role, "admin");
-  assert.match(String(statements[1].sql), /scopeproof\.resolve_active_membership\(:identity_subject\)/);
+  assert.equal((await adapter.findActiveByIdentity({ tenantId: TENANT_A, identitySubject: identity().subject, authenticatedAt: identity().authenticatedAt }))?.membership.role, "admin");
+  assert.match(String(statements[1].sql), /scopeproof\.resolve_active_session_membership\(:identity_subject, CAST\(:authenticated_at AS timestamptz\)\)/);
   assert.doesNotMatch(String(statements[1].sql), /FROM scopeproof\.memberships/);
-  assert.deepEqual((statements[1].parameters as Array<{ name: string }>).map((parameter) => parameter.name), ["identity_subject"]);
+  assert.deepEqual((statements[1].parameters as Array<{ name: string }>).map((parameter) => parameter.name), ["identity_subject", "authenticated_at"]);
 });
 
 test("RDS Data API membership adapter rolls back malformed or duplicate results", async () => {
@@ -308,8 +309,39 @@ test("RDS Data API membership adapter rolls back malformed or duplicate results"
     secretArn: "arn:aws:secretsmanager:us-east-1:123456789012:secret:scopeproof/runtime-AbCd12",
     database: "scopeproof",
   });
-  await assert.rejects(adapter.findActiveByIdentity({ tenantId: TENANT_A, identitySubject: identity().subject }));
+  await assert.rejects(adapter.findActiveByIdentity({ tenantId: TENANT_A, identitySubject: identity().subject, authenticatedAt: identity().authenticatedAt }));
   assert.equal(rollbacks, 1);
+});
+
+test("durable self-session revocation binds verified identity and rolls back malformed receipts", async () => {
+  const statements: Array<Record<string, unknown>> = [];
+  let malformed = false;
+  let commits = 0;
+  let rollbacks = 0;
+  const executor: RdsDataApiExecutor = {
+    beginTransaction: async () => ({ transactionId: "transaction-123456" }),
+    executeStatement: async (input) => {
+      statements.push(input as unknown as Record<string, unknown>);
+      return input.formatRecordsAs === "JSON" ? { formattedRecords: malformed ? "[{}]" : JSON.stringify([
+        { session_epoch: 1, sessions_revoked_through: "2026-09-08T12:00:00.000Z" },
+      ]) } : {};
+    },
+    commitTransaction: async () => { commits += 1; },
+    rollbackTransaction: async () => { rollbacks += 1; },
+  };
+  const adapter = new RdsDataMembershipRepository({ executor,
+    resourceArn: "arn:aws:rds:us-east-1:123456789012:cluster:scopeproof-test",
+    secretArn: "arn:aws:secretsmanager:us-east-1:123456789012:secret:scopeproof/runtime-AbCd12", database: "scopeproof",
+  });
+  const request = { tenantId: TENANT_A, identitySubject: identity().subject, authenticatedAt: identity().authenticatedAt, requestId: "request-session-12345678" };
+  assert.deepEqual(await adapter.revokeOwnSessions(request), { sessionEpoch: 1, revokedThrough: "2026-09-08T12:00:00.000Z" });
+  assert.equal(commits, 1);
+  assert.match(String(statements[1].sql), /scopeproof\.revoke_own_sessions/);
+  assert.deepEqual((statements[1].parameters as Array<{ name: string }>).map((parameter) => parameter.name), ["identity_subject", "authenticated_at", "request_id"]);
+  malformed = true;
+  await assert.rejects(adapter.revokeOwnSessions(request));
+  assert.equal(rollbacks, 1);
+  assert.equal(commits, 1);
 });
 
 test("safe problem responses preserve request IDs without disclosing internal errors", async () => {

@@ -70,7 +70,7 @@ npm run db:generate
 Inspect generated SQL for destructive operations, unintended nullability changes, missing indexes, and table rebuilds. Apply migrations in journal order. Never edit a migration already applied to production; add a new forward migration.
 
 The current application requires every migration through
-`drizzle/0028_native_reconciliation_cursor.sql`. Migrations 0016–0019 add rotation
+`drizzle/0031_brave_silver_fox.sql`. Migrations 0016–0019 add rotation
 leases, occurrence-owned lifecycle state, active-record de-duplication, and
 audited compare-and-swap guards. Migrations 0020–0022 add per-device P-256
 provenance keys, monotonic chain leases/heads, immutable checkpoint receipts,
@@ -92,13 +92,19 @@ Migration 0028 adds the sparse due-work queue, independent pending/orphan
 circular keyset cursors, revision-CAS-protected singleton cursor state, and
 indexes used by the two separately bounded native-reconciliation domains.
 
+Migration 0029 adds append-only control/system evidence requirements. Migration
+0030 binds each collector schedule to one explicit assessment; older schedules
+remain unbound and do not execute until configured. Migration 0031 stores exact
+resolution-evidence snapshots for findings. Historical text-only resolutions
+remain historical, not evidence-backed remediation. Never backfill false proof.
+
 Before applying migrations to a hosted environment or deploying application code, run the fresh- and populated-database preflight:
 
 ```bash
 npm run db:verify
 ```
 
-The preflight replays the complete journal through 0028 against both an empty
+The preflight replays the complete journal through 0031 against both an empty
 database and a populated database containing a legacy device and same-digest
 evidence in two different systems with a null legacy assessment scope. It runs `PRAGMA integrity_check`
 and proves that the populated upgrade preserves both artifacts and creates their
@@ -191,7 +197,9 @@ Run the native tests with the Xcode Swift toolchain, build the `.app`, confirm i
 - Back up D1, R2 ciphertext, cryptographic key versions, and release artifacts according to the evidence-retention policy.
 - Test restoration into an isolated environment and verify sample artifact hashes and audit-chain continuity.
 - Hosted packages expire after seven days; preserve the original evidence rather than depending on package objects as the system of record.
-- Local retention moves files to Trash and does not remove hosted evidence.
+- Explicit verified archival moves only eligible local PNG payloads to Trash;
+  signed metadata, decisions, receipts, archive descriptors and Keychain anchors
+  remain. Same-Mac restoration is supported; cross-Mac trust recovery is not.
 - Place evidence under legal hold before applying deletion when an assessment, investigation, dispute, or regulatory requirement is active.
 
 The full backup manifest, monitoring, quarterly restore-drill, incident-response, and launch-authorization procedures are in [Production operations](PRODUCTION_OPERATIONS.md). A production deployment is not approved until named owners have executed and recorded those controls.

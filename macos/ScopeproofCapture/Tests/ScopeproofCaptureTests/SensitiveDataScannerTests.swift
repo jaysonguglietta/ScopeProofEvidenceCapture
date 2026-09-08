@@ -282,7 +282,7 @@ struct SensitiveDataScannerTests {
         let manifestURL = nested.appendingPathComponent("evidence.json")
         try JSONSerialization.data(withJSONObject: object).write(to: manifestURL)
 
-        let entries = CaptureHistory.entries(in: root)
+        let entries = CaptureHistory.entries(in: root, expectedBinding: .localDefault)
         #expect(entries.count == 1)
         #expect(entries.first?.imageURL.resolvingSymlinksInPath().path == imageURL.resolvingSymlinksInPath().path)
         #expect(entries.first?.manifest.complianceArea == nil)
@@ -381,7 +381,7 @@ struct SensitiveDataScannerTests {
         let zipURL = root.appendingPathComponent("assessor.zip")
         let signingKey = P256.Signing.PrivateKey()
         let package = try AssessorPackageExporter.export(
-            entries: [entry], completeHistory: [entry], to: zipURL, preparedBy: "Reviewer",
+            entries: [entry], completeHistory: [entry], expectedBinding: .localDefault, to: zipURL, preparedBy: "Reviewer",
             packageName: "Q3 Assessment", signingKeyOverride: signingKey,
             captureAnchorOverride: captureAnchor
         )

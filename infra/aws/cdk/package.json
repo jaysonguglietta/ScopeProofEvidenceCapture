@@ -6,7 +6,7 @@
   "scripts": {
     "build": "tsc --noEmit",
     "synth": "cdk synth",
-    "test": "tsc --noEmit && node --test -r ts-node/register test/*.test.ts"
+    "test": "tsc --noEmit && node --test -r ts-node/register test/*.test.ts test/*.test.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-backup": "3.1122.0",

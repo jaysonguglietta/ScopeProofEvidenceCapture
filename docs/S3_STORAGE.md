@@ -99,7 +99,10 @@ Objects use sanitized control-oriented keys:
 
 User input cannot supply traversal segments, backslashes, a host, or an absolute object path. Production mode requires a nonempty prefix so IAM and CloudTrail can be narrowly scoped.
 
-Every PUT includes a base64 SHA-256 checksum and the selected encryption headers. Scopeproof requires S3 to return the same checksum, the expected encryption/KMS key, and a non-null version ID. Only after both objects succeed does it write a mode-`0600` schema-2 `.s3.json` receipt containing:
+Every PUT includes a base64 SHA-256 checksum and the selected encryption headers.
+Scopeproof requires the returned checksum, encryption/KMS key and non-null version
+ID to match. After both objects succeed it writes a mode-`0600` `.s3.json`
+device-sealed envelope containing the original schema-2 S3 response facts:
 
 - AWS account and verified principal ARN;
 - bucket, region, security profile, encryption, KMS key, retention mode, and retention days;
@@ -108,7 +111,30 @@ Every PUT includes a base64 SHA-256 checksum and the selected encryption headers
 
 The receipt is not sufficient by itself to authorize local expiry cleanup. Before treating S3 as the durable copy, Scopeproof uses current credentials bound to the same tenant/workspace and performs live exact-version `HEAD` plus Object Lock retention reads for every receipt object. The response must repeat the exact version, ETag, S3 checksum, expected-owner boundary, encryption mode/KMS key, and a future COMPLIANCE retention date. Any unavailable call, stale credential, missing/replaced version, checksum change, retention change, or identity mismatch preserves the local files.
 
-The receipt contains no AWS credential. A retry creates a new protected version at the deterministic key and records that exact version.
+The envelope key is independently held in this Mac's Keychain. Unsealed legacy,
+tampered, wrong-artifact or wrong-destination receipts do not establish success.
+This is authenticated-response integrity, not a separately verified AWS signature
+or proof that the remote version remains available today. Receipts contain no
+AWS credential. An explicit retry can create a new protected version; reconcile
+uncertain outcomes before retrying.
+
+### Complete-history archival and payload disposal
+
+A PNG/manifest pair is not a complete recovery archive. **Archive & Expire Old
+Payloads…** separately captures all required signed lifecycle/hold decisions,
+manifests and verified transfer receipts in an exact-version archive descriptor.
+It checks live durability for every archive member before moving only an eligible
+PNG to Trash. Signed metadata, complete decision history, descriptors and Keychain
+anchors remain local. Missing or active holds, incomplete legacy history, changed
+bytes or unavailable verification preserve the payload; no trust is grandfathered.
+At most 100 captures are processed per explicit confirmation.
+
+**Restore Archived Evidence…** verifies the descriptor with the existing local
+trust key, fetches its exact versions and stages/validates every required byte.
+It restores to the original path, metadata first and PNG last, without overwrites
+or new evidence identities. Restoration requires the original Mac's Keychain;
+cross-Mac trust enrollment is not implemented. Do not erase the source Mac or
+metadata after uploading. See [Updated workflows](READINESS_WORKFLOWS.md).
 
 ## Required production bucket policy
 

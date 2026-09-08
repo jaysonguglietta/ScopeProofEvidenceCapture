@@ -4,6 +4,7 @@ import { DatabaseSync } from "node:sqlite";
 import test from "node:test";
 import {
   PACKAGE_ELIGIBILITY_COUNTS_SQL,
+  PACKAGE_ELIGIBLE_EVIDENCE_SQL,
   PACKAGE_ELIGIBILITY_PUBLISH_FENCE_SQL,
   packageEligibilityBindings,
   packageEligibilityPublishFenceBindings,
@@ -62,9 +63,10 @@ test("package preflight and build share one eligibility policy", async () => {
 
 test("only a newer usable complete recollection clears a partial-coverage blocker", () => {
   const db = new DatabaseSync(":memory:");
-  db.exec(`CREATE TABLE evidence_artifacts (
+  db.exec(`CREATE TABLE assessments (id TEXT PRIMARY KEY, framework TEXT DEFAULT 'PCI DSS 4.0.1', scope_mode TEXT DEFAULT 'explicit', catalog_id TEXT DEFAULT 'catalog', systems_json TEXT DEFAULT '["production"]', controls_json TEXT DEFAULT '["6.3.2"]');
+  CREATE TABLE evidence_artifacts (
     id TEXT PRIMARY KEY, assessment_id TEXT NOT NULL, control_id TEXT NOT NULL, source TEXT NOT NULL, system TEXT NOT NULL,
-    framework TEXT NOT NULL DEFAULT 'PCI DSS 4.0.1', environment TEXT DEFAULT 'production',
+    framework TEXT NOT NULL DEFAULT 'PCI DSS 4.0.1', byte_size INTEGER NOT NULL DEFAULT 1, environment TEXT DEFAULT 'production',
     assessment_period TEXT DEFAULT '2026', collector_id TEXT DEFAULT 'collector-a',
     coverage_status TEXT NOT NULL, captured_at TEXT NOT NULL, status TEXT NOT NULL, expires_at TEXT NOT NULL,
     type TEXT NOT NULL DEFAULT 'report', sha256 TEXT NOT NULL DEFAULT 'digest', device_id TEXT, manifest_sha256 TEXT,
@@ -87,6 +89,7 @@ test("only a newer usable complete recollection clears a partial-coverage blocke
   const past = "2020-01-01T00:00:00.000Z";
   const at = "2026-09-01T00:00:00.000Z";
   const insert = (id: string, assessment: string, coverage: string, occurrenceCapturedAt: string, status: string, expiresAt: string, artifactCapturedAt = occurrenceCapturedAt) => {
+    db.prepare("INSERT OR IGNORE INTO assessments (id) VALUES (?)").run(assessment);
     insertArtifactRow.run(id, assessment, coverage, artifactCapturedAt, status, expiresAt);
     insertOccurrence.run(`${id}_occurrence`, id, occurrenceCapturedAt, occurrenceCapturedAt, expiresAt, status, coverage);
   };
@@ -147,7 +150,10 @@ test("assessor exports are assessment-scoped and never silently truncated", asyn
   const migration = await read("drizzle/0010_tearful_goblin_queen.sql");
   assert.match(packages, /WHERE e\.assessment_id = \?/);
   assert.match(packages, /truncation: "forbidden"/);
-  assert.match(packages, /exceeding the 100-artifact package limit/);
+  assert.match(packages, /!part && eligibleCount > 100/);
+  assert.match(packages, /Generate an explicit partition plan/);
+  assert.match(packages, /packagePublicationQuery\(/);
+  assert.match(await read("lib/server/package-publication.ts"), /PACKAGE_PLAN_SNAPSHOT_FENCE_SQL/);
   assert.doesNotMatch(packages, /assessment_id = \?[\s\S]{0,200}LIMIT 100/);
   assert.match(migration, /CREATE TABLE `assessments`/);
   assert.match(migration, /`coverage_status`/);
@@ -251,7 +257,7 @@ test("repository SBOM generation is immutable, non-executing, bounded, and asses
   assert.match(sbom, /MAX_COMPONENTS = 5_000/);
   assert.match(sbom, /unzipSync\(bytes, \{ filter:/);
   assert.match(sbom, /controlId: "6\.3\.2"/);
-  assert.match(sbom, /coverageStatus: "complete"/);
+  assert.match(sbom, /coverageStatus: inventory\.complete \? "complete" : "partial"/);
   assert.doesNotMatch(sbom, /child_process|execSync|spawnSync|npm install|yarn install|pnpm install/);
   assert.match(route, /requireApiPermission\(request, "generate_sbom"\)/);
   assert.match(route, /enforceRateLimit\(request, user\.id, "sbom:generate", 10, 3_600\)/);
@@ -309,8 +315,11 @@ test("SBOM evidence is reviewable, downloadable, comparable, and documented for 
   assert.match(consoleSource, /Since prior/);
   assert.match(consoleSource, /\/api\/evidence\/\$\{encodeURIComponent\(item\.evidence_id\)\}/);
   assert.match(packageSource, /FROM evidence_artifacts e JOIN evidence_occurrences o/);
-  assert.match(packageSource, /o\.status = 'approved'/);
-  assert.match(packageSource, /n\.chain_sequence IS NOT NULL AND n\.chain_sequence > 0/);
+  assert.match(packageSource, /PACKAGE_ELIGIBLE_EVIDENCE_SQL/);
+  assert.match(PACKAGE_ELIGIBLE_EVIDENCE_SQL, /o\.status = 'approved'/);
+  assert.match(packageSource, /packagePublicationQuery\(/);
+  assert.match(await read("lib/server/package-publication.ts"), /\$\{PACKAGE_ELIGIBLE_EVIDENCE_SQL\}/);
+  assert.match(PACKAGE_ELIGIBLE_EVIDENCE_SQL, /n\.chain_sequence IS NOT NULL AND n\.chain_sequence > 0/);
   assert.match(guide, /does not clone a repository or execute repository code/);
   assert.match(guide, /Metadata: read/);
   assert.match(guide, /Contents: read/);
@@ -406,7 +415,7 @@ test("native Local Console merges local and S3 screenshots without moving AWS tr
   assert.match(library, /receipt\.versionIDs\[imageKey\]/);
   assert.match(library, /receiptBinding\?\.imageSHA256 == item\.sha256/);
   assert.match(library, /lifecycleValid: false/);
-  assert.match(library, /storageLocation: s3 == nil \? \.local : \.localAndS3/);
+  assert.match(library, /storageLocation: item\.payloadArchived \? \.s3 : \(s3 == nil \? \.local : \.localAndS3\), localAvailable: !item\.payloadArchived/);
   assert.match(assets, /Load secure preview/);
   assert.match(assets, /storage-location/);
   assert.doesNotMatch(assets, /secretAccessKey|sessionToken|versionID|eTag|\.key\b/);
@@ -425,7 +434,8 @@ test("native evidence writes to Documents while legacy Pictures evidence remains
   assert.match(history, /appendingPathComponent\("Documents"/);
   assert.match(history, /appendingPathComponent\("Pictures"/);
   assert.match(history, /resolvingSymlinksInPath/);
-  assert.match(history, /seenEvidenceIDs/);
+  assert.match(history, /Dictionary\(grouping: candidates/);
+  assert.match(history, /grouped\[\$0\.manifest\.evidenceID\]\?\.count == 1/);
   assert.match(installation, /~\/Documents\/Scopeproof Evidence/);
   assert.match(operatorGuide, /iCloud Drive/);
   assert.match(architecture, /new writes never target the legacy root/);

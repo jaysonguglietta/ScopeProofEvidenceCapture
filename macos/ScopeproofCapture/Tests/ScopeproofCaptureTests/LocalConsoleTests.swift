@@ -11,18 +11,18 @@ struct LocalConsoleTests {
         let legacy = CaptureHistory.legacyEvidenceRoot(homeDirectory: home)
         #expect(primary.path == "/Users/tester/Documents/Scopeproof Evidence")
         #expect(legacy.path == "/Users/tester/Pictures/Scopeproof Evidence")
-        let readablePaths = CaptureHistory.readableRoots(for: primary, homeDirectory: home).map(\.path)
+        let readablePaths = CaptureHistory.readableRoots(for: primary, expectedBinding: .localDefault, homeDirectory: home).map(\.path)
         #expect(readablePaths == [primary.path, legacy.path])
-        #expect(CaptureHistory.isWithinReadableRoots(primary.appendingPathComponent("PCI/8.3/evidence.png"), primaryDirectory: primary, homeDirectory: home))
-        #expect(CaptureHistory.isWithinReadableRoots(legacy.appendingPathComponent("PCI/8.3/evidence.png"), primaryDirectory: primary, homeDirectory: home))
-        #expect(!CaptureHistory.isWithinReadableRoots(home.appendingPathComponent("Downloads/evidence.png"), primaryDirectory: primary, homeDirectory: home))
+        #expect(CaptureHistory.isWithinReadableRoots(primary.appendingPathComponent("PCI/8.3/evidence.png"), primaryDirectory: primary, expectedBinding: .localDefault, homeDirectory: home))
+        #expect(CaptureHistory.isWithinReadableRoots(legacy.appendingPathComponent("PCI/8.3/evidence.png"), primaryDirectory: primary, expectedBinding: .localDefault, homeDirectory: home))
+        #expect(!CaptureHistory.isWithinReadableRoots(home.appendingPathComponent("Downloads/evidence.png"), primaryDirectory: primary, expectedBinding: .localDefault, homeDirectory: home))
     }
 
     @Test("Creates a durable SQLite index with a verifiable immutable audit chain")
     func createsIndexAndAuditChain() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("scopeproof-local-console-\(UUID().uuidString)", isDirectory: true)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let index = try LocalEvidenceIndex(databaseURL: directory.appendingPathComponent("index.sqlite3"), auditKeyData: Data(repeating: 0xA5, count: 32))
+        let index = try LocalEvidenceIndex(databaseURL: directory.appendingPathComponent("index.sqlite3"), expectedBinding: .localDefault, auditKeyData: Data(repeating: 0xA5, count: 32))
         try index.sync(entries: [])
         try index.recordAudit(action: "console.test", resourceID: "local")
         #expect(try index.verifyAuditChain())

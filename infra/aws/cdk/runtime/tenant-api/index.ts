@@ -21,6 +21,7 @@ import {
   DynamoTenantAuthorityResolver,
   RdsDataApiAuditOutbox,
   RdsDataMembershipRepository,
+  RdsDataCustomerRepository,
   createTenantApiHandler,
   type ApiAuthenticationDependencies,
   type ApiGatewayRestEvent,
@@ -28,12 +29,16 @@ import {
   type RdsDataApiCommandConstructors,
   type TenantApiRequestRuntime,
   type UploadIntentApiPayload,
+  type CustomerAction,
+  type CustomerBody,
+  type VerifiedCognitoAccessToken,
 } from "../../../../../lib/aws-runtime/http/index.ts";
 import {
   AwsSdkV3ExactPutObjectPresigner,
   DynamoAndRdsUploadIntentStore,
   DynamoConditionalUploadIntentStore,
   DynamoUploadRequestRateLimiter,
+  DynamoTenantRouteRateLimiter,
   RdsDataUploadIntentProjection,
   UploadIntentIssuer,
   deriveServerManagedUploadRetention,
@@ -41,7 +46,7 @@ import {
   verifyDeviceUploadManifest,
 } from "../../../../../lib/aws-runtime/evidence/index.ts";
 import type { AuthorizedApiRequest } from "../../../../../lib/aws-runtime/http/api.ts";
-import { assertSafeJson, TenantSecurityError, type JsonValue } from "../../../../../lib/aws-runtime/contracts.ts";
+import { assertSafeJson, sha256Hex, TenantSecurityError, type JsonValue } from "../../../../../lib/aws-runtime/contracts.ts";
 
 const requiredEnvironment = [
   "API_HOSTNAME",
@@ -111,6 +116,7 @@ const jwt = new CognitoJwtVerifier({
 type CommandInput<T> = T extends new(input: infer Input) => unknown ? Input : never;
 type UploadStoreOptions = ConstructorParameters<typeof DynamoConditionalUploadIntentStore>[0];
 type UploadRateLimiterOptions = ConstructorParameters<typeof DynamoUploadRequestRateLimiter>[0];
+type CustomerRateLimiterOptions = ConstructorParameters<typeof DynamoTenantRouteRateLimiter>[0];
 
 /** AWS SDK inputs are mutable while the reviewed adapters expose readonly inputs. */
 function compatibleAwsCommand<Input>(constructor: new(input: never) => unknown): new(input: Input) => unknown {
@@ -173,6 +179,12 @@ function createRequestRuntime(requestId: string): TenantApiRequestRuntime {
     secretArn: config.DATABASE_SECRET_ARN,
     database: config.DATABASE_NAME,
   });
+  const customer = new RdsDataCustomerRepository({ tenantId: config.TENANT_ID, executor: rds, resourceArn: config.DATABASE_CLUSTER_ARN, secretArn: config.DATABASE_SECRET_ARN, database: config.DATABASE_NAME });
+  const customerLimiter = new DynamoTenantRouteRateLimiter({ client: new DynamoDBClient({ region, credentials }), tableName: config.CONTROL_TABLE_NAME, TransactWriteItemsCommand: compatibleAwsCommand<CommandInput<CustomerRateLimiterOptions["TransactWriteItemsCommand"]>>(TransactWriteItemsCommand as never) });
+  async function customerQuota(tenantId: string, userId: string, action: string) {
+    if (tenantId !== config.TENANT_ID) throw new Error("Authenticated tenant does not match the Lambda boundary.");
+    await customerLimiter.consume({ tenantId, requestedBy: userId, route: `customer.${action}`, maximumRequestsPerPrincipalMinute: 60, maximumRequestsPerTenantMinute: 300, now: new Date() });
+  }
   const authentication: ApiAuthenticationDependencies = Object.freeze({
     authority: Object.freeze({ mode: "api_gateway_domain" as const }),
     jwt,
@@ -181,6 +193,23 @@ function createRequestRuntime(requestId: string): TenantApiRequestRuntime {
   });
   return Object.freeze({
     authentication,
+    async customer(request: AuthorizedApiRequest, action: CustomerAction, body: CustomerBody) {
+      await customerQuota(request.actor.tenantId, request.actor.userId, action);
+      return await customer.invoke(request, action, body);
+    },
+    async acceptInvitation(request: Readonly<{ tenantId: string; identity: VerifiedCognitoAccessToken; requestId: string }>) {
+      // Stable subject-derived quota identity does not grant membership authority.
+      const userId = `usr_${(await sha256Hex(`customer-subject-v1\n${request.tenantId}\n${request.identity.subject}`)).slice(0, 32)}`;
+      await customerQuota(request.tenantId, userId, "invitation_accept");
+      return await customer.acceptInvitation(request);
+    },
+    async revokeOwnSessions(request: AuthorizedApiRequest) {
+      if (request.actor.tenantId !== config.TENANT_ID) throw new Error("Authenticated tenant does not match the Lambda boundary.");
+      return await membership.revokeOwnSessions({
+        tenantId: request.actor.tenantId, identitySubject: request.identity.subject,
+        authenticatedAt: request.identity.authenticatedAt, requestId: request.requestId,
+      });
+    },
     async recordApiAudit(record: HostedApiAuditRecord) {
       if (record.actor.tenantId !== config.TENANT_ID) throw new Error("Authenticated tenant does not match the Lambda boundary.");
       return await auditOutbox.record(record);

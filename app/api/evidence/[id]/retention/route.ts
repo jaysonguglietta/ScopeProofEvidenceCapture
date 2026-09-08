@@ -4,6 +4,21 @@ import { getEnv } from "../../../../../lib/server/env";
 import { enforceRateLimit, requireBoundedContentLength } from "../../../../../lib/server/rate-limit";
 import { randomId, sha256, stableJson } from "../../../../../lib/server/crypto";
 
+export async function GET(request: Request, context: { params: Promise<{ id: string }> }) {
+  try {
+    const actor = await requireApiPermission(request, "manage_retention");
+    await enforceRateLimit(request, actor.id, "retention:read", 60, 60);
+    const { id } = await context.params;
+    if (!/^ev_[a-f0-9]{32}$/u.test(id)) return Response.json({ error: "Invalid evidence identifier." }, { status: 400 });
+    const db = getEnv().DB;
+    if (!await db.prepare("SELECT 1 FROM evidence_artifacts WHERE id = ?").bind(id).first()) return Response.json({ error: "Evidence not found." }, { status: 404 });
+    const now = new Date().toISOString();
+    const hold = await db.prepare("SELECT owner_id, reason, expires_at FROM retention_holds WHERE evidence_id = ? AND expires_at > ?").bind(id, now).first();
+    const releases = (await db.prepare("SELECT id, requested_by, reason, request_digest, status, requested_at, expires_at FROM retention_hold_release_requests WHERE evidence_id = ? ORDER BY requested_at DESC LIMIT 100").bind(id).all()).results;
+    return Response.json({ hold, releases: releases.map((release) => ({ ...release, canApprove: release.status === "pending" && String(release.expires_at) > now && release.requested_by !== actor.id })), actorId: actor.id }, { headers: { "cache-control": "private, no-store" } });
+  } catch (error) { return jsonError(error); }
+}
+
 export async function PUT(request: Request, context: { params: Promise<{ id: string }> }) {
   try {
     requireSameOrigin(request);
