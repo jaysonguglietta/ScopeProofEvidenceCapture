@@ -54,6 +54,12 @@ live-service, signed-app and human workflow acceptance. These are not synonyms.
 
 ## Security findings
 
+The table tracks the original 13 review findings only. Subsequent PR #113 CI
+raised two additional portal CodeQL alerts and a macOS runner test crash; see
+the [publication/check record](PUBLICATION_AND_LOCAL_UPDATE_2026-09-08.md).
+Those checks remain part of release acceptance and are not silently folded into
+or dismissed by the original finding count.
+
 | Finding | Source remediation and evidence | Residual acceptance |
 | --- | --- | --- |
 | SEC-01 shared provisioner authority | Central-only shared secret; immutable approved mappings; tenant NOCREATEROLE/NOCREATEDB and own non-delegable owner; SQL/IAM synthesis denial tests | Real Aurora cross-database/Secrets Manager/IAM negative test |

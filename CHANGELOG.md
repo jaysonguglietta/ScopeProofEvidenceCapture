@@ -4,6 +4,10 @@
 
 ### September 8 product/security remediation (development source)
 
+- September 9 publication follow-up: source pushed as PR #113; local build 26
+  installed/restarted and executable digest verified. Added explicit AppKit
+  test-runner initialization and failure diagnostics after a CI SIGBUS; two
+  portal CodeQL alerts remain open for review. No merge/deployment is implied.
 - Advanced the local development build from 25 to 26 for the September 8
   implementation. This is not a new public DMG or a notarized production release.
   Publication and local installation are recorded separately from source tests.

@@ -1,4 +1,4 @@
-# GitHub publication and local Mac update — September 8
+# GitHub publication and local Mac update — September 8–9
 
 This follow-up is separate from the [initial source validation](READINESS_VALIDATION_2026-09-08.md).
 The requested scope is documentation, GitHub source publication and replacement
@@ -9,13 +9,57 @@ DMG publication, notarization and blanket issue closure are excluded.
 
 - Version: **1.10.0, build 26**, advanced from the previously running build 25.
 - Source branch: `codex/security-product-readiness`, based on `f416d18`.
-- Intended installed path: `~/Applications/Scopeproof Capture.app`.
+- Application implementation commit: `2980ad55dd44cc0a15fade3049882158cf03cb6b`.
+- Verified installed path: `~/Applications/Scopeproof Capture.app`.
 - Signing: local ad-hoc signature, retaining bundle ID `com.scopeproof.capture`.
 - Distribution: development source, not a new notarized or public DMG release.
 
-GitHub publication and installed-process verification are pending at this
-pre-publication checkpoint. This record will be updated only after those
-operations return verified results.
+The implementation was pushed to GitHub and opened as
+[PR #113](https://github.com/jaysonguglietta/ScopeProofEvidenceCapture/pull/113).
+It is not merged into `main`. Later documentation/test-harness commits on that
+PR do not change the installed production executable.
+
+Build 26 was installed and restarted from the path above. The initial macOS
+launch returned error -600; retrying the exact installed path with `open -n`
+succeeded. Process and bundle checks confirmed version/build and an executable
+SHA-256 identical to the built app:
+
+```text
+415e4b3d5609c181cb4af11e03098df8401d757c377ea078cbd83ea8ac679c8d
+```
+
+The previous build-25 bundle was backed up under the Git-ignored
+`DerivedData/.before-build-26.8zZR1A/Scopeproof Capture.app`. Evidence, settings
+and Keychain were not reset or removed by installation. The saved
+`capture.openLocalConsoleAtLaunch` preference is false; no listener at startup
+is expected. Open the Local Console from the shield menu when needed. Visual
+inspection was unavailable because macOS Computer Use permission was not granted;
+no privacy permissions were changed and no capture was initiated.
+
+## GitHub check status
+
+For implementation commit `2980ad5`, dependency review, the main verification
+job and the JavaScript/TypeScript, Actions and manual Swift analysis jobs passed.
+The macOS unit-test process terminated with SIGBUS (signal 10) after successful
+compilation; its log did not include a crash stack. A test-only follow-up now
+initializes AppKit explicitly, closes its test window, runs the presentation
+suite independently and collects failure-only test-process crash reports.
+Local success is not proof that the runner crash is resolved; inspect the latest
+PR checks before merging.
+
+The separate CodeQL alert check reports two high-severity portal alerts:
+`js/clear-text-storage-of-sensitive-data` at the transient PKCE transaction
+storage and `js/user-controlled-bypass` at the callback-code branch. Both remain
+open for security review; neither has been dismissed or suppressed. The stored
+transaction includes a one-time verifier/state and public origin/client binding,
+not access/ID/refresh tokens; the callback validates the transaction and uses
+Cognito token exchange plus server-side JWT/membership authorization. Those
+facts inform triage but do not automatically clear the alerts. These new CI
+alerts are separate from the original 13-finding remediation ledger.
+
+GitHub also reported four `fast-uri` advisories on unchanged `main`; this branch
+pins 3.1.6 and passed dependency review. Default-branch alert closure requires a
+reviewed merge and GitHub rescan, not a manual closure claim.
 
 ## Checks repeated for this update
 

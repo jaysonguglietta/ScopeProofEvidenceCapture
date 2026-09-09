@@ -2,17 +2,30 @@ import AppKit
 import Testing
 @testable import ScopeproofCapture
 
-@Suite("Capture review presentation")
+@Suite("Capture review presentation", .serialized)
+@MainActor
 struct CaptureReviewPresentationTests {
+    init() {
+        // SwiftPM does not run the executable's main.swift AppKit bootstrap.
+        // Initialize the shared application without starting capture, a delegate,
+        // a modal loop, or a user-facing application on the CI runner.
+        _ = NSApplication.shared
+        NSApp.setActivationPolicy(.prohibited)
+    }
+
     @Test("Uses an explicit waiting status and keeps review above browser windows")
     @MainActor
     func configuresModalReviewWindow() {
+        #expect(Thread.isMainThread)
+        #expect(NSApp != nil)
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 800, height: 600),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
         )
+        window.isReleasedWhenClosed = false
+        defer { window.orderOut(nil); window.close() }
 
         CaptureReviewPresentation.configure(window)
 
