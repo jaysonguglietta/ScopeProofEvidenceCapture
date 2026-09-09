@@ -4,6 +4,13 @@ This runbook covers the cross-region recovery resources and the production
 Developer ID/notarization workflow. Both are fail-closed. Neither is deployed or
 submitted to Apple by committing this repository.
 
+September 8 source also includes locked cross-region audit replication and
+separate approval-gated [restore](../infra/aws/RESTORE_OPERATOR.md) and
+[DNS cutover](../infra/aws/CUTOVER_OPERATOR.md) CLIs. These require independently
+verified inventory/completeness, recovery-application acceptance, reconciliation
+and primary-write-fence evidence. They do not implement those prerequisites or
+establish measured RPO/RTO. See [current recovery boundaries](AWS_BOOTSTRAP_AND_RECOVERY_BOUNDARIES.md).
+
 ## Cross-region recovery architecture
 
 The implemented recovery target is deliberately same-account and cross-region:

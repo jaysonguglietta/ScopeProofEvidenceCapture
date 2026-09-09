@@ -4,6 +4,18 @@
 final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
     private var window: NSWindow?
     private var evidenceRoot: URL?
+    private var expectedBinding = TenantWorkspaceBinding.localDefault
+    private var workspaceGeneration = 0
+
+    func invalidateForWorkspaceChange() {
+        workspaceGeneration += 1
+        evidenceRoot = nil
+        serverURL = nil
+        allEntries = []
+        filteredEntries = []
+        tableView.reloadData()
+        window?.orderOut(nil)
+    }
     private var serverURL: URL?
     private var jiraSettings: JiraHandoffSettings = .defaults
     private let jiraCloudService = JiraCloudService()
@@ -25,11 +37,13 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
     private let jiraUploadButton = NSButton(title: "Upload to Jira Cloud…", target: nil, action: nil)
     private let detailsLabel = NSTextField(wrappingLabelWithString: "")
 
-    func show(evidenceRoot: URL, jiraSettings: JiraHandoffSettings = .defaults, serverURL: URL? = nil) {
+    func show(evidenceRoot: URL, expectedBinding: TenantWorkspaceBinding, jiraSettings: JiraHandoffSettings = .defaults, serverURL: URL? = nil) {
+        workspaceGeneration += 1
+        self.expectedBinding = expectedBinding
         self.evidenceRoot = evidenceRoot
         self.jiraSettings = jiraSettings
         self.serverURL = serverURL
-        allEntries = CaptureHistory.entries(in: evidenceRoot)
+        allEntries = CaptureHistory.entries(in: evidenceRoot, expectedBinding: expectedBinding)
         if window == nil { buildWindow() }
         populateFrameworks()
         populateControls()
@@ -251,7 +265,7 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
         case "preview":
             let imageView = NSImageView(frame: NSRect(x: 4, y: 4, width: 54, height: 44))
             if let artifact = try? ValidatedEvidenceArtifact.loadForLegacyBrowsing(
-                entry, requireLifecycle: false
+                entry, requireLifecycle: false, expectedBinding: expectedBinding
             ) {
                 imageView.image = NSImage(data: artifact.imageData)
             }
@@ -266,7 +280,7 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
         case "system": value = manifest.system
         case "status": value = entry.lifecycle.status.rawValue
         case "owner": value = entry.lifecycle.owner
-        case "upload": value = entry.isUploaded ? "Hosted" : "Local"
+        case "upload": value = entry.isPayloadArchived ? "Archived — restore payload" : TransferReceipt.status(for: entry, kind: .hosted)
         default: value = ""
         }
         let field = NSTextField(labelWithString: value)
@@ -281,9 +295,10 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
     private func updateSelectionState() {
         let hasSelection = tableView.selectedRow >= 0 && tableView.selectedRow < filteredEntries.count
         let provenanceVerified = selectedEntry.flatMap {
-            try? ValidatedEvidenceArtifact.load($0, requireLifecycle: false)
+            try? ValidatedEvidenceArtifact.load($0, requireLifecycle: false, expectedBinding: expectedBinding)
         }?.provenanceVerified == true
-        openButton.isEnabled = hasSelection
+        openButton.isEnabled = hasSelection && selectedEntry?.isPayloadArchived != true
+        openButton.toolTip = selectedEntry?.isPayloadArchived == true ? "Use Capture menu → Restore Archived Evidence… first" : nil
         revealButton.isEnabled = hasSelection
         reviewButton.isEnabled = hasSelection && provenanceVerified
         holdButton.isEnabled = hasSelection && provenanceVerified
@@ -301,7 +316,8 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
             }
             let mappings = entry.manifest.mappedControls?.map { "\(ComplianceCatalog.framework(named: $0.framework).fileCode) \($0.controlID)" }.joined(separator: ", ") ?? "None curated"
             let jira = entry.manifest.jiraIssueKey?.isEmpty == false ? entry.manifest.jiraIssueKey! : "not assigned"
-            let provenance = provenanceVerified ? "signed provenance verified" : "legacy unsigned · browsing only"
+            let provenance = entry.isPayloadArchived ? "signed archive verified · restore payload before preview/review/export"
+                : (provenanceVerified ? "signed provenance verified" : "legacy unsigned · browsing only")
             detailsLabel.stringValue = "\(entry.manifest.evidenceID) · \(provenance) · \(lifecycle.status.rawValue) · \(holdStatus) · Jira: \(jira) · tags: \(lifecycle.tags.isEmpty ? "none" : lifecycle.tags.joined(separator: ", ")) · mapped controls: \(mappings)"
         } else {
             holdButton.title = "Place Legal Hold…"
@@ -311,15 +327,16 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
 
     private var selectedEntry: CaptureHistoryEntry? {
         guard tableView.selectedRow >= 0, tableView.selectedRow < filteredEntries.count else { return nil }
-        return filteredEntries[tableView.selectedRow]
+        let entry = filteredEntries[tableView.selectedRow]
+        return entry.manifest.belongs(to: expectedBinding) ? entry : nil
     }
 
     @objc private func openSelected() {
         guard let entry = selectedEntry,
-              (try? ValidatedEvidenceArtifact.loadForLegacyBrowsing(entry, requireLifecycle: false)) != nil else { return }
+              (try? ValidatedEvidenceArtifact.loadForLegacyBrowsing(entry, requireLifecycle: false, expectedBinding: expectedBinding)) != nil else { return }
         NSWorkspace.shared.open(entry.imageURL)
     }
-    @objc private func revealSelected() { if let entry = selectedEntry { NSWorkspace.shared.activateFileViewerSelecting([entry.imageURL]) } }
+    @objc private func revealSelected() { if let entry = selectedEntry { NSWorkspace.shared.activateFileViewerSelecting([entry.isPayloadArchived ? LocalEvidenceArchive.url(for: entry.manifestURL) : entry.imageURL]) } }
 
     @objc private func copyJiraComment() {
         guard let entry = selectedEntry else { return }
@@ -334,6 +351,7 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
         }
         statusLabel.stringValue = "Checking Jira Cloud issue \(issueKey)…"
         jiraUploadButton.isEnabled = false
+        let operationGeneration = workspaceGeneration
         Task {
             do {
                 guard let binding = entry.manifest.tenantBinding else {
@@ -342,10 +360,12 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
                 let connection = try await jiraCloudService.connection(
                     serverURL: serverURL, binding: binding
                 )
+                guard operationGeneration == workspaceGeneration else { return }
                 guard connection.connected else { throw JiraCloudFailure.rejected("Jira Cloud is not connected for this Scopeproof account. Open Scopeproof web → Connections and authorize it first.") }
                 let issue = try await jiraCloudService.issue(
                     issueKey, serverURL: serverURL, binding: binding
                 )
+                guard operationGeneration == workspaceGeneration else { return }
                 let confirmation = NSAlert()
                 confirmation.alertStyle = .warning
                 confirmation.messageText = "Upload approved evidence to \(issue.key)?"
@@ -353,9 +373,11 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
                 confirmation.addButton(withTitle: "Upload to Jira Cloud")
                 confirmation.addButton(withTitle: "Cancel")
                 guard confirmation.runModal() == .alertFirstButtonReturn else { updateSelectionState(); return }
+                guard operationGeneration == workspaceGeneration else { return }
                 statusLabel.stringValue = "Uploading \(entry.manifest.evidenceID) to \(issue.key)…"
-                let receiptURL = try await jiraCloudService.upload(entry: entry, serverURL: serverURL)
-                statusLabel.stringValue = "Uploaded to \(issue.key). Signed receipt saved as \(receiptURL.lastPathComponent)."
+                guard let expectedSiteURL = connection.siteURL else { throw JiraCloudFailure.invalidResponse }
+                let receiptURL = try await jiraCloudService.upload(entry: entry, serverURL: serverURL, expectedSiteURL: expectedSiteURL)
+                statusLabel.stringValue = "Uploaded to \(issue.key). Device-sealed response saved as \(receiptURL.lastPathComponent)."
             } catch {
                 let failure = NSAlert(); failure.alertStyle = .warning; failure.messageText = "Jira Cloud upload failed"; failure.informativeText = error.localizedDescription; failure.runModal()
                 statusLabel.stringValue = "Jira Cloud upload failed. No successful receipt was recorded."
@@ -382,19 +404,22 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
         if [.approved, .rejected, .superseded].contains(selectedStatus) && notes.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let error = NSAlert(); error.alertStyle = .warning; error.messageText = "Add a review note"; error.informativeText = "Approval, rejection, and supersession decisions require a short rationale for the assessor trail."; error.runModal(); return
         }
+        let operationGeneration = workspaceGeneration
         Task { @MainActor in
             do {
                 let identity = try await LocalReviewerAuthorizer.authorize(
                     reason: "Authenticate to save the \(selectedStatus.rawValue) decision for \(entry.manifest.evidenceID)"
                 )
+                guard operationGeneration == workspaceGeneration,
+                      entry.manifest.belongs(to: expectedBinding) else { return }
                 _ = try EvidenceLifecycleStore.update(
                     entry: entry, status: selectedStatus, owner: owner.stringValue,
                     reviewer: "", notes: notes.stringValue,
                     tags: tags.stringValue.split(separator: ",").map(String.init),
                     supersedesEvidenceID: supersedes.stringValue,
-                    reviewerIdentity: identity
+                    reviewerIdentity: identity, expectedBinding: expectedBinding
                 )
-                if let evidenceRoot { allEntries = CaptureHistory.entries(in: evidenceRoot) }
+                if let evidenceRoot { allEntries = CaptureHistory.entries(in: evidenceRoot, expectedBinding: expectedBinding) }
                 applyFilters()
             } catch {
                 let failure = NSAlert(); failure.alertStyle = .warning; failure.messageText = "Review could not be saved"; failure.informativeText = error.localizedDescription; failure.runModal()
@@ -437,16 +462,19 @@ final class EvidenceSearchController: NSObject, NSTableViewDataSource, NSTableVi
         guard reason.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).count >= 10 else {
             let error = NSAlert(); error.alertStyle = .warning; error.messageText = "Add a specific hold reason"; error.informativeText = "Enter at least 10 characters identifying the matter or release authorization."; error.runModal(); return
         }
+        let operationGeneration = workspaceGeneration
         Task { @MainActor in
             do {
                 let identity = try await LocalReviewerAuthorizer.authorize(
                     reason: "Authenticate to \(active ? "place" : "release") the legal hold for \(entry.manifest.evidenceID)"
                 )
+                guard operationGeneration == workspaceGeneration,
+                      entry.manifest.belongs(to: expectedBinding) else { return }
                 _ = try LocalEvidenceHoldStore.set(
                     entry: entry, active: active, reason: reason.stringValue,
-                    reviewerIdentity: identity
+                    reviewerIdentity: identity, expectedBinding: expectedBinding
                 )
-                if let evidenceRoot { allEntries = CaptureHistory.entries(in: evidenceRoot) }
+                if let evidenceRoot { allEntries = CaptureHistory.entries(in: evidenceRoot, expectedBinding: expectedBinding) }
                 applyFilters()
                 statusLabel.stringValue = active ? "Legal hold placed on \(entry.manifest.evidenceID)." : "Legal hold released for \(entry.manifest.evidenceID)."
             } catch {

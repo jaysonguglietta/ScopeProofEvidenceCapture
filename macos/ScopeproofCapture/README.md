@@ -2,7 +2,7 @@
 
 For a complete new-Mac walkthrough, including DMG and source installation, permissions, capture, review, export, S3, one-time SBOM, Jira, and troubleshooting, start with [the repository getting-started guide](../../docs/GETTING_STARTED.md).
 
-The current source metadata allocates **Unreleased Scopeproof Capture 1.10.0 (build 25)** and postdates the public 1.8.1 preview. No 1.10.0 DMG has been published, and this source version is not proof of the bundle installed or running on a particular Mac. It is a local-first menu-bar application for producing, finding, reviewing, storing, browsing, downloading, and packaging timestamped PCI DSS, HIPAA, FedRAMP, SOC 2, ISO 27001, and custom compliance evidence screenshots, plus one-time repository SBOM exports.
+The current source metadata allocates **Unreleased Scopeproof Capture 1.10.0 (build 26)** and postdates the public 1.8.1 preview. No 1.10.0 DMG has been published, and this source version is not proof of the bundle installed or running on a particular Mac. It is a local-first menu-bar application for producing, finding, reviewing, storing, browsing, downloading, and packaging timestamped PCI DSS, HIPAA, FedRAMP, SOC 2, ISO 27001, and custom compliance evidence screenshots, plus one-time repository SBOM exports.
 
 Related guides: [installation and updates](../../docs/MACOS_INSTALLATION.md), [operator workflow](../../docs/OPERATOR_GUIDE.md), [AWS S3 evidence storage](../../docs/S3_STORAGE.md), [Jira handoff](../../docs/JIRA_HANDOFF.md), [repository SBOM generation](../../docs/SBOM_GUIDE.md), [assessor verification](../../docs/ASSESSOR_GUIDE.md), and [security model](../../docs/SECURITY.md).
 
@@ -23,6 +23,23 @@ This single command builds the app, installs it in `~/Applications`, and launche
 The checked-in `Info.plist` contains no allowed hosted API origin. This normal release-mode source build is therefore intentionally local-only for HTTPS hosted synchronization and cannot be redirected by typing an arbitrary server URL. A reviewed production candidate must set one exact pathless `SCOPEPROOF_HOSTED_API_ORIGIN` through `Scripts/configure_macos_release_identity.sh` before building; development-only debug builds may use loopback HTTP for integration testing.
 
 Choose **Generate Repository SBOM…** from the shield menu for a direct one-time CycloneDX 1.6 or SPDX 2.3 export. The native app accepts an exact GitHub URL, a short-lived repository-scoped token, and a branch/tag/commit; reads only recognized lockfile blobs through GitHub's API; saves JSON plus a SHA-256 checksum; and does not persist or retry the credential. Use the hosted workflow instead when the SBOM must be assessment-scoped, independently approved, compared with a prior run, or included automatically in a Scopeproof assessor package.
+
+## September 8 workflows
+
+- **Transfer Recovery…** inspects recent artifacts and verified destination-bound
+  receipts, offers per-item retries and cancellation, and runs at most two
+  transfers concurrently. Switching workspace cancels and clears the old view.
+  An uncertain Jira outcome requires manual reconciliation, not automatic retry.
+- Full-history archive and same-Mac restore preserve signed capture, review and
+  hold history plus Keychain anchors. The old destructive retention path is
+  disabled. PNG disposal requires complete archive verification; replacement-Mac
+  trust recovery is not implemented. Follow the [archive workflow](../../docs/READINESS_WORKFLOWS.md).
+- **AWS Customer Workspace…** is separate from direct S3 configuration and the
+  legacy device-token flow. A reviewed build must contain an approved tenant
+  configuration; the checked-in list is empty. Follow [AWS customer onboarding](AWS_CUSTOMER_ONBOARDING.md)
+  for PKCE sign-in, enrollment, assessment selection, capture submission and
+  authoritative scan/review status. Never add AWS secrets or arbitrary API URLs
+  to the bundled public configuration. Nothing is deployed by using the menu.
 
 ## Local Console
 
@@ -80,13 +97,13 @@ The app never captures on a timer or in the background without an explicit menu 
 1. In the web app, open **Connections → Mac capture devices → Enroll device**.
 2. Copy the one-time token immediately; only its hash is retained by the server.
 3. Confirm the app release was built with that exact pathless HTTPS origin in `ScopeproofHostedAPIOrigins`. The checked-in source array is empty; the release operator supplies `SCOPEPROOF_HOSTED_API_ORIGIN` through `Scripts/configure_macos_release_identity.sh`. In the menu-bar app, open **Capture & Jira Settings**, enter the same Scopeproof origin, paste the token, and optionally enable automatic upload.
-4. Use **Retry Pending Uploads** after an offline capture. Tokens can be revoked from the web app at any time.
+4. Use **Retry Pending Hosted Uploads** after an offline capture. Tokens can be revoked from the web app at any time.
 
 The enrollment token authenticates the API request and HMAC-binds the exact manifest/PNG digests. Separately, the app signs the canonical schema-8 manifest—including the exact customer and workspace identifiers—with its device-only P-256 provenance key and supplies a contiguous local chain sequence. The hosted API requires those identifiers to match `LEGACY_TENANT_ID` and `LEGACY_WORKSPACE_ID`, rejects unsigned, rebound, mismatched, ambiguous, malformed, oversized, non-current, or polyglot uploads, and derives metadata only from that signed manifest.
 
 Before storage, the server independently scans the exact PNG bytes through the service configured by `BROWSER_OCR_ENDPOINT`, `BROWSER_OCR_TOKEN`, and `BROWSER_OCR_ALLOWED_HOSTS`. Those legacy names cover native screenshots as well as browser-originated evidence. It then obtains and verifies the required RFC 3161 timestamp, reserves the exact next device-chain link, encrypts/stores the artifact, and finalizes the artifact ID, image/manifest digests, event hash, sequence, and provenance-key link. Production readiness fails when the independent scanner is missing/unsafe, when trusted timestamp enforcement is disabled, or when timestamp trust material is incomplete.
 
-A scanner or required-timestamp failure stores no hosted artifact and leaves the local evidence usable. A failure after storage but before final chain linkage leaves the hosted record quarantined: read/preview, approval, package/export, and Jira disclosure all remain blocked until the original exact current pair is retried and reconciled. Existing unbound records must be re-uploaded and rescanned; unsigned legacy material must be recaptured. Never grandfather either case with a direct database update. Hosted operators must apply migrations through `0028_native_reconciliation_cursor.sql`. No AWS infrastructure is deployed by building or running this Mac package.
+A scanner or required-timestamp failure stores no hosted artifact and leaves the local evidence usable. A failure after storage but before final chain linkage leaves the hosted record quarantined: read/preview, approval, package/export, and Jira disclosure all remain blocked until the original exact current pair is retried and reconciled. Existing unbound records must be re-uploaded and rescanned; unsigned legacy material must be recaptured. Never grandfather either case with a direct database update. Hosted operators must apply migrations through `0031_brave_silver_fox.sql`. No AWS infrastructure is deployed by building or running this Mac package.
 
 ## Help and operations
 

@@ -61,15 +61,40 @@ private final class RejectRedirectDelegate: NSObject, URLSessionDownloadDelegate
 }
 
 enum BackendHTTP {
-    static func data(for request: URLRequest, audience: URL) async throws -> (Data, URLResponse) {
+    enum ResponseFailure: Error, Equatable {
+        case invalidLimit
+        case exceedsByteLimit
+    }
+
+    static func data(for request: URLRequest, audience: URL, maximumBytes: Int) async throws -> (Data, URLResponse) {
+        guard maximumBytes > 0 else { throw ResponseFailure.invalidLimit }
+        guard BackendTrust.sameOrigin(request.url, audience) else { throw UploadFailure.invalidServer }
         let configuration = URLSessionConfiguration.ephemeral
         configuration.httpShouldSetCookies = false
         configuration.httpCookieAcceptPolicy = .never
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.timeoutIntervalForResource = 120
         let session = URLSession(configuration: configuration, delegate: RejectRedirectDelegate(), delegateQueue: nil)
         defer { session.invalidateAndCancel() }
-        let result = try await session.data(for: request)
-        guard BackendTrust.sameOrigin(result.1.url, audience) else { throw UploadFailure.invalidServer }
+        let (bytes, response) = try await session.bytes(for: request)
+        guard BackendTrust.sameOrigin(response.url, audience) else { throw UploadFailure.invalidServer }
+        // Content-Length only permits early rejection. Delivered (including
+        // decompressed/chunked) bytes are bounded even when the header is absent.
+        guard response.expectedContentLength <= Int64(maximumBytes) else {
+            throw ResponseFailure.exceedsByteLimit
+        }
+        return (try await collect(bytes, maximumBytes: maximumBytes), response)
+    }
+
+    static func collect<S: AsyncSequence>(_ bytes: S, maximumBytes: Int) async throws -> Data where S.Element == UInt8 {
+        guard maximumBytes > 0 else { throw ResponseFailure.invalidLimit }
+        var result = Data()
+        result.reserveCapacity(min(maximumBytes, 64 * 1024))
+        for try await byte in bytes {
+            try Task.checkCancellation()
+            guard result.count < maximumBytes else { throw ResponseFailure.exceedsByteLimit }
+            result.append(byte)
+        }
         return result
     }
 

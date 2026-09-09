@@ -926,7 +926,7 @@ actor UpdateService {
         request.timeoutInterval = 20
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue(appVersion, forHTTPHeaderField: "X-Scopeproof-Version")
-        let (data, response) = try await BackendHTTP.data(for: request, audience: server)
+        let (data, response) = try await BackendHTTP.data(for: request, audience: server, maximumBytes: 32 * 1024)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode), data.count <= 32 * 1024,
               let envelope = try? JSONDecoder().decode(ReleaseEnvelope.self, from: data) else { throw UploadFailure.invalidResponse }
         guard let identity = ReleaseVerifier.configuredIdentity(), let downloadOrigin = ReleaseVerifier.configuredDownloadOrigin() else { throw UpdateFailure.invalidMetadata("the compiled update identity or download origin is not configured") }

@@ -4,6 +4,7 @@ import { executeAuditedBatch } from "./audit";
 import { randomId, sha256, stableJson } from "./crypto";
 import { getEnv } from "./env";
 import { decodePageCursor, pageLimit, pageMeta, type PageMeta } from "./pagination";
+import { isCalendarDate, nextWorkflowTimestamp, workflowBody } from "./workflow-validation";
 
 export type AssessmentStatus = "draft" | "active" | "closed";
 export type AssessmentScopeMode = "explicit";
@@ -92,7 +93,7 @@ async function mapAssessment(row: Record<string, unknown>): Promise<AssessmentRe
   const clean = { ...row };
   delete clean.systems_json;
   delete clean.controls_json;
-  return { ...clean, id: String(row.id), systems, controls, catalog: scopedCatalog(catalog, controls) } as AssessmentRecord;
+  return { ...clean, id: String(row.id), systems, controls, scope_locked: Boolean(row.has_evidence), catalog: scopedCatalog(catalog, controls) } as AssessmentRecord;
 }
 
 export async function listAssessments(input: { cursor?: string; limit?: string; status?: string } = {}): Promise<{ assessments: AssessmentRecord[]; page: PageMeta }> {
@@ -108,7 +109,8 @@ export async function listAssessments(input: { cursor?: string; limit?: string; 
   const countWhere = status ? "WHERE status = ?" : "";
   const countBindings = status ? [status] : [];
   const totalRow = await getEnv().DB.prepare(`SELECT COUNT(*) AS total FROM assessments ${countWhere}`).bind(...countBindings).first<{ total: number }>();
-  const rows = (await getEnv().DB.prepare(`SELECT id, name, framework, period_start, period_end, systems_json, controls_json, catalog_id, scope_mode, owner_id, status, created_at, updated_at
+  const rows = (await getEnv().DB.prepare(`SELECT id, name, framework, period_start, period_end, systems_json, controls_json, catalog_id, scope_mode, owner_id, status, created_at, updated_at,
+    EXISTS (SELECT 1 FROM evidence_artifacts WHERE assessment_id = assessments.id) AS has_evidence
     FROM assessments ${where} ORDER BY created_at DESC, id DESC LIMIT ?`).bind(...bindings, limit + 1).all<Record<string, unknown>>()).results;
   const mapped = await Promise.all(rows.map(mapAssessment));
   const result = pageMeta(mapped, limit, Number(totalRow?.total || 0), "created_at", "id");
@@ -124,6 +126,7 @@ function validateExplicitScope(status: AssessmentStatus, scopeMode: string, syst
 }
 
 export async function createAssessment(actor: AuthenticatedUser, input: Record<string, unknown>): Promise<AssessmentRecord> {
+  workflowBody(input, ["name", "periodStart", "periodEnd", "systems", "controls", "status", "scopeMode", "catalogId"]);
   const name = String(input.name || "").trim();
   const periodStart = String(input.periodStart || "");
   const periodEnd = String(input.periodEnd || "");
@@ -134,7 +137,7 @@ export async function createAssessment(actor: AuthenticatedUser, input: Record<s
   const catalogId = String(input.catalogId || "");
   const catalog = await loadCatalog(catalogId);
   if (!catalog) throw inputError("Select an active versioned control catalog.", 422);
-  if (name.length < 3 || name.length > 180 || !/^\d{4}-\d{2}-\d{2}$/u.test(periodStart) || !/^\d{4}-\d{2}-\d{2}$/u.test(periodEnd) || periodStart > periodEnd || !["draft", "active"].includes(status)) {
+  if (name.length < 3 || name.length > 180 || !isCalendarDate(periodStart) || !isCalendarDate(periodEnd) || periodStart > periodEnd || !["draft", "active"].includes(status)) {
     throw inputError("Name, valid period, and supported status are required.");
   }
   validateExplicitScope(status, scopeMode, systems, controls, catalog);
@@ -149,16 +152,24 @@ export async function createAssessment(actor: AuthenticatedUser, input: Record<s
 
 export async function getAssessment(id: string): Promise<AssessmentRecord | null> {
   if (!/^asm_[a-f0-9]{32}$/u.test(id)) return null;
-  const row = await getEnv().DB.prepare("SELECT * FROM assessments WHERE id = ?").bind(id).first<Record<string, unknown>>();
+  const row = await getEnv().DB.prepare("SELECT *, EXISTS (SELECT 1 FROM evidence_artifacts WHERE assessment_id = assessments.id) AS has_evidence FROM assessments WHERE id = ?").bind(id).first<Record<string, unknown>>();
   return row ? mapAssessment(row) : null;
 }
 
 export async function updateAssessment(actor: AuthenticatedUser, input: Record<string, unknown>): Promise<AssessmentRecord> {
+  workflowBody(input, ["id", "name", "periodStart", "periodEnd", "systems", "controls", "status", "scopeMode", "catalogId", "expectedUpdatedAt"]);
   const id = String(input.id || "");
   const current = await getAssessment(id);
   if (!current) throw inputError("Assessment not found.", 404);
   if (current.status === "closed") throw inputError("Closed assessments are immutable.", 409);
+  if (input.expectedUpdatedAt !== undefined && input.expectedUpdatedAt !== current.updated_at) throw inputError("Assessment changed since it was opened. Reload before saving.", 409);
   const currentStatus = String(current.status) as AssessmentStatus;
+  const name = input.name === undefined ? String(current.name) : String(input.name).trim();
+  const periodStart = input.periodStart === undefined ? String(current.period_start) : String(input.periodStart);
+  const periodEnd = input.periodEnd === undefined ? String(current.period_end) : String(input.periodEnd);
+  const identityChanged = name !== current.name || periodStart !== current.period_start || periodEnd !== current.period_end;
+  if (name.length < 3 || name.length > 180 || !isCalendarDate(periodStart) || !isCalendarDate(periodEnd) || periodStart > periodEnd) throw inputError("A 3–180 character name and real, ordered calendar dates are required.");
+  if (identityChanged && currentStatus !== "draft") throw inputError("Name and assessment period may only change in draft.", 409);
   const status = String(input.status || currentStatus) as AssessmentStatus;
   if (!["draft", "active", "closed"].includes(status) || (currentStatus === "active" && status === "draft")) throw inputError("Assessment status transition is invalid.");
   const existingSystems = current.systems;
@@ -174,7 +185,13 @@ export async function updateAssessment(actor: AuthenticatedUser, input: Record<s
   if (currentStatus === "active" && (systems.some((item) => !existingSystems.includes(item)) || controls.some((item) => !existingControls.includes(item)))) {
     throw inputError("An active assessment may be narrowed, but not expanded. Create a new assessment for broader scope.", 409);
   }
-  const updatedAt = new Date().toISOString();
+  const scopeChanged = requestedCatalogId !== current.catalog_id || scopeMode !== current.scope_mode
+    || systems.length !== existingSystems.length || systems.some((item) => !existingSystems.includes(item))
+    || controls.length !== existingControls.length || controls.some((item) => !existingControls.includes(item));
+  if ((scopeChanged || identityChanged) && await getEnv().DB.prepare("SELECT 1 FROM evidence_artifacts WHERE assessment_id = ? LIMIT 1").bind(id).first()) {
+    throw inputError("An assessment with evidence cannot change its scope. Create a new assessment; historical evidence is preserved.", 409);
+  }
+  const updatedAt = nextWorkflowTimestamp(current.updated_at);
   const action = currentStatus === "draft" && status === "active"
     ? "assessment.activated"
     : status === "closed"
@@ -182,9 +199,9 @@ export async function updateAssessment(actor: AuthenticatedUser, input: Record<s
       : currentStatus === "active"
         ? "assessment.scope_narrowed"
         : "assessment.scope_updated";
-  const [result] = await executeAuditedBatch(actor, action, "assessment", id, { previousStatus: currentStatus, status, catalogId: catalog.id, catalogDigest: catalog.digestSha256, scopeMode, systems, controls, previousUpdatedAt: current.updated_at, updatedAt }, [
-    getEnv().DB.prepare("UPDATE assessments SET framework = ?, systems_json = ?, controls_json = ?, catalog_id = ?, scope_mode = ?, status = ?, updated_at = ? WHERE id = ? AND status = ? AND updated_at = ?")
-      .bind(`${catalog.framework} ${catalog.version}`, stableJson(systems), stableJson(controls), catalog.id, scopeMode, status, updatedAt, id, currentStatus, current.updated_at),
+  const [result] = await executeAuditedBatch(actor, action, "assessment", id, { previousStatus: currentStatus, status, name, periodStart, periodEnd, catalogId: catalog.id, catalogDigest: catalog.digestSha256, scopeMode, systems, controls, previousUpdatedAt: current.updated_at, updatedAt }, [
+    getEnv().DB.prepare("UPDATE assessments SET name = ?, period_start = ?, period_end = ?, framework = ?, systems_json = ?, controls_json = ?, catalog_id = ?, scope_mode = ?, status = ?, updated_at = ? WHERE id = ? AND status = ? AND updated_at = ? AND (? = 0 OR NOT EXISTS (SELECT 1 FROM evidence_artifacts WHERE assessment_id = ?))")
+      .bind(name, periodStart, periodEnd, `${catalog.framework} ${catalog.version}`, stableJson(systems), stableJson(controls), catalog.id, scopeMode, status, updatedAt, id, currentStatus, current.updated_at, Number(scopeChanged || identityChanged), id),
   ], { sql: "EXISTS (SELECT 1 FROM assessments WHERE id = ? AND status = ? AND updated_at = ?)", bindings: [id, status, updatedAt] });
   if (!result.meta.changes) throw inputError("Assessment changed concurrently. Reload it before updating scope.", 409);
   return (await getAssessment(id))!;

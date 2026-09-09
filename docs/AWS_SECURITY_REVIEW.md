@@ -2,6 +2,12 @@
 
 **Review date:** 2026-08-28
 
+This is a historical review with dated addenda. Statements about absent customer
+UI, membership, Mac authentication, bootstrap authority and recovery describe
+that reviewed snapshot. See the [September 8 implementation ledger](READINESS_IMPLEMENTATION_STATUS.md)
+for current source changes and unresolved findings; this report is not blanket
+closure evidence.
+
 **Review basis:** the working-tree implementation under `infra/aws/cdk`, `infra/aws/database`, `lib/aws-runtime`, and the hosted-authentication primitives in `macos/ScopeproofCapture`. The existing web runtime was inspected only where necessary to determine whether it can safely serve the new tenant hostnames.
 
 **Deployment status:** **no AWS deployment was performed.** The resources and findings below describe code and synthesized design, not controls verified in a live AWS account.

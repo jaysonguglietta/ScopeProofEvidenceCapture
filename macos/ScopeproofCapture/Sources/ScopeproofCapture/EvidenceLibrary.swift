@@ -39,6 +39,7 @@ struct EvidenceLibraryRecord: Codable, Sendable {
     let s3VersionCount: Int
     let s3SizeBytes: Int64?
     let s3LastModified: String?
+    var payloadArchived = false
 }
 
 struct S3EvidenceReceiptBinding: Equatable, Sendable {
@@ -74,12 +75,19 @@ enum EvidenceLibraryBuilder {
     ) -> [String: S3EvidenceReceiptBinding] {
         guard settings.isConfigured, destination.matches(settings) else { return [:] }
         let candidates = entries.compactMap { entry -> S3EvidenceReceiptBinding? in
-            let root = entry.evidenceRoot ?? entry.manifestURL.deletingLastPathComponent()
+            if entry.isPayloadArchived {
+                guard let workspace = settings.tenantBinding,
+                      let archive = try? LocalEvidenceArchive.load(for: entry, expectedBinding: workspace),
+                      archive.destination == TransferReceipt.s3Destination(settings, accountID: destination.accountID),
+                      let image = archive.objects.first(where: { $0.filename == entry.imageURL.lastPathComponent }),
+                      let manifest = archive.objects.first(where: { $0.filename == entry.manifestURL.lastPathComponent }) else { return nil }
+                return S3EvidenceReceiptBinding(evidenceID: entry.manifest.evidenceID,
+                    imageKey: image.objectKey, imageVersionID: image.versionID, imageETag: image.eTag, imageSHA256: image.sha256,
+                    manifestKey: manifest.objectKey, manifestVersionID: manifest.versionID, manifestETag: manifest.eTag, manifestSHA256: manifest.sha256)
+            }
             guard let artifact = try? ValidatedEvidenceArtifact.load(entry, requireLifecycle: false),
-                  let receiptData = try? ValidatedEvidenceArtifact.readBoundedRegularFile(
-                    at: entry.s3ReceiptURL, within: root,
-                    maximumBytes: ValidatedEvidenceArtifact.maximumSidecarBytes
-                  ),
+                  let receiptData = try? TransferReceipt.verified(for: entry, kind: .s3, artifact: artifact,
+                    expectedDestination: TransferReceipt.s3Destination(settings, accountID: destination.accountID)).receipt.payload,
                   let receipt = try? JSONDecoder().decode(S3UploadReceipt.self, from: receiptData),
                   [2, 3].contains(receipt.schemaVersion),
                   receipt.evidenceID == artifact.manifest.evidenceID,
@@ -201,15 +209,15 @@ enum EvidenceLibraryBuilder {
             reviewStatus: item.reviewStatus, reviewNotes: item.reviewNotes, tags: item.tags,
             jiraIssueKey: item.jiraIssueKey, sourceURL: item.sourceURL, safetyStatus: item.safetyStatus,
             sha256: item.sha256, uploaded: item.uploaded || s3 != nil, lifecycleValid: item.lifecycleValid,
-            storageLocation: s3 == nil ? .local : .localAndS3, localAvailable: true,
+            storageLocation: item.payloadArchived ? .s3 : (s3 == nil ? .local : .localAndS3), localAvailable: !item.payloadArchived,
             s3Available: s3 != nil,
-            s3PreviewAvailable: s3 != nil && s3PreviewsAllowed && (s3?.size ?? 0) <= 40 * 1024 * 1024,
+            s3PreviewAvailable: !item.payloadArchived && s3 != nil && s3PreviewsAllowed && (s3?.size ?? 0) <= 40 * 1024 * 1024,
             s3IntegrityVerified: s3 != nil,
             s3IntegrityStatus: s3 != nil
                 ? "Exact S3 version bound by local upload receipt"
                 : (unverifiedS3Detected ? "S3 candidate is not bound to this local artifact" : ""),
-            reviewAvailable: true, s3VersionCount: s3?.versionCount ?? 0,
-            s3SizeBytes: s3?.size, s3LastModified: s3?.lastModified
+            reviewAvailable: !item.payloadArchived, s3VersionCount: s3?.versionCount ?? 0,
+            s3SizeBytes: s3?.size, s3LastModified: s3?.lastModified, payloadArchived: item.payloadArchived
         )
     }
 

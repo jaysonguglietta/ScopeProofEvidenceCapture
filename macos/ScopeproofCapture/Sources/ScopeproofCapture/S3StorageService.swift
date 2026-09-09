@@ -355,8 +355,9 @@ actor S3StorageService: S3CallerIdentityVerifying {
         let receiptURL = capture.manifestURL.deletingPathExtension().appendingPathExtension("s3.json")
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
-        try encoder.encode(receipt).write(to: receiptURL, options: [.atomic, .completeFileProtection])
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: receiptURL.path)
+        try TransferReceipt.record(payload: encoder.encode(receipt), kind: .s3, artifact: artifact,
+            manifestURL: capture.manifestURL,
+            destination: TransferReceipt.s3Destination(cleanSettings, accountID: binding.accountID), receiptURL: receiptURL)
         return receiptURL
     }
 
@@ -500,11 +501,8 @@ actor S3StorageService: S3CallerIdentityVerifying {
               cleanSettings.retentionMode == .compliance,
               binding.matches(cleanSettings) else { return false }
         let cleanCredentials = try Self.validatedCredentials(credentials, for: cleanSettings)
-        let root = entry.evidenceRoot ?? entry.manifestURL.deletingLastPathComponent()
-        let receiptData = try ValidatedEvidenceArtifact.readBoundedRegularFile(
-            at: entry.s3ReceiptURL, within: root,
-            maximumBytes: ValidatedEvidenceArtifact.maximumSidecarBytes
-        )
+        let receiptData = try TransferReceipt.verified(for: entry, kind: .s3,
+            expectedDestination: TransferReceipt.s3Destination(cleanSettings, accountID: binding.accountID)).receipt.payload
         let receipt = try JSONDecoder().decode(S3UploadReceipt.self, from: receiptData)
         guard receipt.schemaVersion == 3, receipt.bucket == cleanSettings.bucket,
               receipt.region == cleanSettings.region, receipt.awsAccountID == binding.accountID,
@@ -548,6 +546,119 @@ actor S3StorageService: S3CallerIdentityVerifying {
             )
         }
         return true
+    }
+
+    func archiveHistory(entry: CaptureHistoryEntry, settings: S3StorageSettings, credentials: S3Credentials,
+        binding: S3VerifiedDestination) async throws -> EvidenceArchiveRecord {
+        let clean = try Self.validatedSettings(settings)
+        guard clean.securityProfile == .production, clean.retentionMode == .compliance,
+              clean.downloadsAllowed, binding.matches(clean), let workspace = clean.tenantBinding,
+              entry.manifest.belongs(to: workspace) else { throw EvidenceArchiveFailure.destinationMismatch }
+        let credentials = try Self.validatedCredentials(credentials, for: clean)
+        let snapshot = try LocalEvidenceArchive.snapshot(entry, expectedBinding: workspace)
+        guard try await verifyRemoteDurableCopy(for: entry, settings: clean, credentials: credentials, binding: binding) else {
+            throw EvidenceArchiveFailure.invalidArchive
+        }
+        let receipt = try JSONDecoder().decode(S3UploadReceipt.self, from:
+            TransferReceipt.verified(for: entry, kind: .s3, artifact: snapshot.artifact,
+                expectedDestination: TransferReceipt.s3Destination(clean, accountID: binding.accountID)).receipt.payload)
+        guard let imageKey = receipt.objectKeys.first(where: { ($0 as NSString).lastPathComponent == entry.imageURL.lastPathComponent }) else {
+            throw EvidenceArchiveFailure.invalidArchive
+        }
+        let base = (imageKey as NSString).deletingLastPathComponent
+        var objects: [EvidenceArchiveObject] = []
+        for file in snapshot.files {
+            try Task.checkCancellation()
+            let filename = file.sourceURL.lastPathComponent
+            let key = base + "/" + filename
+            if receipt.objectKeys.contains(key) {
+                guard let version = receipt.versionIDs[key], let etag = receipt.etags[key],
+                      let checksum = receipt.s3ChecksumsSHA256[key], let retained = receipt.retainUntilByObjectKey?[key] else {
+                    throw EvidenceArchiveFailure.invalidArchive
+                }
+                objects.append(EvidenceArchiveObject(filename: filename, objectKey: key, versionID: version,
+                    eTag: etag, sha256: LocalEvidenceArchive.digest(file.data), checksumSHA256: checksum,
+                    byteCount: file.data.count, retainUntil: retained))
+            } else {
+                let write = try await put(file.data, contentType: "application/json", objectKey: key,
+                    settings: clean, credentials: credentials, expectedOwner: binding.accountID)
+                objects.append(EvidenceArchiveObject(filename: filename, objectKey: key, versionID: write.versionID,
+                    eTag: write.eTag, sha256: LocalEvidenceArchive.digest(file.data), checksumSHA256: write.checksumSHA256,
+                    byteCount: file.data.count, retainUntil: write.retainUntil))
+            }
+        }
+        let record = try LocalEvidenceArchive.makeRecord(snapshot: snapshot, objects: objects,
+            destination: TransferReceipt.s3Destination(clean, accountID: binding.accountID))
+        // The signed restore recipe is also durably archived. It contains exact
+        // original manifest bytes and every sidecar's immutable object version.
+        _ = try await put(LocalEvidenceArchive.encoded(record), contentType: "application/json",
+            objectKey: base + "/" + LocalEvidenceArchive.url(for: entry.manifestURL).lastPathComponent,
+            settings: clean, credentials: credentials, expectedOwner: binding.accountID)
+        guard try await revalidateArchive(record, evidenceRoot: try archiveRoot(entry), expectedBinding: workspace,
+            settings: clean, credentials: credentials, binding: binding) else { throw EvidenceArchiveFailure.invalidArchive }
+        try LocalEvidenceArchive.persist(record, for: entry, expectedBinding: workspace)
+        return record
+    }
+
+    func revalidateArchive(_ record: EvidenceArchiveRecord, evidenceRoot: URL, expectedBinding: TenantWorkspaceBinding,
+        settings: S3StorageSettings, credentials: S3Credentials, binding: S3VerifiedDestination, now: Date = Date()) async throws -> Bool {
+        let clean = try Self.validatedSettings(settings)
+        guard binding.matches(clean), clean.tenantBinding == expectedBinding,
+              record.destination == TransferReceipt.s3Destination(clean, accountID: binding.accountID) else { return false }
+        _ = try LocalEvidenceArchive.validate(record, evidenceRoot: evidenceRoot, expectedBinding: expectedBinding)
+        let credentials = try Self.validatedCredentials(credentials, for: clean)
+        for object in record.objects {
+            guard Self.isSafeObjectKey(object.objectKey), let retained = Self.parseISO8601(object.retainUntil), retained > now else { return false }
+            let url = try Self.endpoint(settings: clean, objectKey: object.objectKey, versionID: object.versionID)
+            let request = try Self.signedRequest(method: "HEAD", url: url, region: clean.region, body: Data(), contentType: nil,
+                credentials: credentials, date: now, requireEncryption: false, ifMatch: object.eTag,
+                expectedBucketOwner: binding.accountID, extraHeaders: ["x-amz-checksum-mode": "ENABLED"])
+            let (_, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse, Self.isExpectedResponse(http, requestURL: url), http.statusCode == 200,
+                  Self.safeResponseHeader(http.value(forHTTPHeaderField: "x-amz-version-id"), maximum: 1_024) == object.versionID,
+                  http.value(forHTTPHeaderField: "x-amz-checksum-sha256") == object.checksumSHA256,
+                  Int(http.value(forHTTPHeaderField: "Content-Length") ?? "") == object.byteCount,
+                  http.value(forHTTPHeaderField: "x-amz-server-side-encryption") == clean.encryptionMode.rawValue,
+                  !clean.encryptionMode.needsKMSKey || http.value(forHTTPHeaderField: "x-amz-server-side-encryption-aws-kms-key-id") == clean.kmsKeyARN else { return false }
+            try await verifyObjectRetention(objectKey: object.objectKey, versionID: object.versionID,
+                expected: S3ObjectRetentionExpectation(mode: S3RetentionMode.compliance.rawValue,
+                    retainUntil: object.retainUntil, retainUntilDate: retained, headers: [:]),
+                settings: clean, credentials: credentials, expectedOwner: binding.accountID)
+        }
+        return true
+    }
+
+    func restoreArchive(at archiveURL: URL, evidenceRoot: URL, expectedBinding: TenantWorkspaceBinding,
+        settings: S3StorageSettings, credentials: S3Credentials, binding: S3VerifiedDestination) async throws -> CaptureHistoryEntry {
+        let clean = try Self.validatedSettings(settings)
+        let (record, entry) = try LocalEvidenceArchive.load(at: archiveURL, evidenceRoot: evidenceRoot, expectedBinding: expectedBinding)
+        guard clean.downloadsAllowed, binding.matches(clean), clean.tenantBinding == expectedBinding,
+              record.destination == TransferReceipt.s3Destination(clean, accountID: binding.accountID) else {
+            throw EvidenceArchiveFailure.destinationMismatch
+        }
+        let credentials = try Self.validatedCredentials(credentials, for: clean)
+        let staging = entry.manifestURL.deletingLastPathComponent().appendingPathComponent(".scopeproof-restore-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        defer { try? FileManager.default.removeItem(at: staging) }
+        var files: [ValidatedEvidenceFile] = []
+        for object in record.objects {
+            try Task.checkCancellation()
+            let output = staging.appendingPathComponent(object.filename)
+            let result = try await downloadObject(S3StoredObject(key: object.objectKey, size: Int64(object.byteCount),
+                lastModified: record.createdAt, eTag: object.eTag, versionID: object.versionID),
+                settings: clean, credentials: credentials, binding: binding, to: output)
+            guard result.versionID == object.versionID, result.sha256 == object.sha256 else { throw EvidenceArchiveFailure.invalidArchive }
+            let data = try ValidatedEvidenceArtifact.readBoundedRegularFile(at: output, within: staging, maximumBytes: object.byteCount)
+            files.append(ValidatedEvidenceFile(sourceURL: output, data: data))
+        }
+        try Task.checkCancellation()
+        try LocalEvidenceArchive.restoreStagedFiles(files, record: record, evidenceRoot: evidenceRoot, expectedBinding: expectedBinding)
+        return entry
+    }
+
+    private func archiveRoot(_ entry: CaptureHistoryEntry) throws -> URL {
+        guard let root = entry.evidenceRoot else { throw EvidenceArchiveFailure.invalidArchive }
+        return root
     }
 
     private func put(

@@ -99,7 +99,10 @@ test("native evidence stays quarantined until its immutable signed chain link is
     read("app/api/native/jira/upload/route.ts"),
     read("drizzle/0022_native_provenance_quarantine.sql"),
   ]);
-  for (const source of [evidence, packages, jira]) {
+  const eligibility = await read("lib/server/package-eligibility.ts");
+  assert.match(packages, /packagePublicationQuery\(/);
+  assert.match(await read("lib/server/package-publication.ts"), /\$\{PACKAGE_ELIGIBLE_EVIDENCE_SQL\}/);
+  for (const source of [evidence, eligibility, jira]) {
     assert.match(source, /n\.chain_sequence IS NOT NULL AND n\.chain_sequence > 0/);
     assert.match(source, /d\.provenance_key_id = n\.provenance_key_id/);
     assert.match(source, /d\.chain_sequence >= n\.chain_sequence/);
@@ -151,8 +154,11 @@ test("hosted screenshots require an independent server safety receipt before per
   assert.match(evidence, /e\.type != 'screenshot' OR/);
   assert.match(evidence, /server_safety_scan_sha256 = e\.sha256/);
   assert.match(packages, /pending_safety/);
-  assert.match(packages, /e\.type != 'screenshot' OR/);
-  assert.match(packages, /e\.server_safety_scan_sha256 = e\.sha256/);
+  assert.match(packages, /packagePublicationQuery\(/);
+  const eligibility = await read("lib/server/package-eligibility.ts");
+  assert.match(await read("lib/server/package-publication.ts"), /\$\{PACKAGE_ELIGIBLE_EVIDENCE_SQL\}/);
+  assert.match(eligibility, /e\.type != 'screenshot' OR/);
+  assert.match(eligibility, /e\.server_safety_scan_sha256 = e\.sha256/);
   assert.match(jira, /await evidenceSafetyReceiptSha256/);
   assert.match(jira, /hostedSafetyReceipt !== hosted\.server_safety_receipt_sha256/);
   assert.match(readiness, /independent_image_safety/);

@@ -27,18 +27,21 @@ enum AssessorPackageFailure: LocalizedError {
 enum AssessorPackageExporter {
     static func export(
         entries: [CaptureHistoryEntry], completeHistory: [CaptureHistoryEntry],
-        to destination: URL, preparedBy: String,
+        expectedBinding: TenantWorkspaceBinding, to destination: URL, preparedBy: String,
         packageName: String, jiraSettings: JiraHandoffSettings = .defaults,
         signingKeyOverride: P256.Signing.PrivateKey? = nil,
         captureAnchorOverride: LocalCaptureChainAnchor? = nil
     ) throws -> AssessorPackageResult {
+        guard (entries + completeHistory).allSatisfy({ $0.manifest.belongs(to: expectedBinding) }) else {
+            throw EvidenceArtifactFailure.workspaceMismatch
+        }
         let completeManifestPaths = Set(completeHistory.map { $0.manifestURL.standardizedFileURL.path })
         let selectionBelongsToHistory = entries.allSatisfy {
             completeManifestPaths.contains($0.manifestURL.standardizedFileURL.path)
         }
         let chainValid = captureAnchorOverride.map {
             CaptureHistory.captureChainIntegrity(completeHistory, anchor: $0)
-        } ?? CaptureHistory.captureChainIntegrity(completeHistory)
+        } ?? CaptureHistory.captureChainIntegrity(completeHistory, expectedBinding: expectedBinding)
         guard selectionBelongsToHistory, chainValid else {
             throw AssessorPackageFailure.captureChainInvalid
         }
@@ -62,10 +65,10 @@ enum AssessorPackageExporter {
             let files: [ValidatedEvidenceFile]
             do {
                 artifact = try ValidatedEvidenceArtifact.load(
-                    entry, requireLifecycle: true, trustedAnchor: captureAnchorOverride
+                    entry, requireLifecycle: true, expectedBinding: expectedBinding, trustedAnchor: captureAnchorOverride
                 )
                 files = try ValidatedEvidenceArtifact.exportFiles(
-                    for: entry, trustedAnchor: captureAnchorOverride
+                    for: entry, expectedBinding: expectedBinding, trustedAnchor: captureAnchorOverride
                 )
             } catch {
                 throw AssessorPackageFailure.integrityMismatch(entry.manifest.evidenceID)
@@ -139,6 +142,9 @@ enum AssessorPackageExporter {
         4. Each PNG has an immutable capture manifest (.json), review lifecycle (.review.json), and—when available—a hosted receipt (.receipt.json), Jira receipt (.jira.json), or credential-free S3 receipt (.s3.json).
         5. Follow 04-Verification.txt to validate file hashes and the package signature.
         6. When present, follow 05-Jira-Handoff.txt before attaching files to a Jira issue.
+
+        TRANSFER RECEIPT TRUST
+        Transfer receipt files use the Scopeproof device-sealed response envelope. The base64 payload retains the original provider response; the envelope binds its digest to this exact evidence and recorded destination. The device verified these receipts against its separate Keychain key before packaging. This does not independently establish the identity of a hosted server's embedded signing key, verify Jira's server-only HMAC, or prove that a remote object remains available now. Do not trust an adjacent public key without an independently approved device identity.
 
         PACKAGE POLICY
         Only evidence marked Approved is included. Draft, In Review, Rejected, and Superseded artifacts are excluded. Automated and manual redactions are irreversible; original unredacted pixels are not retained. Cross-framework mappings are informational and require assessor validation.

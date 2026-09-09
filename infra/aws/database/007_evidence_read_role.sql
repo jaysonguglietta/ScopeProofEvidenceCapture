@@ -47,11 +47,7 @@ BEGIN
     'GRANT EXECUTE ON FUNCTION scopeproof.record_api_audit_event(scopeproof.resource_identifier, scopeproof.resource_identifier, text, text, text, text, text, jsonb) TO %I',
     read_role
   );
-  EXECUTE format('ALTER ROLE %I SET search_path = pg_catalog, scopeproof', read_role);
-  EXECUTE format('ALTER ROLE %I SET row_security = on', read_role);
-  EXECUTE format('ALTER ROLE %I SET statement_timeout = %L', read_role, '15s');
-  EXECUTE format('ALTER ROLE %I SET lock_timeout = %L', read_role, '3s');
-  EXECUTE format('ALTER ROLE %I SET idle_in_transaction_session_timeout = %L', read_role, '15s');
+  EXECUTE format('GRANT EXECUTE ON FUNCTION scopeproof.resolve_active_session_membership(text, timestamptz) TO %I', read_role);
 END;
 $$;
 

@@ -79,6 +79,7 @@ function foundation() {
   });
   tenant.addStackDependency(shared);
   const observability = new ObservabilityStack(app, "Observability", {
+    recovery: developmentRecovery,
     env,
     shared,
     tenants: [tenant],
@@ -111,6 +112,31 @@ function assertNoVacuousMultiValueIamConditions(template: Template): void {
   visit(template.toJSON());
 }
 
+function assertCustomerRoutes(template: Template): void {
+  const synthesized = template.toJSON() as { Resources: Record<string, Record<string, unknown>> };
+  const clients = Object.values(synthesized.Resources).filter((resource) => resource.Type === "AWS::Cognito::UserPoolClient");
+  const clientScopes = clients.map((resource) => (resource.Properties as Record<string, unknown>).AllowedOAuthScopes as unknown[]);
+  const nativeScopes = clientScopes.find((scopes) => !JSON.stringify(scopes).includes("/evidence.read"));
+  const nativeCustomScopes = nativeScopes?.filter((scope) => typeof scope !== "string" || scope.startsWith("scopeproof/"));
+  assert.equal(nativeCustomScopes?.length, 1); assert.match(JSON.stringify(nativeCustomScopes), /\/evidence\.collect/);
+  const webScopes = clientScopes.find((scopes) => JSON.stringify(scopes).includes("/evidence.read"));
+  for (const scope of ["tenant.manage", "device.manage", "jobs.manage", "evidence.approve"]) assert.ok(JSON.stringify(webScopes).includes(`/${scope}`));
+  const resourcePath = (id: string): string => {
+    const resource = synthesized.Resources[id];
+    if (!resource || resource.Type !== "AWS::ApiGateway::Resource") return "";
+    const properties = resource.Properties as { ParentId: { Ref?: string }; PathPart: string };
+    return `${properties.ParentId.Ref ? resourcePath(properties.ParentId.Ref) : ""}/${properties.PathPart}`;
+  };
+  const methods = Object.values(synthesized.Resources).filter((resource) => resource.Type === "AWS::ApiGateway::Method").map((resource) => resource.Properties as { HttpMethod: string; ResourceId: { Ref?: string }; AuthorizationType: string; AuthorizationScopes?: string[] });
+  const customerMethods = methods.filter((method) => method.HttpMethod === "POST" && resourcePath(method.ResourceId.Ref ?? "").startsWith("/v1/customer/"));
+  assert.equal(customerMethods.length, 14);
+  for (const method of customerMethods) { assert.equal(method.AuthorizationType, "COGNITO_USER_POOLS"); assert.ok(method.AuthorizationScopes?.length); }
+  for (const name of ["by-evidence", "status"]) {
+    const method = methods.find((method) => method.HttpMethod === "POST" && resourcePath(method.ResourceId.Ref ?? "") === `/v1/legal-hold-requests/${name}`);
+    assert.deepEqual(method?.AuthorizationScopes, ["scopeproof/retention.manage"]);
+  }
+}
+
 function assertRetainedBucketPolicies(template: Template): void {
   const synthesized = template.toJSON() as { Resources: Record<string, Record<string, unknown>> };
   const policies = Object.entries(synthesized.Resources).filter(([, resource]) =>
@@ -141,6 +167,7 @@ function recoveryFoundation() {
     slug: "acme",
   });
   const recovery = parseRecoveryConfiguration({
+    auditDestination: { bucketName: "sp-audit-r-111111111111-us-west-2-prod", kmsKeyArn: "arn:aws:kms:us-west-2:111111111111:key/44444444-4444-4444-8444-444444444444" },
     auroraCopyRetentionDays: 365,
     auroraLocalRetentionDays: 35,
     backupVaultKeyArn: "arn:aws:kms:us-west-2:111111111111:key/11111111-1111-4111-8111-111111111111",
@@ -411,8 +438,13 @@ test("recovery stack creates locked destination vault and immutable tenant evide
       MinRetentionDays: 365,
     },
   });
-  template.resourceCountIs("AWS::KMS::Key", 3);
-  template.resourceCountIs("AWS::S3::Bucket", 2);
+  template.resourceCountIs("AWS::KMS::Key", 4);
+  template.resourceCountIs("AWS::S3::Bucket", 3);
+  template.hasResourceProperties("AWS::S3::Bucket", {
+    BucketName: "sp-audit-r-111111111111-us-west-2-prod",
+    ObjectLockEnabled: true,
+    ObjectLockConfiguration: { ObjectLockEnabled: "Enabled", Rule: { DefaultRetention: { Days: 365, Mode: "COMPLIANCE" } } },
+  });
   template.hasResourceProperties("AWS::S3::Bucket", {
     BucketName: "sp-r-111111111111-uswest2-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
     ObjectLockConfiguration: {
@@ -573,7 +605,10 @@ test("shared platform reserves exact tenant mappings but publishes no tenant DNS
   );
   assert.ok(domain);
   assert.ok(amplifyApp);
-  assert.match(JSON.stringify(amplifyApp), /npm ci --ignore-scripts --cache \.npm --prefer-offline/);
+  assert.match(JSON.stringify(amplifyApp), /node infra\/aws\/customer-portal\/build\.mjs/);
+  assert.match(JSON.stringify(amplifyApp), /baseDirectory: \.scopeproof-portal/);
+  assert.match(JSON.stringify(amplifyApp), /"Platform":"WEB"/);
+  assert.doesNotMatch(JSON.stringify(amplifyApp), /ComputeRoleArn|WEB_COMPUTE|baseDirectory: \.next/);
   assert.doesNotMatch(JSON.stringify(amplifyApp), /node_modules\/\*\*/);
   assert.doesNotMatch(JSON.stringify(domain), /"Prefix":"\*"/);
   assert.equal(
@@ -856,6 +891,7 @@ test("tenant stack is isolated, immutable, and remains provisioning", () => {
   const { tenant } = foundation();
   const template = Template.fromStack(tenant);
   assertRetainedBucketPolicies(template);
+  assertCustomerRoutes(template);
   const synthesized = template.toJSON() as { Resources: Record<string, Record<string, unknown>> };
   const buckets = Object.values(synthesized.Resources).filter(
     (resource) => resource.Type === "AWS::S3::Bucket",
@@ -1219,19 +1255,21 @@ test("runtime assets enforce exact provisioning and single-writer promotion cont
   );
 
   assert.match(provisioner, /SET LOCAL ROLE/);
-  assert.match(provisioner, /REVOKE \$\{ownerRole\} FROM \$\{adminRole\}/);
-  assert.match(provisioner, /pg_catalog\.pg_auth_members/);
+  const bootstrap = readFileSync(path.join(__dirname, "..", "runtime", "bootstrap-database", "index.mjs"), "utf8");
+  const bootstrapContract = readFileSync(path.join(__dirname, "..", "runtime", "bootstrap-database", "contract.mjs"), "utf8");
+  assert.doesNotMatch(provisioner, /ADMIN_SECRET_ARN|CREATE ROLE|ALTER ROLE|CREATE DATABASE|scopeproof_admin/);
+  assert.match(bootstrap, /REVOKE \$\{owner\} FROM \$\{admin\}/);
+  assert.match(provisioner, /pg_auth_members/);
   assert.match(provisioner, /NOT rolinherit/);
-  assert.match(provisioner, /isolated from all role memberships/);
+  assert.match(provisioner, /exact non-delegable owner-to-provisioner edge/);
+  assert.match(bootstrap, /WITH ADMIN FALSE, INHERIT FALSE, SET TRUE/);
   assert.ok(
-    provisioner.indexOf("await verifyManagedRoleIsolation();") <
-      provisioner.indexOf("GRANT ${ownerRole} TO ${adminRole}"),
-    "role membership isolation must pass before the administrator receives temporary owner membership",
+    bootstrap.indexOf("validateApproval(approval") < bootstrap.indexOf("GRANT ${owner} TO ${admin}"),
+    "independent approval must pass before central temporary administrator membership",
   );
   assert.ok(
-    provisioner.lastIndexOf("await verifyManagedRoleIsolation();") >
-      provisioner.indexOf("REVOKE ${ownerRole} FROM ${adminRole}"),
-    "role membership isolation must be rechecked after the temporary owner grant is revoked",
+    provisioner.indexOf("await verifyManagedRoleIsolation();") < provisioner.indexOf("let evidenceAccessMigrationApplied"),
+    "tenant role membership isolation must pass before the first tenant migration",
   );
   assert.match(provisioner, /tenant_security_baseline/);
   assert.match(provisioner, /databaseBundleMarkerPrefix/);
@@ -1255,24 +1293,24 @@ test("runtime assets enforce exact provisioning and single-writer promotion cont
   assert.match(provisioner, /tenant_domains/);
   assert.match(provisioner, /ChangeResourceRecordSetsCommand/);
   assert.match(provisioner, /await verifyDatabase\(\["PROVISIONING", "ACTIVE"\]\)/);
-  assert.match(provisioner, /GRANT EXECUTE ON FUNCTION scopeproof\.current_tenant_id\(\)/);
+  assert.match(provisioner, /validateInstalledFunctionsSql/);
   assert.match(provisioner, /await setDatabaseTenantStatus\("PROVISIONING", \["PROVISIONING", "ACTIVE"\]\)/);
   assert.match(provisioner, /SELECT set_config\('scopeproof\.tenant_id', :tenant_id, true\)/);
-  assert.match(provisioner, /SCRAM-SHA-256/);
-  assert.match(provisioner, /pbkdf2Sync\(password, salt, iterations, 32, "sha256"\)/);
-  assert.match(
-    provisioner,
-    /new Set\(\[\s*password,\s*ingestPassword,\s*controlPassword,\s*legalApiPassword,\s*readPassword,\s*apiAuditPassword,\s*\]\)\.size !== 6/,
-  );
+  assert.match(bootstrapContract, /SCRAM-SHA-256/);
+  assert.match(bootstrapContract, /pbkdf2Sync\(password, salt, rounds, 32, "sha256"\)/);
+  assert.match(bootstrap, /passwords\.has\(secret.password\)/);
   assert.match(provisioner, /import \{ transactionToken \} from "\.\/idempotency\.mjs"/);
   assert.match(provisioner, /lastProvisionExecutionId/);
   assert.match(provisioner, /"read_promoted_evidence_receipt"/);
   assert.match(provisioner, /"approve_exact_version_legal_hold"/);
   assert.match(provisioner, /"read_exact_version_legal_hold_operation"/);
-  assert.match(provisioner, /p\.proname IN \('current_tenant_id', 'resolve_active_membership', 'create_upload_intent', 'record_api_audit_event'\)/);
-  assert.match(provisioner, /fieldNumber\(functions\[0\]\) !== 4/);
+  assert.match(provisioner, /p\.proname IN \('current_tenant_id', 'resolve_active_membership', 'resolve_active_session_membership', 'revoke_own_sessions', 'create_upload_intent', 'record_api_audit_event', 'customer_read', 'customer_mutate', 'customer_accept_invitation'\)/);
+  const uploadVerifier = provisioner.slice(provisioner.indexOf("async function verifyRuntimeControlIsolation("), provisioner.indexOf("async function verifyEvidenceReadRole("));
+  assert.match(uploadVerifier, /fieldNumber\(functions\[0\]\) !== 9/);
+  assert.match(uploadVerifier, /fieldNumber\(functions\[1\]\) !== 9/);
+  assert.match(uploadVerifier, /fieldNumber\(operations\[0\]\) !== 0/);
   assert.match(provisioner, /Tenant upload runtime is not an execute-only membership and upload identity/);
-  assert.match(provisioner, /p\.proname IN \('current_tenant_id', 'resolve_active_membership', 'list_accessible_evidence', 'read_accessible_evidence', 'record_api_audit_event'\)/);
+  assert.match(provisioner, /p\.proname IN \('current_tenant_id', 'resolve_active_membership', 'resolve_active_session_membership', 'list_accessible_evidence', 'read_accessible_evidence', 'record_api_audit_event'\)/);
   assert.match(provisioner, /Tenant evidence-read role is not an execute-only listing and exact-version read identity/);
   assert.match(provisioner, /const apiAuditSignerRoleAllowedFunctions = Object\.freeze\(\[/);
   for (const functionName of [
@@ -1300,10 +1338,12 @@ test("runtime assets enforce exact provisioning and single-writer promotion cont
     "read_tenant_audit_head",
   ]) assert.match(provisioner, new RegExp(`"${functionName}"`));
   assert.match(provisioner, /fieldNumber\(functions\[0\]\) !== controlRoleAllowedFunctions\.length/);
-  assert.match(provisioner, /p\.proname IN \('current_tenant_id', 'resolve_active_membership', 'reserve_exact_version_legal_hold', 'approve_exact_version_legal_hold', 'record_api_audit_event'\)/);
-  assert.match(provisioner, /fieldNumber\(functions\[0\]\) !== 5/);
-  assert.match(provisioner, /p\.proname IN \('claim_promotion_fence', 'current_tenant_id', 'read_promoted_evidence_receipt', 'reconcile_promoted_evidence', 'reconcile_rejected_evidence'\)/);
-  assert.match(provisioner, /fieldNumber\(functions\[0\]\) !== 5/);
+  assert.match(provisioner, /p\.proname IN \('current_tenant_id', 'resolve_active_membership', 'resolve_active_session_membership', 'reserve_exact_version_legal_hold_with_audit', 'approve_exact_version_legal_hold_with_audit', 'customer_legal_hold_target', 'customer_legal_hold_status'\)/);
+  assert.match(provisioner, /fieldNumber\(functions\[0\]\) !== 7/);
+  assert.match(provisioner, /p\.proname IN \('claim_promotion_fence', 'current_tenant_id', 'read_promoted_evidence_receipt', 'reconcile_promoted_evidence', 'reconcile_rejected_evidence', 'repair_upload_intent'\)/);
+  const ingestVerifier = provisioner.slice(provisioner.indexOf("async function verifyIngestRole("), provisioner.indexOf("async function verifyRuntimeControlIsolation("));
+  assert.match(ingestVerifier, /fieldNumber\(functions\[0\]\) !== 6/);
+  assert.match(ingestVerifier, /fieldNumber\(functions\[1\]\) !== 6/);
   assert.doesNotMatch(provisioner, /stableToken\(executionId/);
   assert.doesNotMatch(provisioner, /quoteLiteral\(password\)/);
 

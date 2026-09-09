@@ -93,12 +93,13 @@ enum EvidenceLifecycleStore {
         supersedesEvidenceID: String? = nil,
         privateKeyDataOverride: Data? = nil,
         trustedAnchor: LocalCaptureChainAnchor? = nil,
-        reviewerIdentity: LocalReviewerIdentity? = nil
+        reviewerIdentity: LocalReviewerIdentity? = nil,
+        expectedBinding: TenantWorkspaceBinding? = nil
     ) throws -> EvidenceLifecycleRecord {
         // Lifecycle decisions are trust-bearing. Legacy schema-6 artifacts remain
         // browseable for migration, but cannot acquire a new review history.
         _ = try ValidatedEvidenceArtifact.load(
-            entry, requireLifecycle: false, trustedAnchor: trustedAnchor
+            entry, requireLifecycle: false, expectedBinding: expectedBinding, trustedAnchor: trustedAnchor
         )
         let sidecar = url(for: entry.manifestURL)
         let exists = FileManager.default.fileExists(atPath: sidecar.path)
@@ -280,7 +281,7 @@ enum EvidenceLifecycleStore {
         return false
     }
 
-    private static func trustScope(for entry: CaptureHistoryEntry) -> String {
+    static func trustScope(for entry: CaptureHistoryEntry) -> String {
         let binding = entry.manifest.tenantBinding ?? .localDefault
         return "\(binding.tenantID)/\(binding.workspaceID)/\(entry.manifestURL.standardizedFileURL.path)"
     }

@@ -7,6 +7,8 @@ import { evidenceSafetyReceiptSha256 } from "./image-safety";
 import { NATIVE_ORPHAN_GRACE_MS } from "./native-provenance-contract";
 import { redactJson, redactText, type RedactionFinding } from "./redaction";
 import { decodePageCursor, pageLimit, pageMeta, type PageMeta } from "./pagination";
+import { evidenceWithinAssessmentScopeSql } from "./assessment-scope";
+import { evidenceReviewPolicy } from "./evidence-review-policy";
 
 export type ArtifactType = "screenshot" | "code" | "configuration" | "report";
 export interface EvidenceInput {
@@ -269,6 +271,9 @@ export async function storeEvidence(input: EvidenceInput): Promise<StoreEvidence
 }
 
 export type EvidenceListInput = {
+  controlId?: string;
+  system?: string;
+  evidenceId?: string;
   assessmentId?: string;
   cursor?: string;
   limit?: string;
@@ -331,9 +336,18 @@ export async function listEvidence(input: EvidenceListInput = {}): Promise<{ evi
   const now = new Date().toISOString();
   const baseConditions: string[] = [];
   const baseBindings: unknown[] = [];
+  if (input.evidenceId) {
+    if (!/^ev_[a-f0-9]{32}$/u.test(input.evidenceId)) throw new Response(JSON.stringify({ error: "Evidence identifier is invalid." }), { status: 400, headers: { "content-type": "application/json" } });
+    baseConditions.push("e.id = ?"); baseBindings.push(input.evidenceId);
+  }
   if (assessmentId) { baseConditions.push("e.assessment_id = ?"); baseBindings.push(assessmentId); }
   const conditions = [...baseConditions];
   const bindings = [...baseBindings];
+  for (const [value, column, maximum] of [[input.controlId, "control_id", 80], [input.system, "system", 180]] as const) {
+    if (!value) continue;
+    if (value.length > maximum || /\p{Cc}/u.test(value)) throw Response.json({ error: "Evidence scope filter is invalid." }, { status: 400 });
+    conditions.push(`e.${column} = ?`); bindings.push(value);
+  }
   if (input.status === "expired") {
     conditions.push("(e.status = 'expired' OR (e.status != 'purged' AND e.expires_at <= ?))");
     bindings.push(now);
@@ -357,7 +371,11 @@ export async function listEvidence(input: EvidenceListInput = {}): Promise<{ evi
       CASE WHEN e.status != 'purged' AND e.expires_at <= ? THEN 'expired' ELSE e.status END AS status,
       e.redaction_count, e.redaction_summary_json, e.manifest_sha256, e.chain_previous_hash, e.chain_event_hash, e.timestamp_authority, e.safety_scan_sha256, e.safety_scan_policy, e.safety_scan_completed_at,
       e.server_safety_scan_sha256, e.server_safety_scan_policy, e.server_safety_scan_completed_at, e.server_safety_scanner_origin, e.server_safety_receipt_sha256,
-      e.created_by, e.created_at, e.approved_by, e.approved_at, e.assessment_id, e.coverage_status, e.coverage_json,
+      COALESCE((SELECT latest.created_by FROM evidence_occurrences latest WHERE latest.artifact_id = e.id ORDER BY latest.received_at DESC, latest.id DESC LIMIT 1), e.created_by) AS created_by,
+      e.created_by AS artifact_created_by,
+      (SELECT latest.id FROM evidence_occurrences latest WHERE latest.artifact_id = e.id ORDER BY latest.received_at DESC, latest.id DESC LIMIT 1) AS occurrence_id,
+      ${evidenceWithinAssessmentScopeSql("e")} AS in_scope,
+      e.created_at, e.approved_by, e.approved_at, e.assessment_id, e.coverage_status, e.coverage_json,
       CASE WHEN e.device_id IS NULL THEN 'not_applicable' WHEN EXISTS (
         SELECT 1 FROM native_evidence_manifests n JOIN capture_devices d ON d.id = n.device_id
         WHERE n.artifact_id = e.id AND n.device_id = e.device_id AND n.image_sha256 = e.sha256 AND n.manifest_sha256 = e.manifest_sha256
@@ -373,7 +391,7 @@ export async function listEvidence(input: EvidenceListInput = {}): Promise<{ evi
   const paged = pageMeta(rows, limit, Number(totalRow?.total || 0), "captured_at", "id");
   const baseWhere = baseConditions.length ? `WHERE ${baseConditions.join(" AND ")}` : "";
   const aggregate = await getEnv().DB.prepare(`SELECT COUNT(*) AS total,
-      SUM(CASE WHEN status = 'approved' AND expires_at > ? THEN 1 ELSE 0 END) AS approved,
+      SUM(CASE WHEN status = 'approved' AND expires_at > ? AND ${evidenceWithinAssessmentScopeSql("e")} THEN 1 ELSE 0 END) AS approved,
       SUM(CASE WHEN status = 'needs_review' AND expires_at > ? THEN 1 ELSE 0 END) AS needs_review,
       SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) AS rejected,
       SUM(CASE WHEN status = 'returned' THEN 1 ELSE 0 END) AS returned,
@@ -385,7 +403,7 @@ export async function listEvidence(input: EvidenceListInput = {}): Promise<{ evi
       SUM(CASE WHEN e.status = 'approved' AND e.expires_at > ? THEN 1 ELSE 0 END) AS approved,
       SUM(CASE WHEN e.status = 'needs_review' AND e.expires_at > ? THEN 1 ELSE 0 END) AS needs_review,
       SUM(CASE WHEN e.coverage_status = 'partial' AND e.expires_at > ? THEN 1 ELSE 0 END) AS partial_coverage
-    FROM evidence_artifacts e ${baseWhere} GROUP BY e.control_id ORDER BY e.control_id`).bind(now, now, now, ...baseBindings).all<Record<string, unknown>>()).results;
+    FROM evidence_artifacts e ${baseWhere ? `${baseWhere} AND` : "WHERE"} ${evidenceWithinAssessmentScopeSql("e")} GROUP BY e.control_id ORDER BY e.control_id`).bind(now, now, now, ...baseBindings).all<Record<string, unknown>>()).results;
   const findingRow = assessmentId ? await getEnv().DB.prepare("SELECT COUNT(*) AS total FROM findings WHERE assessment_id = ? AND status IN ('open','in_progress')").bind(assessmentId).first<{ total: number }>() : { total: 0 };
   return {
     evidence: paged.items,
@@ -397,6 +415,18 @@ export async function listEvidence(input: EvidenceListInput = {}): Promise<{ evi
       controls: controlRows.map((row) => ({ controlId: String(row.control_id), total: Number(row.total || 0), approved: Number(row.approved || 0), needsReview: Number(row.needs_review || 0), partialCoverage: Number(row.partial_coverage || 0) })),
     },
   };
+}
+
+export async function getEvidenceMetadata(id: string, actor: AuthenticatedUser): Promise<Record<string, unknown> | null> {
+  if (!/^ev_[a-f0-9]{32}$/u.test(id)) return null;
+  const item = (await listEvidence({ evidenceId: id, limit: "1" })).evidence[0];
+  if (!item) return null;
+  if (item.device_id && item.status !== "approved" && !["reviewer", "compliance_lead", "admin"].includes(actor.role)) {
+    throw new Response(JSON.stringify({ error: "Unapproved native evidence is restricted to authorized internal reviewers." }), { status: 403, headers: { "content-type": "application/json" } });
+  }
+  return { ...item, ...evidenceReviewPolicy({ role: actor.role, actorId: actor.id, creatorId: String(item.created_by || ""),
+    status: String(item.status), expiresAt: String(item.expires_at), inScope: Number(item.in_scope) === 1,
+    coverage: String(item.coverage_status), safetyReady: item.server_safety_status !== "pending", provenanceReady: item.native_provenance_status !== "pending" }) };
 }
 
 export async function readEvidenceBytes(id: string, actor?: AuthenticatedUser): Promise<{ bytes: Uint8Array; row: Record<string, unknown> } | null> {
@@ -446,6 +476,7 @@ export async function approveEvidence(id: string, actor: AuthenticatedUser, revi
   const rationale = review.rationale.trim();
   if (!/^[a-f0-9]{64}$/.test(expectedSha256) || rationale.length < 20 || rationale.length > 1_000) throw new Response(JSON.stringify({ error: "Approval requires the full artifact digest and a 20–1,000 character review rationale." }), { status: 400, headers: { "content-type": "application/json" } });
   const artifact = await getEnv().DB.prepare(`SELECT e.id, e.sha256, e.type, e.status, e.device_id,
+      ${evidenceWithinAssessmentScopeSql("e")} AS in_scope,
       e.server_safety_scan_sha256, e.server_safety_scan_policy, e.server_safety_scan_completed_at, e.server_safety_scanner_origin, e.server_safety_receipt_sha256,
       o.id AS occurrence_id, o.created_by, o.status AS occurrence_status, o.expires_at, o.coverage_status,
       CASE WHEN e.type != 'screenshot' OR (
@@ -460,8 +491,9 @@ export async function approveEvidence(id: string, actor: AuthenticatedUser, revi
       ) THEN 1 ELSE 0 END AS native_finalized
     FROM evidence_artifacts e JOIN evidence_occurrences o ON o.artifact_id = e.id
     WHERE e.id = ? AND o.id = (SELECT latest.id FROM evidence_occurrences latest WHERE latest.artifact_id = e.id ORDER BY latest.received_at DESC, latest.id DESC LIMIT 1)`)
-    .bind(id).first<{ id: string; sha256: string; type: string; status: string; device_id: string | null; server_safety_scan_sha256: string | null; server_safety_scan_policy: string | null; server_safety_scan_completed_at: string | null; server_safety_scanner_origin: string | null; server_safety_receipt_sha256: string | null; occurrence_id: string; created_by: string; occurrence_status: string; expires_at: string; coverage_status: string; server_safety_verified: number; native_finalized: number }>();
+    .bind(id).first<{ id: string; sha256: string; type: string; status: string; device_id: string | null; in_scope: number; server_safety_scan_sha256: string | null; server_safety_scan_policy: string | null; server_safety_scan_completed_at: string | null; server_safety_scanner_origin: string | null; server_safety_receipt_sha256: string | null; occurrence_id: string; created_by: string; occurrence_status: string; expires_at: string; coverage_status: string; server_safety_verified: number; native_finalized: number }>();
   if (!artifact) throw new Response(JSON.stringify({ error: "Evidence not found" }), { status: 404, headers: { "content-type": "application/json" } });
+  if (artifact.in_scope !== 1) throw new Response(JSON.stringify({ error: "Evidence is outside the current assessment scope and cannot be approved." }), { status: 409, headers: { "content-type": "application/json" } });
   if (new Date(artifact.expires_at).getTime() <= Date.now() || artifact.status === "purged") throw new Response(JSON.stringify({ error: "Expired evidence cannot be approved." }), { status: 410, headers: { "content-type": "application/json" } });
   if (artifact.created_by === actor.id) throw new Response(JSON.stringify({ error: "Collectors and uploaders cannot approve their own evidence." }), { status: 403, headers: { "content-type": "application/json" } });
   if (artifact.type === "screenshot") {
@@ -480,6 +512,7 @@ export async function approveEvidence(id: string, actor: AuthenticatedUser, revi
       WHERE id = ? AND artifact_id = ? AND created_by != ? AND status = 'needs_review' AND expires_at > ?
         AND id = (SELECT latest.id FROM evidence_occurrences latest WHERE latest.artifact_id = ? ORDER BY latest.received_at DESC, latest.id DESC LIMIT 1)
         AND EXISTS (SELECT 1 FROM evidence_artifacts e WHERE e.id = ? AND e.sha256 = ?
+          AND ${evidenceWithinAssessmentScopeSql("e")}
           AND (e.type != 'screenshot' OR (
             e.server_safety_scan_sha256 = e.sha256 AND e.server_safety_scan_policy IS NOT NULL AND e.server_safety_scan_completed_at IS NOT NULL
             AND e.server_safety_scanner_origin IS NOT NULL AND e.server_safety_receipt_sha256 IS NOT NULL

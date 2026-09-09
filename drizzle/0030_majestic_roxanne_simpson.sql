@@ -1,0 +1,1 @@
+ALTER TABLE `collectors` ADD `scheduled_assessment_id` text;

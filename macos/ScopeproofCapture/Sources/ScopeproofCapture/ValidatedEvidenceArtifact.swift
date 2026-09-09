@@ -7,6 +7,7 @@ enum EvidenceArtifactFailure: LocalizedError, Equatable {
     case outsideEvidenceRoot
     case unsafeFile(String)
     case fileTooLarge(String)
+    case workspaceMismatch
     case invalidManifest
     case invalidImage
     case invalidLifecycle
@@ -20,6 +21,8 @@ enum EvidenceArtifactFailure: LocalizedError, Equatable {
             return "Evidence file \(name) is not a private regular file or changed while it was read."
         case .fileTooLarge(let name):
             return "Evidence file \(name) exceeds the local safety limit."
+        case .workspaceMismatch:
+            return "This evidence does not belong to the selected customer workspace."
         case .invalidManifest:
             return "The evidence manifest is malformed or does not bind the selected screenshot."
         case .invalidImage:
@@ -72,11 +75,12 @@ struct ValidatedEvidenceArtifact: Sendable {
 
     static func load(
         _ entry: CaptureHistoryEntry, requireLifecycle: Bool = false,
+        expectedBinding: TenantWorkspaceBinding? = nil,
         trustedAnchor: LocalCaptureChainAnchor? = nil
     ) throws -> ValidatedEvidenceArtifact {
         try load(
             entry, requireLifecycle: requireLifecycle, allowUnsignedLegacy: false,
-            trustedAnchor: trustedAnchor
+            expectedBinding: expectedBinding, trustedAnchor: trustedAnchor
         )
     }
 
@@ -85,22 +89,28 @@ struct ValidatedEvidenceArtifact: Sendable {
     /// for upload, review, legal hold, retention, or assessor export decisions.
     static func loadForLegacyBrowsing(
         _ entry: CaptureHistoryEntry, requireLifecycle: Bool = false,
+        expectedBinding: TenantWorkspaceBinding? = nil,
         trustedAnchor: LocalCaptureChainAnchor? = nil
     ) throws -> ValidatedEvidenceArtifact {
         try load(
             entry, requireLifecycle: requireLifecycle, allowUnsignedLegacy: true,
-            trustedAnchor: trustedAnchor
+            expectedBinding: expectedBinding, trustedAnchor: trustedAnchor
         )
     }
 
     private static func load(
         _ entry: CaptureHistoryEntry, requireLifecycle: Bool,
-        allowUnsignedLegacy: Bool, trustedAnchor: LocalCaptureChainAnchor?
+        allowUnsignedLegacy: Bool, expectedBinding: TenantWorkspaceBinding?,
+        trustedAnchor: LocalCaptureChainAnchor?
     ) throws -> ValidatedEvidenceArtifact {
+        if let expectedBinding, !entry.manifest.belongs(to: expectedBinding) {
+            throw EvidenceArtifactFailure.workspaceMismatch
+        }
         let root = entry.evidenceRoot ?? entry.manifestURL.deletingLastPathComponent()
         let manifestData = try readBoundedRegularFile(
             at: entry.manifestURL, within: root, maximumBytes: maximumManifestBytes
         )
+        if entry.isPayloadArchived { throw EvidenceArchiveFailure.restoreRequired }
         let imageData = try readBoundedRegularFile(
             at: entry.imageURL, within: root, maximumBytes: maximumImageBytes
         )
@@ -109,6 +119,9 @@ struct ValidatedEvidenceArtifact: Sendable {
             expectedManifestURL: entry.manifestURL, expectedImageURL: entry.imageURL,
             allowUnsignedLegacy: allowUnsignedLegacy, trustedAnchor: trustedAnchor
         )
+        if let expectedBinding, !artifact.manifest.belongs(to: expectedBinding) {
+            throw EvidenceArtifactFailure.workspaceMismatch
+        }
         guard artifact.manifest.evidenceID == entry.manifest.evidenceID else {
             throw EvidenceArtifactFailure.invalidManifest
         }
@@ -141,9 +154,10 @@ struct ValidatedEvidenceArtifact: Sendable {
     }
 
     static func exportFiles(
-        for entry: CaptureHistoryEntry, trustedAnchor: LocalCaptureChainAnchor? = nil
+        for entry: CaptureHistoryEntry, expectedBinding: TenantWorkspaceBinding? = nil,
+        trustedAnchor: LocalCaptureChainAnchor? = nil
     ) throws -> [ValidatedEvidenceFile] {
-        let artifact = try load(entry, requireLifecycle: true, trustedAnchor: trustedAnchor)
+        let artifact = try load(entry, requireLifecycle: true, expectedBinding: expectedBinding, trustedAnchor: trustedAnchor)
         var files = [
             ValidatedEvidenceFile(sourceURL: entry.imageURL, data: artifact.imageData),
             ValidatedEvidenceFile(sourceURL: entry.manifestURL, data: artifact.manifestData),
@@ -154,10 +168,12 @@ struct ValidatedEvidenceArtifact: Sendable {
             ))
         }
         let root = entry.evidenceRoot ?? entry.manifestURL.deletingLastPathComponent()
-        for url in [entry.receiptURL, entry.jiraReceiptURL, entry.s3ReceiptURL] where FileManager.default.fileExists(atPath: url.path) {
+        for kind in TransferReceiptKind.allCases {
+            let url = TransferReceipt.url(for: entry, kind: kind)
+            guard FileManager.default.fileExists(atPath: url.path) else { continue }
+            let verified = try TransferReceipt.verified(for: entry, kind: kind, artifact: artifact)
             files.append(ValidatedEvidenceFile(
-                sourceURL: url,
-                data: try readBoundedRegularFile(at: url, within: root, maximumBytes: maximumSidecarBytes)
+                sourceURL: url, data: verified.data
             ))
         }
         let holdURL = LocalEvidenceHoldStore.url(for: entry.manifestURL)

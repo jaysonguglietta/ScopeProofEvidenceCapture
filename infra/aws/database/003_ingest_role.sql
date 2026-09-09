@@ -53,11 +53,12 @@ BEGIN
     ingest_role
   );
 
-  EXECUTE format('ALTER ROLE %I SET search_path = pg_catalog, scopeproof', ingest_role);
-  EXECUTE format('ALTER ROLE %I SET row_security = on', ingest_role);
-  EXECUTE format('ALTER ROLE %I SET statement_timeout = %L', ingest_role, '15s');
-  EXECUTE format('ALTER ROLE %I SET lock_timeout = %L', ingest_role, '3s');
-  EXECUTE format('ALTER ROLE %I SET idle_in_transaction_session_timeout = %L', ingest_role, '15s');
+  -- Delayed metadata repair is distinct from fresh capability issuance. Only
+  -- ingestion workers receive this procedure; it cannot issue an S3 URL.
+  EXECUTE format(
+    'GRANT EXECUTE ON FUNCTION scopeproof.repair_upload_intent(scopeproof.resource_identifier, text, scopeproof.resource_identifier, scopeproof.resource_identifier, scopeproof.resource_identifier, scopeproof.resource_identifier, text, text, text, bigint, text, timestamptz, timestamptz, text, text, text, text, text, text, timestamptz, timestamptz, jsonb, timestamptz) TO %I',
+    ingest_role
+  );
 END;
 $$;
 

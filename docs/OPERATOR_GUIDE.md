@@ -4,7 +4,7 @@ This guide is for evidence collectors, control owners, and reviewers. It describ
 
 ## Install and open the local Mac app
 
-For a tagged-build evaluation on an Apple Silicon Mac, download the older [Scopeproof Capture 1.8.1 development preview](https://github.com/jaysonguglietta/ScopeProofEvidenceCapture/releases/tag/v1.8.1-development-preview.1), verify its adjacent SHA-256 file, open the DMG, and drag **Scopeproof Capture** to **Applications**. It was built from `8cd2d5c`, predates the current **Unreleased 1.10.0 (build 25)** native changes, is ad-hoc signed, and is not Apple-notarized. No 1.10.0 DMG exists. Use an exact reviewed source checkout to test current behavior until a new DMG is published; the public release remains 1.8.1 until a separate release workflow succeeds.
+For a tagged-build evaluation on an Apple Silicon Mac, download the older [Scopeproof Capture 1.8.1 development preview](https://github.com/jaysonguglietta/ScopeProofEvidenceCapture/releases/tag/v1.8.1-development-preview.1), verify its adjacent SHA-256 file, open the DMG, and drag **Scopeproof Capture** to **Applications**. It was built from `8cd2d5c`, predates the current **Unreleased 1.10.0 (build 26)** native changes, is ad-hoc signed, and is not Apple-notarized. No 1.10.0 DMG exists. Use an exact reviewed source checkout to test current behavior until a new DMG is published; the public release remains 1.8.1 until a separate release workflow succeeds.
 
 Developers can instead build from the repository root:
 
@@ -170,7 +170,7 @@ Detailed validation steps are in the [assessor guide](ASSESSOR_GUIDE.md). Jira-s
 
 ## Retention and disposal
 
-**Apply Local Retention…** moves expired local evidence to Trash; it does not delete hosted or S3 evidence. Active or invalid local hold state blocks cleanup. When the policy permits cleanup only after a durable S3 copy, Scopeproof must successfully revalidate every exact remote version and its unexpired COMPLIANCE Object Lock retention live; a receipt or object name alone is never enough. Confirm legal hold, assessment status, regulatory retention, contractual obligations, and organizational policy before disposing of evidence. Empty the Trash only when the deletion is authorized.
+**Archive & Expire Old Payloads…** explicitly confirms a batch of at most 100 eligible captures. Scopeproof archives complete signed metadata and decision history, revalidates every exact remote version with COMPLIANCE retention, then moves only eligible PNG payloads to Trash. Manifests, decisions, receipts, archive descriptors and Keychain anchors remain. Held, changed, partially archived or unverifiable artifacts are preserved. **Restore Archived Evidence…** retrieves exact versions to their original location on this Mac without overwriting existing evidence or adopting a new trust key. A replacement Mac is not supported: preserve the original Keychain and evidence directory. Old PNG/manifest pairs alone cannot authorize disposal. See [Updated evidence workflows](READINESS_WORKFLOWS.md) and the [implementation ledger](READINESS_IMPLEMENTATION_STATUS.md).
 
 ## Troubleshooting
 

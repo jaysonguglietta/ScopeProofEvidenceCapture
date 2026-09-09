@@ -71,7 +71,7 @@ class ProjectionExecutor implements RdsDataApiExecutor {
 
   async executeStatement(input: Parameters<RdsDataApiExecutor["executeStatement"]>[0]) {
     this.calls.push({ kind: "execute", input: input as unknown as Record<string, unknown> });
-    if (!input.sql.includes("create_upload_intent")) return {};
+    if (!/create_upload_intent|repair_upload_intent/.test(input.sql)) return {};
     if (this.malformed) return { formattedRecords: "[{\"upload_intent_id\":\"upl_wrong\"}]" };
     return { formattedRecords: JSON.stringify([{
       upload_intent_id: INTENT,
@@ -84,14 +84,25 @@ class ProjectionExecutor implements RdsDataApiExecutor {
   async rollbackTransaction(input: Record<string, string>) { this.calls.push({ kind: "rollback", input }); }
 }
 
-function projection(executor: RdsDataApiExecutor): RdsDataUploadIntentProjection {
+function projection(executor: RdsDataApiExecutor, mode: "issue" | "repair" = "issue"): RdsDataUploadIntentProjection {
   return new RdsDataUploadIntentProjection({
     executor,
     resourceArn: "arn:aws:rds:us-east-1:111111111111:cluster:scopeproof",
     secretArn: "arn:aws:secretsmanager:us-east-1:111111111111:secret:tenant-runtime-AbCd",
     database: "scopeproof_acme",
+    mode,
   });
 }
+
+test("repair projection uses only the privileged procedure and original reservation time", async () => {
+  const executor = new ProjectionExecutor();
+  await projection(executor, "repair").project(intent(), evidence());
+  const call = executor.calls.find((entry) => String(entry.input.sql).includes("repair_upload_intent"));
+  assert.ok(call);
+  assert.ok(!String(call.input.sql).includes("create_upload_intent"));
+  assert.ok((call.input.parameters as { name: string; value: { stringValue: string } }[])
+    .some((parameter) => parameter.name === "reserved_at" && parameter.value.stringValue === intent().issuedAt));
+});
 
 test("RDS upload projection calls only the tenant-scoped idempotent procedure with bound data", async () => {
   const executor = new ProjectionExecutor();

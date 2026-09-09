@@ -32,6 +32,22 @@ struct RepositorySBOMResult: Sendable {
     let componentCount: Int
     let directDependencyCount: Int
     let artifactSHA256: String
+    let coverage: [RepositoryManifestCoverage]
+    var coverageComplete: Bool { coverage.allSatisfy(\.complete) }
+}
+
+struct RepositoryManifestCoverage: Codable, Sendable {
+    let path: String
+    let parser: String
+    let complete: Bool
+    let componentCount: Int
+    let warnings: [String]
+}
+
+struct RepositorySBOMInventory: Sendable {
+    let components: [RepositorySBOMComponent]
+    let coverage: [RepositoryManifestCoverage]
+    var complete: Bool { !coverage.isEmpty && coverage.allSatisfy(\.complete) }
 }
 
 struct RepositorySBOMComponent: Hashable, Sendable {
@@ -41,6 +57,7 @@ struct RepositorySBOMComponent: Hashable, Sendable {
     let purl: String
     var direct: Bool
     var manifests: [String]
+    var directKnown = false
 }
 
 enum RepositorySBOMFailure: LocalizedError, Equatable {
@@ -58,6 +75,8 @@ enum RepositorySBOMFailure: LocalizedError, Equatable {
     case noSupportedManifests
     case noComponents
     case tooManyComponents
+    case unsupportedManifestVersion(String)
+    case manifestTooComplex(String)
 
     var errorDescription: String? {
         switch self {
@@ -75,6 +94,8 @@ enum RepositorySBOMFailure: LocalizedError, Equatable {
         case .noSupportedManifests: return "No supported dependency lockfiles were found at this repository ref."
         case .noComponents: return "Supported lockfiles were found, but no pinned dependency versions could be parsed."
         case .tooManyComponents: return "The repository dependency inventory exceeds the 5,000-component safety limit."
+        case .unsupportedManifestVersion(let path): return "Dependency manifest \(path) uses an unsupported lockfile version. npm versions 1, 2 and 3 are supported."
+        case .manifestTooComplex(let path): return "Dependency manifest \(path) exceeds the 100-level nesting safety limit."
         }
     }
 }
@@ -93,7 +114,7 @@ actor RepositorySBOMService {
     private static let maximumSelectedBytes = 8 * 1024 * 1024
     private static let maximumComponents = 5_000
     private static let generatorName = "scopeproof-native-static-sbom"
-    private static let generatorVersion = "1.0.0"
+    private static let generatorVersion = "1.1.0"
 
     private struct CommitResponse: Decodable { let sha: String }
     private struct TreeResponse: Decodable { let tree: [TreeEntry]; let truncated: Bool }
@@ -191,7 +212,8 @@ actor RepositorySBOMService {
             manifests.append(Manifest(path: entry.path, data: data, text: text))
         }
 
-        let components = try Self.parseManifests(manifests.map { ($0.path, $0.text) })
+        let inventory = try Self.parseInventory(manifests.map { ($0.path, $0.text) })
+        let components = inventory.components
         guard !components.isEmpty else { throw RepositorySBOMFailure.noComponents }
         let generatedAt = ISO8601DateFormatter().string(from: Date())
         let manifestSetSHA256 = Self.manifestSetDigest(manifests)
@@ -202,7 +224,7 @@ actor RepositorySBOMService {
             generatedAt: generatedAt,
             manifestSetSHA256: manifestSetSHA256,
             manifests: manifests.map(\.path),
-            components: components
+            components: components, coverage: inventory.coverage
         )
         guard JSONSerialization.isValidJSONObject(document) else { throw RepositorySBOMFailure.invalidProviderResponse }
         var data = try JSONSerialization.data(withJSONObject: document, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
@@ -216,8 +238,8 @@ actor RepositorySBOMService {
             resolvedCommit: commit.sha,
             manifestPaths: manifests.map(\.path),
             componentCount: components.count,
-            directDependencyCount: components.filter(\.direct).count,
-            artifactSHA256: artifactSHA256
+            directDependencyCount: components.filter { $0.directKnown && $0.direct }.count,
+            artifactSHA256: artifactSHA256, coverage: inventory.coverage
         )
     }
 
@@ -256,53 +278,102 @@ actor RepositorySBOMService {
     }
 
     static func parseManifests(_ manifests: [(path: String, text: String)]) throws -> [RepositorySBOMComponent] {
+        try parseInventory(manifests).components
+    }
+
+    static func parseInventory(_ manifests: [(path: String, text: String)]) throws -> RepositorySBOMInventory {
+        guard manifests.count <= maximumManifestCount else { throw RepositorySBOMFailure.treeTooLarge }
         var found: [RepositorySBOMComponent] = []
+        var coverage: [RepositoryManifestCoverage] = []
         for manifest in manifests {
-            switch basename(manifest.path) {
-            case "package-lock.json", "npm-shrinkwrap.json": found += try packageLock(path: manifest.path, text: manifest.text)
-            case "pipfile.lock", "composer.lock": found += try jsonDependencies(path: manifest.path, text: manifest.text)
-            case "cargo.lock": found += blockPackages(path: manifest.path, text: manifest.text, ecosystem: "cargo")
-            case "poetry.lock": found += blockPackages(path: manifest.path, text: manifest.text, ecosystem: "PyPI")
-            default: found += lineManifest(path: manifest.path, text: manifest.text)
+            guard manifest.text.utf8.count <= maximumManifestBytes else { throw RepositorySBOMFailure.manifestTooLarge(manifest.path) }
+            guard !manifest.text.contains("\0") else { throw RepositorySBOMFailure.unsafeManifest(manifest.path) }
+            let parser = basename(manifest.path)
+            guard supportedManifestNames.contains(parser) else { throw RepositorySBOMFailure.unsafeManifest(manifest.path) }
+            var warnings: [String] = []
+            let parsed: [RepositorySBOMComponent]
+            switch parser {
+            case "package-lock.json", "npm-shrinkwrap.json": parsed = try packageLock(path: manifest.path, text: manifest.text, warnings: &warnings)
+            case "pipfile.lock", "composer.lock": parsed = try jsonDependencies(path: manifest.path, text: manifest.text)
+            case "cargo.lock": parsed = blockPackages(path: manifest.path, text: manifest.text, ecosystem: "cargo")
+            case "poetry.lock": parsed = blockPackages(path: manifest.path, text: manifest.text, ecosystem: "PyPI")
+            default: parsed = lineManifest(path: manifest.path, text: manifest.text)
             }
+            if !["package-lock.json", "npm-shrinkwrap.json"].contains(parser) {
+                warnings.append("Static parser coverage is partial for this format. Independently validated replacement inventory is required before assessor approval.")
+            }
+            if parsed.isEmpty { warnings.append("No pinned components were extracted from this recognized manifest.") }
+            coverage.append(RepositoryManifestCoverage(path: manifest.path, parser: parser,
+                complete: warnings.isEmpty, componentCount: parsed.count, warnings: Array(Set(warnings)).sorted()))
+            found += parsed
             if found.count > maximumComponents * 2 { throw RepositorySBOMFailure.tooManyComponents }
         }
         var merged: [String: RepositorySBOMComponent] = [:]
         for item in found {
             if var existing = merged[item.purl] {
                 existing.direct = existing.direct || item.direct
+                existing.directKnown = existing.direct || (existing.directKnown && item.directKnown)
                 existing.manifests = Array(Set(existing.manifests + item.manifests)).sorted()
                 merged[item.purl] = existing
             } else { merged[item.purl] = item }
         }
         let result = merged.values.sorted { $0.purl < $1.purl }
         guard result.count <= maximumComponents else { throw RepositorySBOMFailure.tooManyComponents }
-        return result
+        return RepositorySBOMInventory(components: result, coverage: coverage)
     }
 
-    private static func packageLock(path: String, text: String) throws -> [RepositorySBOMComponent] {
+    private static func packageLock(path: String, text: String, warnings: inout [String]) throws -> [RepositorySBOMComponent] {
         let data = try jsonObject(text, path: path)
+        guard let version = data["lockfileVersion"] as? Int, [1, 2, 3].contains(version) else {
+            throw RepositorySBOMFailure.unsupportedManifestVersion(path)
+        }
+        var found: [RepositorySBOMComponent] = []
+        func add(_ name: String, value: [String: Any], direct: Bool) throws {
+            guard let pinned = value["version"] as? String,
+                  pinned.range(of: #"^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$"#, options: .regularExpression) != nil else {
+                warnings.append("Non-registry, unpinned or malformed dependency versions were not inventoried.")
+                return
+            }
+            guard var item = component(name: name, version: pinned, ecosystem: "npm", direct: direct, manifest: path) else {
+                warnings.append("A dependency has an invalid component identity."); return
+            }
+            item.directKnown = version != 1
+            found.append(item)
+            if found.count > maximumComponents * 2 { throw RepositorySBOMFailure.tooManyComponents }
+        }
+        if version == 1 {
+            func visit(_ raw: Any?, depth: Int) throws {
+                guard depth <= 100 else { throw RepositorySBOMFailure.manifestTooComplex(path) }
+                guard let dependencies = raw as? [String: Any] else {
+                    warnings.append("The legacy lockfile has no valid dependency collection."); return
+                }
+                for (name, value) in dependencies {
+                    guard let entry = value as? [String: Any] else { warnings.append("A dependency entry is malformed."); continue }
+                    // Hoisted v1 dependencies do not identify directness without package.json.
+                    try add(name, value: entry, direct: false)
+                    if let children = entry["dependencies"] { try visit(children, depth: depth + 1) }
+                }
+            }
+            try visit(data["dependencies"], depth: 0)
+            return found
+        }
         let packages = data["packages"] as? [String: Any]
+        guard packages != nil else { throw RepositorySBOMFailure.unsafeManifest(path) }
+        if packages?[""] as? [String: Any] == nil { warnings.append("The npm packages map has no valid root dependency metadata.") }
         let root = (packages?[""] as? [String: Any]) ?? data
         let directNames = Set(["dependencies", "devDependencies", "optionalDependencies", "peerDependencies"].flatMap { key in
             (root[key] as? [String: Any])?.keys.map { $0 } ?? []
         })
-        var found: [RepositorySBOMComponent] = []
         if let packages {
             for (location, raw) in packages where !location.isEmpty {
-                guard let value = raw as? [String: Any] else { continue }
+                guard let value = raw as? [String: Any] else { warnings.append("A packages-map entry is malformed."); continue }
+                if value["link"] as? Bool == true { warnings.append("Workspace or linked dependencies require additional reviewed inventory."); continue }
                 var name = value["name"] as? String ?? ""
                 if name.isEmpty {
                     if let range = location.range(of: "/node_modules/", options: .backwards) { name = String(location[range.upperBound...]) }
                     else { name = location.replacingOccurrences(of: "node_modules/", with: "", options: .anchored) }
                 }
-                if let item = component(name: name, version: value["version"], ecosystem: "npm", direct: directNames.contains(name), manifest: path) { found.append(item) }
-            }
-        }
-        if found.isEmpty, let dependencies = data["dependencies"] as? [String: Any] {
-            for (name, raw) in dependencies {
-                let value = raw as? [String: Any]
-                if let item = component(name: name, version: value?["version"], ecosystem: "npm", direct: directNames.contains(name), manifest: path) { found.append(item) }
+                try add(name, value: value, direct: directNames.contains(name) && location == "node_modules/\(name)")
             }
         }
         return found
@@ -391,12 +462,14 @@ actor RepositorySBOMService {
         return "pkg:\(type)/\(name.split(separator: "/", omittingEmptySubsequences: false).map { encode(String($0)) }.joined(separator: "/"))@\(encode(version))"
     }
 
-    private static func buildDocument(format: RepositorySBOMFormat, repository: String, commit: String, generatedAt: String, manifestSetSHA256: String, manifests: [String], components: [RepositorySBOMComponent]) -> [String: Any] {
+    static func buildDocument(format: RepositorySBOMFormat, repository: String, commit: String, generatedAt: String, manifestSetSHA256: String, manifests: [String], components: [RepositorySBOMComponent], coverage: [RepositoryManifestCoverage]) -> [String: Any] {
+        let complete = !coverage.isEmpty && coverage.allSatisfy(\.complete)
+        let coverageJSON = String(data: (try? JSONEncoder().encode(coverage)) ?? Data(), encoding: .utf8) ?? "[]"
         if format == .spdx {
             let packages: [[String: Any]] = components.enumerated().map { index, item in
                 ["SPDXID": "SPDXRef-Package-\(index)-\(safeIdentifier(item.name))", "name": item.name, "versionInfo": item.version, "downloadLocation": "NOASSERTION", "filesAnalyzed": false,
                  "externalRefs": [["referenceCategory": "PACKAGE-MANAGER", "referenceType": "purl", "referenceLocator": item.purl]],
-                 "annotations": [["annotationType": "OTHER", "annotator": "Tool: \(generatorName)-\(generatorVersion)", "annotationDate": generatedAt, "comment": "direct=\(item.direct); manifests=\(item.manifests.joined(separator: ","))"]]]
+                 "annotations": [["annotationType": "OTHER", "annotator": "Tool: \(generatorName)-\(generatorVersion)", "annotationDate": generatedAt, "comment": "direct=\(item.directKnown ? String(item.direct) : "unknown"); manifests=\(item.manifests.joined(separator: ","))"]]]
             }
             let repositoryPackage: [String: Any] = ["SPDXID": "SPDXRef-Repository", "name": repository, "versionInfo": commit, "downloadLocation": "https://github.com/\(repository)", "filesAnalyzed": false]
             let relationships: [[String: Any]] = [["spdxElementId": "SPDXRef-DOCUMENT", "relationshipType": "DESCRIBES", "relatedSpdxElement": "SPDXRef-Repository"]] + packages.compactMap { package in
@@ -405,7 +478,7 @@ actor RepositorySBOMService {
             }
             return ["spdxVersion": "SPDX-2.3", "dataLicense": "CC0-1.0", "SPDXID": "SPDXRef-DOCUMENT", "name": "\(repository)-\(commit.prefix(12))-sbom",
                     "documentNamespace": "https://scopeproof.local/sbom/\(UUID().uuidString.lowercased())",
-                    "creationInfo": ["created": generatedAt, "creators": ["Tool: \(generatorName)-\(generatorVersion)"], "comment": "Repository https://github.com/\(repository); commit \(commit); manifest-set SHA-256 \(manifestSetSHA256); manifests \(manifests.joined(separator: ","))"],
+                    "creationInfo": ["created": generatedAt, "creators": ["Tool: \(generatorName)-\(generatorVersion)"], "comment": "Repository https://github.com/\(repository); commit \(commit); manifest-set SHA-256 \(manifestSetSHA256); manifests \(manifests.joined(separator: ",")); manifest coverage complete=\(complete); coverage=\(coverageJSON). Static manifest inventory does not prove the installed/runtime dependency graph."],
                     "packages": [repositoryPackage] + packages,
                     "relationships": relationships]
         }
@@ -415,12 +488,15 @@ actor RepositorySBOMService {
             ["name": "scopeproof:manifestSetSha256", "value": manifestSetSHA256],
             ["name": "scopeproof:manifests", "value": manifests.joined(separator: ",")],
             ["name": "scopeproof:collectionMethod", "value": "github-git-data-api-static"],
+            ["name": "scopeproof:manifestCoverageComplete", "value": String(complete)],
+            ["name": "scopeproof:manifestCoverage", "value": coverageJSON],
+            ["name": "scopeproof:limitation", "value": "Static manifest inventory does not prove the installed/runtime dependency graph."],
         ]
         return ["bomFormat": "CycloneDX", "specVersion": "1.6", "serialNumber": "urn:uuid:\(UUID().uuidString.lowercased())", "version": 1,
                 "metadata": ["timestamp": generatedAt, "tools": ["components": [["type": "application", "name": generatorName, "version": generatorVersion]]],
                              "component": ["type": "application", "name": repository, "version": commit, "bom-ref": "repository:\(repository)@\(commit)"], "properties": properties],
                 "components": components.map { item in ["type": "library", "name": item.name, "version": item.version, "purl": item.purl, "bom-ref": item.purl,
-                                                          "properties": [["name": "scopeproof:direct", "value": String(item.direct)], ["name": "scopeproof:manifests", "value": item.manifests.joined(separator: ",")]]] }]
+                                                          "properties": [["name": "scopeproof:direct", "value": item.directKnown ? String(item.direct) : "unknown"], ["name": "scopeproof:manifests", "value": item.manifests.joined(separator: ",")]]] }]
     }
 
     private static func jsonObject(_ text: String, path: String) throws -> [String: Any] {

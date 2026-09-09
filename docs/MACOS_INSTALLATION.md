@@ -18,14 +18,14 @@ The downloadable DMG does not require a repository checkout, Xcode, or Swift. Bu
 ## Install the development-preview DMG
 
 > **Older published build:** `v1.8.1-development-preview.1` was built from
-> commit `8cd2d5c`. It does not contain the current **Unreleased 1.10.0 (build 25)** native changes
+> commit `8cd2d5c`. It does not contain the current **Unreleased 1.10.0 (build 26)** native changes
 > described elsewhere in this guide. No corresponding DMG has been published. Use this
 > DMG only to evaluate the tagged build. It writes new captures under
 > `~/Pictures/Scopeproof Evidence` and uses manual AWS credential entry rather
 > than the current Documents-root and direct AWS CLI IAM Identity
 > Center/AssumeRole workflow. Build an exact reviewed current-source checkout for
 > current behavior until a new versioned DMG is independently verified and
-> published. Current source is version `1.10.0` build `25`; no 1.10.0 artifact
+> published. Current source is version `1.10.0` build `26`; no 1.10.0 artifact
 > exists.
 
 Open the [Scopeproof Capture 1.8.1 development-preview release](https://github.com/jaysonguglietta/ScopeProofEvidenceCapture/releases/tag/v1.8.1-development-preview.1) and download both:
@@ -71,6 +71,21 @@ Record those values with the exact source commit used for the build. If the app 
 
 Scopeproof appears as a shield in the menu bar and opens its Local Console in the default browser. The console is served by the running Mac app on a random `127.0.0.1` port and is not published to the LAN or internet. A one-time nonce in the URL fragment is exchanged for a separate short-lived in-memory bearer and then cleared; no localhost authentication cookie is created. Do not copy or share that launch URL. Its Evidence library shows only the active tenant/workspace's local screenshots and, when the matching S3 destination is configured and verified, matching S3 screenshots with explicit storage badges and on-demand previews. If the tab is closed, choose **Open Local Console** from the shield menu or press `Command-Shift-L`.
 
+### New workflow checks after an update
+
+Confirm **Transfer Recovery…** and **AWS Customer Workspace…** appear in the
+shield menu. Transfer Recovery validates artifact/destination-bound receipts,
+offers bounded per-item retry/cancel, and keeps uncertain Jira outcomes for
+manual reconciliation. The AWS customer workflow requires a reviewed bundled
+tenant configuration; the default empty list is intentional. Direct S3 storage
+does not require that hosted configuration. See [AWS customer onboarding](../macos/ScopeproofCapture/AWS_CUSTOMER_ONBOARDING.md).
+
+Evidence archives preserve complete signed history and local Keychain anchors.
+Restore currently requires the same Mac, original Keychain and original path;
+it is not device-loss recovery. Never remove metadata or reset trust keys to
+make a restore pass. See [workflow instructions](READINESS_WORKFLOWS.md) and the
+[implementation limits](READINESS_IMPLEMENTATION_STATUS.md).
+
 ## Grant capture permission
 
 On the first capture:
@@ -94,7 +109,7 @@ Hosted synchronization is not required for installation or local use. The checke
 
 A production server accepts the current signed schema-8 PNG/manifest pair only and requires its tenant/workspace to match the server's isolated legacy binding. It independently rescans the exact PNG through the OCR/DLP service configured by the legacy-named `BROWSER_OCR_ENDPOINT`, `BROWSER_OCR_TOKEN`, and `BROWSER_OCR_ALLOWED_HOSTS` settings, verifies a trusted RFC 3161 timestamp, and finalizes the exact artifact into the server-side device chain. Recognized OCR text is evaluated transiently and is not retained. Until the binding, scan, timestamp, and final chain linkage succeed, the hosted item is quarantined and cannot be read, previewed, approved, packaged, exported, or sent to Jira.
 
-If scanner or timestamp verification is unavailable, the hosted upload fails closed while the local artifact remains usable. Retry the unchanged current pair after recovery. An unsigned legacy capture must be recaptured; an older hosted item missing the independent scan or final linkage must be re-uploaded/rescanned. Administrators must never grandfather either population with direct database updates. Server operators must apply migrations through `0028_native_reconciliation_cursor.sql` and confirm production readiness has no scanner or trusted-timestamp failures before enabling native uploads. No AWS deployment is performed by installing or building the Mac app.
+If scanner or timestamp verification is unavailable, the hosted upload fails closed while the local artifact remains usable. Retry the unchanged current pair after recovery. An unsigned legacy capture must be recaptured; an older hosted item missing the independent scan or final linkage must be re-uploaded/rescanned. Administrators must never grandfather either population with direct database updates. Server operators must apply migrations through `0031_brave_silver_fox.sql` and confirm production readiness has no scanner or trusted-timestamp failures before enabling native uploads. No AWS deployment is performed by installing or building the Mac app.
 
 ## Update the DMG installation
 

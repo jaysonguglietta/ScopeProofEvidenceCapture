@@ -6,9 +6,10 @@ Lambda, strict tenant/JWT/membership adapters, an idempotent upload-intent route
 with DynamoDB/Aurora reconciliation, a durable public-API audit outbox and
 bounded KMS signer, KMS-signed audit/promotion receipts,
 CDK-wired two-person exact-version legal-hold routes/worker, a cross-region recovery topology
-with existing-version backfill, and a protected macOS release workflow. It still
-does **not** contain the complete customer web product, membership-administration
-UI or complete membership/administration workflows. Nothing in this work was deployed to
+with existing-version backfill, and a protected macOS release workflow. The separate
+static Cognito portal implements invitations, memberships, devices, assessment
+scope, evidence inspection/review and legal holds. Complete legacy feature
+parity and live qualification remain open. Nothing in this work was deployed to
 AWS or submitted to Apple; a successful synthesis or future CDK deployment is
 not a production-ready hosted service until the release gates below are closed.
 
@@ -17,10 +18,10 @@ not a production-ready hosted service until the release gates below are closed.
 - **Users:** compliance teams, customer reviewers, auditors, and Scopeproof operators.
 - **Problem:** isolate each customer's portal and evidence without host discovery, cross-tenant access, unscanned promotion, or retention bypass.
 - **Primary workflows:** provision a tenant, authenticate on its exact host, issue a one-time upload, quarantine/scan/promote evidence, browse authorized versions, and process jobs.
-- **Views still to migrate:** sign-in, evidence browser, capture/upload, job status, membership administration, and operator tenant lifecycle management.
+- **Implemented views:** separate Cognito sign-in, customer evidence browser/review, membership/device/assessment/hold administration and native upload/status. Full tenant lifecycle, packages, findings, SBOM and integration parity remain outside this narrow AWS workflow.
 - **Core models:** opaque tenant, exact domain, membership, upload lifecycle, immutable evidence version/receipt, job, audit event/head, and retention policy.
 - **Edge cases:** replay/duplicate/expired uploads, slow scans, unknown hosts, partial schemas, failed DNS, poison messages, KMS denial, and Object Lock conflicts.
-- **Assumptions:** `us-east-1`, an owned Route 53 domain, Amplify Hosting compute, and authoritative host-plus-membership authorization on every request.
+- **Assumptions:** `us-east-1`, an owned Route 53 domain, static Amplify Hosting without an SSR compute role, and authoritative host-plus-membership authorization on every API request.
 - **Done here:** shared/tenant/audit stacks, fail-closed provisioning, DNS-last activation, a tenant-specific API/custom domain with API Gateway mock health plus authenticated identity/upload-intent routes, immutable S3 boundaries, an active exact-intent GuardDuty promotion path, upload reconciliation, durable KMS-signed API auditing, two-person legal-hold persistence procedures, split API/runtime/ingest/evidence-control roles, WAF, CloudTrail data events, encrypted alerting/logs, budgets, release distribution, SES identity, and an explicit two-phase cross-region recovery foundation with a global control table and existing-version backfill/verifier.
 
 ## Implemented architecture
@@ -40,7 +41,11 @@ not a production-ready hosted service until the release gates below are closed.
 
 The design avoids always-on containers, load balancers, NAT gateways, and provisioned DynamoDB. Route 53, WAF, CloudFront, KMS, Secrets Manager, GuardDuty, logs, S3, Amplify, Cognito, Aurora, CloudTrail, and backups remain billable.
 
-The dormant Amplify build specification uses `npm ci --ignore-scripts --cache .npm --prefer-offline`, keeps npm data under the workspace `.npm` cache, and then runs `npm run build`. This reduces lifecycle-script and home-cache exposure, but it does not make the current UI deployable: the Amplify app has no repository/source connection, its branch has automatic builds disabled, and no AWS web release has run.
+The dormant Amplify WEB build runs `node infra/aws/customer-portal/build.mjs`
+with reviewed `SCOPEPROOF_PORTAL_CONFIG_JSON`, producing only the static
+`.scopeproof-portal` artifact. Do not publish the legacy Vinext/D1/R2 console
+into this AWS app. Amplify has no repository/source connection, automatic builds
+are disabled and no AWS web release has run. See the [customer portal guide](../../../docs/AWS_CUSTOMER_PORTAL.md).
 
 ## Layout and validation
 
@@ -160,8 +165,10 @@ new live source object version/checksum/KMS/retention/hold in the destination,
 test a control-plane canary through the global-table replica, then perform an
 isolated Aurora restore and tenant ownership/RLS verification. CloudFormation
 synthesis proves configuration shape, not recovery. No restore/cutover
-automation, recovery-account isolation, or audit-bucket replication is
+automation or recovery-account isolation is
 implemented in this slice.
+
+The destination bootstrap also creates an immutable, separately keyed platform audit bucket. Enabled recovery now requires an `auditDestination` object containing its exact `bucketName` and `kmsKeyArn` outputs. Observability configures live replication for `AWSLogs/<account>/`, including CloudTrail logs and digest files, only after the exact replication policy exists. The existing generated-name source bucket is retained and is not renamed. This changes the enabled recovery context contract: copy the two destination outputs into the reviewed context before updating source stacks. Existing audit versions still need an approved S3 Batch replication backfill, exact-version verification, and CloudTrail digest validation; a quiet replication alarm does not prove coverage. See `docs/AWS_BOOTSTRAP_AND_RECOVERY_BOUNDARIES.md` for unresolved authority and restore acceptance requirements.
 
 ## Baseline context example
 
@@ -189,20 +196,35 @@ There is no default domain or deployment environment: `cdk.json` leaves `rootDom
 
 ## Fail-closed activation
 
-CloudFormation creates the Cognito client, tenant data plane, exact Amplify mapping, and `TENANT#<id>`/`DOMAIN#<host>` registry rows in `PROVISIONING`; it publishes no tenant CNAME. Start `TenantProvisioningStateMachineArn` with a unique Standard Workflow execution name. It:
+CloudFormation establishes PROVISIONING registry mappings but publishes no
+customer CNAME. First complete the independently approved
+[central database bootstrap](../DATABASE_BOOTSTRAP.md). Only that central
+workflow reads the shared administrator secret and creates the fixed mapped
+database/roles. Distinct platform operator and approver identities authorize
+one immutable mapping/execution for at most fifteen minutes.
 
-1. atomically leases both registry rows;
-2. creates a separate NOLOGIN/NOSUPERUSER/NOBYPASSRLS owner and six distinct NOINHERIT logins—upload runtime, ingest reconciliation, evidence control, legal-hold API, evidence read, and API-audit signer—supplying PostgreSQL-native SCRAM verifiers rather than placing reusable generated passwords in SQL;
-3. temporarily grants the administrator `SET ROLE` membership, applies authoritative owner migrations `001`, `006`, and forward-only `009` as the owner, applies grants migrations `002`, `003`, `004`, `005`, `007`, and `008`, records an all-nine-file bundle digest plus live function/index catalog digest, and always revokes membership;
-4. verifies that exact database attestation, tables/domains/functions and their owners, FORCE RLS policies, tenant FKs, triggers, singleton tenant/domain rows, all six role boundaries, zero PostgreSQL membership edges involving any managed owner/application role, and a real wrong-context denial;
-5. re-verifies, requires a strongly consistent `CUSTOMER_ENABLED` approval bound to this exact tenant and Standard Workflow execution, UPSERTs only the approved CNAME under conditioned IAM, waits for Route 53 `INSYNC`, then marks the database and both registry rows `ACTIVE`; and
-6. restores the database to `PROVISIONING` and marks registry rows `FAILED` on terminal failure. A `FAILED` tenant can be retried with a new execution.
+The tenant worker requires the exact PREPARED mapping receipt and uses a
+tenant-specific NOCREATEDB/NOCREATEROLE/NOINHERIT login with non-delegable SET
+membership in its own NOLOGIN owner. It cannot read the shared administrator
+secret or invoke central bootstrap. It installs SQL through 011, recompiles
+all functions with checking enabled, resets six execute-only application grants,
+and verifies exact identity, ownership, RLS, function/trigger inventory, role
+boundaries and wrong-context denial. Application roles have no membership edges
+or direct table grants.
 
-Active registry rows record schema version 3 and the SHA-256 of all nine packaged SQL files. The database migration table comment independently binds that package digest to an ordered SHA-256 of the live `scopeproof` function and index definitions. Any mismatch fails before activation and requires a separately reviewed forward migration; changing the recorded hash is not an upgrade mechanism. The exact-execution `CUSTOMER_ENABLED` record authorizes this infrastructure activation only; it does not prove that an application release, memberships, DLP, recovery, or tenant-isolation tests are complete. A CNAME may remain after a late failure, but the tenant API must return a generic non-disclosing failure for non-active registry state; DNS is never authorization.
+Current attestation is schema/owner version 5, bundle v7, binding exact SQL bytes
+and the ordered live function/index catalog. Historical 001 is preserved and
+uses the exact-hash guarded transform described in the bootstrap guide; unknown
+prior catalogs/hashes fail closed. Never edit an attestation to claim upgrade.
 
-The shared Aurora administrator secret, cluster, database KMS key, tenant database secrets, upload-idempotency HMAC secret, and tenant secret KMS keys are retained. The administrator secret uses the customer-managed database key; each provisioner receives only exact secret-read, Secrets Manager-scoped KMS decrypt, and Data API permissions. Stack deletion must never be used as credential rotation or offboarding.
+DNS-last activation requires a separate exact-tenant/execution CUSTOMER_ENABLED
+approval and waits for INSYNC. ACTIVE is only approved infrastructure/database
+readiness, not customer application release. Failures retain data and leave
+service state fail closed. Tenant updates require re-verification and canaries.
 
-Any subsequent tenant-stack update moves both registry rows back to `PROVISIONING` and is rejected while a provisioning execution lease is active. Re-run the state machine and all change-specific canaries before restoring infrastructure readiness. This deliberately favors a visible, recoverable outage over serving with a changed bucket, role, key, client, or database mapping that has not been re-verified.
+Administrator, tenant and HMAC secrets, KMS keys and data resources are retained.
+Tenant provisioners receive only their exact restricted secret/Data API scope.
+Stack deletion is neither credential rotation nor offboarding.
 
 ## Tenant API source boundary
 
@@ -345,9 +367,8 @@ Before launch:
 4. retain `AWSPREVIOUS` through intent expiry plus the seven-day reconciliation
    grace, exercise rotation against outstanding exact retries, and remove the
    prior stage only after the durable retry inventory is empty;
-5. implement invitation/membership administration, the legal-hold UI/operating
-   process, onboarding/offboarding, AWS release publishing, SES delivery,
-   and incident workflows;
+5. qualify the implemented customer invitation/membership/device/hold workflows;
+   complete offboarding, AWS release publishing, SES delivery and incident operations;
 6. live-test API-audit ordering, KMS verification, ambiguous Data API commit
    recovery, lease takeover, eight-attempt dead-lettering, owner-only requeue,
    alarm delivery, and a backlog that contains both a poison row and later valid
@@ -362,14 +383,14 @@ Evidence, keys, registry/audit data, and databases are retained/deletion-protect
 1. The small tenant API is composed in source, but no AWS route is deployed and
    the Amplify customer UI has no source/release connection. Most product routes
    remain on the legacy runtime.
-2. No invitation/membership administration, legal-hold UI/deployed operating
-   workflow, or offboarding workflow. The two-person legal-hold routes, domain/
-   persistence, worker, and alarms are source infrastructure only.
+2. The separate static portal implements customer invitations, membership,
+   devices, assessments, evidence inspection/review and legal holds. These are
+   not deployed/qualified; complete offboarding and legacy feature parity remain open.
 3. Security-sensitive AWS integrations are source/template-tested, not account integration-tested, and nothing has been deployed.
 4. Primary compute, identity, control, and database infrastructure remains shared; account-per-tenant has a smaller blast radius. Recovery is same-account/cross-region and does not protect against full account compromise.
 5. The global control table, live S3 replication, S3 Batch existing-version
    backfill/exact verifier, and Aurora copies are source infrastructure only:
-   existing-table migration, restore/cutover orchestration, audit-bucket
-   replication, and demonstrated RPO/RTO remain outstanding.
+   existing-table migration, restore/cutover orchestration, historical audit
+   backfill and digest verification, and demonstrated RPO/RTO remain outstanding.
 6. SES sending and dashboards remain outside this slice. KMS application audit adapters exist, but general product-route audit receipt composition remains outstanding.
 7. Production release-candidate signing/notarization and advanced CodeQL are automated in source; Swift uses a manual arm64 build while JavaScript/TypeScript and Actions retain no-build coverage. Merge the workflow before switching the repository from default to advanced setup, then require every language check. Protected repository settings, Apple credentials, and explicit release publication are still required.

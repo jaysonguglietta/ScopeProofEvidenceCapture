@@ -74,19 +74,25 @@ test("managed jobs are durable while one-time-token SBOM remains request-bound",
 
 test("hosted dialogs trap focus and restore the invoking control", async () => {
   const consoleSource = await read("app/evidence-console.tsx");
-  assert.match(consoleSource, /previous\?\.focus\(\)/);
-  assert.match(consoleSource, /event\.key !== "Tab"/);
+  const focus = await read("app/use-dialog-focus.ts");
+  assert.match(focus, /previous\?\.isConnected/);
+  assert.match(focus, /previous\.focus\(\)/);
+  assert.match(focus, /event\.key !== "Tab"/);
+  assert.match(consoleSource, /useDialogFocus\(\)/);
   assert.match(consoleSource, /role="dialog" aria-modal="true"/);
 });
 
 test("the console browses complete pages and uses the persisted remediation workflow", async () => {
   const consoleSource = await read("app/evidence-console.tsx");
   assert.match(consoleSource, /Load 50 more/);
-  for (const kind of ["evidence", "runs", "sboms", "findings"]) {
+  for (const kind of ["evidence", "runs", "sboms"]) {
     assert.match(consoleSource, new RegExp(`loadMoreWorkspace\\(\\"${kind}\\"\\)`));
   }
   assert.match(consoleSource, /fetch\("\/api\/findings", \{ method: "POST"/u);
-  assert.match(consoleSource, /fetch\(`\/api\/findings\/\$\{encodeURIComponent\(id\)\}`/u);
+  assert.match(consoleSource, /FindingWorkflowPanel/);
+  const workflow = await read("app/components/workflow-admin.tsx");
+  assert.match(workflow, /load\(page.nextCursor\)/);
+  assert.match(workflow, /patch\(`\/api\/findings\/\$\{finding.id\}`/u);
   assert.match(consoleSource, /packagePreflight\?\.ready/u);
   assert.match(consoleSource, /async function loadAssessmentPage/);
   assert.match(consoleSource, /loadAssessmentPage\(null, "active"\)/);

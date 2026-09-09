@@ -24,6 +24,7 @@ struct LocalEvidenceRecord: Codable, Sendable {
     let sha256: String
     let uploaded: Bool
     let lifecycleValid: Bool
+    var payloadArchived = false
 }
 
 struct LocalEvidenceSummary: Codable, Sendable {
@@ -59,8 +60,10 @@ final class LocalEvidenceIndex: @unchecked Sendable {
     private let auditSigningKeyID: String
     private let auditTrustScope: String
     private let anchorAuditToKeychain: Bool
+    private let expectedBinding: TenantWorkspaceBinding
 
-    init(databaseURL: URL, auditKeyData: Data, anchorAuditToKeychain: Bool = false) throws {
+    init(databaseURL: URL, expectedBinding: TenantWorkspaceBinding, auditKeyData: Data, anchorAuditToKeychain: Bool = false) throws {
+        self.expectedBinding = expectedBinding
         try FileManager.default.createDirectory(
             at: databaseURL.deletingLastPathComponent(),
             withIntermediateDirectories: true,
@@ -112,12 +115,16 @@ final class LocalEvidenceIndex: @unchecked Sendable {
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """
                 for entry in entries {
-                    guard let artifact = try? ValidatedEvidenceArtifact.loadForLegacyBrowsing(
-                        entry, requireLifecycle: false
-                    ) else { continue }
-                    let manifest = artifact.manifest
+                    let artifact = try? ValidatedEvidenceArtifact.loadForLegacyBrowsing(
+                        entry, requireLifecycle: false, expectedBinding: expectedBinding
+                    )
+                    let archive = artifact == nil && entry.isPayloadArchived ? try? LocalEvidenceArchive.load(for: entry, expectedBinding: expectedBinding) : nil
+                    guard artifact != nil || archive != nil else { continue }
+                    let manifest = artifact?.manifest ?? entry.manifest
+                    let provenanceVerified = artifact?.provenanceVerified ?? (archive != nil)
+                    let payloadArchived = archive != nil
                     let lifecycle = entry.lifecycle
-                    let valid = artifact.provenanceVerified && EvidenceLifecycleStore.verify(
+                    let valid = provenanceVerified && EvidenceLifecycleStore.verify(
                         lifecycle, artifactSha256: manifest.sha256,
                         provenanceKeyID: manifest.provenance?.keyID
                     )
@@ -133,9 +140,9 @@ final class LocalEvidenceIndex: @unchecked Sendable {
                             .text(lifecycle.reviewer), .text(lifecycle.status.rawValue), .text(lifecycle.reviewNotes),
                             .text(tagsJSON), manifest.jiraIssueKey.map(SQLiteValue.text) ?? .null,
                             manifest.sourceURL.map(SQLiteValue.text) ?? .null,
-                            .text(artifact.provenanceVerified ? manifest.safetyStatus : "Legacy unsigned · browsing only"),
-                            .text(manifest.sha256), .integer(entry.isUploaded && artifact.provenanceVerified ? 1 : 0),
-                            .integer(valid ? 1 : 0), .text(entry.manifestURL.path), .text(entry.imageURL.path),
+                            .text(provenanceVerified ? manifest.safetyStatus : "Legacy unsigned · browsing only"),
+                            .text(manifest.sha256), .integer(entry.isUploaded && provenanceVerified ? 1 : 0),
+                            .integer(valid ? 1 : 0), .text(entry.manifestURL.path), .text(payloadArchived ? "" : entry.imageURL.path),
                             .text(ISO8601DateFormatter().string(from: Date())),
                         ]
                         try bind(values, to: statement)
@@ -158,7 +165,7 @@ final class LocalEvidenceIndex: @unchecked Sendable {
             let sql = """
                 SELECT evidence_id, captured_at, local_timestamp, compliance_area, control_id, control_title,
                        title, system_name, environment, assessment_period, owner, reviewer, review_status,
-                       review_notes, tags_json, jira_issue_key, source_url, safety_status, sha256, uploaded, lifecycle_valid
+                       review_notes, tags_json, jira_issue_key, source_url, safety_status, sha256, uploaded, lifecycle_valid, image_path
                 FROM evidence_index
                 WHERE (? = '' OR lower(title || ' ' || system_name || ' ' || owner || ' ' || tags_json || ' ' || evidence_id || ' ' || coalesce(jira_issue_key, '') || ' ' || coalesce(source_url, '')) LIKE ?)
                   AND (? = '' OR compliance_area = ?)
@@ -186,7 +193,8 @@ final class LocalEvidenceIndex: @unchecked Sendable {
                         jiraIssueKey: sqlite3_column_type(statement, 15) == SQLITE_NULL ? nil : columnText(statement, 15),
                         sourceURL: sqlite3_column_type(statement, 16) == SQLITE_NULL ? nil : columnText(statement, 16),
                         safetyStatus: columnText(statement, 17), sha256: columnText(statement, 18),
-                        uploaded: sqlite3_column_int(statement, 19) == 1, lifecycleValid: sqlite3_column_int(statement, 20) == 1
+                        uploaded: sqlite3_column_int(statement, 19) == 1, lifecycleValid: sqlite3_column_int(statement, 20) == 1,
+                        payloadArchived: columnText(statement, 21).isEmpty
                     ))
                 }
                 return records

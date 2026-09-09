@@ -6,6 +6,7 @@ export const metadata: Metadata = {
   description: "Continuous PCI DSS evidence operations.",
 };
 
-export default function Home() {
-  return <EvidenceConsole />;
+export default async function Home({ searchParams }: { searchParams: Promise<Record<string, string | string[] | undefined>> }) {
+  const query = await searchParams;
+  return <EvidenceConsole initialView={typeof query?.view === "string" ? query.view : "Overview"} />;
 }

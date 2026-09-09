@@ -16,7 +16,10 @@
 
 ## Local web development
 
-Requirements: Node.js 22.13 or newer and npm.
+Requirements: the reviewed Node.js patch in `.node-version` (currently 22.23.2)
+and npm. CI reads this file. Use the CDK package's pinned pnpm version for its
+separate lockfile. Local checks for this remediation ran on Node 26.8.1; the
+configured CI baseline still needs its own CI run.
 
 ```bash
 npm ci
@@ -87,7 +90,7 @@ Hosted ingestion adds independent controls in this order: validate schema-8 prov
 
 `BROWSER_OCR_ENDPOINT`, `BROWSER_OCR_TOKEN`, and `BROWSER_OCR_ALLOWED_HOSTS` are legacy names retained for configuration compatibility. They now configure the independent server OCR/DLP processor for every hosted screenshot, including native captures. The processor response text is bounded and examined in memory only; never return it from `scanExactEvidencePixels`, place it in evidence/audit/database records, or log it. Persist only the exact digest, policy version, completion time, scanner origin, and receipt digest.
 
-Production readiness must fail if independent scanner configuration is missing or unsafe, if `REQUIRE_TRUSTED_TIMESTAMP` is false/invalid, or if the RFC 3161 issuer/verifier trust material is incomplete. Development may exercise explicit failure fixtures, but must not relabel a readiness failure as production-capable. Replay all migrations through `0028_native_reconciliation_cursor.sql`; do not backfill `0022` provenance or `0023` scan fields to make legacy/unbound records eligible. Test recovery by retrying the exact current artifact and proving reconciliation finalizes it without duplicate occurrence multiplication. Test migration-0028 cursor wrap, revision-CAS conflict, poison-row isolation, the independent 25-item pending and orphan budgets, and terminal sparse-queue cleanup.
+Production readiness must fail if independent scanner configuration is missing or unsafe, if `REQUIRE_TRUSTED_TIMESTAMP` is false/invalid, or if the RFC 3161 issuer/verifier trust material is incomplete. Development may exercise explicit failure fixtures, but must not relabel a readiness failure as production-capable. Replay all migrations through `0031_brave_silver_fox.sql`; do not backfill `0022` provenance or `0023` scan fields to make legacy/unbound records eligible. Test recovery by retrying the exact current artifact and proving reconciliation finalizes it without duplicate occurrence multiplication. Test migration-0028 cursor wrap, revision-CAS conflict, poison-row isolation, the independent 25-item pending and orphan budgets, and terminal sparse-queue cleanup.
 
 ## Change discipline
 
@@ -97,7 +100,7 @@ Production readiness must fail if independent scanner configuration is missing o
 - Use bound SQL parameters and strict size/type limits.
 - Never log secrets, decrypted evidence, device tokens, or recognized OCR text.
 - Keep original capture manifests immutable; record later decisions in lifecycle/audit records.
-- Generate and inspect a forward migration for every D1 schema change. The current ordered migration set runs through `0028_native_reconciliation_cursor.sql`; a fresh-database replay and a populated upgrade replay must both pass.
+- Generate and inspect a forward migration for every D1 schema change. The current ordered migration set runs through `0031_brave_silver_fox.sql`; a fresh-database replay and a populated upgrade replay must both pass.
 - Update root, operator, assessor, security, deployment, native, in-app Help, and changelog documentation when behavior or trust boundaries change.
 
 ## Extending SBOM support
@@ -110,7 +113,7 @@ Hosted one-time credential changes must preserve exact `github.com` URL parsing,
 
 ## Native release
 
-The current source metadata allocates bundle version/build `1.10.0`/`25`. It is
+The current source metadata allocates bundle version/build `1.10.0`/`26`. It is
 **Unreleased**, postdates the public `v1.8.1-development-preview.1` artifact at
 `8cd2d5c`, and has no corresponding DMG. Do not rebuild or publish these changes
 under the 1.8.1 release identity. Before the next public artifact, re-verify the

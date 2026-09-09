@@ -11,6 +11,7 @@ export interface EvidenceRecoveryDestination {
 }
 
 export interface RecoveryConfiguration {
+  readonly auditDestination?: Readonly<{ bucketName: string; kmsKeyArn: string }>;
   readonly deploymentEnvironment: DeploymentEnvironment;
   readonly mode: RecoveryMode;
   readonly region?: string;
@@ -66,6 +67,18 @@ export function recoveryBackupVaultName(environment: DeploymentEnvironment): str
   return `scopeproof-${environment}-recovery`;
 }
 
+export function recoveryAuditBucketName(account: string, region: string, environment: DeploymentEnvironment): string {
+  validateAccount(account);
+  validateRecoveryRegion(region);
+  validateDeploymentEnvironment(environment);
+  return `sp-audit-r-${account}-${region}-${environment}`;
+}
+
+export function recoveryAuditReplicationRoleName(environment: DeploymentEnvironment): string {
+  validateDeploymentEnvironment(environment);
+  return `sp-${environment}-audit-replication`;
+}
+
 export function recoveryBackupRoleName(environment: DeploymentEnvironment): string {
   return `sp-${environment}-aurora-backup`;
 }
@@ -111,6 +124,7 @@ export function parseRecoveryConfiguration(
     "s3ReplicationTimeControl",
     "backupVaultKeyArn",
     "evidenceDestinations",
+    "auditDestination",
   ]));
 
   const mode = String(input.mode ?? "disabled").trim().toLowerCase() as RecoveryMode;
@@ -200,10 +214,19 @@ export function parseRecoveryConfiguration(
     mode,
   );
   let backupVaultKeyArn: string | undefined;
+  let auditDestination: RecoveryConfiguration["auditDestination"];
   if (mode === "enabled") {
     backupVaultKeyArn = validateKmsKeyArn(input.backupVaultKeyArn, account, region, "recovery.backupVaultKeyArn");
+    const raw = input.auditDestination;
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new Error("Enabled recovery requires recovery.auditDestination from the destination bootstrap outputs.");
+    const audit = raw as Record<string, unknown>;
+    rejectUnknownKeys(audit, new Set(["bucketName", "kmsKeyArn"]));
+    const expectedName = recoveryAuditBucketName(account, region, options.deploymentEnvironment);
+    if (audit.bucketName !== expectedName) throw new Error(`Audit recovery bucket must be ${expectedName}.`);
+    auditDestination = Object.freeze({ bucketName: expectedName,
+      kmsKeyArn: validateKmsKeyArn(audit.kmsKeyArn, account, region, "recovery.auditDestination.kmsKeyArn") });
   } else {
-    if (input.backupVaultKeyArn !== undefined || evidenceDestinations.size > 0) {
+    if (input.backupVaultKeyArn !== undefined || evidenceDestinations.size > 0 || input.auditDestination !== undefined) {
       throw new Error("Bootstrap mode must not include generated recovery key ARNs or destinations.");
     }
   }
@@ -220,6 +243,7 @@ export function parseRecoveryConfiguration(
     backupVaultName: vaultName,
     backupVaultArn,
     backupVaultKeyArn,
+    auditDestination,
     evidenceDestinations,
   });
 }

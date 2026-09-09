@@ -80,11 +80,6 @@ BEGIN
     control_role
   );
 
-  EXECUTE format('ALTER ROLE %I SET search_path = pg_catalog, scopeproof', control_role);
-  EXECUTE format('ALTER ROLE %I SET row_security = on', control_role);
-  EXECUTE format('ALTER ROLE %I SET statement_timeout = %L', control_role, '15s');
-  EXECUTE format('ALTER ROLE %I SET lock_timeout = %L', control_role, '3s');
-  EXECUTE format('ALTER ROLE %I SET idle_in_transaction_session_timeout = %L', control_role, '15s');
 END;
 $$;
 

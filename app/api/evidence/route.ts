@@ -10,6 +10,8 @@ export async function GET(request: Request) {
     const query = new URL(request.url).searchParams;
     return Response.json(await listEvidence({
       assessmentId: query.get("assessmentId") || undefined,
+      controlId: query.get("controlId") || undefined,
+      system: query.get("system") || undefined,
       cursor: query.get("cursor") || undefined,
       limit: query.get("limit") || undefined,
       status: query.get("status") || undefined,

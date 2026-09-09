@@ -14,10 +14,13 @@ import * as s3 from "aws-cdk-lib/aws-s3";
 import { Construct } from "constructs";
 import type { SharedPlatformStack } from "./shared-platform-stack";
 import type { TenantStack } from "./tenant-stack";
+import type { RecoveryConfiguration } from "./recovery-config";
+import { configureAuditRecovery } from "./audit-recovery";
 
 export interface ObservabilityStackProps extends StackProps {
   readonly shared: SharedPlatformStack;
   readonly tenants: readonly TenantStack[];
+  readonly recovery: RecoveryConfiguration;
 }
 
 export class ObservabilityStack extends Stack {
@@ -56,6 +59,9 @@ export class ObservabilityStack extends Stack {
       versioned: true,
     });
     auditBucket.policy?.applyRemovalPolicy(RemovalPolicy.RETAIN);
+    if (props.recovery.mode === "enabled") configureAuditRecovery(this, {
+      configuration: props.recovery, sourceBucket: auditBucket, sourceKey: auditKey, operationsTopic: props.shared.operationsTopic,
+    });
     const trailLogGroup = new logs.LogGroup(this, "TrailLogs", {
       encryptionKey: auditKey,
       removalPolicy: RemovalPolicy.RETAIN,

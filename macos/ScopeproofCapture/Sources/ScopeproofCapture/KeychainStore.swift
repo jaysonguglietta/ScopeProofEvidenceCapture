@@ -3,7 +3,31 @@ import Foundation
 import LocalAuthentication
 import Security
 
+#if DEBUG
+/// Explicit, task-local unit-test storage. Not compiled into release builds and
+/// never enabled by environment, preferences, or an application UI.
+final class InMemoryKeychainTestStore: @unchecked Sendable {
+    private let lock = NSLock()
+    private var records: [String: Data] = [:]
+    func read(_ account: String) -> Data? {
+        lock.lock(); defer { lock.unlock() }
+        return records[account]
+    }
+    func write(_ data: Data, account: String) {
+        lock.lock(); defer { lock.unlock() }
+        records[account] = data
+    }
+    func delete(_ account: String) {
+        lock.lock(); defer { lock.unlock() }
+        records.removeValue(forKey: account)
+    }
+}
+#endif
+
 enum KeychainStore {
+    #if DEBUG
+    @TaskLocal static var testStore: InMemoryKeychainTestStore?
+    #endif
     private struct DeviceCredential: Codable {
         let schemaVersion: Int
         let audience: String
@@ -24,6 +48,8 @@ enum KeychainStore {
     private static let localProvenanceAccount = "local-evidence-provenance-p256-v1"
     private static let localLifecycleAccount = "local-lifecycle-provenance-p256-v1"
     private static let localHoldAccount = "local-hold-provenance-p256-v1"
+    private static let localTransferReceiptAccount = "local-transfer-response-p256-v1"
+    private static let localArchiveAccount = "local-evidence-archive-p256-v1"
     private static let captureChainAnchorAccount = "local-capture-chain-anchor-v1"
     private static let captureCommitJournalAccount = "local-capture-commit-journal-v1"
     private static let s3CredentialsAccount = "aws-s3-evidence-credentials-v1"
@@ -228,6 +254,24 @@ enum KeychainStore {
 
     static func localHoldPrivateKey() throws -> Data {
         try localSigningPrivateKey(account: localHoldAccount)
+    }
+
+    static func localTransferReceiptPrivateKey() throws -> Data {
+        try localSigningPrivateKey(account: localTransferReceiptAccount)
+    }
+
+    static func localArchivePrivateKey() throws -> Data { try localSigningPrivateKey(account: localArchiveAccount) }
+    static func localArchiveSigningKeyID() -> String? {
+        guard let data = keychainData(account: localArchiveAccount),
+              let key = try? P256.Signing.PrivateKey(rawRepresentation: data) else { return nil }
+        return SHA256.hash(data: key.publicKey.x963Representation).map { String(format: "%02x", $0) }.joined()
+    }
+
+    // Receipt verification is read-only: never create a replacement trust key.
+    static func localTransferReceiptSigningKeyID() -> String? {
+        guard let data = keychainData(account: localTransferReceiptAccount),
+              let key = try? P256.Signing.PrivateKey(rawRepresentation: data) else { return nil }
+        return SHA256.hash(data: key.publicKey.x963Representation).map { String(format: "%02x", $0) }.joined()
     }
 
     private static func localSigningPrivateKey(account: String) throws -> Data {
@@ -479,7 +523,73 @@ enum KeychainStore {
         captureChainAccount(binding: binding)
     }
 
+    static func awsCollectorIdentity(scope: String, userId: String) throws -> AWSCollectorDeviceIdentity {
+        let account = "aws-collector-proof-v1-" + LocalEvidenceArchive.digest(Data((scope + "\n" + userId).utf8))
+        if let data = try requiredAWSCollectorKeychainData(account: account) {
+            guard data.count <= 8_192,
+                  let identity = try? JSONDecoder().decode(AWSCollectorDeviceIdentity.self, from: data),
+                  identity.schemaVersion == 1, identity.scope == scope, identity.userId == userId,
+                  AWSCollectorService.resourceID(identity.deviceId, prefix: "dev"),
+                  (try? identity.publicKey) != nil else { throw AWSCollectorFailure.enrollmentRejected }
+            return identity
+        }
+        let identity = AWSCollectorDeviceIdentity(schemaVersion: 1, scope: scope, userId: userId,
+            deviceId: "dev_" + UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased(),
+            privateKey: P256.Signing.PrivateKey().rawRepresentation)
+        try saveKeychainData(JSONEncoder().encode(identity), account: account, accessible: kSecAttrAccessibleWhenUnlockedThisDeviceOnly)
+        return identity
+    }
+
+    static func saveAWSCollectorEnrollment(_ enrollment: AWSCollectorEnrollment, scope: String, userId: String) throws {
+        let identity = try awsCollectorIdentity(scope: scope, userId: userId)
+        guard enrollment.id == identity.deviceId, enrollment.principalId == userId,
+              enrollment.publicKeySha256 == (try identity.fingerprint), enrollment.status == "ACTIVE" else { throw AWSCollectorFailure.enrollmentRejected }
+        try saveKeychainData(JSONEncoder().encode(enrollment),
+            account: "aws-collector-enrollment-v1-" + LocalEvidenceArchive.digest(Data((scope + "\n" + userId).utf8)),
+            accessible: kSecAttrAccessibleWhenUnlockedThisDeviceOnly)
+    }
+
+    static func nextAWSCollectorUploadSequence(scope: String, userId: String) throws -> Int {
+        let account = "aws-collector-sequence-v1-" + LocalEvidenceArchive.digest(Data((scope + "\n" + userId).utf8))
+        let previous: Int
+        if let data = try requiredAWSCollectorKeychainData(account: account) {
+            guard let value = try? JSONDecoder().decode(Int.self, from: data), value >= 0, value < 9_007_199_254_740_991 else { throw AWSCollectorUploadFailure.reconcile }
+            previous = value
+        } else { previous = 0 }
+        try saveKeychainData(JSONEncoder().encode(previous + 1), account: account, accessible: kSecAttrAccessibleWhenUnlockedThisDeviceOnly)
+        return previous + 1
+    }
+
+    static func awsCollectorUpload(scope: String, userId: String, manifestSHA: String) throws -> AWSCollectorUploadRecord? {
+        let account = "aws-collector-upload-v1-" + LocalEvidenceArchive.digest(Data((scope + "\n" + userId + "\n" + manifestSHA).utf8))
+        guard let data = try requiredAWSCollectorKeychainData(account: account) else { return nil }
+        guard data.count <= 131_072, let record = try? JSONDecoder().decode(AWSCollectorUploadRecord.self, from: data),
+              record.scope == scope, record.selection.userId == userId, record.manifestSHA256 == manifestSHA else { throw AWSCollectorUploadFailure.reconcile }
+        return record
+    }
+    static func saveAWSCollectorUpload(_ record: AWSCollectorUploadRecord) throws {
+        let data = try JSONEncoder().encode(record)
+        guard data.count <= 131_072 else { throw AWSCollectorUploadFailure.reconcile }
+        try saveKeychainData(data, account: "aws-collector-upload-v1-" + LocalEvidenceArchive.digest(Data((record.scope + "\n" + record.selection.userId + "\n" + record.manifestSHA256).utf8)), accessible: kSecAttrAccessibleWhenUnlockedThisDeviceOnly)
+    }
+
+    private static func requiredAWSCollectorKeychainData(account: String) throws -> Data? {
+        #if DEBUG
+        if let testStore { return testStore.read(account) }
+        #endif
+        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service,
+            kSecAttrAccount as String: account, kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess, let data = item as? Data else { throw NSError(domain: NSOSStatusErrorDomain, code: Int(status)) }
+        return data
+    }
+
     private static func keychainData(account: String) -> Data? {
+        #if DEBUG
+        if let testStore { return testStore.read(account) }
+        #endif
         let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrService as String: service, kSecAttrAccount as String: account, kSecReturnData as String: true, kSecMatchLimit as String: kSecMatchLimitOne]
         var item: CFTypeRef?
         guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess else { return nil }
@@ -489,6 +599,9 @@ enum KeychainStore {
     private static func saveKeychainData(
         _ data: Data, account: String, accessible: CFString
     ) throws {
+        #if DEBUG
+        if let testStore { testStore.write(data, account: account); return }
+        #endif
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -517,6 +630,9 @@ enum KeychainStore {
     }
 
     private static func deleteKeychainData(account: String) {
+        #if DEBUG
+        if let testStore { testStore.delete(account); return }
+        #endif
         SecItemDelete([
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,

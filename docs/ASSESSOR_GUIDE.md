@@ -34,6 +34,19 @@ Hosted exports contain `00-READ-ME.txt`, `01-Evidence-Index.csv`, `02-Jira-Hando
 
 ## Verification sequence
 
+For a partitioned hosted delivery, obtain every numbered part and its checksum.
+Verify that every signed manifest binds the same complete-plan digest, total
+parts, assessment/scope and snapshot, with no missing or duplicate part indexes.
+A part is explicitly incomplete on its own. The current bounds are 1,000
+snapshot records, 100 records per part and 25 MiB per part; no truncation is
+permitted. Reject changed snapshot/approval/scope facts instead of combining
+different plans. See [package workflow](READINESS_WORKFLOWS.md).
+
+Control requirement counts indicate current eligible evidence, not a regulatory
+compliance score. Finding resolution must refer to its exact independently
+approved evidence occurrences; risk acceptance is a separate disposition.
+SBOM schema validity does not prove parser completeness or runtime inventory.
+
 1. Calculate SHA-256 for the ZIP before extraction and compare it with the separately delivered checksum.
 2. Extract into a protected working directory. Do not execute or preview unexpected active content.
 3. Review the Read Me and evidence index. Confirm the framework, catalog version, explicit controls/systems, period, preparer, package ID, and approved-only inclusion policy match the engagement. The bundled PCI DSS 4.0.1 Scopeproof operations catalog is intentionally limited; it is not evidence that every PCI DSS requirement was in scope.

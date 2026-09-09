@@ -50,7 +50,7 @@ jobs:
           trivyignores: .trivyignore.yaml
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: "22.13.0"
+          node-version-file: .node-version
           cache: npm
       - run: npm ci --ignore-scripts
       - name: Enforce lint and TypeScript contracts
@@ -106,9 +106,26 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Record native test toolchain
+        run: |
+          swift --version
+          xcodebuild -version
+      - name: Test AppKit presentation harness independently
+        working-directory: macos/ScopeproofCapture
+        run: swift test --arch arm64 --filter CaptureReviewPresentationTests
       - name: Test native application
         working-directory: macos/ScopeproofCapture
         run: swift test --arch arm64
+      - name: Preserve native test crash diagnostics
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: scopeproof-native-test-crashes
+          path: |
+            ~/Library/Logs/DiagnosticReports/ScopeproofCapturePackageTests*.ips
+            ~/Library/Logs/DiagnosticReports/ScopeproofCapturePackageTests*.crash
+          if-no-files-found: warn
+          retention-days: 7
       - name: Build development application
         run: ./Scripts/build_macos_capture.sh
       - name: Verify bundle metadata and signature

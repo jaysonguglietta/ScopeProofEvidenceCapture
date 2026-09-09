@@ -21,6 +21,7 @@ import {
 } from "../evidence/signed-audit-receipt.ts";
 import type { HostedApiAuditAction, HostedApiAuditResourceType } from "./audit-outbox.ts";
 import type { RdsDataApiExecutor } from "./membership.ts";
+import { customerAuditActions } from "./customer-contracts.ts";
 
 export interface ClaimedApiAuditOutboxEvent {
   readonly tenantId: string;
@@ -391,6 +392,8 @@ function parseClaim(value: string | undefined, tenantId: string, leaseToken: str
   const resourceType = exactResourceType(row.resource_type);
   const resourceId = asResourceId(exactString(row.resource_id));
   assertActionResource(action, resourceType, resourceId, tenantId);
+  const actorUserId = asUserId(exactString(row.actor_user_id));
+  if (action === "session.all_revoked" && String(resourceId) !== String(actorUserId)) throw malformed();
   const details = assertSafeJson(row.details, "API audit outbox details");
   if (!details || typeof details !== "object" || Array.isArray(details)) throw malformed();
   for (const reserved of ["scopeproofMembershipId", "scopeproofOutboxDigest", "scopeproofOutboxId"]) {
@@ -404,7 +407,7 @@ function parseClaim(value: string | undefined, tenantId: string, leaseToken: str
     outboxId,
     eventId,
     occurredAt: canonicalInstant(exactString(row.occurred_at), "API audit occurrence time"),
-    actorUserId: asUserId(exactString(row.actor_user_id)),
+    actorUserId,
     membershipId: asMembershipId(exactString(row.membership_id)),
     requestId,
     action,
@@ -537,18 +540,26 @@ function exactLeaseToken(value: string): string {
 
 function exactAction(value: unknown): HostedApiAuditAction {
   const action = exactString(value);
-  if (!["evidence.upload_intent_issued", "evidence.search_performed", "evidence.download_intent_issued", "evidence.legal_hold_requested", "evidence.legal_hold_approved"].includes(action)) throw malformed();
+  if (![...customerAuditActions, "evidence.upload_intent_issued", "evidence.search_performed", "evidence.download_intent_issued", "evidence.legal_hold_requested", "evidence.legal_hold_approved", "session.all_revoked"].includes(action)) throw malformed();
   return action as HostedApiAuditAction;
 }
 
 function exactResourceType(value: unknown): HostedApiAuditResourceType {
   const resourceType = exactString(value);
-  if (!["evidence", "evidence_collection", "legal_hold_operation"].includes(resourceType)) throw malformed();
+  if (!["evidence", "evidence_collection", "legal_hold_operation", "principal", "device", "assessment"].includes(resourceType)) throw malformed();
   return resourceType as HostedApiAuditResourceType;
 }
 
 function assertActionResource(action: HostedApiAuditAction, type: HostedApiAuditResourceType, id: string, tenantId: string): void {
-  if (action === "evidence.search_performed") {
+  if (action.startsWith("customer.devices_")) {
+    if (type !== "device" || !/^dev_[a-f0-9]{32}$/.test(id)) throw malformed();
+  } else if (action.startsWith("customer.assessments_")) {
+    if (type !== "assessment" || !/^asm_[a-f0-9]{32}$/.test(id)) throw malformed();
+  } else if (action === "customer.evidence_reviewed") {
+    if (type !== "evidence" || !/^evd_[a-f0-9]{32}$/.test(id)) throw malformed();
+  } else if (action.startsWith("customer.members_") || action === "customer.invitation_accepted" || action === "session.all_revoked") {
+    if (type !== "principal" || !/^usr_[a-f0-9]{32}$/.test(id)) throw malformed();
+  } else if (action === "evidence.search_performed") {
     if (type !== "evidence_collection" || id !== tenantId) throw malformed();
   } else if (action === "evidence.upload_intent_issued" || action === "evidence.download_intent_issued") {
     if (type !== "evidence" || !/^evd_[a-f0-9]{32}$/.test(id)) throw malformed();

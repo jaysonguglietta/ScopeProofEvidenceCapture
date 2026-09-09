@@ -69,6 +69,16 @@ struct CaptureManifest: Codable, Sendable {
 }
 
 extension CaptureManifest {
+    /// Legacy schemas have no signed workspace identity and are local/default only.
+    func belongs(to expectedBinding: TenantWorkspaceBinding) -> Bool {
+        if schemaVersion < 8 {
+            return expectedBinding == .localDefault && tenantID == nil && workspaceID == nil
+        }
+        guard let tenantID, let workspaceID else { return false }
+        return tenantBinding == expectedBinding
+            && tenantID == expectedBinding.tenantID && workspaceID == expectedBinding.workspaceID
+    }
+
     var tenantBinding: TenantWorkspaceBinding? {
         guard let tenantID, let workspaceID else { return nil }
         return TenantWorkspaceBinding.validated(tenantID: tenantID, workspaceID: workspaceID)

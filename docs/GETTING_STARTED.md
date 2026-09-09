@@ -1,5 +1,12 @@
 # Install and use Scopeproof Capture on a Mac
 
+For current development changes, also read [Updated evidence workflows](READINESS_WORKFLOWS.md).
+Legacy destructive retention is disabled. The new explicit archive workflow
+preserves all signed metadata and only moves verified archived PNGs to Trash;
+same-Mac recovery requires the original Keychain trust material. Legacy unsealed
+transfer receipts require verification or reconciliation. The public
+DMG has not been rebuilt by this implementation work.
+
 This guide is the shortest complete path from a new Mac to a reviewed evidence package. It also explains the optional S3, GitHub SBOM, Jira, and hosted-service paths so an operator can tell which credentials are needed and where data goes.
 
 ## Choose how you want to run it
@@ -92,8 +99,9 @@ The preview is ad-hoc signed and is not Apple-notarized. After verifying the che
    intend to evaluate, record its full SHA, and confirm `git status --short` is
    clean. A branch name or bundle version does not prove that a checkout contains
    the current unreleased changes. Do not infer release status from the `1.10.0`
-   bundle version: build `25` is source-only until an exact reviewed commit is
-   merged and a separately verified 1.10.0 artifact is published.
+   bundle version: build `26` identifies this unreleased development build,
+   not a public DMG or production qualification. Use the exact reviewed
+   commit on `codex/security-product-readiness` for these changes until merged.
 
 3. Build, install into your personal Applications folder, and launch:
 
@@ -252,7 +260,7 @@ The current public code still contains the legacy single-tenant hosted runtime. 
 
 For an existing approved single-tenant service, the bootstrap administrator first uses **Settings → Team & access** to create expiring invitations and assign roles. An administrator or compliance lead can then enroll a capture device and provide its one-time `spdev_dev_…` token. The release must already contain that exact HTTPS origin in `ScopeproofHostedAPIOrigins`; the checked-in source array is empty. Enter the same origin and token under **Capture & Jira Settings…**. The token is audience-bound, stored in Keychain, expires after 30 days, and is shown again only when an administrator rotates it. Rotation invalidates the old token immediately. Leave the Server URL blank for local-only operation.
 
-Before enabling native hosted uploads, the service operator must apply database migrations through `0028_native_reconciliation_cursor.sql`, run `npm run db:verify`, configure the independent scanner through the legacy-named `BROWSER_OCR_*` settings, configure the RFC 3161 issuer/verifier trust boundary, and confirm the administrator readiness endpoint has no failures. Hosted assessments must use an explicit digest-verified catalog/system/control scope; package export runs one shared fail-closed eligibility policy at preflight and publication; durable findings separate reviewer maintenance from compliance-lead/administrator disposition. Immutable external-checkpoint delivery attempts, atomic checkpoint retry leases, durable per-record key-rotation retries, and the sparse native-reconciliation queue/cursors must be healthy before launch. Production readiness fails when the scanner is missing or unsafe, when trusted timestamp enforcement is disabled, or when the timestamp service/trust material is incomplete. The legacy application does not cryptographically authenticate its expected identity headers; separately prove in the authorized deployed environment that an identity-aware private dispatcher overwrites every caller-supplied header variant and that no direct Worker, preview, or origin route is reachable. No AWS environment was deployed by this repository work; the AWS files are reviewed templates and implementation source only.
+Before enabling native hosted uploads, the service operator must apply database migrations through `0031_brave_silver_fox.sql`, run `npm run db:verify`, configure the independent scanner through the legacy-named `BROWSER_OCR_*` settings, configure the RFC 3161 issuer/verifier trust boundary, and confirm the administrator readiness endpoint has no failures. Hosted assessments must use an explicit digest-verified catalog/system/control scope; package export runs one shared fail-closed eligibility policy at preflight and publication; durable findings separate reviewer maintenance from compliance-lead/administrator disposition. Immutable external-checkpoint delivery attempts, atomic checkpoint retry leases, durable per-record key-rotation retries, and the sparse native-reconciliation queue/cursors must be healthy before launch. Production readiness fails when the scanner is missing or unsafe, when trusted timestamp enforcement is disabled, or when the timestamp service/trust material is incomplete. The legacy application does not cryptographically authenticate its expected identity headers; separately prove in the authorized deployed environment that an identity-aware private dispatcher overwrites every caller-supplied header variant and that no direct Worker, preview, or origin route is reachable. No AWS environment was deployed by this repository work; the AWS files are reviewed templates and implementation source only.
 
 ## Routine operator checklist
 

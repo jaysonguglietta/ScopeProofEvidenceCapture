@@ -22,6 +22,7 @@ struct JiraCloudIssue: Decodable, Sendable {
 }
 
 struct JiraCloudUploadReceipt: Decodable, Sendable {
+    struct Attachment: Decodable, Sendable { let id: String; let filename: String; let size: Int }
     let receiptID: String
     let evidenceID: String
     let issueKey: String
@@ -29,11 +30,12 @@ struct JiraCloudUploadReceipt: Decodable, Sendable {
     let uploadedAt: String
     let receiptSHA256: String
     let signature: String
+    let attachments: [Attachment]?
 
     private enum CodingKeys: String, CodingKey {
         case receiptID = "receiptId"
         case evidenceID = "evidenceId"
-        case issueKey, siteURL = "siteUrl", uploadedAt, receiptSHA256 = "receiptSha256", signature
+        case issueKey, siteURL = "siteUrl", uploadedAt, receiptSHA256 = "receiptSha256", signature, attachments
     }
 }
 
@@ -63,7 +65,7 @@ actor JiraCloudService {
         let (request, audience) = try authorizedRequest(
             serverURL: serverURL, path: "api/native/jira/status", binding: binding
         )
-        let (data, response) = try await BackendHTTP.data(for: request, audience: audience)
+        let (data, response) = try await BackendHTTP.data(for: request, audience: audience, maximumBytes: 64 * 1024)
         return try decode(ConnectionEnvelope.self, data: data, response: response).connection
     }
 
@@ -75,11 +77,11 @@ actor JiraCloudService {
         request.timeoutInterval = 30
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: ["issueKey": issueKey])
-        let (data, response) = try await BackendHTTP.data(for: request, audience: audience)
+        let (data, response) = try await BackendHTTP.data(for: request, audience: audience, maximumBytes: 64 * 1024)
         return try decode(IssueEnvelope.self, data: data, response: response).issue
     }
 
-    func upload(entry: CaptureHistoryEntry, serverURL: URL?) async throws -> URL {
+    func upload(entry: CaptureHistoryEntry, serverURL: URL?, expectedSiteURL: String) async throws -> URL {
         guard let binding = entry.manifest.tenantBinding,
               let audience = BackendTrust.normalizedOrigin(serverURL),
               let token = KeychainStore.readToken(for: audience, binding: binding),
@@ -105,11 +107,12 @@ actor JiraCloudService {
         request.setValue(UploadService.uploadSignature(token: token, manifest: manifest, image: screenshot), forHTTPHeaderField: "X-Scopeproof-Upload-Signature")
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         request.httpBody = multipart(boundary: boundary, files: files)
-        let (data, response) = try await BackendHTTP.data(for: request, audience: requestAudience)
+        let (data, response) = try await BackendHTTP.data(for: request, audience: requestAudience, maximumBytes: 256 * 1024)
         _ = try decode(ReceiptEnvelope.self, data: data, response: response)
         let receiptURL = entry.jiraReceiptURL
-        try data.write(to: receiptURL, options: [.atomic, .completeFileProtection])
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: receiptURL.path)
+        try TransferReceipt.record(payload: data, kind: .jira, artifact: artifact,
+            manifestURL: entry.manifestURL, destination: ["origin": audience.absoluteString,
+            "siteURL": expectedSiteURL, "issueKey": artifact.manifest.jiraIssueKey ?? ""], receiptURL: receiptURL)
         return receiptURL
     }
 

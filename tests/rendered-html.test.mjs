@@ -12,7 +12,7 @@ test("builds the PCI evidence operations console and protected API surface", asy
   assert.match(page, /EvidenceConsole/);
   assert.match(consoleSource, /Scopeproof/);
   assert.match(consoleSource, /PCI DSS 4\.0\.1/);
-  assert.match(consoleSource, /Control coverage/);
+  assert.match(consoleSource, /Approved evidence presence/);
   assert.match(consoleSource, /Recent evidence/);
   assert.match(consoleSource, /Run collection/);
   assert.match(worker, /content-security-policy/);
@@ -33,7 +33,8 @@ test("keeps evidence models, product UI, and starter cleanup explicit", async ()
   assert.doesNotMatch(consoleSource, /localStorage/);
   assert.match(consoleSource, /SHA-256|sha256/);
   assert.match(consoleSource, /Scan results are supporting claims/);
-  assert.match(consoleSource, /Approve evidence/);
+  assert.match(consoleSource, /metadata\?\.allowedActions\.includes\(action\)/);
+  assert.match(consoleSource, /onReview\(item, action/);
   assert.match(data, /PCI control|control:/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);
   await assert.rejects(access(new URL("../app/_sites-preview/SkeletonPreview.tsx", import.meta.url)));

@@ -67,6 +67,10 @@ export class SharedPlatformStack extends Stack {
     evidenceRead: cognito.OAuthScope;
     evidenceCollect: cognito.OAuthScope;
     retentionManage: cognito.OAuthScope;
+    tenantManage: cognito.OAuthScope;
+    deviceManage: cognito.OAuthScope;
+    jobsManage: cognito.OAuthScope;
+    evidenceApprove: cognito.OAuthScope;
   }>;
   public readonly databaseCluster: rds.DatabaseCluster;
   public readonly jobsQueue: sqs.Queue;
@@ -198,15 +202,25 @@ export class SharedPlatformStack extends Stack {
       scopeName: "retention.manage",
       scopeDescription: "Request and approve tenant retention and legal-hold operations",
     });
+    const customerScopes = {
+      tenantManage: new cognito.ResourceServerScope({ scopeName: "tenant.manage", scopeDescription: "Manage current tenant membership and invitation workflows" }),
+      deviceManage: new cognito.ResourceServerScope({ scopeName: "device.manage", scopeDescription: "Enroll and revoke current tenant devices" }),
+      jobsManage: new cognito.ResourceServerScope({ scopeName: "jobs.manage", scopeDescription: "Manage current tenant scoped assessments" }),
+      evidenceApprove: new cognito.ResourceServerScope({ scopeName: "evidence.approve", scopeDescription: "Review and approve current tenant evidence" }),
+    };
     const scopeproofResourceServer = this.userPool.addResourceServer("ScopeproofResourceServer", {
       identifier: "scopeproof",
-      scopes: [evidenceReadScope, evidenceCollectScope, retentionManageScope],
+      scopes: [evidenceReadScope, evidenceCollectScope, retentionManageScope, ...Object.values(customerScopes)],
       userPoolResourceServerName: "Scopeproof tenant API",
     });
     this.oauthScopes = Object.freeze({
       evidenceRead: cognito.OAuthScope.resourceServer(scopeproofResourceServer, evidenceReadScope),
       evidenceCollect: cognito.OAuthScope.resourceServer(scopeproofResourceServer, evidenceCollectScope),
       retentionManage: cognito.OAuthScope.resourceServer(scopeproofResourceServer, retentionManageScope),
+      tenantManage: cognito.OAuthScope.resourceServer(scopeproofResourceServer, customerScopes.tenantManage),
+      deviceManage: cognito.OAuthScope.resourceServer(scopeproofResourceServer, customerScopes.deviceManage),
+      jobsManage: cognito.OAuthScope.resourceServer(scopeproofResourceServer, customerScopes.jobsManage),
+      evidenceApprove: cognito.OAuthScope.resourceServer(scopeproofResourceServer, customerScopes.evidenceApprove),
     });
 
     const authCertificate = new acm.Certificate(this, "CognitoCertificate", {
@@ -805,26 +819,28 @@ export class SharedPlatformStack extends Stack {
         "version: 1",
         "frontend:",
         "  phases:",
-        "    preBuild:",
-        "      commands:",
-        "        - npm ci --ignore-scripts --cache .npm --prefer-offline",
         "    build:",
         "      commands:",
-        "        - npm run build",
+        "        - node infra/aws/customer-portal/build.mjs",
         "  artifacts:",
-        "    baseDirectory: .next",
+        "    baseDirectory: .scopeproof-portal",
         "    files:",
         "      - '**/*'",
-        "  cache:",
-        "    paths:",
-        "      - .npm/**/*",
-        "      - .next/cache/**/*",
       ].join("\n"),
-      computeRoleArn: this.amplifyComputeRole.roleArn,
-      description: "Scopeproof multi-tenant evidence console",
+      customHeaders: [
+        "customHeaders:", "  - pattern: '**/*'", "    headers:",
+        "      - key: Content-Security-Policy",
+        `        value: "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' blob:; connect-src 'self' https://*.${this.rootDomain} https://*.amazonaws.com https://*.amazonaws.com.cn; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; upgrade-insecure-requests"`,
+        "      - key: Referrer-Policy", "        value: no-referrer",
+        "      - key: X-Content-Type-Options", "        value: nosniff",
+        "      - key: Cache-Control", "        value: no-store",
+        "      - key: Strict-Transport-Security", "        value: max-age=31536000; includeSubDomains",
+      ].join("\n"),
+      customRules: [{ source: "/auth/callback", target: "/index.html", status: "200" }],
+      description: "Scopeproof static AWS customer portal; public tenant outputs required at build time",
       iamServiceRole: amplifyServiceRole.roleArn,
       name: "scopeproof",
-      platform: "WEB_COMPUTE",
+      platform: "WEB",
     });
     new wafv2.CfnWebACLAssociation(this, "AmplifyWebAclAssociation", {
       resourceArn: this.formatArn({
@@ -844,7 +860,6 @@ export class SharedPlatformStack extends Stack {
         { name: "SCOPEPROOF_ROOT_DOMAIN", value: this.rootDomain },
         { name: "SCOPEPROOF_CONTROL_TABLE", value: this.controlTable.tableName },
       ],
-      framework: "Next.js - SSR",
       stage: "PRODUCTION",
     });
     const amplifyDomain = new amplify.CfnDomain(this, "AmplifyDomain", {

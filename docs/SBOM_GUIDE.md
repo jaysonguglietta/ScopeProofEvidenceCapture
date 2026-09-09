@@ -30,7 +30,7 @@ Set `GITHUB_ORG` to the one organization operators may inventory. Set `GITHUB_TO
 Do not grant write, administration, workflow, issue, or secret permissions. Rotate the credential using the platform secret manager; never put it in the browser, Mac app, repository, or D1.
 
 Apply every migration in journal order through
-`drizzle/0028_native_reconciliation_cursor.sql` before enabling the current
+`drizzle/0031_brave_silver_fox.sql` before enabling the current
 application, and run `npm run db:verify` as a deployment preflight. Migration
 0012 creates the SBOM job domain; migrations through 0023 add membership,
 retry authorization, occurrence/lifecycle, audited mutation, immutable receipt,
@@ -103,7 +103,16 @@ The server enforces a 20 MB compressed archive limit, 5,000-entry limit, 100-man
 
 The native Mac generator does not download or extract an archive. It uses only `api.github.com`, rejects redirects, caps the recursive tree response at 8 MB and 5,000 entries, selects at most 100 recognized lockfile blobs, limits each to 2 MB and their decoded total to 8 MB, requires valid UTF-8 without NUL bytes, and emits at most 5,000 unique components. Only one native run may execute at a time and no failed request retries automatically. GitHub's own API rate limits still apply.
 
-Supported inputs are `package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock`, `pnpm-lock.yaml`, `requirements.txt`, `Pipfile.lock`, `poetry.lock`, `Cargo.lock`, `go.sum`, `Gemfile.lock`, and `composer.lock`. A run fails explicitly when no supported lockfile or pinned component can be found. Unsupported ecosystems require a reviewed parser addition; Scopeproof does not infer a complete inventory from unpinned manifest files.
+Recognized inputs include `package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock`,
+`pnpm-lock.yaml`, `requirements.txt`, `Pipfile.lock`, `poetry.lock`, `Cargo.lock`,
+`go.sum`, `Gemfile.lock` and `composer.lock`. Recognition is not complete support.
+Native and hosted npm versions 1/2/3 preserve nested and simultaneous versions;
+v1 direct/transitive classification is unknown. Unsupported recognized versions
+are rejected. Currently heuristic non-npm parsers are explicitly partial review
+aids, not complete inventories eligible for approval. A run with no supported
+pinned components fails; unpinned manifests never imply completeness. Generated
+CycloneDX 1.6 and SPDX 2.3 are tested against pinned official offline schemas with
+shared native/hosted ground-truth fixtures. Schema validity is not completeness.
 
 Managed repository listing is intentionally capped at 250 repositories. If an intended repository is absent, narrow the managed token's selected repositories, use a dedicated Scopeproof GitHub organization/installation boundary, or use one-time access rather than broadening a persistent credential. Generated evidence is valid for 365 days by default but remains subject to the assessment period, ordinary evidence retention, legal hold, approval, supersession, and expiration controls.
 
@@ -111,7 +120,14 @@ Managed repository listing is intentionally capped at 250 repositories. If an in
 
 The SBOM proves the dependency inventory parsed from supported lockfiles present at the recorded commit. It does not prove that the same commit was deployed, that every runtime dependency appears in a supported lockfile, or that listed packages are vulnerability-free. Pair it with deployment provenance, release attestations, vulnerability scan results, and change-management evidence.
 
-For repeat runs, Scopeproof records added, removed, and version-changed component names against the most recent completed inventory for the same repository and assessment. The full current SBOM remains authoritative; the change summary is a review aid.
+For repeat runs, Scopeproof compares complete version sets for each component
+against an eligible same-repository, same-assessment baseline. Expand the hosted
+inventory panel to inspect the exact baseline identity, coverage/manifests and
+searchable component details. The bounded preview explicitly reports truncation;
+download full bounded inventory/change details as JSON. Auditor visibility still
+requires approved evidence. Native one-time JSON output remains operator-managed,
+not automatically hosted assessment evidence. The full SBOM is authoritative;
+the change summary remains a review aid, not a runtime or vulnerability scan.
 
 ## Troubleshooting and response
 

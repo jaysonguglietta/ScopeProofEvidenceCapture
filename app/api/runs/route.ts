@@ -3,6 +3,7 @@ import { getEnv } from "../../../lib/server/env";
 import { enforceRateLimit, requireBoundedContentLength } from "../../../lib/server/rate-limit";
 import { ensureDefaultCollectors, queueCollection } from "../../../lib/server/jobs";
 import { decodePageCursor, pageLimit, pageMeta } from "../../../lib/server/pagination";
+import { watchedJobIds } from "../../../lib/server/job-watch";
 
 export async function GET(request: Request) {
   try {
@@ -13,6 +14,7 @@ export async function GET(request: Request) {
     const assessmentId = query.get("assessmentId") || "";
     if (assessmentId && !/^asm_[a-f0-9]{32}$/u.test(assessmentId)) return Response.json({ error: "Assessment identifier is invalid." }, { status: 400 });
     const limit = pageLimit(query.get("limit"), 50, 100);
+    const watched = watchedJobIds(query.get("watch"), assessmentId, "job");
     const cursor = decodePageCursor(query.get("cursor"), /^job_[a-f0-9]{32}$/u);
     const conditions: string[] = [];
     const bindings: unknown[] = [];
@@ -30,7 +32,8 @@ export async function GET(request: Request) {
       SUM(CASE WHEN j.status = 'failed' THEN 1 ELSE 0 END) AS failed
       FROM collection_jobs j ${baseWhere}`).bind(...baseBindings).first<Record<string, number>>();
     const paged = pageMeta(rows, limit, Number(total?.total || 0), "created_at", "id");
-    return Response.json({ runs: paged.items, page: paged.page, summary }, { headers: { "cache-control": "private, no-store" } });
+    const updates = watched.length ? (await getEnv().DB.prepare("SELECT j.*, c.display_name, c.provider FROM collection_jobs j JOIN collectors c ON c.id=j.collector_id WHERE j.assessment_id=? AND j.id IN (SELECT value FROM json_each(?)) ORDER BY j.created_at DESC,j.id DESC LIMIT 50").bind(assessmentId, JSON.stringify(watched)).all<Record<string, unknown>>()).results : [];
+    return Response.json({ runs: paged.items, updates, page: paged.page, summary, activeCount: Number(summary?.active || 0) }, { headers: { "cache-control": "private, no-store" } });
   } catch (error) { return jsonError(error); }
 }
 

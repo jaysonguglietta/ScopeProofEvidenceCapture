@@ -3,6 +3,8 @@ import { getEnv } from "../../../lib/server/env";
 import { buildAssessorPackage, preflightAssessorPackage } from "../../../lib/server/packages";
 import { enforceRateLimit, requireBoundedContentLength } from "../../../lib/server/rate-limit";
 import { decodePageCursor, pageLimit, pageMeta } from "../../../lib/server/pagination";
+import { workflowBody } from "../../../lib/server/workflow-validation";
+import type { PartitionRequest } from "../../../lib/server/package-plan";
 
 export async function GET(request: Request) {
   try {
@@ -32,10 +34,17 @@ export async function POST(request: Request) {
     const user = await requireApiPermission(request, "export_packages");
     await enforceRateLimit(request, user.id, "package:create", 10, 3_600);
     requireBoundedContentLength(request, 4 * 1024);
-    const body = await request.json() as { assessmentId?: string };
+    const body = workflowBody(await request.json(), ["assessmentId", "partition"]);
     const assessmentId = String(body.assessmentId || "");
+    let partition: PartitionRequest | undefined;
+    if (body.partition !== undefined) {
+      const input = workflowBody(body.partition, ["digest", "index"]);
+      if (typeof input.digest !== "string" || !/^[a-f0-9]{64}$/u.test(input.digest) || !Number.isSafeInteger(input.index) || Number(input.index) < 1 || Number(input.index) > 1000) return Response.json({ error: "A valid plan digest and part index are required." }, { status: 400 });
+      partition = { digest: input.digest, index: Number(input.index) };
+    }
     const preflight = await preflightAssessorPackage(assessmentId);
-    if (!preflight.ready) return Response.json({ error: "Package preflight failed.", preflight }, { status: 409 });
-    return Response.json({ package: await buildAssessorPackage(user, assessmentId), preflight }, { status: 201 });
+    const blockers = partition ? preflight.blockers.filter((item) => !["PACKAGE_LIMIT", "PACKAGE_BYTES_LIMIT"].includes(item.code)) : preflight.blockers;
+    if (blockers.length) return Response.json({ error: "Package preflight failed.", preflight }, { status: 409 });
+    return Response.json({ package: await buildAssessorPackage(user, assessmentId, partition), preflight }, { status: 201 });
   } catch (error) { return jsonError(error); }
 }

@@ -87,7 +87,7 @@ enum LocalProvenance {
         _ hold: LocalEvidenceHoldRecord, privateKeyData: Data? = nil
     ) throws -> LocalProvenanceSignature {
         try sign(
-            payload: canonicalJSON(hold, removingTopLevelKeys: ["provenance"]),
+            payload: canonicalJSON(hold, removingTopLevelKeys: ["provenance", "history"]),
             domain: holdDomain,
             privateKeyData: try privateKeyData ?? KeychainStore.localHoldPrivateKey()
         )
@@ -95,7 +95,7 @@ enum LocalProvenance {
 
     static func verifyHold(_ hold: LocalEvidenceHoldRecord) -> Bool {
         guard let signature = hold.provenance,
-              let payload = try? canonicalJSON(hold, removingTopLevelKeys: ["provenance"]) else {
+              let payload = try? canonicalJSON(hold, removingTopLevelKeys: ["provenance", "history"]) else {
             return false
         }
         return verify(signature, payload: payload, domain: holdDomain)

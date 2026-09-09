@@ -1,5 +1,9 @@
 # Security and product remediation status — 2026-09-01
 
+Historical batch record. The [September 8 ledger](READINESS_IMPLEMENTATION_STATUS.md)
+supersedes current implementation status and migration prerequisites; this
+document preserves the evidence and limitations of the earlier batch.
+
 This document records source-level remediation status after the 2026-08-28 adversarial review. Its statements apply only to an exact reviewed commit containing the referenced changes; an uncommitted working tree, branch name, or local build is not closure evidence. It is a change-status and deployment-readiness reference, not a replacement for the threat model in [Security audit — 2026-08-28](SECURITY_AUDIT_2026-08-28.md).
 
 The audit's open questions are intentionally not decided here. Those governance decisions remain with the product, legal, security, privacy, and records owners. This document instead distinguishes controls that now exist in source from external prerequisites that an operator must satisfy and validate before production use.

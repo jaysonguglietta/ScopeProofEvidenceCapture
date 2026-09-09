@@ -1,6 +1,35 @@
 # Changelog
 
-## Unreleased — 1.10.0 (build 25)
+## Unreleased — 1.10.0 (build 26)
+
+### September 8 product/security remediation (development source)
+
+- September 9 publication follow-up: source pushed as PR #113; local build 26
+  installed/restarted and executable digest verified. Added explicit AppKit
+  test-runner initialization and failure diagnostics after a CI SIGBUS; two
+  portal CodeQL alerts remain open for review. No merge/deployment is implied.
+- Advanced the local development build from 25 to 26 for the September 8
+  implementation. This is not a new public DMG or a notarized production release.
+  Publication and local installation are recorded separately from source tests.
+- Added workspace-scoped native reads, device-sealed transfer responses, bounded
+  streaming responses, full-history exact-version archival and same-Mac restore.
+  Payload disposal preserves signed metadata and refuses incomplete history.
+- Added draft scope/compatibility preview, explicit assessment-bound schedules,
+  resilient domain loads and older-page job polling, durable library navigation,
+  authoritative review actions, evidence-backed findings, versioned requirements,
+  full SBOM detail and explicitly labeled package partition plans.
+- Corrected nested/multi-version SBOM inventories in both generators and added
+  pinned official CycloneDX/SPDX schema validation and provider-contract fixtures.
+- Added AWS customer API/membership/device/scope/review adapters and a separate
+  static Cognito portal; isolated central bootstrap authority; installed forward
+  SQL 010/011 with real PostgreSQL role/semantic tests; added approval-gated
+  restore and separate DNS-cutover operator tooling without executing it.
+- Updated fast-uri, the CI Node patch baseline and required TS/MJS test discovery.
+  Added D1 migrations 0029–0031. See the implementation ledger for outstanding
+  cross-Mac recovery, legacy ingress and live/signed release qualifications.
+- No AWS deployment, public DMG or production certification is implied by these
+  source changes. See the [source validation](docs/READINESS_VALIDATION_2026-09-08.md)
+  and [publication/install handoff](docs/PUBLICATION_AND_LOCAL_UPDATE_2026-09-08.md).
 
 - Advanced the unreleased macOS build from 24 to 25 so the hardened binary has a unique bundle identity and cannot be confused with an earlier local 1.10.0 build containing different bytes.
 - Restored current Mac-to-hosted compatibility by accepting only signed schema-8 native manifests at the hosted boundary and requiring their customer/workspace identifiers to exactly match the isolated deployment's `LEGACY_TENANT_ID` and `LEGACY_WORKSPACE_ID`; schema-7 evidence cannot be silently rebound across this boundary.
@@ -71,7 +100,7 @@
 
 > **Not published:** these source changes postdate
 > `v1.8.1-development-preview.1` (`8cd2d5c`) and are not present in that public
-> DMG. Version `1.10.0` and build `25` are allocated in source, but no 1.10.0
+> DMG. Version `1.10.0` and build `26` are allocated in source, but no 1.10.0
 > artifact exists; an independently verified new release is required before
 > these entries can be described as downloadable behavior.
 

@@ -30,7 +30,7 @@ BEGIN
   EXECUTE format('GRANT CONNECT ON DATABASE %I TO %I', current_database(), runtime_role);
   EXECUTE format('GRANT USAGE ON SCHEMA scopeproof TO %I', runtime_role);
   -- This migration is an allow-list reset. Reapplying it removes legacy table
-  -- grants before restoring only the four reviewed SECURITY DEFINER entrypoints.
+  -- grants before restoring only the nine reviewed runtime entrypoints.
   EXECUTE format('REVOKE ALL ON ALL TABLES IN SCHEMA scopeproof FROM %I', runtime_role);
   EXECUTE format('REVOKE ALL ON ALL SEQUENCES IN SCHEMA scopeproof FROM %I', runtime_role);
   EXECUTE format('REVOKE ALL ON ALL FUNCTIONS IN SCHEMA scopeproof FROM %I', runtime_role);
@@ -47,11 +47,11 @@ BEGIN
     'GRANT EXECUTE ON FUNCTION scopeproof.record_api_audit_event(scopeproof.resource_identifier, scopeproof.resource_identifier, text, text, text, text, text, jsonb) TO %I',
     runtime_role
   );
-  EXECUTE format('ALTER ROLE %I SET search_path = pg_catalog, scopeproof', runtime_role);
-  EXECUTE format('ALTER ROLE %I SET row_security = on', runtime_role);
-  EXECUTE format('ALTER ROLE %I SET statement_timeout = %L', runtime_role, '15s');
-  EXECUTE format('ALTER ROLE %I SET lock_timeout = %L', runtime_role, '3s');
-  EXECUTE format('ALTER ROLE %I SET idle_in_transaction_session_timeout = %L', runtime_role, '15s');
+  EXECUTE format('GRANT EXECUTE ON FUNCTION scopeproof.resolve_active_session_membership(text, timestamptz) TO %I', runtime_role);
+  EXECUTE format('GRANT EXECUTE ON FUNCTION scopeproof.revoke_own_sessions(text, timestamptz, text) TO %I', runtime_role);
+  EXECUTE format('GRANT EXECUTE ON FUNCTION scopeproof.customer_read(text, timestamptz, text, jsonb) TO %I', runtime_role);
+  EXECUTE format('GRANT EXECUTE ON FUNCTION scopeproof.customer_mutate(text, timestamptz, text, jsonb, text) TO %I', runtime_role);
+  EXECUTE format('GRANT EXECUTE ON FUNCTION scopeproof.customer_accept_invitation(text, timestamptz, text) TO %I', runtime_role);
 END;
 $$;
 

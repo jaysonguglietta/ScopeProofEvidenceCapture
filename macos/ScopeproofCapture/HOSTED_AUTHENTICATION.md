@@ -31,7 +31,7 @@ Every server-side read/preview, approval, package/export, and native Jira route 
 
 ## Upgrade, quarantine, and reconciliation
 
-Apply and verify migrations through `0028_native_reconciliation_cursor.sql` before enabling production native uploads. Migrations `0020`, `0022`, and `0023` remain the native-ingestion foundation; `0024` adds the current explicit assessment scope and durable review/finding/hold-release state used by downstream authorization. Migrations `0025` through `0027` add append-only checkpoint delivery attempts, durable key-rotation retry state, and atomic checkpoint-delivery claims with bounded backoff and terminal action-required state. Migration `0028` adds the sparse native-reconciliation queue and independent durable circular cursors:
+Apply and verify migrations through `0031_brave_silver_fox.sql` before enabling production native uploads. Migrations `0020`, `0022`, and `0023` remain the native-ingestion foundation; `0024` adds the current explicit assessment scope and durable review/finding/hold-release state used by downstream authorization. Migrations `0025` through `0027` add append-only checkpoint delivery attempts, durable key-rotation retry state, and atomic checkpoint-delivery claims with bounded backoff and terminal action-required state. Migration `0028` adds the sparse native-reconciliation queue and independent durable circular cursors:
 
 - `0020_native_device_chain.sql` introduces the device signing-key and chain reservation state.
 - `0022_native_provenance_quarantine.sql` records immutable native sequence/event/key finalization and prevents native manifest updates/deletes; the current route requires the schema-8 signed tenant/workspace binding before using those fields.
